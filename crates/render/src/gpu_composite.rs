@@ -457,7 +457,7 @@ impl ProceduralInputs {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct FilterStage {
     layer: u32,
     preceding: u32,
@@ -479,9 +479,12 @@ struct FilterStage {
     /// Evaluated once per update by the whole-set pre-pass ([`FilterPlan::whole_set`]) instead
     /// of in every band: a stage with a large reach, or one that needs the whole set.
     whole: bool,
-    /// A stage of the lit Base Color's own view for its mask (first slot of that stack): the
-    /// prepare pass evaluates the content with the default material ([`OWN_VIEW`]).
-    own_view: Option<u32>,
+    /// How the prepare pass views the content (bits of its `field_layout.w`): [`OWN_VIEW`], the
+    /// layer's own material read as the channels' defaults (a mask's This Layer of a lit Base
+    /// Color), and [`NO_FIELDS`], every neighbourhood stage as identity.
+    view: u32,
+    /// The prepare pass's `mask_view` (`FilterPlan::add_lit_mask_views`), zero for most stages
+    mask_view: [u32; 4],
 }
 
 /// The whole-set pre-pass of a program: the stages it evaluates (the whole-set stages and the
@@ -553,9 +556,10 @@ impl WholePass {
 /// own Height, `layer_content`), or an input source read as colour into words 5..8.
 const INPUT_LAYER: u32 = 2;
 const INPUT_COLOR: u32 = 4;
-/// The prepare pass's `field_layout.w` bit of a stage of the lit Base Color's own view
-/// (`FilterStage::own_view`), whose first slot goes in `params.anchor.y`
+/// The prepare pass's `field_layout.w` bits of a stage's view (`FilterStage::view`): the layer's
+/// own material read as the channels' defaults, and every neighbourhood stage as identity
 const OWN_VIEW: u32 = 8;
+const NO_FIELDS: u32 = 32;
 /// The prepare pass's `field_layout.w` bit of a stage with a second input (`FilterStage::input2`),
 /// whose operation plus one goes in `params.anchor.z`
 const INPUT2: u32 = 16;
@@ -628,18 +632,43 @@ impl FilterPlan {
                         plan.add_layer_content(layers, effects, own, run.clone(), inputs, (&mut prepared, &mut stack_reads, &mut read_effects));
                     }
                 }
-                plan.add_this_layer_reads(layers, effects, (mask, mask_count), lit, inputs);
+                // A mask comparing its lit Base Color, which has stages: two masks (M1, M2)
+                let base_stages = |base: usize| {
+                    let [_, _, content, count] = layers[base].effects.map(|word| word as usize);
+                    effects.iter().skip(content).take(count).any(|op| op.ids[1] == NEIGHBOURHOOD_OPCODE)
+                };
+                let reads_base = |base: usize| {
+                    effects
+                        .iter()
+                        .skip(mask as usize)
+                        .take(mask_count as usize)
+                        .any(|op| packages::mask_reads_own_layer(op) && op.effects[0] == base as u32 + 1)
+                };
+                match lit.filter(|&base| base_stages(base) && reads_base(base)) {
+                    Some(base) => {
+                        let progress = (&mut prepared, &mut stack_reads, &mut read_effects);
+                        let mask_base = plan.add_lit_mask_views(layers, effects, (index, base, run.clone()), (mask, mask_count), inputs, progress);
+                        masks.insert(mask, mask_base);
+                    }
+                    None => {
+                        plan.add_this_layer_reads(layers, effects, (mask, mask_count), lit, |_| true);
+                    }
+                }
             }
-            let mask_has_fields = mask_count > 0
-                && *masks.entry(mask).or_insert_with(|| {
+            // The mask stack's first slot plus one (0: no fields), read by `layer_mask`
+            let mask_base = if mask_count == 0 {
+                0
+            } else {
+                *masks.entry(mask).or_insert_with(|| {
                     let before = plan.stages.len();
                     plan.add_stack(effects, (mask, mask_count), (index as u32, None), None, inputs);
-                    plan.stages.len() != before
-                });
+                    if plan.stages.len() != before { before as u32 + 1 } else { 0 }
+                })
+            };
             // The layer's own material is captured after its mask and its other channels' stacks
             plan.bind_stack_reads(layers, effects, index, run.clone(), true, (&mut stack_reads, &mut read_effects));
             plan.add_layer_content(layers, effects, index, run, inputs, (&mut prepared, &mut stack_reads, &mut read_effects));
-            layers[index].spatial[2] = u32::from(mask_has_fields);
+            layers[index].spatial[2] = mask_base;
         }
         // An anchor can carry a filter's footprint into the next layer. Independent
         // channels within a layer share a footprint instead of adding to one another.
@@ -679,8 +708,9 @@ impl FilterPlan {
         let mut stacks = BTreeMap::<(u32, bool), (BTreeSet<usize>, Vec<usize>)>::new();
         for &output in &outputs {
             let stack = self.stages[output].stack();
-            let lower =
-                (0..=output).filter(|&index| self.stages[index].stack() == stack && !self.stages[index].anchors() && self.stages[index].own_view.is_none());
+            let lower = (0..=output).filter(|&index| {
+                self.stages[index].stack() == stack && !self.stages[index].anchors() && self.stages[index].view == 0 && self.stages[index].mask_view == [0; 4]
+            });
             let (stages, own) = stacks.entry(stack).or_default();
             stages.extend(lower);
             own.push(output);
@@ -795,7 +825,8 @@ impl FilterPlan {
                         input2: 0,
                         wrap: false,
                         whole: false,
-                        own_view: None,
+                        view: 0,
+                        mask_view: [0; 4],
                     });
                     self.stages.len() as u32
                 });
@@ -819,60 +850,90 @@ impl FilterPlan {
     }
 
     /// The layer's own content as its mask reads it (This Layer, `this_layer_content` in WGSL):
-    /// one stage per read channel operation, prepared from its whole content stack before the
-    /// mask stack, its slot plus one in the reading effect's `effects[2]`. The mask then reads a
-    /// field instead of evaluating the content inline, which keeps the content's code out of
-    /// the mask's (the driver inlines every call site).
+    /// one stage per read channel operation (`reads` picks which), prepared from its whole
+    /// content stack before the mask stack, its slot plus one in the reading effect's
+    /// `effects[2]`. The mask then reads a field instead of evaluating the content inline, which
+    /// keeps the content's code out of the mask's (the driver inlines every call site).
     ///
     /// The lit Base Color `lit`: the CPU evaluates the mask with no lit material (`Texel::lit`
-    /// is None while `node_mask` runs), so its lighting takes the default material there. Its
-    /// stack's stages get a copy prepared that way (`OWN_VIEW`), which its This Layer stage
-    /// resumes from; the real stack follows the mask and the material's capture.
+    /// is None while `node_mask` runs), so its own-material reads give the defaults there
+    /// (`OWN_VIEW`) past its last field.
+    #[allow(clippy::too_many_arguments)]
     fn add_this_layer_reads(
         &mut self,
         layers: &[Operation],
         effects: &mut [Operation],
         (mask, mask_count): (u32, u32),
         lit: Option<usize>,
-        inputs: &ProceduralInputs,
-    ) {
+        reads: impl Fn(u32) -> bool,
+    ) -> BTreeMap<u32, u32> {
         let mut views = BTreeMap::<u32, u32>::new();
         for effect in mask as usize..(mask + mask_count) as usize {
             let Some(op) = effects.get(effect).filter(|op| packages::mask_reads_own_layer(op)) else { continue };
-            let Some(own) = op.effects[0].checked_sub(1) else { continue };
-            let slot = match views.get(&own) {
-                Some(&slot) => slot,
-                None => {
-                    let own_view = (lit == Some(own as usize)).then(|| {
-                        let [_, _, content, content_count] = layers[own as usize].effects;
-                        let first = self.stages.len();
-                        self.add_stack(effects, (content, content_count), (own, None), Some(slot_kind(layers[own as usize].ids[0])), inputs);
-                        for stage in &mut self.stages[first..] {
-                            stage.own_view = Some(first as u32);
-                            stage.whole = false;
-                        }
-                        first as u32
-                    });
-                    self.stages.push(FilterStage {
-                        layer: own,
-                        preceding: layers[own as usize].effects[3],
-                        filter: None,
-                        cell: 1,
-                        anchor: None,
-                        input: 0,
-                        input_kind: 0,
-                        input2: 0,
-                        wrap: false,
-                        whole: false,
-                        own_view,
-                    });
-                    let slot = self.stages.len() as u32;
-                    views.insert(own, slot);
-                    slot
-                }
-            };
+            let Some(own) = op.effects[0].checked_sub(1).filter(|&own| reads(own)) else { continue };
+            let slot = *views.entry(own).or_insert_with(|| self.add_this_layer(layers, own, if lit == Some(own as usize) { OWN_VIEW } else { 0 }));
             effects[effect].effects[2] = slot;
         }
+        views
+    }
+
+    /// A This Layer stage of layer operation `own` viewed as `view`: its slot plus one.
+    fn add_this_layer(&mut self, layers: &[Operation], own: u32, view: u32) -> u32 {
+        self.stages.push(FilterStage {
+            layer: own,
+            preceding: layers[own as usize].effects[3],
+            filter: None,
+            cell: 1,
+            anchor: None,
+            input: 0,
+            input_kind: 0,
+            input2: 0,
+            wrap: false,
+            whole: false,
+            view,
+            mask_view: [0; 4],
+        });
+        self.stages.len() as u32
+    }
+
+    /// A mask that compares its lit Base Color `base` (This Layer) on a layer whose Base Color
+    /// has stages. The CPU (`fields_of`) builds the content fields first, Base Color last; the
+    /// material its lighting reads lies under a first mask M1, whose This Layer reads the Base
+    /// Color with no fields (its stages as identity, `Filter::point`) and no lit material. Then
+    /// it builds the mask field M2, whose This Layer resumes from the finished Base Color
+    /// field; the composite uses M2. So: the other This Layer stages, the Base Color's view V1
+    /// (`OWN_VIEW | NO_FIELDS`), M1 (a copy of the mask stack), the material's capture, the Base
+    /// Color's stack, its view V2 (`OWN_VIEW`), and M2, the layer's mask stack. M1's stages and
+    /// the capture read M1 and V1 in M2's and V2's place (`mask_view`). Returns M2's base plus one.
+    #[allow(clippy::too_many_arguments)]
+    fn add_lit_mask_views(
+        &mut self,
+        layers: &mut [Operation],
+        effects: &mut [Operation],
+        (index, base, run): (usize, usize, std::ops::Range<usize>),
+        (mask, mask_count): (u32, u32),
+        inputs: &ProceduralInputs,
+        (prepared, stages, done): ContentProgress,
+    ) -> u32 {
+        self.add_this_layer_reads(layers, effects, (mask, mask_count), None, |own| own as usize != base);
+        let first_view = self.add_this_layer(layers, base as u32, OWN_VIEW | NO_FIELDS);
+        let first_mask = self.stages.len();
+        self.add_stack(effects, (mask, mask_count), (index as u32, None), None, inputs);
+        let first_end = self.stages.len();
+        self.bind_stack_reads(layers, effects, base, run.clone(), true, (stages, done));
+        let capture_end = self.stages.len();
+        self.add_layer_content(layers, effects, base, run, inputs, (prepared, stages, done));
+        let views = self.add_this_layer_reads(layers, effects, (mask, mask_count), Some(base), |own| own as usize == base);
+        let view = views.get(&(base as u32)).copied();
+        let mask_base = self.stages.len();
+        let copy: Vec<FilterStage> = self.stages[first_mask..first_end].to_vec();
+        self.stages.extend(copy);
+        let mask_view = [mask_base as u32 + 1, first_mask as u32 + 1, first_view, view.unwrap_or(0)];
+        for stage in &mut self.stages[first_mask..capture_end] {
+            stage.mask_view = mask_view;
+            stage.whole = false;
+        }
+        if first_end == first_mask { 0 } else { mask_base as u32 + 1 }
     }
 
     /// The stack reads and the content stack of layer operation `index`, once: its first stage
@@ -918,7 +979,8 @@ impl FilterPlan {
                 input2: 0,
                 wrap: false,
                 whole: false,
-                own_view: None,
+                view: 0,
+                mask_view: [0; 4],
             });
         }
     }
@@ -951,7 +1013,9 @@ impl FilterPlan {
             }
             if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&effect.ids[1]) && effect.spatial[1] != 0 {
                 let (filter, cell) = inputs.generator_stages[effect.spatial[1] as usize - 1];
-                effect.spatial[1] = self.stages.len() as u32 + 1;
+                // Relative to the stack's first stage, as a mask stack's fields are read
+                // (`layer_mask` adds the layer's mask base, `spatial[2]`)
+                effect.spatial[1] = (self.stages.len() - first) as u32 + 1;
                 reach = reach.saturating_add(filter.map_or(0, NeighbourhoodFilter::reach));
                 if cell > 1 {
                     reach = reach.saturating_add(cell * 2);
@@ -967,7 +1031,8 @@ impl FilterPlan {
                     input2: 0,
                     wrap: false,
                     whole: false,
-                    own_view: None,
+                    view: 0,
+                    mask_view: [0; 4],
                 });
                 continue;
             }
@@ -978,7 +1043,7 @@ impl FilterPlan {
             let Some(filter) = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.resolution, *opacity, channel) else { continue };
             let slot = self.stages.len();
             let whole = filter.whole_set(inputs.resolution);
-            effect.spatial[0] = if mask { slot } else { slot - first } as u32;
+            effect.spatial[0] = (slot - first) as u32;
             let preceding = preceding as u32 | if mask { MASK_STAGE } else { 0 };
             // An image input the effect registered (`ProceduralInputs::register_input`), read as
             // colour when registered so; Height To Normal on a Normal operation reads the layer's
@@ -1007,7 +1072,8 @@ impl FilterPlan {
                 input2,
                 wrap,
                 whole,
-                own_view: None,
+                view: 0,
+                mask_view: [0; 4],
             });
             reach = reach.saturating_add(filter.reach());
         }
@@ -3370,13 +3436,10 @@ impl GpuCompositor {
                             let mut source = values(paint_params);
                             source[25..28].copy_from_slice(&[slot, stage.layer, stage.preceding]);
                             source[packages::FIELD_LAYOUT + 2] = stage.input;
-                            source[packages::FIELD_LAYOUT + 3] =
-                                u32::from(wraps) | stage.input_kind | stage.own_view.map_or(0, |_| OWN_VIEW) | if stage.input2 != 0 { INPUT2 } else { 0 };
-                            if let Some(first) = stage.own_view {
-                                source[37] = first;
-                            }
-                            // A second input source (operation plus one)
+                            source[packages::FIELD_LAYOUT + 3] = u32::from(wraps) | stage.input_kind | stage.view | if stage.input2 != 0 { INPUT2 } else { 0 };
+                            // A second input source (operation plus one), the mask views
                             source[38] = stage.input2;
+                            source[packages::MASK_VIEW..packages::MASK_VIEW + 4].copy_from_slice(&stage.mask_view);
                             source
                         };
                         let mut chunks: Vec<[u32; 4]> = (0..field_rect[3])
@@ -3537,13 +3600,10 @@ impl GpuCompositor {
                         source[packages::FIELD_LAYOUT + 2] = stage.input;
                         // In a wrapping program every stage's field is a periodic copy of the set
                         // past its edges; the stages keep apart what lies across a seam (`bounds`)
-                        source[packages::FIELD_LAYOUT + 3] =
-                            u32::from(wraps) | stage.input_kind | stage.own_view.map_or(0, |_| OWN_VIEW) | if stage.input2 != 0 { INPUT2 } else { 0 };
-                        if let Some(first) = stage.own_view {
-                            source[37] = first;
-                        }
-                        // A second input source (operation plus one)
+                        source[packages::FIELD_LAYOUT + 3] = u32::from(wraps) | stage.input_kind | stage.view | if stage.input2 != 0 { INPUT2 } else { 0 };
+                        // A second input source (operation plus one), the mask views
                         source[38] = stage.input2;
+                        source[packages::MASK_VIEW..packages::MASK_VIEW + 4].copy_from_slice(&stage.mask_view);
                         if let Some((channel, first, cut)) = stage.anchor {
                             source[36..39].copy_from_slice(&[channel_slot(channel), first, cut]);
                             source[40..43].copy_from_slice(&channel.default_value().map(f32::to_bits));

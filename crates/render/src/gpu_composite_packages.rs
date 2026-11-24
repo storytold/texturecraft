@@ -49,7 +49,9 @@ const PACKAGE_SLOTS: usize = 48;
 /// `whole_rect`), after the package vec4s.
 pub(super) const WHOLE_SET: usize = PACKAGE_SLOTS + 8 * 4;
 /// Words of the band uniform.
-pub(super) const UNIFORM_WORDS: usize = WHOLE_COMPACT + 4;
+pub(super) const UNIFORM_WORDS: usize = MASK_VIEW + 4;
+/// The lit Base Color's mask views (`mask_view` in composite.wgsl, `FilterPlan::add_lit_mask_views`).
+pub(super) const MASK_VIEW: usize = WHOLE_COMPACT + 4;
 /// The whole-set pre-pass's compact slots (`whole_compact` in composite.wgsl): the first stage
 /// slot of the pass, its stage count, the program's first working field, and 1 when active.
 pub(super) const WHOLE_COMPACT: usize = WHOLE_SET + 3 * 4;
@@ -1083,7 +1085,7 @@ mod tests {
         let (reading, layers) = stages(true);
         assert_eq!(reading.last(), Some(&true), "the mask last: {reading:?}");
         assert!(reading[..reading.len() - 1].iter().all(|mask| !mask), "{reading:?}");
-        assert!(layers.iter().all(|spatial| spatial[1] == 1 && spatial[2] == 1), "{layers:?}");
+        assert!(layers.iter().all(|spatial| spatial[1] == 1 && spatial[2] != 0), "{layers:?}");
     }
 
     /// Programs that do not ask for the bake rows upload the built-in maps alone, and a mask's

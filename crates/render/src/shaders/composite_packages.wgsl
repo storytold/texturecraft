@@ -118,15 +118,23 @@ fn stack_at_second(effect: Operation, pixel: vec2<u32>) -> vec3<f32> {
 // (channel_default; their channel slots plus one in effects.z).
 var<private> reading_own_layer: bool = false;
 
+// Set by layer_mask while it evaluates the lit layer's first mask (params.mask_view)
+var<private> mask_view_active: bool = false;
+
 // The effect's layer's own content of the read channel, with its coverage in alpha: Compare's
 // This Layer mixes it over stack_at. It reads the field of its This Layer stage (slot plus one in
 // Operation.effects.z, FilterPlan::add_this_layer_reads), prepared from the whole content stack
 // before the mask: no content code inline in the mask's.
 fn this_layer_content(effect: Operation, texel: LayerTexel) -> vec4<f32> {
-    if effect.effects.z == 0u {
+    var slot = effect.effects.z;
+    // The lit layer's first mask reads its Base Color without fields or material (mask_view)
+    if mask_view_active && slot == params.mask_view.w {
+        slot = params.mask_view.z;
+    }
+    if slot == 0u {
         return vec4(0.0);
     }
-    let field = filter_value(effect.effects.z - 1u, texel.pixel);
+    let field = filter_value(slot - 1u, texel.pixel);
     let coverage = clamp(field.a, 0.0, 1.0);
     return vec4(select(vec3(0.0), field.rgb / coverage, coverage > 1e-5), coverage);
 }

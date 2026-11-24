@@ -380,10 +380,8 @@ mod tests {
     /// Base Color last: its lighting's material lies under a mask M1 whose This Layer reads the
     /// Base Color with no fields (its stages as identity) and no lit material. Then it builds
     /// the mask field M2, whose This Layer resumes from the finished Base Color field. The final
-    /// composite uses M2. The GPU has one mask stack per layer (its effects hold absolute
-    /// slots), and it prepares that stack as M1 (`add_this_layer_reads`), so M2 differs.
+    /// composite uses M2. The GPU prepares both (`FilterPlan::add_lit_mask_views`).
     #[test]
-    #[ignore = "the CPU uses two masks here (M1 for the material, M2 for the composite); the GPU one"]
     fn a_mask_comparing_its_lit_base_color_matches_the_cpu() {
         use texturecraft_core::{BlendMode, Channel, CompareOp, CompareSource, Effect, EffectKind, StylizedLighting};
 
@@ -402,7 +400,7 @@ mod tests {
                 left: CompareSource::ThisLayer,
                 right: CompareSource::Constant,
                 channel: Channel::BaseColor,
-                hardness: 0.6,
+                hardness: 0.1,
             };
             let ids = [project.alloc_id(), project.alloc_id()];
             if let Some(mask) = lit_layer(project).and_then(|layer| layer.mask.as_mut()) {
