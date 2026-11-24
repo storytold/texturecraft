@@ -1450,7 +1450,7 @@ pub(crate) mod tests {
         };
 
         check(None);
-        if let Ok(gpu) = Headless::new() {
+        if let Ok(gpu) = Headless::for_tests() {
             check(Some(Arc::new(HeadlessBrush(Mutex::new(gpu)))));
         }
     }
