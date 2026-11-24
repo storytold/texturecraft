@@ -78,6 +78,13 @@ pub(crate) struct NeighbourhoodFilter {
     pub(crate) context: u32,
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    /// Test seam: built-in stages reaching at least this many texels run in the whole-set
+    /// pre-pass, so its tests need no package stage.
+    pub(crate) static WHOLE_SET_TEST_REACH: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// `params.stage.x` of a stage filtering a mask, and of content by the channel's kind.
 pub(crate) const STAGE_MASK: u32 = 0;
 pub(crate) const STAGE_COLOR: u32 = 1;
@@ -241,6 +248,24 @@ impl NeighbourhoodFilter {
         Some(out)
     }
 
+    /// Whether the stage runs in the whole-set pre-pass (once per update over the region the
+    /// bands read, in stripes) instead of in every band: a package's stage with a large reach
+    /// (P4: Bevel, Drop Shadow) or one that needs the whole set (P5: Color Match, Mirror,
+    /// Transform). `resolution` is the set's working resolution.
+    pub(crate) fn whole_set(self, resolution: u32) -> bool {
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        if WHOLE_SET_TEST_REACH.get().is_some_and(|reach| self.reach() >= reach) {
+            return true;
+        }
+        if self.kind.box_family() {
+            return box_family::whole_set(self, resolution);
+        }
+        if self.kind.gather() {
+            return gather::whole_set(self, resolution);
+        }
+        false
+    }
+
     /// Source texels the stage reads around an output texel.
     pub(crate) fn reach(self) -> u32 {
         if self.kind.box_family() {
@@ -294,6 +319,13 @@ pub(crate) struct NeighbourhoodRegion {
     pub(crate) field_words: u32,
     /// 1 when the original field carries the input word.
     pub(crate) input: u32,
+    /// The stage wraps: it reads the field's periodic copies past the set's edges.
+    pub(crate) wrap: bool,
+    /// The set in field-local texels [x0, y0, x1, y1]: in a wrapping program the field holds
+    /// periodic copies of the set past its edges, and a stage that does not wrap never reads
+    /// across these bounds (`bounds` and the segment checks in neighbourhood.wgsl). Without a
+    /// wrapping stage the field lies inside the set and the bounds reach past it.
+    pub(crate) bounds: [i32; 4],
 }
 
 impl NeighbourhoodRegion {
@@ -313,6 +345,7 @@ struct Params {
     field_layout: [u32; 4],
     extra: [f32; 8],
     stage: [u32; 4],
+    bounds: [i32; 4],
 }
 
 pub(crate) struct NeighbourhoodGpu {
@@ -320,6 +353,7 @@ pub(crate) struct NeighbourhoodGpu {
     apply: wgpu::ComputePipeline,
     cell_average: wgpu::ComputePipeline,
     cell_interpolate: wgpu::ComputePipeline,
+    copy: wgpu::ComputePipeline,
     // The packages' own passes (distance transforms, structure tensors, reductions)
     box_family: box_family::Pipelines,
     gather: gather::Pipelines,
@@ -333,7 +367,7 @@ impl NeighbourhoodGpu {
 
     /// The entry points of the built-in passes (the packages add theirs in their `Pipelines`).
     #[cfg(all(test, not(target_arch = "wasm32")))]
-    pub(crate) const ENTRY_POINTS: [&str; 4] = ["box_blur", "apply_neighbourhood", "average_cells", "interpolate_cells"];
+    pub(crate) const ENTRY_POINTS: [&str; 5] = ["box_blur", "apply_neighbourhood", "average_cells", "interpolate_cells", "copy_field"];
 
     pub(crate) fn new(device: &wgpu::Device) -> Self {
         let module = device
@@ -353,6 +387,7 @@ impl NeighbourhoodGpu {
             apply: pipeline("apply_neighbourhood"),
             cell_average: pipeline("average_cells"),
             cell_interpolate: pipeline("interpolate_cells"),
+            copy: pipeline("copy_field"),
             box_family: box_family::Pipelines::new(&pipeline),
             gather: gather::Pipelines::new(&pipeline),
         }
@@ -373,10 +408,35 @@ impl NeighbourhoodGpu {
             buffers: [region.original, region.blur[0], region.output, 0],
             mode: [cell, 0, 0, 0],
             field_layout: region.field_layout([0; 2]),
+            bounds: region.bounds,
             ..Params::zeroed()
         };
         Self::run(&self.cell_average, device, encoder, scratch, &params, cells.map(|side| side.div_ceil(APPLY_WORKGROUP)));
         Self::run(&self.cell_interpolate, device, encoder, scratch, &params, [width.div_ceil(APPLY_WORKGROUP), height.div_ceil(APPLY_WORKGROUP)]);
+    }
+
+    /// Copy `size` texels of the field at word `field` (`field_width` texels wide), from field
+    /// texel `from`, into rows `row..` of the whole-set result at word `result` (`result_width`
+    /// texels wide).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_copy(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scratch: &wgpu::Buffer,
+        (field, field_width, from): (u32, u32, [u32; 2]),
+        (result, result_width, row): (u32, u32, u32),
+        size: [u32; 2],
+        field_words: u32,
+    ) {
+        let params = Params {
+            rect: [from[0], from[1], field_width, 0],
+            buffers: [field, 0, result, 0],
+            mode: [result_width, size[0], size[1], row],
+            field_layout: [field_words, 0, 0, 0],
+            ..Params::zeroed()
+        };
+        Self::run(&self.copy, device, encoder, scratch, &params, [size[0].div_ceil(APPLY_WORKGROUP), size[1].div_ceil(APPLY_WORKGROUP)]);
     }
 
     fn run(
@@ -433,7 +493,8 @@ impl NeighbourhoodGpu {
                 direction: [filter.direction[0], filter.direction[1], 0.0, 0.0],
                 field_layout: region.field_layout(filter.words),
                 extra: filter.extra,
-                stage: [filter.context, 0, 0, 0],
+                stage: [filter.context, u32::from(region.wrap), 0, 0],
+                bounds: region.bounds,
             };
             Self::run(pipeline, device, encoder, scratch, &params, groups);
         };

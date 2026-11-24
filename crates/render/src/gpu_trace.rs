@@ -830,7 +830,11 @@ mod tests {
     }
 
     fn gpu() -> Option<(Headless, GpuTracer)> {
-        let Ok(h) = Headless::new() else {
+        gpu_with(Headless::new())
+    }
+
+    fn gpu_with(headless: Result<Headless, String>) -> Option<(Headless, GpuTracer)> {
+        let Ok(h) = headless else {
             eprintln!("skipping: no GPU adapter");
             return None;
         };
@@ -904,7 +908,8 @@ mod tests {
     /// Rejecting an oversized render preserves the image and lets tracing continue.
     #[test]
     fn failed_reset_retains_the_active_render() {
-        let Some((mut headless, mut tracer)) = gpu() else { return };
+        // The WebGPU default limits (128 MiB per binding) reject an 8192² accumulation
+        let Some((mut headless, mut tracer)) = gpu_with(Headless::with_limits(|_| wgpu::Limits::default())) else { return };
         let scene = sphere_scene(&mut headless, crate::ibl::environment("Studio Soft", 32), &WHITE);
         let camera = camera();
         let settings = TraceSettings::default();

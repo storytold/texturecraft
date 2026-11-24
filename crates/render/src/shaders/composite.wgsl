@@ -45,6 +45,12 @@ struct Params {
     field_layout: vec4<u32>,
     // One vec4 per GPU port package, P1 to P8, written by its `band_uniform` in Rust.
     packages: array<vec4<u32>, 8>,
+    // The whole-set pre-pass's outputs the bands read instead of a band field: stage slot plus
+    // one (0: none), their first word in the scratch buffer, and the region they cover in source
+    // texels (origin as i32 bits, size). FilterPlan::whole_set in Rust.
+    whole_slots: vec4<u32>,
+    whole_bases: vec4<u32>,
+    whole_rect: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;

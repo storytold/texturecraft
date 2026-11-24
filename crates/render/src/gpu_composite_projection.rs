@@ -541,6 +541,15 @@ fn put_symmetry(words: &mut [u32; SLOT_WORDS], symmetry: &FillSymmetry) -> Optio
     put(words, SLOT_SYMMETRY_SPAN, &[span])
 }
 
+/// The work per output texel of operation `op`, whose own work (a Tile Generator's placements
+/// per plane and sample, 0 for other operations) is `own`: P1 adds its fills' cost here,
+/// symmetry copies times sampling (planes, Bilinear HQ levels), so bands shrink and one
+/// submission stays short. It counts against the update budget too
+/// (`MAX_TILE_WORK_PER_UPDATE`). Today: `own`.
+pub(super) fn work_per_texel(_op: &Operation, own: u64) -> u64 {
+    own
+}
+
 /// Whether a program needs the full `composite_projection.wgsl`.
 pub(super) fn uses_shader(program: &CompositeProgram) -> bool {
     program.operations.iter().any(|op| op.ext[1] != 0 || PROJECTION_SELECTORS.contains(&op.procedural[3]))
@@ -784,6 +793,11 @@ mod tests {
         assert_eq!(super::image_use(Sampling::SAVED_BEFORE, ChannelKind::Color), ImageUse::Material);
         assert_eq!(super::image_use(Sampling::default(), ChannelKind::Color), ImageUse::MipmappedColor);
         assert_eq!(super::image_use(Sampling::default(), ChannelKind::Scalar), ImageUse::Mipmapped);
+
+        // A fill the built-in paths evaluate costs what the bands counted before
+        let op = source_operation(Some(&image), &Projection::triplanar(), Sampling::SAVED_BEFORE, [0.5; 3], ChannelKind::Color, &mut ProceduralInputs::new(64))
+            .unwrap();
+        assert_eq!((super::work_per_texel(&op, 0), super::work_per_texel(&op, 7)), (0, 7));
     }
 
     /// Image sources read the nearest texel through every projection the built-in paths have
