@@ -103,7 +103,7 @@ fn the_file_refers_to_the_textures_each_texture_set_was_exported_with() {
 
     let files = referenced_files(&dir);
     assert!(files.iter().any(|f| f.ends_with("_OcclusionRoughnessMetallic.png")), "the second texture set's template: {files:?}");
-    assert!(files.iter().any(|f| f.ends_with("_roughness.png")), "the first texture set's template: {files:?}");
+    assert!(files.iter().any(|f| f.ends_with("_Roughness.png")), "the first texture set's template: {files:?}");
     for file in &files {
         assert!(dir.join(file).is_file(), "{file} was written");
     }
@@ -120,7 +120,7 @@ fn only_the_exported_texture_sets_have_textures() {
     let first = texturecraft_engine::formats::export::sanitize_file_stem(&h.state().session.doc.project.texture_sets[0].name);
     let files = referenced_files(&dir);
     assert!(!files.is_empty());
-    assert!(files.iter().all(|f| !f.starts_with(&format!("material_ball_{first}_"))), "the skipped texture set has none: {files:?}");
+    assert!(files.iter().all(|f| !f.starts_with(&format!("{first}_"))), "the skipped texture set has none: {files:?}");
 }
 
 #[test]

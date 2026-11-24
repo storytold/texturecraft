@@ -576,7 +576,16 @@ mod texture_binding_tests {
     }
 
     fn map(file: &str, format: FileFormat, channels: Vec<(Dest, SourceRef)>) -> MapSpec {
-        MapSpec { file: file.into(), format, bit_depth: 8, channels, inverted: Vec::new() }
+        MapSpec {
+            file: file.into(),
+            format,
+            bit_depth: 8,
+            channels,
+            inverted: Vec::new(),
+            dither: false,
+            when_channels: Vec::new(),
+            unless_channels: Vec::new(),
+        }
     }
 
     fn options(maps: Vec<MapSpec>) -> ExportOptions {

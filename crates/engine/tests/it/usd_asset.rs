@@ -129,7 +129,7 @@ fn it_writes_the_mesh_with_materials_that_read_the_exported_textures() {
         for (input, output, space) in [("diffuseColor", "rgb", "sRGB"), ("roughness", "r", "raw"), ("metallic", "r", "raw"), ("normal", "rgb", "raw")] {
             let read = read(input);
             assert_eq!((read.output.as_str(), read.colour_space.as_str()), (output, space), "{input} of {name}");
-            assert!(read.file.starts_with(&format!("material_ball_{name}_")), "{input} reads a file of its own texture set: {}", read.file);
+            assert!(read.file.starts_with(&format!("{name}_")), "{input} reads a file of its own texture set: {}", read.file);
             assert!(dir.join(&read.file).is_file(), "{} was written", read.file);
             assert!(!read.flips_green, "the project's normals are OpenGL");
         }
@@ -181,7 +181,7 @@ fn a_texture_set_outside_the_export_has_no_textures() {
     assert!(!materials[material_of(&s, 0)].0.is_empty());
     assert!(materials[material_of(&s, 1)].0.is_empty(), "{:?}", materials[material_of(&s, 1)]);
     let name = texturecraft_formats::export::sanitize_file_stem(&s.doc.project.texture_sets[1].name);
-    assert!(!std::fs::read_dir(&*dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(&format!("_{name}_"))), "set 1 was not written");
+    assert!(!std::fs::read_dir(&*dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with(&format!("{name}_"))), "set 1 was not written");
 }
 
 #[test]
@@ -403,7 +403,7 @@ fn a_mesh_without_materials_gets_a_material_bound_to_the_default_texture_set() {
     let inputs = &materials[0].0;
     assert!(["diffuseColor", "roughness", "metallic", "normal"].iter().all(|input| inputs.contains_key(*input)), "{inputs:?}");
     for read in inputs.values() {
-        assert!(read.file.starts_with("plane_Default_"), "reads the Default texture set's files: {}", read.file);
+        assert!(read.file.starts_with("Default_"), "reads the Default texture set's files: {}", read.file);
         assert!(dir.join(&read.file).is_file(), "{} was written", read.file);
     }
 }
