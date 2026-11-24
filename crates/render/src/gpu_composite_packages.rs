@@ -82,10 +82,25 @@ pub(super) fn lower_filter(filter: &Filter, effect: &Effect, op: &mut Operation,
     }
     #[cfg(all(test, not(target_arch = "wasm32")))]
     if let (Some(probe), Filter::Smoothstep { min, max }) = (PROBE_LOWERING.get(), filter) {
-        match probe {
-            188 | 189 => op.spatial[3] = *min as u32 + 1,
-            190 => op.ext[0] = inputs.pack_image("probe", crate::gpu_image_source::ImageUse::Material)?,
-            _ => op.effects[3] = inputs.register_input(Operation { low: [*max; 4], ..bytemuck::Zeroable::zeroed() }),
+        match (probe, PROBE_SELECTOR.get()) {
+            (188 | 189, _) => op.spatial[3] = *min as u32 + 1,
+            (190, _) => op.ext[0] = inputs.pack_image("probe", crate::gpu_image_source::ImageUse::Material)?,
+            (_, 0) => op.effects[3] = inputs.register_input(Operation { low: [*max; 4], ..bytemuck::Zeroable::zeroed() }),
+            (_, 5) => {
+                op.spatial[3] = *min as u32 + 1;
+                op.spatial[2] = *max as u32 + 1;
+                op.ext[0] = inputs.pack_words(&[5])?;
+            }
+            (_, 6) => {
+                let environment = inputs.reserve_environment()?;
+                op.ext[0] = inputs.pack_words(&[6, environment, *max as u32])?;
+            }
+            (_, selector) => {
+                if selector >= 7 {
+                    inputs.read_bake_rows();
+                }
+                op.ext[0] = inputs.pack_words(&[selector])?;
+            }
         }
         return Some((probe, [0.0; 3]));
     }
@@ -113,12 +128,32 @@ thread_local! {
     /// composite_packages.wgsl): 188 this layer, 189 the stack below (channel slot `min`),
     /// 190 an image named "probe" read nearest, 191 an image input of uniform `max`.
     pub(super) static PROBE_LOWERING: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// Test seam: with probe 191, a P0h hook in place of the image input (`probe_late_hooks` in
+    /// composite_packages.wgsl): 1..4 the surface tangent, 5 the second stack read (channel slots
+    /// `min` and `max`), 6 environment word `max`, 7 the baked Height row, 8 the ambient
+    /// occlusion with the bake rows present.
+    pub(super) static PROBE_SELECTOR: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether an operation needs the surface inputs (positions, normals, bakes) besides the
 /// projection selector, generators and Baked Lighting checked by the caller.
 pub(super) fn needs_surface(op: &Operation) -> bool {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    if op.ids[1] == 191 && op.ext[0] != 0 {
+        return true;
+    }
     lighting::needs_surface(op)
+}
+
+/// Whether a mask effect operation reads its own layer's content (`this_layer_content` in WGSL):
+/// the layer's content stacks are then prepared before its mask stack, so the mask's prepare
+/// pass reads prepared content fields. Content stacks never read the mask.
+pub(super) fn mask_reads_own_layer(op: &Operation) -> bool {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    if op.ids[1] == 188 {
+        return true;
+    }
+    stack::reads_own_layer(op)
 }
 
 /// Reorders a layer's finished channel operations (P6: Base Color after the channels lighting
@@ -833,6 +868,218 @@ mod tests {
         let ((project, owner), _) = probe(191, 0.0, 0.65);
         let gray = mask_gray(&mut gpu, &compile(&project, owner, true));
         assert!(gray.iter().all(|&value| value.abs_diff(166) <= 1), "{:?}", &gray[..4]);
+    }
+
+    /// The P0h hooks reach the shader (probe 191 with a selector, through the mask preview): the
+    /// surface tangent equals the CPU g-buffer's at every covered texel of a sphere, a second
+    /// stack read gets its own channel, the environment words come from the reader the program
+    /// was given, and the bake rows hold the Height below the built-in maps without moving them.
+    #[test]
+    fn late_bound_hooks_reach_the_shader() {
+        use std::sync::Arc;
+
+        use texturecraft_compose::environment_sh::EnvironmentSh;
+        use texturecraft_compose::{BakedMaps, ImageStore};
+        use texturecraft_core::{BakedMap, Effect};
+        use texturecraft_geom::{Mesh, UvGBuffer, primitives};
+
+        use crate::gpu_composite::oracle::headless;
+        use crate::readback::Readback;
+
+        let Some(mut gpu) = headless() else { return };
+        const SIZE: u32 = 64;
+        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Metallic];
+        // A lower fill of roughness 0.3 and metallic 0.6, an upper white fill masked by `mask`
+        let project_with = |mask: EffectKind| {
+            let mut project = Project::new("Probes", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+            let lower = Fill {
+                sources: BTreeMap::from([
+                    (Channel::BaseColor, Source::Uniform([0.1, 0.4, 0.2])),
+                    (Channel::Roughness, Source::Uniform([0.3; 3])),
+                    (Channel::Metallic, Source::Uniform([0.6; 3])),
+                ]),
+                ..Default::default()
+            };
+            let lower_id = project.alloc_id();
+            project.insert_layer(0, Layer::new(lower_id, "Lower", LayerKind::Fill(lower), &channels), None, false).unwrap();
+            let owner = project.alloc_id();
+            let upper = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([1.0; 3]))]), ..Default::default() };
+            let mut layer = Layer::new(owner, "Upper", LayerKind::Fill(upper), &channels);
+            let mut layer_mask = Mask::new(MaskBackground::Black);
+            layer_mask.effects.push(Effect::new(project.alloc_id(), mask));
+            layer.mask = Some(layer_mask);
+            project.insert_layer(0, layer, None, false).unwrap();
+            (project, owner)
+        };
+        // The probe as the upper layer's mask, compiled for the mask preview or the material
+        let compile_probe = |selector: u32, min: f32, max: f32, preview: bool| {
+            let (project, owner) = project_with(EffectKind::Filter(Filter::Smoothstep { min, max }));
+            super::PROBE_LOWERING.set(Some(191));
+            super::PROBE_SELECTOR.set(selector);
+            let pixels = PixelStore::default();
+            let program = if preview {
+                CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None)
+            } else {
+                CompositeProgram::try_compile_region(&project, &pixels, 0, None)
+            };
+            super::PROBE_LOWERING.set(None);
+            super::PROBE_SELECTOR.set(0);
+            program.unwrap()
+        };
+        let build = |selector: u32, min: f32, max: f32| compile_probe(selector, min, max, true);
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        let mask_gray = |gpu: &mut crate::headless::Headless, program: &CompositeProgram| {
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, program).unwrap();
+            let (_, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.aux_texture(0).unwrap()).unwrap();
+            rgba.as_chunks::<4>().0.iter().map(|texel| texel[0]).collect::<Vec<u8>>()
+        };
+        let to_gray = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let inputs = |mesh: &Arc<Mesh>, program: &mut CompositeProgram, baked: Option<&BakedMaps>| {
+            let gbuf = Arc::new(UvGBuffer::new(mesh, 0, SIZE, SIZE));
+            program.set_surface_inputs(mesh, &gbuf, baked).unwrap();
+            program.set_tile_images(&ImageStore::default());
+            gbuf
+        };
+
+        // The tangent's x, y, z and sign on a sphere, against the CPU surface at each covered texel
+        let sphere = Arc::new(primitives::sphere(1.0, 16, 8));
+        for component in 0..4 {
+            let mut program = build(component as u32 + 1, 0.0, 0.0);
+            let gbuf = inputs(&sphere, &mut program, None);
+            let gray = mask_gray(&mut gpu, &program);
+            let mut checked = 0;
+            for (index, &actual) in gray.iter().enumerate() {
+                let Some(surface) = gbuf.surface(&sphere, index) else { continue };
+                let expected = to_gray(0.5 + 0.5 * surface.tangent[component]);
+                assert!(actual.abs_diff(expected) <= 2, "tangent component {component} at texel {index}: {actual} vs {expected} ({:?})", surface.tangent);
+                checked += 1;
+            }
+            assert!(checked > (SIZE * SIZE / 2) as usize, "covered texels: {checked}");
+        }
+
+        let plane = Arc::new(primitives::plane(1.0, 1));
+        let uniform = |gray: &[u8], expected: u8, what: &str| assert!(gray.iter().all(|&value| value.abs_diff(expected) <= 1), "{what}: {:?}", &gray[..4]);
+
+        // The second stack read: Metallic (0.6) besides Roughness, each in its own capture stage,
+        // as the material's mask against a mask of 0.6
+        let roughness = super::super::channel_slot(Channel::Roughness);
+        let metallic = super::super::channel_slot(Channel::Metallic);
+        let mut program = compile_probe(5, roughness as f32, metallic as f32, false);
+        let captures: Vec<_> = program.filters.stages.iter().filter_map(|stage| stage.anchor.map(|(channel, _, _)| channel)).collect();
+        assert_eq!(captures, [Channel::Roughness, Channel::Metallic]);
+        inputs(&plane, &mut program, None);
+        let (reference, _) = project_with(EffectKind::Fill {
+            source: Source::Uniform([0.6; 3]),
+            projection: texturecraft_core::Projection::default(),
+            sampling: texturecraft_core::Sampling::SAVED_BEFORE,
+        });
+        let mut expected = CompositeProgram::try_compile_region(&reference, &PixelStore::default(), 0, None).unwrap();
+        inputs(&plane, &mut expected, None);
+        let base_color = |gpu: &mut crate::headless::Headless, program: &CompositeProgram| {
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, program).unwrap();
+            let texture = gpu.renderer.display_textures()[0][texturecraft_compose::DisplayKind::BaseColor as usize];
+            Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap().2
+        };
+        let expected = base_color(&mut gpu, &expected);
+        let actual = base_color(&mut gpu, &program);
+        assert!(actual.iter().zip(&expected).all(|(a, b)| a.abs_diff(*b) <= 1), "second stack read: {:?} vs {:?}", &actual[..4], &expected[..4]);
+
+        // Environment words from a stub reader: coefficient word 13 and the rotation (word 27)
+        let stub = EnvironmentSh::new(std::array::from_fn(|i| std::array::from_fn(|k| (3 * i + k) as f32 / 40.0)), 0.6);
+        for (word, expected) in [(13, 13.0 / 40.0), (27, 0.6)] {
+            let mut program = build(6, 0.0, word as f32);
+            assert_eq!(program.environment(), Some(("Studio Soft", 0.0)), "the compiled project's environment");
+            inputs(&plane, &mut program, None);
+            program.set_environment(&stub);
+            uniform(&mask_gray(&mut gpu, &program), to_gray(expected), "environment word");
+        }
+
+        // The bake rows: the Height (0.4) in the second block, the ambient occlusion (0.7) still
+        // where `baked_at` reads it, and 0.25 from the probe without a baked Height
+        let texels = (SIZE * SIZE) as usize;
+        let mut baked = BakedMaps { resolution: SIZE, ..Default::default() };
+        baked.maps.insert(BakedMap::AmbientOcclusion, Arc::new(vec![0.7; texels]));
+        let without_height = baked.clone();
+        baked.maps.insert(BakedMap::Height, Arc::new(vec![0.4; texels]));
+        for (selector, maps, expected) in [(7, &baked, 0.4), (8, &baked, 0.7), (7, &without_height, 0.25), (8, &without_height, 0.7)] {
+            let mut program = build(selector, 0.0, 0.0);
+            inputs(&plane, &mut program, Some(maps));
+            uniform(&mask_gray(&mut gpu, &program), to_gray(expected), &format!("bake rows, selector {selector}"));
+        }
+    }
+
+    /// A mask that reads its own layer (probe 188, `this_layer_content`) comes after that
+    /// layer's content stacks; any other mask stays before them.
+    #[test]
+    fn a_mask_reading_its_layer_follows_the_content_stacks() {
+        use texturecraft_core::Effect;
+
+        let stages = |own: bool| {
+            let mut project = Project::new("Order", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Plane", 0, 64));
+            let owner = project.alloc_id();
+            let channels = [Channel::BaseColor, Channel::Roughness];
+            let mut layer = Layer::new(owner, "Layer", LayerKind::Fill(Fill::default()), &channels);
+            layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 4.0, wrap: false })));
+            let mut mask = Mask::new(MaskBackground::White);
+            if own {
+                let slot = super::super::channel_slot(Channel::Roughness) as f32;
+                mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Smoothstep { min: slot, max: 0.0 })));
+            }
+            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 4.0, wrap: false })));
+            layer.mask = Some(mask);
+            project.insert_layer(0, layer, None, false).unwrap();
+            super::PROBE_LOWERING.set(own.then_some(188));
+            let program = CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None);
+            super::PROBE_LOWERING.set(None);
+            let program = program.unwrap();
+            let kinds: Vec<bool> =
+                program.filters.stages.iter().filter(|stage| stage.filter.is_some()).map(|stage| stage.preceding & super::super::MASK_STAGE != 0).collect();
+            let layers = &program.operations[..program.layer_count as usize];
+            (kinds, layers.iter().map(|op| op.spatial[..3].to_vec()).collect::<Vec<_>>())
+        };
+        let (plain, _) = stages(false);
+        assert_eq!(plain.first(), Some(&true), "the mask first: {plain:?}");
+        let (reading, layers) = stages(true);
+        assert_eq!(reading.last(), Some(&true), "the mask last: {reading:?}");
+        assert!(reading[..reading.len() - 1].iter().all(|mask| !mask), "{reading:?}");
+        assert!(layers.iter().all(|spatial| spatial[1] == 1 && spatial[2] == 1), "{layers:?}");
+    }
+
+    /// Programs that do not ask for the bake rows upload the built-in maps alone, and a mask's
+    /// PBR Validate lowers to nothing (the CPU leaves the mask as it is), with no stack read.
+    #[test]
+    fn bake_rows_only_when_asked_and_pbr_validate_in_masks() {
+        use std::sync::Arc;
+
+        use texturecraft_compose::BakedMaps;
+        use texturecraft_core::{BakedMap, Effect, PbrValidate};
+
+        let mut baked = BakedMaps { resolution: 4, ..Default::default() };
+        baked.maps.insert(BakedMap::AmbientOcclusion, Arc::new(vec![0.7; 16]));
+        baked.maps.insert(BakedMap::Height, Arc::new(vec![0.4; 16]));
+        let plain = super::super::BakedInputs::new(&baked, false).unwrap().unwrap();
+        assert!(plain.blocks() == 1 && plain.uniform_words() == [0, 0] && plain.rows.iter().all(Option::is_none));
+        let rows = super::super::BakedInputs::new(&baked, true).unwrap().unwrap();
+        assert!(rows.blocks() == 2 && rows.uniform_words() == [4, 1]);
+
+        let mut project = Project::new("Validate", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, 64));
+        let owner = project.alloc_id();
+        let mut layer = Layer::new(owner, "Layer", LayerKind::Fill(Fill::default()), &[Channel::BaseColor, Channel::Metallic]);
+        let mut mask = Mask::new(MaskBackground::White);
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::PbrValidate(PbrValidate::LIBRARY))));
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let pixels = PixelStore::default();
+        for program in [
+            CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap(),
+            CompositeProgram::try_compile_mask_preview(&project, &pixels, 0, owner, None, None).unwrap(),
+        ] {
+            assert!(program.filters.stages.is_empty(), "no stack read: {:?}", program.filters.stages);
+            assert!(program.operations.iter().all(|op| !EXTENDED_EFFECTS.contains(&op.ids[1])));
+        }
     }
 
     /// A neighbourhood stage carries its effect's registered image input into the field's sixth
