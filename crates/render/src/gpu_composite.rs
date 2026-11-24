@@ -2591,7 +2591,9 @@ struct CurvatureResources {
 }
 
 pub(crate) struct GpuCompositor {
-    pipelines: CompositePipelines,
+    pipelines: Arc<std::sync::Mutex<CompositePipelines>>,
+    /// Compile new pipelines on worker threads (`set_asynchronous_compile`)
+    asynchronous: bool,
     bindings: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     filter_gpu: Option<NeighbourhoodGpu>,
@@ -2694,7 +2696,8 @@ impl GpuCompositor {
         let default_brush_alpha =
             input_texture(device, "tc_composite_empty_brush_alpha", (1, 1), 1, wgpu::TextureFormat::R16Uint).create_view(&Default::default());
         Self {
-            pipelines: CompositePipelines::new(supports_curvature, supports_id),
+            pipelines: pipelines::shared(device, supports_curvature, supports_id),
+            asynchronous: false,
             bindings,
             pipeline_layout,
             filter_gpu: None,
@@ -3112,7 +3115,7 @@ impl GpuCompositor {
             }
             self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::new(device));
         }
-        let (pipeline, prepare) = self.pipelines.get(device, &self.pipeline_layout, program).ok_or(GPU_PIPELINES_PENDING)?;
+        let (pipeline, prepare) = self.pipelines().get(device, &self.pipeline_layout, program, self.asynchronous).ok_or(GPU_PIPELINES_PENDING)?;
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
         let (surface, vertices) = self.surface_inputs(device, queue, program)?;
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
@@ -3684,17 +3687,21 @@ impl GpuCompositor {
     /// Whether `program`'s pipelines are compiled; starts compiling them otherwise (on worker
     /// threads when [`Self::set_asynchronous_compile`] is on).
     pub(crate) fn pipelines_ready(&mut self, device: &wgpu::Device, program: &CompositeProgram) -> bool {
-        self.pipelines.get(device, &self.pipeline_layout, program).is_some()
+        self.pipelines().get(device, &self.pipeline_layout, program, self.asynchronous).is_some()
     }
 
     /// Start compiling `program`'s pipelines on worker threads without compositing.
     pub(crate) fn prewarm(&mut self, device: &wgpu::Device, program: &CompositeProgram) {
-        self.pipelines.prewarm(device, &self.pipeline_layout, program);
+        self.pipelines().prewarm(device, &self.pipeline_layout, program);
     }
 
     /// Compile new pipelines on worker threads (the app's viewport) or in place (tests, wasm).
     pub(crate) fn set_asynchronous_compile(&mut self, asynchronous: bool) {
-        self.pipelines.asynchronous = asynchronous && !cfg!(target_arch = "wasm32");
+        self.asynchronous = asynchronous && !cfg!(target_arch = "wasm32");
+    }
+
+    fn pipelines(&self) -> std::sync::MutexGuard<'_, CompositePipelines> {
+        self.pipelines.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Bytes of the last update's working buffer and paint upload buffer.

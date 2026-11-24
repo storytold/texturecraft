@@ -200,29 +200,47 @@ pub(super) struct CompositePipelines {
     supports_curvature: bool,
     supports_id: bool,
     variants: BTreeMap<Features, Variants>,
-    /// Compile new pipelines on worker threads: `get` answers None until they are ready (the
-    /// viewport keeps its last result meanwhile). Off by default (tests, wasm).
-    pub(super) asynchronous: bool,
+}
+
+/// The pipelines a compositor uses: its own, or in the render crate's tests one set per device
+/// for every compositor (llvmpipe keeps what it compiled until the process ends, so each test
+/// compiling the same variants again would add up).
+pub(super) fn shared(device: &wgpu::Device, supports_curvature: bool, supports_id: bool) -> Arc<Mutex<CompositePipelines>> {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    {
+        static SHARED: Mutex<Vec<(wgpu::Device, Arc<Mutex<CompositePipelines>>)>> = Mutex::new(Vec::new());
+        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, pipelines)) = shared.iter().find(|(owner, _)| owner == device) {
+            return pipelines.clone();
+        }
+        let pipelines = Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)));
+        shared.push((device.clone(), pipelines.clone()));
+        return pipelines;
+    }
+    #[cfg(not(all(test, not(target_arch = "wasm32"))))]
+    let _ = device;
+    #[allow(unreachable_code)]
+    Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)))
 }
 
 impl CompositePipelines {
     pub(super) fn new(supports_curvature: bool, supports_id: bool) -> Self {
-        Self { supports_curvature, supports_id, variants: BTreeMap::new(), asynchronous: false }
+        Self { supports_curvature, supports_id, variants: BTreeMap::new() }
     }
 
     /// Start compiling `program`'s pipelines without waiting (`get` returns them once ready).
     pub(super) fn prewarm(&mut self, device: &wgpu::Device, layout: &wgpu::PipelineLayout, program: &CompositeProgram) {
-        let asynchronous = std::mem::replace(&mut self.asynchronous, !cfg!(target_arch = "wasm32"));
-        let _ = self.get(device, layout, program);
-        self.asynchronous = asynchronous;
+        let _ = self.get(device, layout, program, !cfg!(target_arch = "wasm32"));
     }
 
-    /// The program's compose and prepare pipelines; None while one still compiles.
+    /// The program's compose and prepare pipelines; None while one still compiles (new ones
+    /// compile on worker threads when `asynchronous`: the viewport keeps its last result).
     pub(super) fn get(
         &mut self,
         device: &wgpu::Device,
         layout: &wgpu::PipelineLayout,
         program: &CompositeProgram,
+        asynchronous: bool,
     ) -> Option<(wgpu::ComputePipeline, Option<wgpu::ComputePipeline>)> {
         let features = Features::of(program);
         let supports_curvature = self.supports_curvature;
@@ -235,7 +253,6 @@ impl CompositePipelines {
             render: [None, None],
             prepare: [None, None],
         });
-        let asynchronous = self.asynchronous;
         let module = variants.module.clone();
         let pipeline = |entry: &'static str, label: &'static str, grouped: bool| {
             let compile = {
@@ -382,7 +399,8 @@ mod tests {
 
         use crate::gpu_composite::{CompositeProgram, GPU_PIPELINES_PENDING};
 
-        let Some(mut gpu) = oracle::headless() else { return };
+        // A device of its own: the tests share their pipelines per device
+        let Ok(mut gpu) = crate::headless::Headless::with_limits(crate::device_limits) else { return };
         let project = |radius: f32| {
             let mut project = Project::new("Asynchronous", "builtin:plane");
             project.texture_sets.push(TextureSet::new("Plane", 0, 64));
@@ -494,7 +512,10 @@ mod tests {
             ("plain fill", project(Vec::new(), Vec::new())),
         ];
         let compositor = GpuCompositor::new(&gpu.device);
-        let (curvature, id) = (compositor.pipelines.supports_curvature, compositor.pipelines.supports_id);
+        let (curvature, id) = {
+            let pipelines = compositor.pipelines();
+            (pipelines.supports_curvature, pipelines.supports_id)
+        };
         let programs =
             cases.map(|(label, project)| (label, Features::of(&CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).unwrap())));
         let everything =
@@ -527,7 +548,10 @@ mod tests {
     fn package_shaders_build_compute_pipelines_in_full_and_as_stubs() {
         let Some(gpu) = oracle::headless() else { return };
         let compositor = GpuCompositor::new(&gpu.device);
-        let (curvature, id) = (compositor.pipelines.supports_curvature, compositor.pipelines.supports_id);
+        let (curvature, id) = {
+            let pipelines = compositor.pipelines();
+            (pipelines.supports_curvature, pipelines.supports_id)
+        };
         // Every package variant; the program with every other feature too is left to the naga
         // check above: Mesa's GL compiler needs over 28 GB for it (llvmpipe, measured)
         // The program with every other feature too stays with the naga check above: Mesa's GL
