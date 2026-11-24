@@ -2,6 +2,7 @@ struct Params {
     dimensions: vec4<u32>,  // Bake width/height, working width/height.
     mode: vec4<u32>,        // Radius, step, vertical flag, input representation.
     level: vec4<u32>,       // Destination atlas origin and size.
+    block: vec4<u32>,       // Bake block width/height, working block side, block columns (0: no tile scales).
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -9,6 +10,7 @@ struct Params {
 @group(0) @binding(2) var destination_image: texture_storage_2d<r32uint, write>;
 @group(0) @binding(3) var<storage, read> coverage: array<u32>;
 @group(0) @binding(4) var bake: texture_2d<u32>;
+// The coarsening's edge weights; in the coverage scan each block's tile scale
 @group(0) @binding(5) var<storage, read> edge_weights: array<f32>;
 
 const FIX: f32 = 16777216.0;
@@ -19,9 +21,43 @@ fn working_covered(point: vec2<u32>) -> bool {
     return (bits & (1u << (point.x % 32u))) != 0u;
 }
 
+// A bake texel of a UV tile atlas whose tiles have scales: covered when a covered working texel
+// of its block reaches it through BlockScales::bake_uv, by its footprint (compose's covered_texels)
+fn scaled_bake_covered(point: vec2<u32>) -> bool {
+    let bake_size = params.dimensions.xy;
+    let working_size = params.dimensions.zw;
+    let bake_block = params.block.xy;
+    let working_block = params.block.z;
+    let cell = point / bake_block;
+    let scale = edge_weights[cell.y * params.block.w + cell.x];
+    let origin = cell * working_block;
+    let end_of_block = min(origin + working_block, working_size);
+    let per_bake = f32(working_block) * scale / vec2<f32>(bake_block);
+    let local = vec2<f32>(point - cell * bake_block);
+    let first = origin + vec2<u32>(max(floor(local * per_bake) - 1.0, vec2(0.0)));
+    let end = min(origin + vec2<u32>(ceil((local + 1.0) * per_bake)) + 1u, end_of_block);
+    let half_width = 0.5 * vec2<f32>(bake_size) / (vec2<f32>(working_size) * scale);
+    for (var y = first.y; y < end.y; y++) {
+        for (var x = first.x; x < end.x; x++) {
+            if !working_covered(vec2(x, y)) { continue; }
+            let uv = (vec2<f32>(vec2(x, y)) + 0.5) / vec2<f32>(working_size);
+            let position = uv * vec2<f32>(working_size) / f32(working_block);
+            let corner = floor(position);
+            let tile_uv = (position - corner) / scale;
+            if any(tile_uv < vec2(0.0)) || any(tile_uv >= vec2(1.0)) { continue; }
+            let center = (corner + tile_uv) * f32(working_block) / vec2<f32>(working_size) * vec2<f32>(bake_size);
+            if all(vec2<f32>(point) >= floor(center - half_width)) && all(vec2<f32>(point) < ceil(center + half_width)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn bake_covered(point: vec2<u32>) -> bool {
     let bake_size = params.dimensions.xy;
     let working_size = params.dimensions.zw;
+    if params.block.w != 0u { return scaled_bake_covered(point); }
     if all(bake_size == working_size) { return working_covered(point); }
 
     // Invert the working-texel footprints, then verify their original float
@@ -77,16 +113,27 @@ fn covered_between(first: vec2<u32>, last: vec2<u32>) -> bool {
     return prefix(hi) + prefix(lo) > prefix(vec2(lo.x, hi.y)) + prefix(vec2(hi.x, lo.y));
 }
 
+// The first and last texel of the UV tile block holding `point`: padding stays within it
+fn block_first(point: vec2<u32>) -> vec2<u32> {
+    return point / params.block.xy * params.block.xy;
+}
+
+fn block_last(point: vec2<u32>) -> vec2<u32> {
+    return min(block_first(point) + params.block.xy, params.dimensions.xy) - 1u;
+}
+
 fn inside_radius(point: vec2<u32>, radius: u32) -> bool {
-    return covered_between(point - min(point, vec2(radius)), min(point + radius, params.dimensions.xy - 1u));
+    let first = block_first(point);
+    return covered_between(max(point - min(point, vec2(radius)), first), min(point + radius, block_last(point)));
 }
 
 fn nearest(point: vec2<u32>) -> vec2<u32> {
     if covered_between(point, point) { return point; }
-    let size = params.dimensions.xy;
+    let size = block_last(point) + 1u;
+    let origin = block_first(point);
     var low = 1u;
     var high = 1u;
-    let limit = max(size.x, size.y);
+    let limit = max(size.x - origin.x, size.y - origin.y);
     // Most uncovered texels are near an island. Find a tight upper bound first.
     while high < limit && !inside_radius(point, high) {
         low = high + 1u;
@@ -101,7 +148,7 @@ fn nearest(point: vec2<u32>) -> vec2<u32> {
             low = mid + 1u;
         }
     }
-    let first = point - min(point, vec2(low));
+    let first = max(point - min(point, vec2(low)), origin);
     let last = min(point + low, size - 1u);
     // Among those at the same distance, the CPU resolves ties in source row-major order.
     low = first.y;
@@ -127,7 +174,8 @@ fn pad_curvature(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = params.dimensions.xy;
     if any(id.xy >= size) { return; }
     var deviation = 0.0;
-    if prefix(vec2<i32>(size - 1u)) != 0u {
+    // A block without a covered texel has no source: it stays flat
+    if covered_between(block_first(id.xy), block_last(id.xy)) {
         deviation = bitcast<f32>(textureLoad(bake, vec2<i32>(nearest(id.xy)), 0).y) - 0.5;
     }
     textureStore(destination_image, vec2<i32>(id.xy), vec4(bitcast<u32>(deviation), 0u, 0u, 0u));
@@ -171,23 +219,28 @@ fn blur_curvature(@builtin(global_invocation_id) id: vec3<u32>) {
     if line >= size.y { return; }
     let radius = params.mode.x;
     let divisor = f32(radius * 2u + 1u);
-    var sum = vec2(0.0);
-    for (var i = 0u; i < min(radius + 1u, size.x); i++) {
-        let point = vec2(i, line);
-        sum = add_compensated(sum, blur_sample(select(point, point.yx, vertical)));
-    }
-    for (var i = 0u; i < size.x; i++) {
-        let point = vec2(i, line);
-        let result = quantize_box(sum.x / divisor);
-        textureStore(destination_image, vec2<i32>(select(point, point.yx, vertical)), vec4(bitcast<u32>(result), 0u, 0u, 0u));
-        let next = i + radius + 1u;
-        if next < size.x {
-            let p = vec2(next, line);
-            sum = add_compensated(sum, blur_sample(select(p, p.yx, vertical)));
+    // Each UV tile block of the line on its own, reading nothing past its ends
+    let segment = max(select(params.block.x, params.block.y, vertical), 1u);
+    for (var start = 0u; start < size.x; start += segment) {
+        let end = min(start + segment, size.x);
+        var sum = vec2(0.0);
+        for (var i = start; i < min(start + radius + 1u, end); i++) {
+            let point = vec2(i, line);
+            sum = add_compensated(sum, blur_sample(select(point, point.yx, vertical)));
         }
-        if i >= radius {
-            let p = vec2(i - radius, line);
-            sum = add_compensated(sum, -blur_sample(select(p, p.yx, vertical)));
+        for (var i = start; i < end; i++) {
+            let point = vec2(i, line);
+            let result = quantize_box(sum.x / divisor);
+            textureStore(destination_image, vec2<i32>(select(point, point.yx, vertical)), vec4(bitcast<u32>(result), 0u, 0u, 0u));
+            let next = i + radius + 1u;
+            if next < end {
+                let p = vec2(next, line);
+                sum = add_compensated(sum, blur_sample(select(p, p.yx, vertical)));
+            }
+            if i >= start + radius {
+                let p = vec2(i - radius, line);
+                sum = add_compensated(sum, -blur_sample(select(p, p.yx, vertical)));
+            }
         }
     }
 }

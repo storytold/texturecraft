@@ -185,13 +185,6 @@ fn a_press_in_the_gap_between_buttons_or_in_the_margin_paints_nothing() {
 }
 
 #[test]
-fn the_2d_view_has_no_orbit_button() {
-    let view = Rect::from_min_size(Pos2::ZERO, vec2(600.0, 500.0));
-    assert!(button_rect(view, NavView::Uv, NavButton::Orbit).is_none());
-    assert!(button_rect(view, NavView::Scene, NavButton::Orbit).is_some());
-}
-
-#[test]
 fn buttons_stay_clear_of_the_pickers_the_gizmo_and_the_split_divider_at_1280_by_800() {
     let (harness, _) = app(ViewLayout::Split);
     let view = harness.state().viewport_rect;

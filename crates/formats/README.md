@@ -52,6 +52,9 @@ pub fn usd_bytes(mesh: &Mesh, name: &str, textures: &[Vec<ExportedFile>], format
 pub fn usd_export_options() -> ExportOptions;                     // render each material's textures with these
 pub enum UsdFormat { Usda, Usdc, Usdz }
 pub struct UsdExport { pub bytes: Vec<u8>, pub textures: Vec<(String, Vec<u8>)> }  // textures: usda/usdc only
+pub fn usd_texture_bindings(set: &TextureSet, opts: &ExportOptions, project_normal: NormalFormat, files: &[PlannedFile]) -> Vec<UsdTextureBinding>;  // which UsdPreviewSurface input reads which output of which exported file
+pub fn usd_layer_with_textures(mesh: &Mesh, name: &str, bindings: &[Vec<UsdTextureBinding>]) -> Result<Vec<u8>>;  // binary `.usd` (Crate) only; material m reads bindings[m] as ./<file>
+pub struct UsdTextureBinding { /* opaque */ }
 ```
 
 OBJ export propagates shared writer validation and limit errors rather than returning empty bytes.
@@ -65,6 +68,11 @@ emissive maps dropped, and both clear coat maps when the coat is black). Meters,
 `.usdc` is a Crate 0.8.0 file; `.usdz` is that layer first plus the PNGs, stored uncompressed at
 64-byte aligned offsets; `.usda` / `.usdc` reference `<name>_<material>_<slot>.png` next to the
 layer.
+`usd_layer_with_textures` writes the same scene as a binary `.usd` (Crate) whose materials read texture files the
+caller already wrote (the Export textures window's USD asset): `usd_texture_bindings` binds base
+color, roughness, metallic, normal (scale/bias for the file's green convention), emissive color,
+opacity, clear coat and clear coat roughness by what each map of the template holds, each reading
+the `rgb`, `r`, `g`, `b` or `a` output of its file; one texture shader per file, so packed maps work.
 
 GLB: one primitive per submesh, one metallic-roughness material per mesh material with its
 textures embedded in the binary chunk (base color sRGB, `alphaMode: BLEND` when it has alpha;

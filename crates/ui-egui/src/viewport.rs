@@ -45,6 +45,21 @@ pub fn set_focus_picking(ctx: &egui::Context, on: bool) {
     ctx.data_mut(|d| d.insert_temp(focus_pick_id(), on));
 }
 
+/// What the views' aux texture shows: the quick mask being edited, a mesh map, the image a pending ID pick reads instead of the ID mesh map, or a mask
+fn aux_view(app: &TextureCraftApp) -> Option<crate::gpu::AuxView> {
+    match (app.session.view, app.picking_id_color) {
+        _ if quick_mask_shown(app) => Some(crate::gpu::AuxView::QuickMask),
+        (ViewMode::MeshMap(BakedMap::Id), Some(pick)) => Some(crate::gpu::AuxView::IdMask(pick.effect)),
+        (ViewMode::MeshMap(map), _) => Some(crate::gpu::AuxView::MeshMap(map)),
+        (ViewMode::Mask(id), _) => Some(crate::gpu::AuxView::Mask(id)),
+        (ViewMode::Image, _) => Some(crate::gpu::AuxView::Image),
+        _ if app.ui.mode == crate::state::Mode::Baking && app.ui.bake_visualization.bent_normal_shown() => {
+            Some(crate::gpu::AuxView::MeshMap(BakedMap::BentNormal))
+        }
+        _ => None,
+    }
+}
+
 /// The viewport dock tab: the paint bar, then the 3D and 2D views in the chosen layout with the mode's overlays
 pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
     let mode = app.ui.mode;
@@ -98,14 +113,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
     finish_unavailable_tool_gestures(app, pending_2d_endpoint);
     crate::id_color_pick::IdColorPick::end_when_stale(app);
     let tokens = Tokens::get(ui.ctx());
-    let aux_view = match app.session.view {
-        _ if quick_mask_shown(app) => Some(crate::gpu::AuxView::QuickMask),
-        ViewMode::MeshMap(map) => Some(crate::gpu::AuxView::MeshMap(map)),
-        ViewMode::Mask(id) => Some(crate::gpu::AuxView::Mask(id)),
-        ViewMode::Image => Some(crate::gpu::AuxView::Image),
-        _ if mode == crate::state::Mode::Baking && app.ui.bake_visualization.bent_normal_shown() => Some(crate::gpu::AuxView::MeshMap(BakedMap::BentNormal)),
-        _ => None,
-    };
+    let aux_view = aux_view(app);
     let mut sync = PendingSync::default();
     let full = ui.available_rect_before_wrap();
     path_keys(app, ui);
@@ -808,8 +816,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         if alt {
             app.session.camera.zoom(-delta.y * DRAG_ZOOM_PER_POINT * app.ui.prefs.drag_zoom_scale());
         } else if shift {
-            let display = &mut app.session.doc.project.display;
-            display.env_rotation = (display.env_rotation + delta.x * LIGHT_DEGREES_PER_POINT).rem_euclid(360.0);
+            turn_environment(&mut app.session, delta.x * LIGHT_DEGREES_PER_POINT);
         } else {
             orbit(app, delta);
         }
@@ -820,7 +827,8 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         app.orbit_snap = None;
     }
 
-    if response.hovered() && !holding {
+    let camera_input = !holding && !ShownGizmo::dragging(ui.ctx());
+    if response.hovered() && camera_input {
         size_brush_by_ctrl_wheel(app, ui);
         if ui.input(|input| input.multi_touch().is_none()) {
             let pinch = trackpad_pinch(ui);
@@ -841,8 +849,8 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
 
     // Touch: two fingers orbit and pinch zooms, three pan; a second finger cancels the first one's stroke
-    let touch = ui.input(|input| input.multi_touch()).filter(|_| response.contains_pointer() || response.dragged());
-    if let Some(gesture) = touch {
+    let touch = ui.input(|input| input.multi_touch()).filter(|_| !holding && (response.contains_pointer() || response.dragged()));
+    if let Some(gesture) = touch.filter(|_| camera_input) {
         if app.session.stroke_active() {
             app.session.cancel_stroke();
         }
@@ -916,18 +924,35 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
 
     crate::properties_popup::open_on_right_click(app, ui, &response, rect, s_held || v_held);
 
-    let popup = app.properties_popup.is_some() || rail_popup;
+    // A press that closes an open colour picker only closes it: it neither paints nor moves a projection
+    let picker = crate::color_picker::blocks_view_press(ui.ctx());
+    let popup = app.properties_popup.is_some() || rail_popup || picker;
 
-    // A pending ID color pick takes the next click instead of the brush
-    let picking = app.picking_id_color.is_some();
+    // A pending ID color pick or eyedropper takes the next click instead of the brush
+    let picking = app.picking_id_color.is_some() || app.picking_color.is_some();
     if picking {
-        crate::id_color_pick::IdColorPick::draw_cursor(ui, rect);
+        // The eyedropper's own pointer is drawn over the whole window (screen_pick)
+        if app.picking_color.is_none() {
+            crate::id_color_pick::IdColorPick::draw_cursor(ui, rect);
+        }
+
+        // The eyedropper's disc shows the colour a click here would pick
+        if app.picking_color.is_some()
+            && let Some(hover) = response.hover_pos()
+            && let Ok(values) = app.session.color_at(local(hover), app.session.viewport)
+            && let Some(color) = values.get(&texturecraft_engine::core::Channel::BaseColor)
+        {
+            crate::screen_pick::SwatchColor::over_model(ui.ctx(), *color);
+        }
         if !alt
             && response.clicked_by(PointerButton::Primary)
             && let Some(position) = response.interact_pointer_pos()
         {
             let (pixel, viewport) = (local(position), app.session.viewport);
-            crate::id_color_pick::IdColorPick::pick_at(app, json!({"x": pixel.x, "y": pixel.y, "viewport": [viewport.x, viewport.y]}));
+            match app.picking_color {
+                Some(bar) => eyedrop(app, ui.ctx(), bar, pixel, viewport),
+                None => crate::id_color_pick::IdColorPick::pick_at(app, json!({"x": pixel.x, "y": pixel.y, "viewport": [viewport.x, viewport.y]})),
+            }
         }
     }
 
@@ -935,10 +960,11 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     let gizmo_free =
         !adjusting && !alt && !holding && !s_held && !v_held && !focus_pick && !popup && !picking && touch.is_none() && !DecalDrop::blocks_input(ui.ctx());
     let gizmo = ShownGizmo::of(app, rect);
-    let frame_drag = gizmo_free && ShownGizmo::input(app, ui, &response, rect, gizmo.as_ref());
+    let began_on_handle = handle_press(ui.ctx(), |at| gizmo.as_ref().is_some_and(|gizmo| gizmo.on_handle(rect, at)));
+    let frame_drag = gizmo_free && began_on_handle && ShownGizmo::input(app, ui, &response, rect, gizmo.as_ref());
 
     // End the gizmo drag when navigation takes over because the camera may have moved
-    if !gizmo_free {
+    if !gizmo_free || !began_on_handle {
         ShownGizmo::let_go(ui.ctx());
     }
 
@@ -971,8 +997,6 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     // A handle owns a new click, but a stroke already under way must still finish over it
     let symmetry_handle = !app.session.stroke_active() && crate::symmetry::manipulator_hovered(app, ui, rect);
 
-    // Keep the handle's original press through release outside the handle
-    let began_on_handle = handle_press(ui.ctx(), |at| gizmo.as_ref().is_some_and(|gizmo| gizmo.on_handle(rect, at)));
     let gizmo_handle = gizmo_free && !app.session.stroke_active() && began_on_handle;
 
     // Painting
@@ -1067,6 +1091,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && (app.session.tool.tool != Tool::Path || adjusting)
         && !crate::symmetry::manipulator_hovered(app, ui, rect)
         && app.picking_id_color.is_none()
+        && app.picking_color.is_none()
         && app.moving_on_model.is_none()
         && !ShownGizmo::hovered(ui, rect, gizmo.as_ref())
         && let Some(hover_pos) = if adjusting { ui.input(|input| input.pointer.press_origin()) } else { response.hover_pos() }
@@ -1820,14 +1845,17 @@ fn scale_brush_by_wheel(app: &mut TextureCraftApp, scroll: f32) {
 /// Whether the press under way, or released this frame, began on a projection handle (`on_handle`); with no press, whether the pointer is on one
 fn handle_press(ctx: &egui::Context, on_handle: impl Fn(Pos2) -> bool) -> bool {
     let id = egui::Id::unique(HANDLE_PRESS_ID);
-    let (pressed, down, released, origin, hover) = ctx.input(|input| {
-        let pointer = &input.pointer;
-        (pointer.any_pressed(), pointer.any_down(), pointer.any_released(), pointer.press_origin(), pointer.hover_pos())
+    let (pressed_at, down, released, hover) = ctx.input(|input| {
+        let pressed_at = input.events.iter().rev().find_map(|event| match event {
+            egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, .. } => Some(*pos),
+            _ => None,
+        });
+        (pressed_at, input.pointer.primary_down(), input.pointer.button_released(PointerButton::Primary), input.pointer.hover_pos())
     });
 
     // Keep the press origin because egui clears it before the release frame
-    if pressed {
-        let on = origin.is_some_and(&on_handle);
+    if let Some(at) = pressed_at {
+        let on = on_handle(at);
         ctx.data_mut(|data| data.insert_temp(id, on));
     }
     let kept = ctx.data(|data| data.get_temp::<bool>(id)).filter(|_| down || released);
@@ -1835,7 +1863,7 @@ fn handle_press(ctx: &egui::Context, on_handle: impl Fn(Pos2) -> bool) -> bool {
         ctx.data_mut(|data| data.remove::<bool>(id));
     }
 
-    kept.unwrap_or_else(|| (if down { origin } else { hover }).is_some_and(on_handle))
+    kept.unwrap_or_else(|| !down && !released && hover.is_some_and(on_handle))
 }
 
 /// Where [`handle_press`] keeps whether the press began on a handle
@@ -2196,11 +2224,13 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && !projection_hint
         && app.properties_popup.is_none()
         && !crate::rail_popup::blocks_paint_input(app, ui.ctx())
+        && !crate::color_picker::blocks_view_press(ui.ctx())
         && !alt
         && !adjusting
         && !v_held
         && !picking_id_color
         && !app.picking_symmetry_plane
+        && app.picking_color.is_none()
         && !DecalDrop::blocks_input(ui.ctx());
     let mut fill_box = None;
     if painting && path_tool {
@@ -2305,7 +2335,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
 
     // Match the 3D view's stamp size and hardness
-    let show_brush_cursor = tool_acts(app) && !alt && !v_held;
+    let show_brush_cursor = tool_acts(app) && !alt && !v_held && app.picking_color.is_none();
     let pointer_in_view = ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| rect.contains(p));
     if show_brush_cursor
         && !path_tool
@@ -2497,6 +2527,26 @@ fn bake_paint_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, t
     painter.add(egui::Shape::mesh(mesh));
 }
 
+/// Hands the base colour on the model at `pixel` to the colour bar `bar` and ends its eyedropper pick; a click off the model ends it too
+fn eyedrop(app: &mut TextureCraftApp, ctx: &egui::Context, bar: egui::Id, pixel: Vec2, viewport: Vec2) {
+    app.picking_color = None;
+    let Ok(values) = app.session.color_at(pixel, viewport) else { return };
+
+    if let Some(color) = values.get(&texturecraft_engine::core::Channel::BaseColor) {
+        crate::color_picker::ColorPick::deliver(ctx, bar, *color);
+    }
+}
+
+/// Turn the viewport environment by `degrees` (Shift+right-drag): the layers Baked Lighting
+/// Environment lights with it composite again, as `display.set` does
+fn turn_environment(session: &mut Session, degrees: f32) {
+    let display = &mut session.doc.project.display;
+    let rotation_before_degrees = display.env_rotation;
+    display.env_rotation = (rotation_before_degrees + degrees).rem_euclid(360.0);
+    let environment = display.environment.clone();
+    texturecraft_engine::view_cmds::relight_environment(session, &environment, rotation_before_degrees);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2535,16 +2585,6 @@ mod tests {
         }
         let (u, v) = uv_axis_directions(std::f32::consts::FRAC_PI_2);
         assert!((u - egui::vec2(0.0, -1.0)).length() < 1e-4 && (v - egui::vec2(-1.0, 0.0)).length() < 1e-4, "a counter-clockwise quarter turn: U up, V left");
-    }
-
-    #[test]
-    fn one_switch_turns_the_wireframe_on_in_both_views_and_polygon_fill_shows_it_without_changing_the_switch() {
-        let mut ui = crate::state::UiState::default();
-        assert!(!wireframe_shown(&ui, false), "off by default");
-        assert!(wireframe_shown(&ui, true), "polygon fill shows the polygons it fills");
-        assert!(!ui.mesh_wireframe);
-        ui.mesh_wireframe = true;
-        assert!(wireframe_shown(&ui, false));
     }
 
     #[test]
@@ -2717,6 +2757,64 @@ mod tests {
         app.session.quick_mask.editing = false;
 
         assert_eq!(mask_view_layer(app), Some(LayerId(7)), "the label returns with the mask view");
+    }
+
+    #[test]
+    fn picking_shows_the_id_mask_its_color_selection_reads() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        use texturecraft_engine::{StackTarget, execute};
+
+        let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
+        execute(&mut session, "layer.add.fill", &json!(null)).unwrap();
+        let effect = texturecraft_engine::core::LayerId(execute(&mut session, "mask.add.colorSelection", &json!(null)).unwrap()["effect"].as_u64().unwrap());
+        session.target = StackTarget::Effect(effect);
+        let mut harness = egui_kittest::Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        harness.run_steps(2);
+
+        crate::id_color_pick::IdColorPick::start(harness.state_mut(), effect, None);
+
+        assert_eq!(aux_view(harness.state()), Some(crate::gpu::AuxView::IdMask(effect)), "the pick's own ID mask");
+
+        crate::id_color_pick::IdColorPick::end(harness.state_mut());
+
+        assert_eq!(aux_view(harness.state()), None, "the earlier view");
+    }
+
+    /// A click in the 2D view while a colour bar's eyedropper waits paints nothing: the pick keeps waiting, as over the 3D view
+    #[test]
+    fn a_waiting_eyedropper_keeps_a_2d_view_click_from_painting() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = texturecraft_engine::sample_session(256, 64).unwrap();
+        let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+        harness.state_mut().ui.layout = ViewLayout::Only2D;
+        harness.state_mut().session.tool.tool = Tool::PolygonFill;
+        harness.run_steps(4);
+
+        // The 2D view fills the window's middle: there the sample's UV islands are (the shelf drop tests click the same point)
+        let on_the_uvs = pos2(700.0, 420.0);
+        let steps = harness.state().session.history_labels().len();
+        let bar = egui::Id::unique("a colour bar");
+        harness.state_mut().picking_color = Some(bar);
+
+        click(&mut harness, on_the_uvs);
+
+        assert_eq!(harness.state().session.history_labels().len(), steps, "the click painted nothing");
+        assert_eq!(harness.state().picking_color, Some(bar), "the eyedropper still waits");
+
+        harness.state_mut().picking_color = None;
+        click(&mut harness, on_the_uvs);
+
+        assert_eq!(harness.state().session.undo_label(), Some("Polygon fill"), "without a pick the same click paints");
+    }
+
+    /// Press and release the primary button at `at`
+    fn click(harness: &mut egui_kittest::Harness<'_, TextureCraftApp>, at: Pos2) {
+        harness.hover_at(at);
+        harness.run_steps(1);
+        harness.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+        harness.run_steps(1);
+        harness.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+        harness.run_steps(2);
     }
 
     #[test]
@@ -2983,5 +3081,25 @@ mod tests {
         visible_dashes(VIEW, &[pos2(-50.0, -10.0), pos2(150.0, -10.0), pos2(120.0, 300.0)], 6.0, 4.0, |_| count += 1);
 
         assert_eq!(count, 0);
+    }
+
+    /// Shift+right-drag's turn composites the layers Baked Lighting Environment lights again, as
+    /// `display.set` does: the CPU material keeps the old light otherwise
+    #[test]
+    fn turning_the_environment_in_the_viewport_relights_the_layers_lit_by_it() {
+        use texturecraft_engine::execute;
+
+        let mut session = texturecraft_engine::sample_session(128, 32).unwrap();
+        execute(&mut session, "layer.add.fill", &serde_json::json!({})).unwrap();
+        execute(&mut session, "effect.add.filter", &serde_json::json!({"target": "content", "filter": "bakedLightingEnvironment"})).unwrap();
+        let revisions = |session: &Session| session.caches.iter().map(|cache| cache.material_revision).collect::<Vec<_>>();
+        let before = revisions(&session);
+
+        turn_environment(&mut session, 25.0);
+
+        // Only the set holding the lit layer composites again
+        let (after, lit) = (revisions(&session), session.ts());
+        let changed: Vec<usize> = before.iter().zip(&after).enumerate().filter(|(_, (before, after))| before != after).map(|(set, _)| set).collect();
+        assert_eq!(changed, [lit], "{before:?} {after:?}");
     }
 }

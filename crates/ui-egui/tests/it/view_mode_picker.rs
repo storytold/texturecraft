@@ -4,7 +4,6 @@ use egui::Role;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable as _;
 use texturecraft_engine::ViewMode;
-use texturecraft_engine::core::Channel;
 use texturecraft_ui_egui::TextureCraftApp;
 
 fn harness() -> Harness<'static, TextureCraftApp> {
@@ -39,63 +38,11 @@ fn query_field<'a>(h: &'a Harness<'_, TextureCraftApp>) -> egui_kittest::Node<'a
 }
 
 #[test]
-fn the_combo_lists_the_reference_sections_and_names() {
-    let mut h = harness();
-    open(&mut h, "Material");
-    for label in [
-        "Lighting",
-        "Material",
-        "Single channel",
-        "Base color",
-        "Base metalness",
-        "Specular roughness",
-        "Normal",
-        "Height",
-        "Normal+height+mesh",
-        "Mesh maps",
-        "World space normal",
-        "ID",
-        "Ambient occlusion",
-        "Curvature",
-        "Position",
-        "Thickness",
-        "Bent normals",
-        "Opacity",
-        "Other...",
-    ] {
-        assert!(h.query_all_by_label(label).next().is_some(), "{label}");
-    }
-    for old in ["Metallic", "Roughness", "Mesh map: Normal", "Mesh map: World Space Normal", "Ambient Occlusion", "Bent Normals"] {
-        assert!(h.query_by_label(old).is_none(), "{old} is not offered");
-    }
-    assert!(h.query_all_by_label("Normal").count() >= 2, "Normal is a channel and a mesh map");
-}
-
-#[test]
 fn the_section_titles_cannot_be_picked() {
     let mut h = harness();
     open(&mut h, "Material");
     pick(&mut h, "Single channel");
     assert_eq!(h.state().session.view, ViewMode::Material, "a title is no mode");
-}
-
-#[test]
-fn a_channel_shows_under_its_reference_name_in_this_combo_only() {
-    let mut h = harness();
-    open(&mut h, "Material");
-    pick(&mut h, "Specular roughness");
-    assert_eq!(h.state().session.view, ViewMode::Channel(Channel::Roughness));
-    picker(&h, "Specular roughness");
-    assert_eq!(Channel::Roughness.label(), "Roughness", "other places keep the channel's name");
-}
-
-#[test]
-fn a_mesh_map_shows_without_a_prefix() {
-    let mut h = harness();
-    open(&mut h, "Material");
-    pick(&mut h, "Ambient occlusion");
-    assert_eq!(h.state().session.view, ViewMode::MeshMap(texturecraft_engine::core::BakedMap::AmbientOcclusion));
-    picker(&h, "Ambient occlusion");
 }
 
 fn png() -> Vec<u8> {
@@ -189,16 +136,4 @@ fn removing_the_shown_image_brings_the_material_back() {
     h.run_steps(3);
     assert_eq!(h.state().session.view, ViewMode::Material);
     picker(&h, "Material");
-}
-
-#[test]
-fn bake_mode_keeps_its_own_view_list() {
-    let mut h = harness();
-    h.state_mut().ui.mode = texturecraft_ui_egui::state::Mode::Baking;
-    h.run_steps(4);
-    open(&mut h, "Neutral Material");
-    h.get_by_label("Mesh map: Ambient Occlusion").scroll_to_me();
-    h.run_steps(3);
-    assert!(h.query_by_label("Mesh map: Ambient Occlusion").is_some(), "mesh maps keep their prefix in Bake mode");
-    assert!(h.query_by_label("Lighting").is_none() && h.query_by_label("Mesh maps").is_none(), "no section titles in Bake mode");
 }

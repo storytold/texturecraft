@@ -15,7 +15,7 @@ use crate::export::sanitize_file_stem;
 use crate::presets::{GLTF_BASE_COLOR, GLTF_CLEARCOAT, GLTF_EMISSIVE, GLTF_NORMAL, GLTF_ORM, GLTF_SHEEN, gltf_pbr_maps};
 use crate::{ExportOptions, ExportPreset, ExportedFile, FileFormat, FormatError, Result};
 
-pub use usd::{NamedFiles, UsdExport, UsdFormat, usd_bytes, usd_export_options};
+pub use usd::{NamedFiles, UsdExport, UsdFormat, UsdTextureBinding, usd_bytes, usd_export_options, usd_layer_with_textures, usd_texture_bindings};
 
 /// The mesh as OBJ text (UV v flipped back to OBJ's bottom-up convention).
 /// Invalid mesh data or shared writer limits return an error, never an empty successful export.

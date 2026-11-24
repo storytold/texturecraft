@@ -372,6 +372,7 @@ mod tests {
             projection: Default::default(),
             sampling: Default::default(),
             link: None,
+            material: None,
         };
         let mut layer = Layer::new(id, "fill", LayerKind::Fill(fill), &[Channel::Roughness]);
         layer.mask = Some(Mask::new(MaskBackground::White));

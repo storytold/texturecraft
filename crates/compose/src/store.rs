@@ -145,6 +145,15 @@ impl ImageRes {
         bilinear(&self.rgba, self.width, self.height, u, v, (true, true))
     }
 
+    /// The texel under (`u`, `v`) as stored, wrapping (an ID map's colors must not blend)
+    pub fn sample_nearest(&self, u: f32, v: f32) -> [f32; 4] {
+        if !u.is_finite() || !v.is_finite() {
+            return [0.0; 4];
+        }
+
+        self.nearest(u, v, (true, true))
+    }
+
     /// The texel under (`u`, `v`), on the axes that do not `repeat` the edge texel past the edge
     fn nearest(&self, u: f32, v: f32, repeat: (bool, bool)) -> [f32; 4] {
         self.texel((u * self.width as f32).floor() as i64, (v * self.height as f32).floor() as i64, repeat)
@@ -172,11 +181,21 @@ impl ImageRes {
         self.mips.get_or_init(|| self.build_mips(MipLevel::halve))
     }
 
+    /// The halved levels Bilinear HQ reads (level 1 first; level 0 is the image), built once.
+    /// The GPU compositor uploads the same levels.
+    pub fn mip_chain(&self) -> &[MipLevel] {
+        self.mips()
+    }
+
+    /// The halved levels of an sRGB image's colour read: RGB linear, alpha unchanged (the chain
+    /// `sample_srgb_color` reads), built once.
+    pub fn linear_mip_chain(&self) -> &[MipLevel] {
+        self.linear_mips.get_or_init(|| self.build_mips(|rgba, width, height| MipLevel::halve_with(rgba, width, height, Some(linearize_rgb))))
+    }
+
     /// Sample an sRGB image as linear color, preserving the full-resolution filter.
     pub(crate) fn sample_srgb_color(&self, u: f32, v: f32, sampling: Sampling, footprint: f32) -> [f32; 4] {
-        self.sample_filtered_with(u, v, sampling, footprint, linearize_rgb, || {
-            self.linear_mips.get_or_init(|| self.build_mips(|rgba, width, height| MipLevel::halve_with(rgba, width, height, Some(linearize_rgb))))
-        })
+        self.sample_filtered_with(u, v, sampling, footprint, linearize_rgb, || self.linear_mip_chain())
     }
 
     /// Read coverage from either mip chain since the RGB transfer leaves alpha unchanged.
@@ -337,6 +356,18 @@ mod tests {
         assert!((midpoint[0] - 0.25).abs() < 1e-6, "mix linear black and the half-bright mip: {midpoint:?}");
         assert_eq!(midpoint[3], coverage);
         assert!(image.mips.get().is_none(), "coverage can use the same mip chain as color");
+    }
+
+    #[test]
+    fn the_public_mip_chains_are_the_levels_bilinear_hq_reads() {
+        let image = ImageRes::new(8, 8, (0..64).map(|i| [i as f32 / 63.0, 0.25, 0.75, 1.0]).collect(), false);
+        let sampling = Sampling { filtering: Filtering::BilinearHq, ..Sampling::SAVED_BEFORE };
+        // Footprint 2: exactly the first halved level
+        let level = &image.mip_chain()[0];
+        assert_eq!(image.sample_filtered(0.3, 0.6, sampling, 2.0), bilinear(&level.rgba, level.width, level.height, 0.3, 0.6, (true, true)));
+        let srgb = ImageRes::new(8, 8, image.rgba.clone(), true);
+        let level = &srgb.linear_mip_chain()[0];
+        assert_eq!(srgb.sample_srgb_color(0.3, 0.6, sampling, 2.0), bilinear(&level.rgba, level.width, level.height, 0.3, 0.6, (true, true)));
     }
 
     #[test]

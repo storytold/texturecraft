@@ -55,12 +55,14 @@ impl ShownGizmo {
             }
     }
 
+    pub(crate) fn dragging(ctx: &egui::Context) -> bool {
+        dragging::<FrameGizmo>(ctx).is_some() || dragging::<RoundGizmo>(ctx).is_some()
+    }
+
     /// Whether the pointer is over one of `gizmo`'s handles or dragging one (the brush cursor hides there)
     pub(crate) fn hovered(ui: &Ui, rect: Rect, gizmo: Option<&ShownGizmo>) -> bool {
         let ctx = ui.ctx();
-        dragging::<FrameGizmo>(ctx).is_some()
-            || dragging::<RoundGizmo>(ctx).is_some()
-            || ctx.pointer_hover_pos().is_some_and(|hover| gizmo.is_some_and(|gizmo| gizmo.on_handle(rect, hover)))
+        Self::dragging(ctx) || ctx.pointer_hover_pos().is_some_and(|hover| gizmo.is_some_and(|gizmo| gizmo.on_handle(rect, hover)))
     }
 
     /// The gizmo over the 3D view

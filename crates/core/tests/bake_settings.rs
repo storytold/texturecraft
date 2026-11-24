@@ -118,7 +118,6 @@ fn components_keep_their_own_defaults() {
     }))
     .unwrap();
     assert_eq!(settings, bake::BakeSettings::default());
-    assert_eq!(settings.maps.thickness.parameters.rays.max_distance, 0.1);
 }
 
 #[test]

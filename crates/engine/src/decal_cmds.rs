@@ -483,13 +483,16 @@ fn store_decal(session: &mut Session, layer_id: LayerId, effect: Option<LayerId>
     let LayerKind::Fill(fill) = &mut session.doc.project.layer_mut(layer_id)?.kind else { return Ok(()) };
     fill.projection = projection;
 
-    // The new image goes where the decal's image is (the channel it was placed in)
+    let Some(image) = image else { return Ok(()) };
+
+    // Replace the original image in every channel that shared it
     let placed = fill.sources.values().find_map(|source| match source {
         Source::Image { name, .. } => Some(name.clone()),
         _ => None,
     });
-    match (image, placed) {
-        (Some(image), Some(placed)) => {
+    match placed {
+        Some(placed) if placed == image => return Ok(()),
+        Some(placed) => {
             for source in fill.sources.values_mut() {
                 if let Source::Image { name, .. } = source
                     && *name == placed
@@ -498,10 +501,10 @@ fn store_decal(session: &mut Session, layer_id: LayerId, effect: Option<LayerId>
                 }
             }
         }
-        (Some(image), None) => {
+        None => {
             fill.sources.insert(Channel::BaseColor, Source::image(image));
         }
-        (None, _) => {}
     }
+    fill.material = None;
     Ok(())
 }

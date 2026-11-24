@@ -17,6 +17,7 @@ use texturecraft_engine::geom::glam::{Vec2, Vec3, Vec4};
 use rayon::prelude::*;
 
 use crate::projector_outline::ProjectorOutline;
+use crate::slot_thumbnail::FULL_UV;
 use crate::theme::Tokens;
 
 mod preview_shape;
@@ -28,9 +29,6 @@ use preview_shape::PreviewShape;
 use rendered_preview::RenderedPreview;
 use screen::Screen;
 use view::View;
-
-/// The whole of a texture, as the part of it a picture shows
-const FULL_UV: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
 /// Largest preview side in pixels; the square is never drawn bigger than this
 const MAX_SIDE_PX: usize = 256;

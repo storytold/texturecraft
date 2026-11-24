@@ -77,9 +77,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   pattern resolution separately for each source. Each channel takes its own image, such as a
   normal, roughness or height map. Import it with *File › Import resources...*, then select it
   in the channel's source picker or drop it from the Assets panel onto the channel. Mark
-  DirectX normal maps (Y down) with **DirectX normal map**.
-  For a color channel that reads a pattern or anchor point, choose **Gradient Map** from the
-  three-dot menu beside its source slot. Up to 16 color stops map dark to light across the
+  DirectX normal maps (Y down) by choosing **DirectX** under **Attributes › Normal format**.
+  For a color channel that reads a pattern or anchor point, use `layer.fill.set` with
+  `gradientMap: true` to initialize a ramp, or supply its stops in `colors`. Up to 16 stops map dark to light across the
   pattern or recolor the stack below by its lightness. The **Gradient map** filter does the
   same for a whole layer's content.
   Alt+click a material channel (of a fill or the brush) to keep that channel alone.
@@ -105,8 +105,8 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **MaterialCraft materials:** *File › Import material*, a drop on the window, or MaterialCraft's
   *File › Send to TextureCraft* (it lands under *My smart materials*) adds a `.mcmat` portable
   material, or a `.mcraft` package, as a fill layer. Its exposed graph inputs (numbers, vectors,
-  toggles, options, colors) and presets show in the layer's properties; every change re-cooks
-  the maps through MaterialCraft's command line at the texture set's resolution, on a worker
+  toggles, options, colors) and presets appear in the layer's properties. Editing them re-cooks
+  the maps through MaterialCraft's command line at the selected resolution, on a worker
   thread, with the set's baked mesh maps (curvature, AO, thickness…) feeding graph inputs of the
   same name. *Open in MaterialCraft* edits the graph itself. In the browser the cooked maps paint,
   but the inputs are read-only.
@@ -175,8 +175,34 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   *Cancel* goes back to the settings the window opened with, *Maximum size for all Texture Sets*
   exports every set at the largest set's size; a click on a texture set overrides its template,
   file type, size or padding, and each output map's file type and bit depth, or leaves a map out;
-  Export shows the progress, a console of its steps and the written files, and can be canceled
-  between texture sets).
+  Export shows the progress, a console of its steps, the written files and the export's
+  warnings (each once), and can be canceled between texture sets).
+- **USD asset export:** the *Export USD asset* checkbox on the Export textures window's Global
+  settings (off by default, remembered with the other settings) also writes `<mesh>.usd` (binary USD) next to
+  the exported textures when the last selected texture set is written. It holds the whole mesh with
+  one UsdPreviewSurface material per texture set; each material refers to the textures that texture
+  set was exported with (its own output template, file type, size and normal format) by relative
+  file name. Base colour, roughness, metallic, normal, emissive colour, opacity, clear coat and clear
+  coat roughness are bound; a packed template (ORM, mask map) binds several inputs to different
+  channels of one file. A UDIM map that lost a tile to an earlier texture set's file name or to a
+  UDIM pattern an earlier MaterialX document of the export uses gets no binding, and a mesh with no materials gets one implicit "default" material bound to the Default
+  texture set. Ambient occlusion, height and specular are not bound (the material has occlusion,
+  displacement and specularColor inputs, but TextureCraft does not fill them), nor are glossiness
+  (no matching input) and baked maps; sheen, anisotropy, transmission, scatter and coat normal have no
+  UsdPreviewSurface input. Colour maps written as sRGB are tagged sRGB, other maps raw; a DirectX normal map is
+  flipped back in the material. A texture set outside the export has no textures in the file. A
+  canceled export writes none, and a failure to write it is a warning. In the browser the option is
+  greyed.
+- **MaterialX export:** the *Export MaterialX* checkbox on the Export textures window's Global
+  settings (off by default, remembered with the other settings) writes an OpenPBR `.mtlx` for
+  each selected texture set with usable maps. Materials reference textures beside the document.
+  The export reuses compatible OpenPBR maps and writes dedicated maps for the other supported
+  inputs using the set's effective settings. Dedicated maps use PNG when the chosen file type
+  is unsuitable, and a DirectX export keeps its selected normal alongside a separate OpenGL
+  normal for the material. The export console identifies collisions and skipped files.
+  The browser shows the option disabled. The exporter supports OpenPBR maps including base
+  color, roughness and normals. Standard Surface, coat normal, specular level, anisotropy angle
+  and constants such as IOR remain open.
 - **Mesh export** to OBJ with an MTL material library and its maps (PBR extension keys for
   roughness, metallic, normal and coat; UV-tiled sets keep their UDIM UVs and export their maps
   through Export textures), textured GLB (with clear coat and sheen) and USD (with clear coat).

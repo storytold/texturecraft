@@ -19,6 +19,10 @@ struct Dab {
     tangent: vec4<f32>,
     bitangent: vec4<f32>,
     seed: u32,
+    // A symmetry copy's way back to its source stamp (StampSource): origin, w 1 on a copy
+    source: vec4<f32>,
+    // The columns of StampSource::to_source
+    to_source: array<vec4<f32>, 3>,
 }
 // Corresponds to the BrushAlpha mapping in BrushPipeline::pipeline.
 override alpha_kind: u32 = 0u;
@@ -79,14 +83,17 @@ fn ray_visible(point: vec3<f32>, geometric: vec3<f32>, direction: vec3<f32>) -> 
     return traverse_from(0u, point + (side + direction) * lift, direction, distance - lift, true).idx == NONE;
 }
 
+// How far toward the eye a grazing point may be tested past its neighbours (back faces get none)
+fn grazing_reach(point: vec3<f32>, facing: f32) -> f32 {
+    if facing <= 0.0 { return 0.0; }
+    let angle = clamp(facing, 0.05, 1.0);
+    let clip_w = max(0.0, (params.camera * vec4(point, 1.0)).w);
+    return clip_w * 3.0 * sqrt(1.0 - angle * angle) / (params.view_scale.x * angle);
+}
+
 fn visible(point: vec3<f32>, geometric: vec3<f32>, direction: vec3<f32>, facing: f32) -> bool {
     if params.view_scale.w == 0.0 { return true; }
-    var reach = 0.0;
-    if facing > 0.0 {
-        let angle = clamp(facing, 0.05, 1.0);
-        let clip_w = max(0.0, (params.camera * vec4(point, 1.0)).w);
-        reach = clip_w * 3.0 * sqrt(1.0 - angle * angle) / (params.view_scale.x * angle);
-    }
+    let reach = grazing_reach(point, facing);
     let test = depth_test(point + direction * reach);
     if test.x {
         return reach <= 0.0 || depth_test(point).x || ray_visible(point, geometric, direction);
@@ -211,6 +218,32 @@ fn brush_view(point: vec3<f32>, geometric: vec3<f32>, normal: vec3<f32>) -> Brus
     return BrushView(select(normal, geometric, dot(geometric, geometric) > 0.0), direction, dot(normal, direction));
 }
 
+fn source_direction(dab: Dab, direction: vec3<f32>) -> vec3<f32> {
+    return mat3x3<f32>(dab.to_source[0].xyz, dab.to_source[1].xyz, dab.to_source[2].xyz) * direction;
+}
+
+fn source_point(dab: Dab, point: vec3<f32>) -> vec3<f32> {
+    return dab.source.xyz + source_direction(dab, point - dab.source.xyz);
+}
+
+// A symmetry copy paints where its source stamp would, so it sees the texel from the source's side
+fn copy_view(dab: Dab, point: vec3<f32>, geometric: vec3<f32>, normal: vec3<f32>) -> BrushView {
+    return brush_view(source_point(dab, point), source_direction(dab, geometric), source_direction(dab, normal));
+}
+
+// The raster's surface_visible for a copy: the source's point may lie up to the stamp depth off an asymmetric surface
+fn copy_visible(dab: Dab, point: vec3<f32>, view: BrushView) -> bool {
+    if params.view_scale.w == 0.0 { return true; }
+    let seen = source_point(dab, point);
+    let allowed = seen + view.direction * (dab.center.w * dab.normal.w);
+    let reach = grazing_reach(seen, view.facing);
+    let test = depth_test(allowed + view.direction * reach);
+    if test.x {
+        return reach <= 0.0 || depth_test(allowed).x || ray_visible(allowed, view.geometric, view.direction);
+    }
+    return test.y && ray_visible(allowed, view.geometric, view.direction);
+}
+
 fn quick_limit(pixel: vec2<u32>, offset: u32) -> f32 {
     if params.flags.w == 0u { return 1.0; }
     var coverage = 0.0;
@@ -233,6 +266,7 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32, mask: u32) -> u32 {
     var point = vec3(0.0);
     var normal = vec3(0.0);
     var geometric = vec3(0.0);
+    var back_facing = false;
     var view = BrushView(vec3(0.0), vec3(0.0), 1.0);
     var has_normal = false;
     var texels_per_unit = 1.0;
@@ -276,15 +310,18 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32, mask: u32) -> u32 {
         has_normal = dot(normal, normal) > 0.0;
         if has_normal {
             view = brush_view(point, geometric, normal);
-            if params.flags.y != 0u && view.facing <= 0.0 { return coverage; }
+            // Symmetry copies see the texel from their source's side
+            back_facing = params.flags.y != 0u && view.facing <= 0.0;
         }
     }
     var tested_visibility = false;
+    var hidden = false;
     for (var i = 0u; i < count; i++) {
         let dab = dabs[tiles[first + i]];
         var local = vec2(0.0);
         var fade = 1.0;
         var dab_view = view;
+        let symmetry_copy = !uv_mode && dab.source.w != 0.0;
         if uv_mode {
             let reach = dab.center.w * 1.42;
             let p = vec2<f32>(pixel);
@@ -299,8 +336,12 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32, mask: u32) -> u32 {
             if dot(local, local) > 2.0 || abs(dot(offset, dab.normal.xyz)) > dab.center.w * dab.normal.w {
                 continue;
             }
-            if has_normal {
-                if dot(normal, dab.normal.xyz) <= 0.0 { continue; }
+            if has_normal && dot(normal, dab.normal.xyz) <= 0.0 { continue; }
+            if symmetry_copy {
+                dab_view = copy_view(dab, point, geometric, select(dab.normal.xyz, normal, has_normal));
+                if params.flags.y != 0u && dab_view.facing <= 0.0 { continue; }
+            } else if has_normal {
+                if back_facing || hidden { continue; }
             } else {
                 dab_view = brush_view(point, geometric, dab.normal.xyz);
                 if params.flags.y != 0u && dab_view.facing <= 0.0 { continue; }
@@ -312,9 +353,11 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32, mask: u32) -> u32 {
         }
         let opacity = stamp_shape(local, dab.bitangent.w, dab.seed, dab.center.w * texels_per_unit) * dab.tangent.w * fade * limit;
         if opacity <= 0.0 { continue; }
-        if !uv_mode && !tested_visibility {
+        if symmetry_copy {
+            if !copy_visible(dab, point, dab_view) { continue; }
+        } else if !uv_mode && !tested_visibility {
             if !visible(point, dab_view.geometric, dab_view.direction, dab_view.facing) {
-                if has_normal { return coverage; }
+                hidden = has_normal;
                 continue;
             }
             tested_visibility = has_normal;

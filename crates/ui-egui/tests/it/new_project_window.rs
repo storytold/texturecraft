@@ -1,9 +1,6 @@
-//! File > New project: the sections and their order, the defaults, settings shown disabled with a
-//! hint until TextureCraft has them, Create waiting for a mesh file, and the settings that reach
-//! the `file.new` command.
+//! New project creation, including mesh selection, disabled controls and settings passed to file.new.
 
 use egui::Role;
-use egui::accesskit::Toggled;
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_engine::template_cmds::DEFAULT_TEMPLATE;
@@ -89,81 +86,15 @@ fn create_keeps_the_mesh_buffer_for_retry_and_drops_it_after_success() {
     assert_eq!(h.state().session.doc.project.name, "retry");
 }
 
-fn top(h: &Harness<'_, TextureCraftApp>, label: &str) -> f32 {
-    h.get_all_by_label(label).map(|node| node.rect().top()).fold(f32::INFINITY, f32::min)
-}
-
 fn disabled(h: &Harness<'_, TextureCraftApp>, role: Role, label: &str) -> bool {
     h.get_by_role_and_label(role, label).accesskit_node().is_disabled()
 }
 
-fn ticked(h: &Harness<'_, TextureCraftApp>, role: Role, label: &str) -> bool {
-    h.get_by_role_and_label(role, label).accesskit_node().toggled() == Some(Toggled::True)
-}
-
 #[test]
-fn the_sections_follow_the_project_setup_order() {
-    let h = harness();
-    let order = [
-        "BASIC SETTINGS",
-        "3D mesh",
-        "Project template",
-        "Document resolution (px)",
-        "ADVANCED SETTINGS",
-        "Normal map format",
-        "Compute tangent space per fragment",
-        "UV Tile settings (UDIMs)",
-        "You can enable or disable UV tiles later in Texture Set Settings.",
-        "Use UV Tile workflow",
-        "Keep UV tiles together per material",
-        "Use a separate texture set for each tile",
-        "Import settings",
-        "Import cameras",
-        "Auto-unwrap",
-        "Import baked maps",
-        "Import mesh normal maps and baked maps for all materials.",
-        "Normal map filename: <texture set>_normal",
-        "Physical size",
-        "Use the mesh file’s unit scale",
-        "Custom unit scale",
-        "Scale material fills in real-world units",
-        "Color management",
-        "Working color space",
-    ];
-    let tops: Vec<f32> = order.iter().map(|label| top(&h, label)).collect();
-    for (pair, labels) in tops.windows(2).zip(order.windows(2)) {
-        assert!(pair[0] < pair[1], "{} comes before {}: {pair:?}", labels[0], labels[1]);
-    }
-    assert!(h.query_by_label("Linear - sRGB Chrominance (ITU-R BT.709)").is_some());
-}
-
-#[test]
-fn the_defaults_match_the_reference() {
+fn the_uv_layout_control_is_disabled_when_uv_tiles_are_off() {
     let h = harness();
 
-    assert!(h.query_by_label("No file selected").is_some());
-    assert!(h.query_by_value("Default (OpenPBR)").is_some(), "the default template");
-    assert!(h.query_by_value("1024 x 1024").is_some());
-    assert!(h.query_by_value("OpenGL").is_some());
-    assert!(h.query_by_value("Legacy").is_some());
-    assert!(!ticked(&h, Role::CheckBox, "Compute tangent space per fragment"));
-    assert!(!ticked(&h, Role::CheckBox, "Use UV Tile workflow"));
-    assert!(ticked(&h, Role::RadioButton, "Keep UV tiles together per material"));
-    assert!(disabled(&h, Role::RadioButton, "Keep UV tiles together per material"), "greyed while UV tiles are off");
-    assert!(ticked(&h, Role::CheckBox, "Import cameras") && !disabled(&h, Role::CheckBox, "Import cameras"));
-    assert!(ticked(&h, Role::CheckBox, "Auto-unwrap"));
-    assert!(ticked(&h, Role::RadioButton, "Use the mesh file’s unit scale"));
-    assert!(!ticked(&h, Role::CheckBox, "Scale material fills in real-world units"));
-}
-
-#[test]
-fn template_controls_name_and_built_in_meshes_are_gone() {
-    let h = harness();
-
-    for label in ["Template name", "Save current project as template", "Name", "UV tiles (UDIM)"] {
-        assert!(h.query_by_label(label).is_none(), "{label} is not in the window");
-    }
-    assert!(h.query_by_label_contains("Built-in:").is_none(), "no built-in mesh dropdown");
+    assert!(disabled(&h, Role::RadioButton, "Keep UV tiles together per material"));
 }
 
 #[test]

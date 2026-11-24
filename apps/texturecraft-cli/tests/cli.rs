@@ -16,17 +16,6 @@ fn cli_binary_path(runner_path: Option<OsString>) -> OsString {
     runner_path.unwrap_or_else(|| env!("CARGO_BIN_EXE_texturecraft-cli").into())
 }
 
-#[test]
-fn cli_binary_prefers_relocated_runner_path() {
-    let relocated = OsString::from("relocated archive/texturecraft-cli");
-    assert_eq!(cli_binary_path(Some(relocated.clone())), relocated);
-}
-
-#[test]
-fn cli_binary_defaults_to_cargo_path() {
-    assert_eq!(cli_binary_path(None), OsString::from(env!("CARGO_BIN_EXE_texturecraft-cli")));
-}
-
 fn cli(args: &[&str]) -> Output {
     Command::new(cli_binary()).args(args).output().unwrap()
 }

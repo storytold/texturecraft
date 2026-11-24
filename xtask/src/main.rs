@@ -145,6 +145,63 @@ fn cmd_wasm() -> Result<(), String> {
     if failed == 0 { Ok(()) } else { Err(format!("{failed} package(s) failed the wasm check")) }
 }
 
+/// The render crate's unit test modules that compile the most GPU pipelines, each tested in a
+/// process of its own on Linux; the rest of its unit tests run in one more process.
+const RENDER_TEST_MODULES: &[&str] = &[
+    "gpu_composite::procedural_tests::",
+    "gpu_composite::fill_projection::",
+    "gpu_composite::stack::",
+    "gpu_composite::packages::",
+    "gpu_composite::lighting::",
+    "gpu_composite::point::",
+    "gpu_composite::brush::",
+    "gpu_composite::pipelines::",
+    "gpu_composite::udim::",
+    "gpu_neighbourhood::gather::",
+    "gpu_neighbourhood::box_family::",
+    "gpu_neighbourhood::tests::",
+];
+
+/// `cargo test --workspace`. On Linux the render crate's unit tests run one module per process,
+/// with two malloc arenas: they compile many GPU pipelines on Mesa (llvmpipe), which keeps what
+/// it compiled until the process ends, so one process for all of them outgrows a 16 GB runner,
+/// and the default per-thread arenas fragment that memory. A MALLOC_ARENA_MAX the caller set wins.
+fn cmd_test() -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        let mut c = cargo();
+        c.args(["test", "--workspace"]);
+        return run(c, "cargo test --workspace");
+    }
+    let test = |args: &[&str], filter: &[&str]| {
+        let mut c = cargo();
+        c.arg("test").args(args);
+        if !filter.is_empty() {
+            c.arg("--").args(filter);
+        }
+        if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+            c.env("MALLOC_ARENA_MAX", "2");
+        }
+        let what = format!("cargo test {} {}", args.join(" "), if filter.is_empty() { String::new() } else { format!("-- {}", filter.join(" ")) });
+        run(c, what.trim_end())
+    };
+    const RENDER: &str = "texturecraft-render";
+    let mut failed = Vec::new();
+    let mut step = |result: Result<(), String>| {
+        if let Err(error) = result {
+            failed.push(error);
+        }
+    };
+    step(test(&["--workspace", "--exclude", RENDER], &[]));
+    step(test(&["-p", RENDER, "--doc"], &[]));
+    step(test(&["-p", RENDER, "--test", "*"], &[]));
+    for module in RENDER_TEST_MODULES {
+        step(test(&["-p", RENDER, "--lib"], &[module]));
+    }
+    let rest: Vec<&str> = RENDER_TEST_MODULES.iter().flat_map(|module| ["--skip", module]).collect();
+    step(test(&["-p", RENDER, "--lib"], &rest));
+    if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
+}
+
 fn cmd_ci() -> Result<(), String> {
     let cargo_step = |args: &'static [&'static str]| {
         move || {
@@ -159,7 +216,7 @@ fn cmd_ci() -> Result<(), String> {
         ("fmt", Box::new(cargo_step(&["fmt", "--all", "--", "--check"]))),
         ("layers", Box::new(cmd_layers)),
         ("clippy", Box::new(cargo_step(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))),
-        ("test", Box::new(cargo_step(&["test", "--workspace"]))),
+        ("test", Box::new(cmd_test)),
         ("wasm", Box::new(cmd_wasm)),
     ];
     for (i, (name, step)) in steps.iter().enumerate() {

@@ -13,7 +13,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Reset fill settings",
         [],
         None,
-        "{layer? | effect?: content fill effect id} — the Fill section back to a new fill's in one undo step: the same projection kind with its defaults (tiling 1, no offset or rotation, a planar or warp frame stays where it is placed, a warp's corners unpulled), the default filtering, wrap and scale mode (symmetry, sources and material stay)",
+        "{layer? | effect?: content or mask fill effect id} — the Fill section back to a new fill's in one undo step: the same projection kind with its defaults (tiling 1, no offset or rotation, a planar or warp frame stays where it is placed, a warp's corners unpulled), the default filtering, wrap and scale mode (symmetry, sources and material stay)",
         has_layer,
         reset_projection
     )]

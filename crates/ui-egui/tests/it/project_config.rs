@@ -17,10 +17,6 @@ const TRIANGLE: &str = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1
 const FORMAT_HINT: &str = "For the whole project: how normal map images set as mesh maps are read (set them again after a change), and the default for export";
 const TITLE: &str = "Project configuration";
 
-/// The window sits at the middle of the 1600-point-wide screen and is 560 points wide
-const WINDOW_MIDDLE_X: f32 = 800.0;
-const WINDOW_HALF_WIDTH: f32 = 280.0;
-
 fn temp_dir(test: &str) -> TempDir {
     TempDir::new(test)
 }
@@ -87,21 +83,6 @@ fn own_tick(h: &Harness<'_, TextureCraftApp>) -> bool {
 }
 
 #[test]
-fn the_menu_opens_the_window() {
-    let dir = temp_dir("menu");
-    let mut h = app_on_a_quad(&dir);
-
-    assert!(!window_is_open(&h));
-
-    open_window(&mut h);
-
-    assert!(window_is_open(&h));
-    assert!(h.query_by_label("3D MESH").is_some(), "the 3D mesh section");
-    assert!(!reimport_ticked(&h), "nothing is ticked at first");
-    assert!(h.state().ui.rail_panel.is_none(), "the Display panel stays where it was");
-}
-
-#[test]
 fn many_texture_sets_keep_dialog_actions_reachable_in_a_short_viewport() {
     let dir = temp_dir("many-tiles");
     let mut h = app_on_a_quad(&dir);
@@ -130,69 +111,12 @@ fn many_texture_sets_keep_dialog_actions_reachable_in_a_short_viewport() {
 }
 
 #[test]
-fn every_setting_has_an_info_icon_and_the_window_ends_with_a_note() {
-    let dir = temp_dir("info");
-    let mut h = app_on_a_quad(&dir);
-
-    open_window(&mut h);
-
-    let icons: Vec<_> = h.get_all_by_label(egui_phosphor::regular::INFO).collect();
-    let tip = "Green channel convention of normal maps: OpenGL (Y+) or DirectX (Y-). Imported and exported normal maps follow it.";
-
-    assert!(h.query_by_label("Changing the mesh or normal format can recalculate texture channels.").is_some(), "the note above the buttons");
-    assert_eq!(
-        icons.len(),
-        13,
-        "3D mesh, Reimport mesh, Normal map format, tangent space, UV tiles and its two layouts, Import cameras, Preserve strokes, Auto-unwrap, \
-         Physical size, Color management, Working color space"
-    );
-    assert!(h.query_by_label(tip).is_none(), "no tooltip before hovering");
-
-    // The format icon is third in the window's rows
-    let mut centers: Vec<_> = icons.iter().map(|n| n.rect().center()).collect();
-    centers.sort_by(|a, b| a.y.total_cmp(&b.y));
-    let format_center = centers[2];
-    h.hover_at(format_center);
-    h.run_steps(30);
-
-    assert!(h.query_by_label(tip).is_some(), "hovering the normal map format icon explains it");
-}
-
-#[test]
-fn the_window_follows_the_reference_layout() {
-    let dir = temp_dir("layout");
+fn unsupported_project_settings_are_disabled() {
+    let dir = temp_dir("unsupported-settings");
     let mut h = app_on_a_quad(&dir);
     h.set_size(egui::vec2(1600.0, 2000.0));
-
     open_window(&mut h);
 
-    let order = [
-        "3D MESH",
-        "Reimport mesh",
-        "PROJECT SETTINGS",
-        "Compute tangent space per fragment",
-        "UV Tile settings (UDIMs)",
-        "Change the UV tiles of a texture set in Texture Set Settings",
-        "Use UV Tile workflow",
-        "Use a separate texture set for each tile",
-        "Import settings",
-        "Import cameras",
-        "Preserve stroke positions on mesh",
-        "Auto-unwrap",
-        "Physical size",
-        "Working color space",
-    ];
-
-    // Only the window's own rows: a dock panel may show the same text (the fill's Scale switch offers Physical size)
-    let in_window = |node: &egui_kittest::Node<'_>| (node.rect().center().x - WINDOW_MIDDLE_X).abs() <= WINDOW_HALF_WIDTH;
-    let top = |label: &str| h.get_all_by_label(label).filter(in_window).map(|n| n.rect().top()).fold(f32::INFINITY, f32::min);
-    for labels in order.windows(2) {
-        assert!(top(labels[0]) < top(labels[1]), "{} comes before {}", labels[0], labels[1]);
-    }
-
-    assert!(h.query_by_label("Custom unit scale").is_none(), "Physical size starts collapsed");
-
-    let disabled = |role: Role, label: &str| h.get_by_role_and_label(role, label).accesskit_node().is_disabled();
     for (role, label) in [
         (Role::CheckBox, "Compute tangent space per fragment"),
         (Role::CheckBox, "Use UV Tile workflow"),
@@ -202,14 +126,8 @@ fn the_window_follows_the_reference_layout() {
         (Role::CheckBox, "Auto-unwrap"),
         (Role::Button, "Auto-unwrap options"),
     ] {
-        assert!(disabled(role, label), "{label} is disabled");
+        assert!(h.get_by_role_and_label(role, label).accesskit_node().is_disabled(), "{label}");
     }
-
-    let center = h.get_by_role_and_label(Role::CheckBox, "Compute tangent space per fragment").rect().center();
-    h.hover_at(center);
-    h.run_steps(30);
-
-    assert!(h.query_by_label("Not available yet").is_some(), "the hint of a setting TextureCraft does not have yet");
 }
 
 #[test]

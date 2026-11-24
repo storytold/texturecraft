@@ -1,11 +1,12 @@
 use std::ops::RangeInclusive;
 
-use egui::{Align2, Id, Rect, Sense, Stroke, WidgetInfo, pos2};
+use egui::{Align2, Color32, CornerRadius, FontId, Id, Rect, Response, Sense, Stroke, StrokeKind, WidgetInfo, pos2};
+use egui_phosphor::regular as ic;
 
 use super::number_field::shown_number;
 use super::track::Track;
 use super::value_text::ValueText;
-use super::{PropertySheet, ROW_HIT_HALF_HEIGHT, RowLead, TEXT_SIZE};
+use super::{CONTROL_RADIUS, ICON_SIZE, PropertySheet, ROW_HIT_HALF_HEIGHT, RowLead, SMALL_TEXT_SIZE, TEXT_SIZE};
 use crate::theme::semibold;
 
 /// Radius of a slider's knob
@@ -29,14 +30,71 @@ const DIAL_ZERO_DEGREES: f32 = 90.0;
 /// Air between the dial and the value, and between the track's end and the dial
 const DIAL_AIR: f32 = 6.0;
 
+/// Air between a tinted slider's track end and its right-hand color name
+const TINT_WORD_AIR: f32 = 8.0;
+
+/// Half the height of Intensity's divider chip
+const CHIP_HALF_HEIGHT: f32 = 10.0;
+
+/// The chip's room around its number: the caret and the air on both sides
+const CHIP_PADDING: f32 = 24.0;
+
+/// Air between the chip and the value, beyond the panel's value column
+const CHIP_TO_VALUE: f32 = 18.0;
+
+/// Where a slider's unit chip draws its caret and its text, from the chip's right end
+const CHIP_CARET_INSET: f32 = 9.0;
+const CHIP_TEXT_INSET: f32 = 18.0;
+
 impl PropertySheet<'_> {
+    /// A bounded number; `Some(merge)` when `value` changed, `merge` true for a drag's later steps
+    pub(crate) fn slider(&mut self, label: &str, value: &mut f32, range: RangeInclusive<f32>, decimals: usize) -> Option<bool> {
+        self.slider_with_suffix(label, value, range, decimals, "")
+    }
+
+    /// [`Self::slider`] with a unit after the value ("°", "%")
+    pub(crate) fn slider_with_suffix(&mut self, label: &str, value: &mut f32, range: RangeInclusive<f32>, decimals: usize, suffix: &str) -> Option<bool> {
+        self.slider_led(RowLead::label(label), value, range, decimals, suffix)
+    }
+
     /// [`Self::slider_with_suffix`] led by `lead` (a picture row, a child setting)
     pub(crate) fn slider_led(&mut self, lead: RowLead<'_>, value: &mut f32, range: RangeInclusive<f32>, decimals: usize, suffix: &str) -> Option<bool> {
         let (control, center_y) = self.row_with(lead);
-        let id = self.next_id();
+        let id = self.named_id("slider", lead.text());
         let track = Track { start: control.left() + KNOB_RADIUS, end: self.track_end(), center_y, zero: None, ramp: false };
         let dragged = self.track(id, lead.text(), &track, value, &range);
         let typed = self.value_field(id, lead.text(), center_y, *value, &range, decimals, suffix);
+        Self::apply_typed(value, typed, dragged)
+    }
+
+    /// A signed range: fills from zero and marks it with a tick
+    pub(crate) fn signed_slider(&mut self, label: &str, value: &mut f32, range: RangeInclusive<f32>, decimals: usize) -> Option<bool> {
+        self.centered_slider(label, value, range, 0.0, decimals)
+    }
+
+    /// A range whose middle `centre` leaves things as they are: fills from it and marks it with a tick, like a signed range
+    pub(crate) fn centered_slider(&mut self, label: &str, value: &mut f32, range: RangeInclusive<f32>, centre: f32, decimals: usize) -> Option<bool> {
+        let (control, center_y) = self.row(label);
+        let id = self.next_id();
+        let track = Track { start: control.left() + KNOB_RADIUS, end: self.track_end(), center_y, zero: Some(centre), ramp: false };
+        let dragged = self.track(id, label, &track, value, &range);
+        let typed = self.value_field(id, label, center_y, *value, &range, decimals, "");
+        Self::apply_typed(value, typed, dragged)
+    }
+
+    /// A −1..1 balance between two tinted color names, left as the label and right after the track (`rights`: the group's right names)
+    pub(crate) fn tinted_slider(&mut self, left: (&str, Color32), right: (&str, Color32), rights: &[&str], value: &mut f32) -> Option<bool> {
+        let tokens = self.tokens;
+        let readable = |tint: Color32| crate::theme::legible_tint(tint, tokens.row, tokens.text);
+        let (control, center_y) = self.row_with(RowLead::Tinted { text: left.0, color: readable(left.1) });
+        let id = self.next_id();
+        let widest = rights.iter().map(|name| self.text_width(name, FontId::proportional(TEXT_SIZE))).fold(0.0, f32::max);
+        let word_x = self.track_end() - widest;
+        let track = Track { start: control.left() + KNOB_RADIUS, end: word_x - TINT_WORD_AIR, center_y, zero: Some(0.0), ramp: false };
+        let range = -1.0..=1.0;
+        let dragged = self.track(id, left.0, &track, value, &range);
+        self.ui.painter().text(pos2(word_x, center_y), Align2::LEFT_CENTER, right.0, FontId::proportional(TEXT_SIZE), readable(right.1));
+        let typed = self.value_field(id, left.0, center_y, *value, &range, 2, "");
         Self::apply_typed(value, typed, dragged)
     }
 
@@ -48,6 +106,11 @@ impl PropertySheet<'_> {
     /// [`Self::angle`] led by `lead`
     pub(crate) fn angle_led(&mut self, lead: RowLead<'_>, degrees: &mut f32, range: RangeInclusive<f32>) -> Option<bool> {
         self.angle_shown(lead, degrees, range, false)
+    }
+
+    /// An angle added to others: a signed track over `range` with its zero tick, the dial, and the value with its sign ("+30°")
+    pub(crate) fn relative_angle(&mut self, label: &str, degrees: &mut f32, range: RangeInclusive<f32>) -> Option<bool> {
+        self.angle_shown(RowLead::label(label), degrees, range, true)
     }
 
     /// [`Self::angle_led`], the value shown with its sign when `plus`
@@ -75,6 +138,40 @@ impl PropertySheet<'_> {
         let shown = if plus { format!("{:+.0}°", *degrees) } else { format!("{:.0}°", *degrees) };
         let typed = self.column_value_field(id, &name, center_y, &shown, "°", *degrees, &range, 0);
         Self::apply_typed(degrees, typed, dragged)
+    }
+
+    /// A slider with a small dropdown chip before its value (Intensity's divider); returns the edit and the chip
+    pub(crate) fn slider_with_chip(
+        &mut self,
+        label: &str,
+        value: &mut f32,
+        range: RangeInclusive<f32>,
+        decimals: usize,
+        chip: &str,
+        widest_chip: &str,
+    ) -> (Option<bool>, Response) {
+        let (control, center_y) = self.row(label);
+        let id = self.next_id();
+        let chip_end = self.right - self.used.value_width.max(super::VALUE_MIN_WIDTH) - CHIP_TO_VALUE;
+        let chip_width = self.text_width(widest_chip, FontId::proportional(TEXT_SIZE)) + CHIP_PADDING;
+        let chip_rect = Rect::from_min_max(pos2(chip_end - chip_width, center_y - CHIP_HALF_HEIGHT), pos2(chip_end, center_y + CHIP_HALF_HEIGHT));
+        let chip_response = self.ui.interact(chip_rect, id.with("chip"), Sense::click());
+        chip_response.widget_info(|| WidgetInfo::labeled(egui::Role::ComboBox, true, chip));
+
+        let tokens = self.tokens;
+        let open = egui::Popup::is_id_open(self.ui.ctx(), egui::Popup::default_response_id(&chip_response));
+        let painter = self.ui.painter();
+        painter.rect_filled(chip_rect, CornerRadius::same(CONTROL_RADIUS), if chip_response.hovered() { tokens.row_hover } else { tokens.button });
+        if open {
+            painter.rect_stroke(chip_rect, CornerRadius::same(CONTROL_RADIUS), Stroke::new(1.0, tokens.accent), StrokeKind::Inside);
+        }
+        painter.text(pos2(chip_end - CHIP_CARET_INSET, center_y), Align2::CENTER_CENTER, ic::CARET_DOWN, FontId::proportional(ICON_SIZE), tokens.text);
+        painter.text(pos2(chip_end - CHIP_TEXT_INSET, center_y), Align2::RIGHT_CENTER, chip, semibold(SMALL_TEXT_SIZE), tokens.text);
+
+        let track = Track { start: control.left() + KNOB_RADIUS, end: chip_rect.left() - DIAL_AIR - KNOB_RADIUS, center_y, zero: None, ramp: false };
+        let dragged = self.track(id, label, &track, value, &range);
+        let typed = self.value_field(id, label, center_y, *value, &range, decimals, "");
+        (Self::apply_typed(value, typed, dragged), chip_response)
     }
 
     /// A typed value wins over a drag in the same frame and starts its own undo step

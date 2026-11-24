@@ -1,4 +1,7 @@
-//! Derived curvature detail for classic texture sets, computed from the bake on the GPU.
+//! Derived curvature detail, computed from the bake on the GPU as compose's `curvature_sizes.rs`
+//! builds it: each UV tile's block of the bake on its own (a classic set is one block), padded
+//! within the block, blurred at a radius of the block's width and coarsened in steps that divide
+//! the block. A UV tile smaller than its block covers the bake through its block scale.
 
 use bytemuck::{Pod, Zeroable};
 use texturecraft_core::CurvatureDetail;
@@ -19,6 +22,11 @@ pub(crate) struct CurvatureInput<'a> {
     pub(crate) coverage: Option<&'a wgpu::Buffer>,
     pub(crate) working_size: [u32; 2],
     pub(crate) needed: [bool; SIZES],
+    /// The bake texels of one UV tile block (`bake_size` for a classic set)
+    pub(crate) block: [u32; 2],
+    /// A UV tile atlas's working block side and each block's tile scale, row by row, when a tile
+    /// is smaller than its block (empty otherwise: the bake then covers what the working texels do)
+    pub(crate) scales: (u32, &'a [f32]),
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +65,9 @@ struct Params {
     dimensions: [u32; 4],
     mode: [u32; 4],
     level: [u32; 4],
+    /// The bake block's width and height, the working block's side and the block columns (0
+    /// without tile scales)
+    block: [u32; 4],
 }
 
 pub(crate) struct CurvatureGpu {
@@ -138,7 +149,10 @@ impl CurvatureGpu {
         if input.coverage.is_some_and(|coverage| coverage.size() < coverage_bytes) {
             return Err("The curvature UV coverage does not match its working size.".into());
         }
-        let (extent, layout, levels) = plan_atlas(input.bake_size, input.needed, limits.max_texture_dimension_2d)
+        let block = [input.block[0].clamp(1, width), input.block[1].clamp(1, height)];
+        let columns = if input.scales.1.is_empty() { 0 } else { width.div_ceil(block[0]) };
+        let block_words = [block[0], block[1], input.scales.0, columns];
+        let (extent, layout, levels) = plan_atlas(input.bake_size, block, input.needed, limits.max_texture_dimension_2d)
             .ok_or("Curvature detail sizes do not fit the GPU texture dimensions.")?;
         crate::gpu_trace::scoped(device, "GPU curvature detail", || {
             let result = CurvatureLevels::new(device, extent, &layout);
@@ -154,7 +168,7 @@ impl CurvatureGpu {
                            groups: [u32; 2]| {
                 let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("tc_curvature_params"),
-                    contents: bytemuck::bytes_of(&Params { dimensions, mode, level }),
+                    contents: bytemuck::bytes_of(&Params { dimensions, mode, level, block: block_words }),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
                 let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -174,8 +188,17 @@ impl CurvatureGpu {
                 pass.set_bind_group(0, &bindings, &[]);
                 pass.dispatch_workgroups(groups[0], groups[1], 1);
             };
+            // The coverage scan reads each block's tile scale where the edge weights go later
+            let scales = (!input.scales.1.is_empty()).then(|| {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tc_curvature_block_scales"),
+                    contents: bytemuck::cast_slice(input.scales.1),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+            });
+            let scales = scales.as_ref().unwrap_or(&self.empty);
             let (original, ping_pong, encoding) = if let Some(third) = &third {
-                run(&self.scan_rows, (input.baked, &first), &self.empty, [0; 4], [0; 4], [height.div_ceil(LINE_WORKGROUP), 1]);
+                run(&self.scan_rows, (input.baked, &first), scales, [0; 4], [0; 4], [height.div_ceil(LINE_WORKGROUP), 1]);
                 run(&self.scan_columns, (&first, &second), &self.empty, [0; 4], [0; 4], [width.div_ceil(LINE_WORKGROUP), 1]);
                 run(&self.pad, (&second, &first), &self.empty, [0; 4], [0; 4], [width.div_ceil(TILE_WORKGROUP), height.div_ceil(TILE_WORKGROUP)]);
                 (&first, [&second, third], 1)
@@ -198,7 +221,10 @@ impl CurvatureGpu {
                     );
                     source = destination;
                 }
-                let weights: Vec<_> = inside_weights(width, level.radius).chain(inside_weights(height, level.radius)).collect();
+                // Each block is blurred alone, so its edges lose support at its own sides
+                let block_weights =
+                    |length: u32, side: u32| (0..length).step_by(side as usize).flat_map(move |start| inside_weights(side.min(length - start), level.radius));
+                let weights: Vec<_> = block_weights(width, block[0]).chain(block_weights(height, block[1])).collect();
                 let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("tc_curvature_edge_weights"),
                     contents: bytemuck::cast_slice(&weights),
@@ -226,24 +252,26 @@ struct Level {
     rect: [u32; 4],
 }
 
-fn plan_atlas(size: [u32; 2], needed: [bool; SIZES], limit: u32) -> Option<([u32; 2], Layout, Vec<Level>)> {
+/// The levels' places in one atlas: each size's radius (texels at 2K, scaled to the block's
+/// width) and coarsening step (dividing the block, so no cell spans two UV tiles).
+fn plan_atlas(size: [u32; 2], block: [u32; 2], needed: [bool; SIZES], limit: u32) -> Option<([u32; 2], Layout, Vec<Level>)> {
     let radii: Vec<_> = CurvatureDetail::SIZES
         .iter()
         .skip(1)
         .zip(needed)
-        .map(|(&radius, needed)| needed.then_some((radius * size[0] as f32 / 2048.0).round().max(1.0) as u32))
+        .map(|(&radius, needed)| needed.then_some((radius * block[0] as f32 / 2048.0).round().max(1.0) as u32))
         .collect();
-    let initial_width = radii.iter().flatten().map(|&radius| size[0].div_ceil(level_step(size, radius))).max()?;
+    let initial_width = radii.iter().flatten().map(|&radius| size[0].div_ceil(level_step(block, radius))).max()?;
     if initial_width > limit {
         return None;
     }
     std::iter::successors(Some(initial_width), |&width| (width < limit).then_some(width.saturating_mul(2).min(limit)))
-        .filter_map(|width| pack_levels(size, &radii, width, limit))
+        .filter_map(|width| pack_levels((size, block), &radii, width, limit))
         .min_by_key(|(extent, ..)| u64::from(extent[0]) * u64::from(extent[1]))
 }
 
-fn pack_levels(size: [u32; 2], radii: &[Option<u32>], row_width: u32, limit: u32) -> Option<([u32; 2], Layout, Vec<Level>)> {
-    let mut layout = Layout { levels: [[0; 4]; SIZES], bake_size: [size[0], size[1], 0, 0] };
+fn pack_levels((size, block): ([u32; 2], [u32; 2]), radii: &[Option<u32>], row_width: u32, limit: u32) -> Option<([u32; 2], Layout, Vec<Level>)> {
+    let mut layout = Layout { levels: [[0; 4]; SIZES], bake_size: [size[0], size[1], block[0], block[1]] };
     let mut levels = Vec::<Level>::new();
     let mut extent = [1, 1];
     let (mut x, mut y, mut row_height) = (0, 0, 0);
@@ -253,7 +281,7 @@ fn pack_levels(size: [u32; 2], radii: &[Option<u32>], row_width: u32, limit: u32
             *slot = [previous.rect[0], previous.rect[1], previous.step, 0];
             continue;
         }
-        let step = level_step(size, radius);
+        let step = level_step(block, radius);
         let [width, height] = size.map(|edge| edge.div_ceil(step));
         if x + width > row_width {
             x = 0;
@@ -272,9 +300,9 @@ fn pack_levels(size: [u32; 2], radii: &[Option<u32>], row_width: u32, limit: u32
     Some((extent, layout, levels))
 }
 
-fn level_step(size: [u32; 2], radius: u32) -> u32 {
+fn level_step(block: [u32; 2], radius: u32) -> u32 {
     let mut step = (radius / 2).max(1).next_power_of_two();
-    while size.iter().any(|edge| !edge.is_multiple_of(step)) {
+    while block.iter().any(|edge| !edge.is_multiple_of(step)) {
         step /= 2;
     }
     step

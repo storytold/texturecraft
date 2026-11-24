@@ -31,17 +31,32 @@ pub(crate) fn pattern_properties(app: &mut TextureCraftApp, ui: &mut Ui, target:
             Some(tile) => tile_parameters(app, ui, target, pattern, tile),
             None => pattern_parameters(app, ui, target, pattern),
         }
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(tr("Restore defaults")).clicked() {
-                    restore_defaults(app, target, pattern);
-                }
-            });
-        });
+        restore_row(app, ui, target, pattern);
     });
     if let Some(tile) = pattern.tile.as_deref() {
         section(ui, &id("inputs"), tr("Image inputs"), false, |ui| image_inputs(app, ui, target, pattern, tile));
     }
+}
+
+/// A Tile Generator under a slot whose rows already show its scale, contrast, seed and resolution: its own parameters and image inputs
+pub(crate) fn tile_generator_sections(app: &mut TextureCraftApp, ui: &mut Ui, target: &PatternTarget, pattern: &Procedural, tile: &TileGenerator) {
+    let id = |name: &str| format!("pattern_{name}_{}", target.salt);
+    section(ui, &id("parameters"), tr("Parameters"), true, |ui| {
+        tile_parameters(app, ui, target, pattern, tile);
+        restore_row(app, ui, target, pattern);
+    });
+    section(ui, &id("inputs"), tr("Image inputs"), false, |ui| image_inputs(app, ui, target, pattern, tile));
+}
+
+/// Restore defaults, on the right
+fn restore_row(app: &mut TextureCraftApp, ui: &mut Ui, target: &PatternTarget, pattern: &Procedural) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button(tr("Restore defaults")).clicked() {
+                restore_defaults(app, target, pattern);
+            }
+        });
+    });
 }
 
 /// Sends `pattern` again (its kind, scale, seed, contrast, balance and invert) with `extra` to its fill

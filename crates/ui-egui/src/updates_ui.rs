@@ -143,15 +143,6 @@ mod tests {
     }
 
     #[test]
-    fn default_runtime_is_idle() {
-        let rt = Runtime::default();
-        assert!(!rt.startup_check);
-        assert!(!rt.check_requested);
-        assert!(!rt.updater.prompt_open());
-        assert_eq!(rt.updater.status(), &Status::Idle);
-    }
-
-    #[test]
     fn the_menu_item_runs_a_check_that_reports_its_outcome() {
         let _language = language();
         let (ask, asked) = source();

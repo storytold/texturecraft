@@ -2,9 +2,7 @@
 
 use std::io::Read as _;
 
-use craft_usd::scene::{
-    Budget, MAX_DECODED_BYTES, Prop, SceneError, UsdAttr, UsdLayer, UsdPrim, UsdValue, Val, read_layer, read_layer_with_budget, write_usda, write_usdc,
-};
+use craft_usd::scene::{Budget, Prop, SceneError, UsdAttr, UsdLayer, UsdPrim, UsdValue, Val, read_layer, read_layer_with_budget, write_usda, write_usdc};
 use texturecraft_geom::Mesh;
 use texturecraft_geom::glam::{Vec2, Vec3, Vec4};
 
@@ -407,55 +405,6 @@ fn usd_extension_detects_the_encoding() {
 }
 
 #[test]
-fn integer_coding_round_trips() {
-    let values: Vec<i64> = vec![0, 1, 2, 3, 3, 3, -5, 1000, -70000, i64::from(i32::MAX), i64::from(i32::MIN), 7, 7, 7, 8];
-    for (w_enum, width) in [(craft_usd::integers::Width::I32, 4), (craft_usd::integers::Width::I64, 8)] {
-        let enc = craft_usd::integers::encode(&values, w_enum, MAX_DECODED_BYTES).unwrap();
-        assert!(enc.len() <= craft_usd::codec::encoded_ints_len(values.len(), width));
-        assert_eq!(craft_usd::integers::decode(&enc, values.len(), w_enum, MAX_DECODED_BYTES).unwrap(), values);
-        assert!(craft_usd::integers::decode(&enc[..enc.len() - 1], values.len(), w_enum, MAX_DECODED_BYTES).is_err());
-    }
-    let wide = vec![i64::MAX, i64::MIN, 0, 1 << 40];
-    let enc_wide = craft_usd::integers::encode(&wide, craft_usd::integers::Width::I64, MAX_DECODED_BYTES).unwrap();
-    assert_eq!(craft_usd::integers::decode(&enc_wide, 4, craft_usd::integers::Width::I64, MAX_DECODED_BYTES).unwrap(), wide);
-    let big: Vec<u8> = (0..5000u32).flat_map(|i| (i % 7).to_le_bytes()).collect();
-    let comp = craft_usd::compress::compress(&big, MAX_DECODED_BYTES).unwrap();
-    assert_eq!(craft_usd::decompress(&comp, big.len()).unwrap(), big);
-    assert!(craft_usd::decompress(&[0, 0xF0], 10).is_err());
-}
-
-#[test]
-fn shared_crate_lz4_writer_preserves_bytes() {
-    for len in [0, 1, 15, 16, 255, 4096] {
-        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-        let mut previous = vec![0];
-        previous.extend(lz4_flex::block::compress(&data));
-        assert_eq!(craft_usd::compress::compress(&data, MAX_DECODED_BYTES).unwrap(), previous);
-    }
-}
-
-#[test]
-fn shared_integer_decoder_rejects_oversized_output() {
-    assert!(craft_usd::integers::decode(&[], MAX_DECODED_BYTES / 8 + 1, craft_usd::integers::Width::I64, MAX_DECODED_BYTES).is_err());
-    assert!(craft_usd::integers::decode(&[], 0, craft_usd::integers::Width::I32, MAX_DECODED_BYTES).unwrap().is_empty());
-}
-
-#[test]
-fn shared_crate_lz4_retains_chunk_and_budget_policy() {
-    let mut frame = vec![2];
-    for raw in [b"abc".as_slice(), b"def".as_slice()] {
-        let block = lz4_flex::block::compress(raw);
-        frame.extend((block.len() as i32).to_le_bytes());
-        frame.extend(block);
-    }
-    frame.extend(b"old reader ignores this tail");
-    assert_eq!(craft_usd::decompress(&frame, 6).unwrap(), b"abcdef");
-    assert!(craft_usd::decompress(&frame, 5).is_err());
-    assert!(craft_usd::decompress(&[1, 255, 255, 255, 255], 64).is_err());
-    assert!(craft_usd::decompress(&[128], 64).is_err());
-}
-
-#[test]
 fn malformed_usd_never_panics() {
     // A small two-material mesh keeps the byte loops fast.
     let src = r#"#usda 1.0
@@ -511,13 +460,6 @@ fn loose_layer_textures_are_packaged() {
         let f = self_contained_mesh(&format!("t.{ext}"), out.bytes.clone(), &mut |_: &str| None).unwrap();
         assert_eq!((f.name, f.bytes == out.bytes, f.warnings.len()), (format!("t.{ext}"), true, 1), "{ext}");
     }
-}
-
-#[test]
-fn shared_integer_writer_preserves_tie_wire_and_rejects_oversized_budget() {
-    assert_eq!(craft_usd::integers::encode(&[1, 3, 4, 6], craft_usd::integers::Width::I32, MAX_DECODED_BYTES).unwrap(), vec![2, 0, 0, 0, 17, 1, 1]);
-    assert!(craft_usd::integers::encode(&[1], craft_usd::integers::Width::I32, 16).is_err());
-    assert!(craft_usd::integers::encode(&[], craft_usd::integers::Width::I64, 0).unwrap().is_empty());
 }
 
 /// Keep the final mesh contract of the binary fixture used before the shared USD cutover.

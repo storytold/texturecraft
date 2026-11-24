@@ -9,6 +9,7 @@ use std::sync::{Mutex, PoisonError};
 
 use texturecraft_engine::Session;
 use texturecraft_engine::core::PROJECT_EXT;
+#[cfg(any(target_arch = "wasm32", test))]
 use texturecraft_engine::formats::ExportedFile;
 use texturecraft_engine::formats::export::sanitize_file_stem;
 use texturecraft_engine::formats::mesh_import::MESH_EXTENSIONS;
@@ -228,16 +229,14 @@ pub fn project_file_name(app: &TextureCraftApp) -> String {
 }
 
 /// Pack exported textures into one zip archive.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg(any(target_arch = "wasm32", test))]
 fn zip_files(files: Vec<ExportedFile>) -> Result<Vec<u8>, String> {
-    use std::io::Write as _;
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(true);
+    let mut zip = craft_zip::Writer::new();
     for f in files {
-        zip.start_file(f.name.as_str(), opts).map_err(|e| e.to_string())?;
-        zip.write_all(&f.bytes).map_err(|e| e.to_string())?;
+        // add_with reserves ZIP64 headers up front, even for small entries.
+        zip.add_with(&f.name, craft_zip::Compression::Deflated, |out| out.write_all(&f.bytes)).map_err(|e| e.to_string())?;
     }
-    Ok(zip.finish().map_err(|e| e.to_string())?.into_inner())
+    zip.finish().map_err(|e| e.to_string())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -525,16 +524,23 @@ mod tests {
     fn zip_round_trips_every_export_file() {
         let file = |name: &str, bytes: &[u8]| ExportedFile { name: name.into(), bytes: bytes.to_vec(), width: 1, height: 1, warnings: Vec::new() };
         let normal = [7u8; 4096];
-        let expected = [("a_BaseColor.png", b"one".as_slice()), ("a_Normal.png", normal.as_slice())];
+        let expected = [("z_BaseColor.png", b"one".as_slice()), ("a_Normal.png", normal.as_slice())];
         let files = expected.iter().map(|(name, bytes)| file(name, bytes)).collect();
 
         let bytes = zip_files(files).unwrap();
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
 
         assert_eq!(zip.len(), expected.len());
-        for (name, expected_bytes) in expected {
+        for (index, (name, expected_bytes)) in expected.into_iter().enumerate() {
+            let mut entry = zip.by_index(index).unwrap();
+            assert_eq!(entry.name().unwrap(), name);
+            assert_eq!(entry.compression(), zip::CompressionMethod::Deflated);
+            let header = entry.header_start() as usize;
+            let name_len = u16::from_le_bytes(bytes[header + 26..header + 28].try_into().unwrap()) as usize;
+            let extra = header + 30 + name_len;
+            assert_eq!(&bytes[extra..extra + 4], &[1, 0, 16, 0], "expected a ZIP64 size extra field");
             let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut zip.by_name(name).unwrap(), &mut out).unwrap();
+            std::io::Read::read_to_end(&mut entry, &mut out).unwrap();
             assert_eq!(out, expected_bytes);
         }
     }

@@ -3,7 +3,9 @@ fn generator_curvature(effect: Operation, pixel: vec2<u32>, finest: f32, mode: u
     let offset = u32(effect.uv.x);
     var edges = 0.0;
     var cavities = 0.0;
-    for (var i = 0u; i < 7u; i++) {
+    // P8: no curvature where a smaller UV tile leaves its block empty, only the micro height
+    let sizes = select(0u, 7u, udim_bake_valid(pixel));
+    for (var i = 0u; i < sizes; i++) {
         let weight = bitcast<f32>(srgb[offset + i]);
         if weight == 0.0 { continue; }
         var response = (finest - 0.5) * 2.0;

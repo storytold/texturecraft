@@ -1,6 +1,6 @@
 use egui::{Align2, Color32, CornerRadius, FontId, Painter, Rect, Response, Role, Sense, Stroke, StrokeKind, WidgetInfo, pos2, vec2};
 
-use super::{CONTROL_RADIUS, PropertySheet, ROW_HEIGHT, ROW_PICTURE_AIR, ROW_PICTURE_SIZE, SMALL_TEXT_SIZE, TEXT_SIZE};
+use super::{CONTROL_RADIUS, PropertySheet, ROW_HEIGHT, ROW_PICTURE_AIR, ROW_PICTURE_SIZE, RowLead, SMALL_TEXT_SIZE, TEXT_SIZE};
 use crate::theme::semibold;
 
 /// Draws a picture row's picture into its square
@@ -32,12 +32,36 @@ const PILL_RADIUS: u8 = 6;
 const TOGGLE_KNOB_RADIUS: f32 = 4.0;
 const TOGGLE_KNOB_TRAVEL: f32 = 4.5;
 
+/// Air after a toggle's label, before the column the panel's toggles line up on
+const TOGGLE_LABEL_AIR: f32 = 10.0;
+
+/// From that column to the pill's centre: the pill starts on the column
+const TOGGLE_CENTER_OFFSET: f32 = PILL_SIZE.x / 2.0;
+
 /// From one of a pair's toggles to the next, and from its name to its pill's centre
 const PAIR_PITCH: f32 = 76.0;
 const PAIR_NAME_TO_PILL: f32 = 32.0;
 
+/// Height of a channel pill, and the air between pills
+const CHANNEL_PILL_HEIGHT: f32 = 22.0;
+const CHANNEL_PILL_GAP: f32 = 4.0;
+
+/// Corner radius of a channel pill: half its height, so its ends are round
+const CHANNEL_PILL_RADIUS: u8 = 11;
+
+/// Air under the channel strip
+const CHANNEL_STRIP_AIR: f32 = 6.0;
+
+/// The least air around a channel pill's name before the names shrink a point
+const PILL_TEXT_AIR: f32 = 10.0;
+
 /// Width of a focused control's outline in points
 const FOCUS_OUTLINE_WIDTH: f32 = 2.0;
+
+/// No tint for any segment: the chosen word keeps the text colour
+pub(super) fn untinted(_index: usize) -> &'static [Color32] {
+    &[]
+}
 
 pub(super) fn paint_focus_outline(painter: &Painter, rect: Rect, color: Color32) {
     painter.rect_stroke(rect, CornerRadius::same(CONTROL_RADIUS), Stroke::new(FOCUS_OUTLINE_WIDTH, color), StrokeKind::Inside);
@@ -68,6 +92,16 @@ impl PropertySheet<'_> {
         self.segments(control, options, selected, runs, None)
     }
 
+    /// [`Self::switch`] with its label always above it, the switch across the whole panel (long choices in a set of such switches); returns the picked index
+    pub(crate) fn stacked_switch(&mut self, label: &str, options: &[&str], selected: usize) -> Option<usize> {
+        if !self.switch_fits(options, self.left) {
+            return self.switch_dropdown(label, options, selected);
+        }
+
+        let (control, _) = self.row_with(RowLead::Label { text: label, stack: true });
+        self.segments(control, options, selected, untinted, None)
+    }
+
     /// Whether every option's word fits its share of a switch from `left` to the panel's right edge
     fn switch_fits(&self, options: &[&str], left: f32) -> bool {
         let segment = (self.right - left) / options.len().max(1) as f32;
@@ -78,6 +112,26 @@ impl PropertySheet<'_> {
     fn switch_dropdown(&mut self, label: &str, options: &[&str], selected: usize) -> Option<usize> {
         let name = |index: usize| options.get(index).copied().unwrap_or_default().to_owned();
         self.dropdown_built(label, selected, || 0..options.len(), name, None).0
+    }
+
+    /// A boxed switch across the whole panel; the chosen word takes its colours from `tints` (several colours split the word between them)
+    pub(crate) fn wide_switch(&mut self, options: &[&str], selected: usize, tints: &[&[Color32]]) -> Option<usize> {
+        let control = self.wide_row();
+        self.segments(control, options, selected, |index| tints.get(index).copied().unwrap_or_default(), None)
+    }
+
+    /// A row's control box, `CONTROL_HEIGHT` tall, from the left padding to the right one
+    pub(super) fn wide_row(&mut self) -> Rect {
+        let row = self.take(ROW_HEIGHT);
+        let center_y = row.center().y;
+        self.drawn(center_y + super::CONTROL_HEIGHT / 2.0);
+        Rect::from_x_y_ranges(self.left..=self.right, (center_y - super::CONTROL_HEIGHT / 2.0)..=(center_y + super::CONTROL_HEIGHT / 2.0))
+    }
+
+    /// A boxed switch across the whole panel (a mode switch at the top of a group), each word led by its picture; returns the picked index
+    pub(crate) fn picture_switch(&mut self, options: &[&str], selected: usize, picture: SegmentPicture<'_>) -> Option<usize> {
+        let control = self.wide_row();
+        self.segments(control, options, selected, untinted, Some(picture))
     }
 
     /// A boxed switch's box and segments in `control`, the chosen word in the colours `tints` gives its index (none: the text colour); returns the segment clicked when it was not the chosen one
@@ -133,6 +187,27 @@ impl PropertySheet<'_> {
             painter.galley(pos2(word_left, rect.center().y - word.size().y / 2.0), word, color);
         }
         picked
+    }
+
+    /// An on/off beside its label; every toggle in a panel lines up past the longest toggle label
+    pub(crate) fn toggle(&mut self, label: &str, on: &mut bool) -> bool {
+        let rect = self.take(ROW_HEIGHT);
+        let center_y = rect.center().y;
+        let label_x = self.left + self.lead_shift();
+        self.paint_info(center_y);
+        let font = FontId::proportional(TEXT_SIZE);
+        let label_end = label_x - self.left + self.text_width(label, font.clone()) + TOGGLE_LABEL_AIR;
+        self.seen.toggle_label_end = self.seen.toggle_label_end.max(label_end);
+
+        let column = (self.column() - self.left).max(self.used.toggle_label_end).max(label_end);
+        let pill = Rect::from_center_size(pos2(self.left + column + TOGGLE_CENTER_OFFSET, center_y), PILL_SIZE);
+        let clicked = self.toggle_hit(Rect::from_min_max(pos2(label_x, rect.top()), pos2(pill.right(), rect.bottom())), label, on);
+
+        let text = self.tokens.text;
+        self.ui.painter().text(pos2(label_x, center_y), Align2::LEFT_CENTER, label, font, text);
+        self.pill(pill.center(), *on, true);
+        self.drawn(center_y + PILL_SIZE.y / 2.0);
+        clicked
     }
 
     /// A culling row on the panel's grid: its name on the label column, its picture where the controls start with the switch after it, a pending i at the row's right end
@@ -207,6 +282,51 @@ impl PropertySheet<'_> {
         let painter = self.ui.painter();
         painter.rect(Rect::from_center_size(center, PILL_SIZE), CornerRadius::same(PILL_RADIUS), fill, Stroke::new(1.0, border), StrokeKind::Inside);
         painter.circle_filled(pos2(knob_x, center.y), TOGGLE_KNOB_RADIUS, knob);
+    }
+
+    /// The channel strip: one pill per channel; returns the clicked index and whether Alt (solo) was held
+    pub(crate) fn channel_pills(&mut self, names: &[&str], on: &[bool]) -> Option<(usize, bool)> {
+        let rect = self.take(CHANNEL_PILL_HEIGHT);
+        let count = names.len().max(1) as f32;
+        let width = (self.right - self.left - (count - 1.0) * CHANNEL_PILL_GAP) / count;
+        let size = if names.iter().all(|name| self.text_width(name, semibold(SMALL_TEXT_SIZE)) + PILL_TEXT_AIR <= width) {
+            SMALL_TEXT_SIZE
+        } else {
+            SMALL_TEXT_SIZE - 1.0
+        };
+
+        let tokens = self.tokens;
+        let mut clicked = None;
+        for (index, name) in names.iter().enumerate() {
+            let pill = Rect::from_min_size(pos2(self.left + index as f32 * (width + CHANNEL_PILL_GAP), rect.top()), vec2(width, CHANNEL_PILL_HEIGHT));
+            let id = self.next_id();
+            let response = self.ui.interact(pill, id, Sense::click());
+            if response.clicked() {
+                clicked = Some((index, self.ui.input(|input| input.modifiers.alt)));
+            }
+
+            let enabled = on.get(index).copied().unwrap_or(false);
+            response.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, enabled, *name));
+            let (fill, border, color, font) = if enabled {
+                (tokens.accent_dim, tokens.accent, tokens.text, semibold(size))
+            } else {
+                (tokens.field, tokens.field_border, tokens.text_dim, FontId::proportional(size))
+            };
+            let painter = self.ui.painter();
+            painter.rect(
+                pill,
+                CornerRadius::same(CHANNEL_PILL_RADIUS),
+                if response.hovered() && !enabled { tokens.row_hover } else { fill },
+                Stroke::new(1.0, border),
+                StrokeKind::Inside,
+            );
+            painter.text(pill.center(), Align2::CENTER_CENTER, *name, font, color);
+            self.paint_control_focus(&response);
+        }
+        self.drawn(rect.bottom());
+        self.space(CHANNEL_STRIP_AIR);
+        self.air_at = Some(self.cursor_y());
+        clicked
     }
 }
 

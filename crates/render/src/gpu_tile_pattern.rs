@@ -178,14 +178,14 @@ enum RgbaEncoding {
 }
 
 impl RgbaEncoding {
-    fn for_image(image: &ImageRes) -> Self {
+    fn for_texels(rgba: &[[f32; 4]]) -> Self {
         let exact = |v: f32, scale: f32| {
             let integer = (v * scale).round();
             integer >= 0.0 && integer <= scale && (v == integer / scale || v == integer * (1.0 / scale))
         };
-        if image.rgba.par_iter().all(|pixel| pixel.iter().all(|&v| exact(v, 255.0))) {
+        if rgba.par_iter().all(|pixel| pixel.iter().all(|&v| exact(v, 255.0))) {
             Self::Bytes
-        } else if image.rgba.par_iter().all(|pixel| pixel.iter().all(|&v| exact(v, 65535.0))) {
+        } else if rgba.par_iter().all(|pixel| pixel.iter().all(|&v| exact(v, 65535.0))) {
             Self::Shorts
         } else {
             Self::Floats
@@ -211,24 +211,58 @@ impl RgbaEncoding {
 struct RgbaRegion {
     encoding: RgbaEncoding,
     planes: Vec<ImageRegion>,
+    /// The halved levels held besides the image, level 1 first: size, encoding and planes each
+    levels: Vec<RgbaLevel>,
+}
+
+struct RgbaLevel {
+    size: [u32; 2],
+    encoding: RgbaEncoding,
+    planes: Vec<ImageRegion>,
+}
+
+/// Which halved levels of a colour image the atlas holds besides the image. P1 (fill sampling)
+/// chooses per image through `MaterialImages::atlas_images`; `None` uploads exactly what the
+/// atlas held before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AtlasMips {
+    #[default]
+    None,
+    /// `ImageRes::mip_chain`: the levels as stored (Bilinear HQ of scalar and alpha reads).
+    Stored,
+    /// `ImageRes::linear_mip_chain`: RGB linear, alpha unchanged (an sRGB image's colour read).
+    LinearColor,
+}
+
+/// One exact-f32 plane of the atlas (P1: a projector depth grid), row by row. The atlas keeps a
+/// weak pointer to `texels`, so a plane rebuilt for every program rebuilds the atlas.
+#[derive(Clone, Debug)]
+pub(crate) struct RawPlane {
+    pub(crate) size: [u32; 2],
+    pub(crate) texels: Arc<Vec<f32>>,
 }
 
 pub(crate) struct TileImageAtlas {
     images: Vec<Weak<ImageRes>>,
     regions: Vec<ImageRegion>,
     color: Vec<RgbaRegion>,
+    color_mips: Vec<AtlasMips>,
+    raw: Vec<(Weak<Vec<f32>>, ImageRegion)>,
     pub(crate) view: wgpu::TextureView,
 }
 
 impl TileImageAtlas {
-    pub(crate) fn matches(&self, gray: &[&Arc<ImageRes>], color: &[&Arc<ImageRes>]) -> bool {
+    pub(crate) fn matches(&self, gray: &[&Arc<ImageRes>], color: &[(&Arc<ImageRes>, AtlasMips)], raw: &[RawPlane]) -> bool {
         self.regions.len() == gray.len()
             && self.color.len() == color.len()
-            && self.images.iter().zip(gray.iter().chain(color)).all(|(old, new)| old.ptr_eq(&Arc::downgrade(new)))
+            && self.images.iter().zip(gray.iter().copied().chain(color.iter().map(|(image, _)| *image))).all(|(old, new)| old.ptr_eq(&Arc::downgrade(new)))
+            && self.color_mips.iter().eq(color.iter().map(|(_, mips)| mips))
+            && self.raw.len() == raw.len()
+            && self.raw.iter().zip(raw).all(|((old, region), new)| old.ptr_eq(&Arc::downgrade(&new.texels)) && region.size == new.size)
     }
 
     pub(crate) fn is_live(&self) -> bool {
-        self.images.iter().all(|image| image.strong_count() != 0)
+        self.images.iter().all(|image| image.strong_count() != 0) && self.raw.iter().all(|(texels, _)| texels.strong_count() != 0)
     }
 
     pub(crate) fn empty_view(device: &wgpu::Device) -> wgpu::TextureView {
@@ -239,43 +273,79 @@ impl TileImageAtlas {
         let region = &self.color[color_index];
         let offset = words.len() as u32;
         let [width, height] = region.planes[0].size;
-        let flags = region.encoding as u32 | (u32::from(srgb) << 8);
+        // Bit 9: halved levels follow the planes; without levels the words are exactly as before
+        let flags = region.encoding as u32 | (u32::from(srgb) << 8) | (u32::from(!region.levels.is_empty()) << 9);
         words.extend([width, height, flags]);
         for plane in &region.planes {
             words.extend(plane.origin);
         }
+
+        // The level count, each level's word offset (so a level is one read away), then per level its width, height, encoding and plane origins
+        if !region.levels.is_empty() {
+            words.push(region.levels.len() as u32);
+            let table = words.len();
+            words.resize(table + region.levels.len(), 0);
+            for (index, level) in region.levels.iter().enumerate() {
+                words[table + index] = words.len() as u32;
+                words.extend([level.size[0], level.size[1], level.encoding as u32]);
+                for plane in &level.planes {
+                    words.extend(plane.origin);
+                }
+            }
+        }
         offset
     }
 
-    pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, gray: &[&Arc<ImageRes>], color: &[&Arc<ImageRes>]) -> Result<Self, String> {
+    /// The words of raw plane `index`: width, height and its origin (x, y, layer), read as f32 bits.
+    pub(crate) fn append_raw(&self, words: &mut Vec<u32>, index: usize) -> u32 {
+        let offset = words.len() as u32;
+        let (_, region) = &self.raw[index];
+        words.extend([region.size[0], region.size[1]]);
+        words.extend(region.origin);
+        offset
+    }
+
+    /// Upload `gray` (one plane each), `color` (one to four planes each by encoding, plus the
+    /// chosen halved levels) and `raw` (one exact-f32 plane each) into one array texture.
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        gray: &[&Arc<ImageRes>],
+        color: &[(&Arc<ImageRes>, AtlasMips)],
+        raw: &[RawPlane],
+    ) -> Result<Self, String> {
         let limits = device.limits();
-        let encodings: Vec<_> = color.iter().map(|image| RgbaEncoding::for_image(image)).collect();
         let size = |image: &Arc<ImageRes>| [image.width.max(1), image.height.max(1)];
+        // Per colour image: the image, then each level, with its encoding
+        let color_parts: Vec<Vec<ColorPart>> = color
+            .iter()
+            .map(|&(image, mips)| {
+                std::iter::once((image.rgba.as_slice(), size(image)))
+                    .chain(levels_of(image, mips))
+                    .map(|(texels, size)| (texels, size, RgbaEncoding::for_texels(texels)))
+                    .collect()
+            })
+            .collect();
         let sizes: Vec<_> = gray
             .iter()
             .map(|image| size(image))
-            .chain(color.iter().zip(&encodings).flat_map(|(image, &encoding)| std::iter::repeat_n(size(image), encoding as usize)))
+            .chain(color_parts.iter().flatten().flat_map(|&(_, size, encoding)| std::iter::repeat_n(size, encoding as usize)))
+            .chain(raw.iter().map(|plane| plane.size.map(|side| side.max(1))))
             .collect();
-        let budget = if color.is_empty() { MAX_ATLAS_BYTES } else { MAX_COLOR_ATLAS_BYTES };
+        let budget = if color.is_empty() && raw.is_empty() { MAX_ATLAS_BYTES } else { MAX_COLOR_ATLAS_BYTES };
         let (extent, regions) =
             arrange_images(&sizes, limits.max_texture_dimension_2d, limits.max_texture_array_layers, device.adapter_info().backend, budget)?;
         let texture = atlas_texture(device, extent[0], extent[1], extent[2]);
         let mut pixels = Vec::new();
         let mut pending = 0;
-        let mut upload = |image: &ImageRes, region: &ImageRegion, encoding: Option<(RgbaEncoding, usize)>| -> Result<(), String> {
+        let mut upload = |region: &ImageRegion, word: &dyn Fn(usize) -> u32| -> Result<(), String> {
             let [width, height] = region.size;
             for top in (0..height).step_by(IMAGE_ROWS) {
                 let rows = (height - top).min(IMAGE_ROWS as u32);
                 let first = top as usize * width as usize;
                 let n = rows as usize * width as usize;
                 pixels.clear();
-                pixels.extend((first..first + n).map(|index| {
-                    let sample = image.rgba.get(index).copied().unwrap_or_default();
-                    match encoding {
-                        Some((encoding, lane)) => encoding.word(sample, lane),
-                        None => ((sample[0] + sample[1] + sample[2]) / 3.0).to_bits(),
-                    }
-                }));
+                pixels.extend((first..first + n).map(word));
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         origin: wgpu::Origin3d { x: region.origin[0], y: region.origin[1] + top, z: region.origin[2] },
@@ -294,22 +364,56 @@ impl TileImageAtlas {
             }
             Ok(())
         };
-        let (gray_regions, mut color_regions) = regions.split_at(gray.len());
+        let (gray_regions, mut remaining) = regions.split_at(gray.len());
         for (image, region) in gray.iter().zip(gray_regions) {
-            upload(image, region, None)?;
+            upload(region, &|index| {
+                let sample = image.rgba.get(index).copied().unwrap_or_default();
+                ((sample[0] + sample[1] + sample[2]) / 3.0).to_bits()
+            })?;
         }
         let mut color_layout = Vec::new();
-        for (image, encoding) in color.iter().zip(encodings) {
-            let (planes, remaining) = color_regions.split_at(encoding as usize);
-            color_regions = remaining;
-            for (lane, plane) in planes.iter().enumerate() {
-                upload(image, plane, Some((encoding, lane)))?;
+        for parts in &color_parts {
+            let mut uploaded = Vec::new();
+            for &(texels, size, encoding) in parts {
+                let (planes, rest) = remaining.split_at(encoding as usize);
+                remaining = rest;
+                for (lane, plane) in planes.iter().enumerate() {
+                    upload(plane, &|index| encoding.word(texels.get(index).copied().unwrap_or_default(), lane))?;
+                }
+                uploaded.push(RgbaLevel { size, encoding, planes: planes.to_vec() });
             }
-            color_layout.push(RgbaRegion { encoding, planes: planes.to_vec() });
+            let mut uploaded = uploaded.into_iter();
+            let Some(image) = uploaded.next() else { continue };
+            color_layout.push(RgbaRegion { encoding: image.encoding, planes: image.planes, levels: uploaded.collect() });
+        }
+        let mut raw_layout = Vec::new();
+        for (plane, region) in raw.iter().zip(remaining) {
+            upload(region, &|index| plane.texels.get(index).copied().unwrap_or_default().to_bits())?;
+            raw_layout.push((Arc::downgrade(&plane.texels), *region));
         }
         let view = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
-        Ok(Self { images: gray.iter().chain(color).map(|image| Arc::downgrade(image)).collect(), regions: gray_regions.to_vec(), color: color_layout, view })
+        Ok(Self {
+            images: gray.iter().copied().chain(color.iter().map(|(image, _)| *image)).map(Arc::downgrade).collect(),
+            regions: gray_regions.to_vec(),
+            color: color_layout,
+            color_mips: color.iter().map(|&(_, mips)| mips).collect(),
+            raw: raw_layout,
+            view,
+        })
     }
+}
+
+/// The texels, size and encoding of a colour image or one of its halved levels.
+type ColorPart<'a> = (&'a [[f32; 4]], [u32; 2], RgbaEncoding);
+
+/// The halved levels `mips` asks for, as texels and size.
+fn levels_of(image: &ImageRes, mips: AtlasMips) -> Vec<(&[[f32; 4]], [u32; 2])> {
+    let chain = match mips {
+        AtlasMips::None => &[][..],
+        AtlasMips::Stored => image.mip_chain(),
+        AtlasMips::LinearColor => image.linear_mip_chain(),
+    };
+    chain.iter().map(|level| (level.rgba.as_slice(), [level.width.max(1), level.height.max(1)])).collect()
 }
 
 fn arrange_images(images: &[[u32; 2]], side_limit: u32, layer_limit: u32, backend: wgpu::Backend, budget: u64) -> Result<([u32; 3], Vec<ImageRegion>), String> {
@@ -389,6 +493,45 @@ mod tests {
         assert_eq!(extent, [8192, 8192, 1]);
         let error = arrange_images(&[large, small], 8192, 16, wgpu::Backend::Vulkan, MAX_ATLAS_BYTES).err();
         assert!(error.is_some_and(|error| error.contains("memory budget")));
+    }
+
+    /// Without mips or raw planes the atlas words are exactly the old ones and the cache still
+    /// matches; mip levels and raw planes add their words and invalidate the cache.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn atlas_mips_and_raw_planes_extend_the_old_layout() {
+        let Some(gpu) = crate::gpu_composite::oracle::headless() else { return };
+        let image = Arc::new(ImageRes::new(8, 4, (0..32).map(|i| [i as f32 / 31.0, 0.5, 0.25, 1.0]).collect(), true));
+        let bytes = Arc::new(ImageRes::new(2, 2, vec![[1.0, 0.0, 0.0, 1.0]; 4], true));
+        let plain = [(&image, AtlasMips::None), (&bytes, AtlasMips::None)];
+        let atlas = TileImageAtlas::new(&gpu.device, &gpu.queue, &[], &plain, &[]).unwrap();
+        assert!(atlas.matches(&[], &plain, &[]));
+        for (index, (image, _)) in plain.iter().enumerate() {
+            let mut words = Vec::new();
+            atlas.append_rgba(&mut words, index, true);
+            let region = &atlas.color[index];
+            let mut old = vec![image.width, image.height, region.encoding as u32 | (1 << 8)];
+            old.extend(region.planes.iter().flat_map(|plane| plane.origin));
+            assert_eq!(words, old, "image {index}");
+        }
+
+        let with_mips = [(&image, AtlasMips::LinearColor), (&bytes, AtlasMips::None)];
+        assert!(!atlas.matches(&[], &with_mips, &[]));
+        let plane = RawPlane { size: [3, 2], texels: Arc::new(vec![0.5, -1.0, f32::NEG_INFINITY, 2.0, 3.0, 4.0]) };
+        let atlas = TileImageAtlas::new(&gpu.device, &gpu.queue, &[], &with_mips, std::slice::from_ref(&plane)).unwrap();
+        assert!(atlas.matches(&[], &with_mips, std::slice::from_ref(&plane)));
+        assert!(!atlas.matches(&[], &with_mips, &[RawPlane { texels: Arc::new(plane.texels.to_vec()), ..plane.clone() }]));
+        let mut words = Vec::new();
+        atlas.append_rgba(&mut words, 0, true);
+        assert_ne!(words[2] & (1 << 9), 0);
+        let levels = image.linear_mip_chain();
+        let planes = atlas.color[0].planes.len();
+        assert_eq!(words[3 + planes * 3] as usize, levels.len());
+        let first_level = words[4 + planes * 3] as usize;
+        assert_eq!(words[first_level..first_level + 2], [levels[0].width, levels[0].height]);
+        let mut raw = Vec::new();
+        atlas.append_raw(&mut raw, 0);
+        assert_eq!(raw[..2], [3, 2]);
     }
 
     #[test]

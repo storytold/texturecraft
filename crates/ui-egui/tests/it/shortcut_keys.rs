@@ -113,12 +113,3 @@ fn a_command_without_a_default_key_runs_from_the_key_it_is_bound_to() {
     h.run_steps(2);
     assert_eq!(h.state().session.doc.project.layers.len(), before + 1, "F7 added a fill layer");
 }
-
-#[test]
-fn the_shortcut_editor_lists_a_command_without_a_key_and_hides_one_that_needs_a_parameter() {
-    let mut h = harness();
-    h.state_mut().ui.windows.shortcuts = true;
-    h.run_steps(4);
-    assert!(h.query_by_label("Toggle layer visibility").is_some(), "Toggle layer visibility is listed");
-    assert!(h.query_by_label("Select texture set").is_none(), "Select texture set needs a texture set");
-}

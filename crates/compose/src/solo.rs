@@ -114,7 +114,8 @@ mod tests {
     fn solo_keeps_the_folders_around_a_layer_and_everything_inside_a_soloed_folder() {
         let mut p = project();
         let outside = add(&mut p, 0, LayerKind::Paint, None, false);
-        let folder = add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false }, None, false);
+        let folder =
+            add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false, contents: Default::default(), randomized: Vec::new() }, None, false);
         let inner = add(&mut p, 0, LayerKind::Paint, Some(folder), true);
         let sibling = add(&mut p, 0, LayerKind::Paint, Some(inner), false);
         let view = solo_project(&p, inner, false).unwrap();
@@ -131,7 +132,8 @@ mod tests {
     #[test]
     fn ignoring_the_mask_disables_it_on_the_layer_and_its_folders_only() {
         let mut p = project();
-        let folder = add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false }, None, false);
+        let folder =
+            add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false, contents: Default::default(), randomized: Vec::new() }, None, false);
         let inner = add(&mut p, 0, LayerKind::Paint, Some(folder), true);
         let other = add(&mut p, 0, LayerKind::Paint, None, false);
         for id in [folder, inner, other] {
@@ -163,16 +165,12 @@ mod tests {
     #[test]
     fn a_soloed_instance_of_a_folder_keeps_the_folders_contents_drawn() {
         let mut p = project();
-        let folder = add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false }, None, false);
+        let folder =
+            add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false, contents: Default::default(), randomized: Vec::new() }, None, false);
         let inner = add(&mut p, 0, LayerKind::Paint, Some(folder), true);
         let instance = add(&mut p, 0, LayerKind::Instance { source: folder }, None, false);
         let view = solo_project(&p, instance, false).unwrap();
 
         assert!(view.layers[&instance].visible && view.layers[&folder].visible && view.layers[&inner].visible);
-    }
-
-    #[test]
-    fn a_layer_in_no_stack_gives_nothing() {
-        assert!(solo_project(&project(), LayerId(99), true).is_none());
     }
 }

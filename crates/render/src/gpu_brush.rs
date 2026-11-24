@@ -1,7 +1,7 @@
 //! GPU brush coverage and projection. Only finished stroke tiles return to the document.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use bytemuck::{Pod, Zeroable};
 use texturecraft_compose::{ImageRes, Stencil};
@@ -18,6 +18,9 @@ use crate::gpu_stencil::{self, GpuStencil};
 type Tiles = BTreeSet<(u32, u32)>;
 type TileDabs = BTreeMap<(u32, u32), Vec<u32>>;
 type ProjectedTiles = BTreeMap<(u32, u32), Vec<[f32; 4]>>;
+/// A finished stroke's alpha map and the tiles it wrote, which the next stroke of that size
+/// clears and reuses instead of allocating a set-size map (a path repaints one per change)
+type SpareAlpha = Arc<Mutex<Option<(wgpu::Texture, Tiles)>>>;
 const ROW_BYTES: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 const TILE_BYTES: u64 = (ROW_BYTES * TILE) as u64;
 const CHUNK: usize = 256;
@@ -62,6 +65,10 @@ struct Dab {
     bitangent: [f32; 4],
     seed: u32,
     padding: [u32; 3],
+    /// A symmetry copy's source origin with w 1, zero for any other dab.
+    source: [f32; 4],
+    /// The columns of the copy's `StampSource::to_source`.
+    to_source: [[f32; 4]; 3],
 }
 
 struct Visibility {
@@ -81,6 +88,7 @@ pub(crate) struct BrushPipeline {
     image_tip: Option<(Weak<ImageRes>, wgpu::TextureView)>,
     blank_tip: wgpu::TextureView,
     projection_readback: Option<wgpu::ComputePipeline>,
+    spare_alpha: SpareAlpha,
 }
 
 impl BrushPipeline {
@@ -127,6 +135,7 @@ impl BrushPipeline {
             image_tip: None,
             blank_tip,
             projection_readback: None,
+            spare_alpha: SpareAlpha::default(),
         }
     }
 
@@ -247,7 +256,14 @@ impl BrushPipeline {
             return Err("The quick mask does not match the GPU brush texture size.".into());
         }
         let visibility = self.visibility(device, queue, &input)?;
-        let alpha = texture(device, size, wgpu::TextureFormat::R16Uint);
+        let spare = self.spare_alpha.lock().ok().and_then(|mut spare| spare.take());
+        let alpha = match spare {
+            Some((alpha, written)) if [alpha.width(), alpha.height()] == size => {
+                clear_tiles(queue, &alpha, &written);
+                alpha
+            }
+            _ => texture(device, size, wgpu::TextureFormat::R16Uint),
+        };
         let view = alpha.create_view(&Default::default());
         let (lo, hi) = input.mesh.bounds();
         let center = (lo + hi) * 0.5;
@@ -311,6 +327,8 @@ impl BrushPipeline {
             params,
             scratch: None,
             projection,
+            written: Tiles::new(),
+            spare_alpha: self.spare_alpha.clone(),
         })
     }
 }
@@ -328,6 +346,17 @@ pub struct GpuBrushStroke {
     params: Parameters,
     scratch: Option<wgpu::Buffer>,
     projection: Option<(GpuStencil, wgpu::ComputePipeline)>,
+    /// The alpha tiles the stroke wrote, cleared when the next stroke reuses its map
+    written: Tiles,
+    spare_alpha: SpareAlpha,
+}
+
+impl Drop for GpuBrushStroke {
+    fn drop(&mut self) {
+        if let Ok(mut spare) = self.spare_alpha.lock() {
+            *spare = Some((self.alpha.clone(), std::mem::take(&mut self.written)));
+        }
+    }
 }
 
 impl GpuBrushStroke {
@@ -348,6 +377,10 @@ impl GpuBrushStroke {
             if !stamp.radius.is_finite() || stamp.radius <= 0.0 || !stamp.center.is_finite() {
                 continue;
             }
+            let (source, to_source) = match stamp.source {
+                Some(source) => (source.origin.extend(1.0).to_array(), source.to_source.to_cols_array_2d().map(|[x, y, z]| [x, y, z, 0.0])),
+                None => ([0.0; 4], [[0.0; 4]; 3]),
+            };
             let index = dabs.len() as u32;
             dabs.push(Dab {
                 center: stamp.center.extend(stamp.radius).to_array(),
@@ -356,6 +389,8 @@ impl GpuBrushStroke {
                 bitangent: stamp.bitangent.extend(stamp.hardness).to_array(),
                 seed: stamp.seed,
                 padding: [0; 3],
+                source,
+                to_source,
             });
             let extent = stamp.world_extent();
             let mut touched = Tiles::new();
@@ -393,6 +428,8 @@ impl GpuBrushStroke {
                 bitangent: [0.0, 0.0, 0.0, stamp.hardness],
                 seed: stamp.seed,
                 padding: [0; 3],
+                source: [0.0; 4],
+                to_source: [[0.0; 4]; 3],
             });
             let reach = Vec2::splat(radius * 1.42);
             let mut touched = Tiles::new();
@@ -411,6 +448,7 @@ impl GpuBrushStroke {
         }
         let mut params = self.params;
         params.flags[0] = u32::from(uv);
+        self.written.extend(tiles.keys());
         let coordinates: Vec<_> = tiles.iter().collect();
         let (device, queue) = (&self.device, &self.queue);
         crate::gpu_trace::scoped(device, "GPU brush dispatch", || {
@@ -633,6 +671,15 @@ fn add_tiles(tiles: &mut Tiles, lo: Vec2, hi: Vec2, size: Vec2) {
     }
 }
 
+/// Zero `tiles` of a reused alpha map, so a new stroke starts with no coverage.
+fn clear_tiles(queue: &wgpu::Queue, alpha: &wgpu::Texture, tiles: &Tiles) {
+    let zeros = vec![0_u8; (TILE * TILE) as usize * size_of::<u16>()];
+    let layout = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(TILE * size_of::<u16>() as u32), rows_per_image: None };
+    for &(x, y) in tiles {
+        queue.write_texture(tile_copy(alpha, x * TILE, y * TILE), &zeros, layout, extent(TILE, TILE));
+    }
+}
+
 fn extent(width: u32, height: u32) -> wgpu::Extent3d {
     wgpu::Extent3d { width, height, depth_or_array_layers: 1 }
 }
@@ -740,6 +787,44 @@ mod tests {
             assert!(sampled > 0 && skipped > 0);
             assert!(tile || clipped > 0);
         }
+    }
+
+    #[test]
+    fn a_new_stroke_reuses_the_alpha_map_without_the_old_coverage() {
+        let Ok(mut gpu) = Headless::new() else { return };
+        let size = 128;
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let bvh = Arc::new(Bvh::new(&mesh));
+        let uv = Arc::new(UvGBuffer::new(&mesh, 0, size, size));
+        let input = || BrushInput {
+            mesh: mesh.clone(),
+            bvh: bvh.clone(),
+            uv: uv.clone(),
+            material: 0,
+            depth: None,
+            settings: BrushSettings::default(),
+            alpha_image: None,
+            stencil: None,
+            limit: None,
+        };
+        let dab = |center: Vec2| UvStamp { center, radius: 0.1, angle: 0.0, flow: 0.9, hardness: 0.8, seed: 0, source: None };
+        let mut first = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input()).unwrap();
+        let first_tiles = first.append_uv(&[dab(Vec2::splat(0.25))]).unwrap();
+        let first_map = first.alpha.clone();
+        drop(first);
+
+        let mut second = gpu.renderer.start_gpu_brush(&gpu.device, &gpu.queue, input()).unwrap();
+        let cleared = second.read_alpha(&first_tiles).unwrap();
+        let second_dab = dab(Vec2::splat(0.7));
+        let second_tiles = second.append_uv(&[second_dab]).unwrap();
+        let actual = second.read_alpha(&second_tiles).unwrap();
+        let mut cpu = StrokeCanvas::new(size, size);
+        let shape = Shape::new(BrushAlpha::Round, None, None, BrushSettings::default().alpha_params);
+        rasterize_uv(&mut cpu, &uv, shape, &[second_dab]);
+
+        assert!(second.alpha == first_map, "the second stroke reuses the first one's map");
+        assert_eq!(cleared.allocated().count(), 0, "the reused map starts without the old coverage");
+        assert_alpha_pattern(&cpu.alpha, &actual, BrushAlpha::Round, "reused map");
     }
 
     #[test]
@@ -918,6 +1003,71 @@ mod tests {
         let expected = cpu.get(32, 32)[0];
         assert!(expected > 0 && expected < u16::MAX);
         assert_eq!(actual.get(32, 32)[0], expected);
+    }
+
+    /// Coverage within one 8-bit step, except visibility decisions flipped on at most 0.1 % of
+    /// the covered texels.
+    fn assert_coverage_matches(cpu: &TileImage, gpu: &TileImage, label: &str) {
+        const EIGHT_BIT_STEP: u16 = 257;
+        let (mut covered, mut differing) = (0, 0);
+        for y in 0..cpu.height() {
+            for x in 0..cpu.width() {
+                let (expected, observed) = (cpu.get(x, y)[0], gpu.get(x, y)[0]);
+                covered += usize::from(expected != 0 || observed != 0);
+                differing += usize::from(expected.abs_diff(observed) > EIGHT_BIT_STEP);
+            }
+        }
+        assert!(covered > 0, "{label}: nothing painted");
+        assert!(differing * 1000 <= covered, "{label}: {differing}/{covered} texels differ");
+    }
+
+    #[test]
+    fn symmetry_copies_see_the_texel_from_their_source_stamp() {
+        use texturecraft_geom::glam::Mat3;
+        use texturecraft_paint::StampSource;
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        let camera = OrbitCamera { pitch: 1.2, ..OrbitCamera::default() };
+
+        // A stroke and its copy across the X plane, with culling and the camera's visibility
+        let mirror_x = StampSource { origin: Vec3::ZERO, to_source: Mat3::from_diagonal(Vec3::new(-1.0, 1.0, 1.0)) };
+        let stroke = Stamp {
+            center: Vec3::new(-0.25, 0.0, 0.1),
+            normal: Vec3::Y,
+            tangent: Vec3::X,
+            bitangent: Vec3::Z,
+            radius: 0.15,
+            flow: 0.8,
+            hardness: 0.7,
+            depth: 1.0,
+            seed: 3,
+            source: None,
+        };
+        let copy = Stamp { center: Vec3::new(0.25, 0.0, 0.1), tangent: Vec3::NEG_X, bitangent: Vec3::Y.cross(Vec3::NEG_X), source: Some(mirror_x), ..stroke };
+        let settings = BrushSettings { backface_culling: true, ..Default::default() };
+        let (cpu, actual) = world_brush_coverage(&mut gpu, primitives::plane(1.0, 4), settings.clone(), Some(camera), &[stroke, copy]);
+        assert_coverage_matches(&cpu, &actual, "mirrored plane");
+        assert!(actual.get(96, 77)[0] > 0, "the copy paints across the plane");
+
+        // A copy whose source faces away from the camera paints nothing, though its own texels face it
+        let mirror_y = StampSource { origin: Vec3::ZERO, to_source: Mat3::from_diagonal(Vec3::new(1.0, -1.0, 1.0)) };
+        let away = Stamp { center: Vec3::new(0.25, 0.0, 0.1), source: Some(mirror_y), ..stroke };
+        let (cpu, actual) = world_brush_coverage(&mut gpu, primitives::plane(1.0, 4), settings.clone(), Some(camera), &[stroke, away]);
+        assert_coverage_matches(&cpu, &actual, "copy of a back face");
+        assert_eq!(actual.get(96, 77)[0], 0, "the copy sees the texel from its back-facing source");
+
+        // A copy whose source point lies under another surface, inside the stamp depth
+        let corners = [Vec3::new(-1.0, 0.03, -1.0), Vec3::new(1.0, 0.03, -1.0), Vec3::new(1.0, 0.03, 1.0), Vec3::new(-1.0, 0.03, 1.0)];
+        let source_corners = corners.map(|point| Vec3::new(point.x, -0.02, point.z));
+        let uvs = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y].into_iter().chain([Vec2::ZERO; 4]).collect();
+        let indices = [0, 2, 1, 0, 3, 2, 4, 6, 5, 4, 7, 6].to_vec();
+        let mesh = Mesh::from_parts(corners.into_iter().chain(source_corners).collect(), None, uvs, indices, "Asymmetric mirror").unwrap();
+        let copy = Stamp { center: Vec3::new(0.0, 0.03, 0.0), radius: 0.3, flow: 1.0, hardness: 0.9, source: Some(mirror_y), ..stroke };
+        let looking_down = OrbitCamera { pitch: 1.45, ..OrbitCamera::default() };
+        let settings = BrushSettings { backface_culling: false, ..settings };
+        let (cpu, actual) = world_brush_coverage(&mut gpu, mesh, settings, Some(looking_down), &[copy]);
+        assert_coverage_matches(&cpu, &actual, "source behind its surface");
+        assert!(actual.get(64, 64)[0] > 0, "the copy paints the visible texel");
     }
 
     #[test]

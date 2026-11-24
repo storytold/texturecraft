@@ -17,7 +17,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Reset frame",
         [],
         None,
-        "{layer? | effect?: content fill effect id} — a warp projection's frame back around the mesh, seen from the front, with its corners unpulled (Projection Depth and the other settings stay)",
+        "{layer? | effect?: content or mask fill effect id} — a warp projection's frame back around the mesh, seen from the front, with its corners unpulled (Projection Depth and the other settings stay)",
         has_layer,
         reset_frame
     )]

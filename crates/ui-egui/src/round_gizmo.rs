@@ -432,10 +432,11 @@ pub(crate) fn overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, gizmo: &RoundG
 #[cfg(test)]
 pub(crate) mod tests {
     use egui::{Modifiers, PointerButton, vec2};
+    use egui_kittest::kittest::Queryable;
     use texturecraft_engine::core::{Fill, LayerId, LayerKind, Projection, Projector};
 
     use super::*;
-    use crate::frame_gizmo::tests::{drag, drag_frames, fill_app, fill_app_with, panel_xyz, press_and_move, projection};
+    use crate::frame_gizmo::tests::{ball_app, drag, drag_frames, fill_app, fill_app_with, panel_xyz, press_and_move, projection};
 
     fn gizmo(harness: &egui_kittest::Harness<'_, TextureCraftApp>) -> RoundGizmo {
         RoundGizmo::of(harness.state(), harness.state().viewport_rect).unwrap()
@@ -726,6 +727,26 @@ pub(crate) mod tests {
         assert!(gizmo(&harness).rings.iter().all(|ring| !ring.is_empty()), "turned aside, every ring shows");
     }
 
+    /// A paint layer on the ball whose mask holds a fill effect (selected) projecting `kind`: painting there paints the mask
+    fn mask_fill_app(kind: &str) -> (egui_kittest::Harness<'static, TextureCraftApp>, LayerId) {
+        let mut harness = ball_app(false);
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let image = harness.state_mut().session.import_resource_bytes("decal.png", png).unwrap();
+        harness.state_mut().run("layer.add.decal", json!({"image": image, "channel": "mask", "size": 0.5})).unwrap();
+        let texturecraft_engine::StackTarget::Effect(effect) = harness.state().session.target else { panic!("the mask fill is selected") };
+        harness.state_mut().run("layer.fill.projection", json!({"effect": effect.0, "projection": kind})).unwrap();
+        harness.run_steps(2);
+        (harness, effect)
+    }
+
+    fn effect_projection(harness: &egui_kittest::Harness<'_, TextureCraftApp>, effect: LayerId) -> Projection {
+        match &harness.state().session.doc.project.effect(effect).unwrap().1.kind {
+            texturecraft_engine::core::EffectKind::Fill { projection, .. } => projection.clone(),
+            other => panic!("a fill effect: {other:?}"),
+        }
+    }
+
     /// A point on the model clear of every handle of the shown gizmo
     pub(crate) fn on_the_model_off_the_handles(harness: &egui_kittest::Harness<'_, TextureCraftApp>) -> Pos2 {
         let app = harness.state();
@@ -741,6 +762,33 @@ pub(crate) mod tests {
             .flat_map(|ring| (0..16).map(move |step| rect.center() + egui::Vec2::angled(step as f32 / 16.0 * std::f32::consts::TAU) * (ring as f32 * 14.0)))
             .find(|p| clear(*p) && clear(*p + vec2(30.0, 0.0)))
             .expect("the model shows past the handles")
+    }
+
+    /// With every projection, a drag on the model away from the gizmo leaves the projection put (and paints nothing: no tool acts on a selected fill effect); only a drag that starts on a handle moves the projection
+    #[test]
+    fn only_a_handle_moves_the_projection_and_any_other_drag_on_the_model_leaves_it() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for kind in ["planar", "warp", "triplanar", "spherical", "cylindrical"] {
+            let (mut harness, effect) = mask_fill_app(kind);
+            let rect = harness.state().viewport_rect;
+            let before = effect_projection(&harness, effect);
+            let steps = harness.state().session.history_labels().len();
+
+            let from = on_the_model_off_the_handles(&harness);
+            drag(&mut harness, from, from + vec2(30.0, 0.0), Modifiers::NONE);
+
+            assert_eq!(effect_projection(&harness, effect), before, "{kind}: a drag off the handles leaves the projection alone");
+            assert_eq!(harness.state().session.history_labels().len(), steps, "{kind}: and adds no undo step");
+
+            let center = match RoundGizmo::of(harness.state(), rect) {
+                Some(round) => round.center,
+                None => crate::frame_gizmo::FrameGizmo::of(harness.state(), rect).unwrap_or_else(|| panic!("{kind}: a gizmo shows")).center,
+            };
+            drag(&mut harness, center, center + vec2(0.0, -30.0), Modifiers::NONE);
+
+            assert_ne!(effect_projection(&harness, effect), before, "{kind}: the centre square moves it");
+            assert_eq!(harness.state().session.history_labels().len(), steps + 1, "{kind}: one step, no stroke");
+        }
     }
 
     /// A sphere has one size handle (it only scales evenly); a tri-planar box scales evenly from its corner and along one direction from a face's double arrow
@@ -873,6 +921,33 @@ pub(crate) mod tests {
 
         harness.event(egui::Event::ModifiersChanged(Modifiers::NONE));
         harness.run_steps(2);
+    }
+
+    /// A plain left press on the projector's handle while a colour picker is open only closes the picker: no stroke, no slide, and the press after it works again
+    #[test]
+    fn a_press_that_closes_the_colour_picker_neither_paints_nor_slides() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut harness, layer) = fill_app("triplanar");
+        let before = projection(&harness, layer);
+        let from = gizmo(&harness).center;
+        harness.get_by_role_and_label(egui::Role::Tab, "Material").click();
+        harness.run_steps(25);
+        harness.get_by_role_and_label(egui::Role::Button, "Base color").click();
+        harness.run_steps(2);
+
+        assert!(crate::color_picker::open_window(&harness.ctx).is_some(), "the picker is open");
+
+        let steps = harness.state().session.history_labels().len();
+
+        drag(&mut harness, from, from + vec2(40.0, 0.0), Modifiers::NONE);
+
+        assert!(crate::color_picker::open_window(&harness.ctx).is_none(), "the press closed the picker");
+        assert_eq!(projection(&harness, layer), before, "and slid nothing");
+        assert_eq!(harness.state().session.history_labels().len(), steps, "nor made an undo step");
+
+        drag(&mut harness, from, from + vec2(40.0, 0.0), Modifiers::NONE);
+
+        assert_ne!(projection(&harness, layer), before, "the next press slides again");
     }
 
     /// A tri-planar fill selected while the quick mask is edited with the Paint tool: brushes act and the projector shows

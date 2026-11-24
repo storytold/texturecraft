@@ -363,6 +363,14 @@ pub struct ExportUi {
     /// "" (by file format: sRGB, or linear for float files), or a colour space name.
     #[serde(default)]
     pub color_space: String,
+    /// Also write `<mesh>.usd`: the mesh and a material per texture set that reads the exported
+    /// textures (`usdAsset` of `file.exportTextures`).
+    #[serde(default)]
+    pub usd_asset: bool,
+    /// Also write an OpenPBR MaterialX (`.mtlx`) file per texture set (`materialX` of
+    /// `file.exportTextures`).
+    #[serde(default)]
+    pub materialx: bool,
     /// Texture sets excluded from export.
     pub skip: Vec<usize>,
     /// Per texture set (by index) overrides of the settings above.
@@ -424,6 +432,8 @@ impl Default for ExportUi {
             size: 0,
             normal_format: String::new(),
             color_space: String::new(),
+            usd_asset: false,
+            materialx: false,
             skip: Vec::new(),
             sets: Default::default(),
             owner: Vec::new(),
@@ -475,6 +485,11 @@ fn deserialize_shelf_panes_split<'de, D: serde::Deserializer<'de>>(deserializer:
 /// "Wireframe opacity" until changed: 40 of 100, as in the reference app
 fn default_wireframe_opacity() -> f32 {
     40.0
+}
+
+/// The Layers panel's channel list starts on Material, so the Material tab's orb shows the whole material
+fn default_layer_material_view() -> bool {
+    true
 }
 
 /// Settings that start on, for saved states that predate them
@@ -530,6 +545,9 @@ pub struct UiState {
     pub uv_rotation: f32,
     /// Channel whose blending the layer rows show.
     pub layer_channel: Channel,
+    /// The Layers panel's channel list is on Material: the Material tab's orb shows the whole material, else `layer_channel` alone
+    #[serde(default = "default_layer_material_view")]
+    pub layer_material_view: bool,
     pub shelf_filter: String,
     /// The asset shelf's picked type: an index into the shelf's types, or past them for every type
     #[serde(default)]
@@ -707,6 +725,7 @@ impl Default for UiState {
             uv_rotation: 0.0,
             layer_channel: Channel::BaseColor,
             blend_clipboard: None,
+            layer_material_view: true,
             shelf_filter: String::new(),
             shelf_tab: 0,
             shelf_path: Vec::new(),

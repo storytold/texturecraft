@@ -348,6 +348,9 @@ pub struct ToolState {
     pub material: Option<String>,
     /// Gray painted into masks.
     pub mask_value: f32,
+    /// Image resource whose gray is painted into masks in place of `mask_value`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_image: Option<String>,
     pub fill_mode: FillMode,
     /// How a polygon fill box decides which polygons it selects
     #[serde(default)]
@@ -422,6 +425,7 @@ impl Default for ToolState {
             enabled: [Channel::BaseColor, Channel::Metallic, Channel::Roughness, Channel::Height, Channel::Normal].into_iter().collect(),
             material: None,
             mask_value: 1.0,
+            mask_image: None,
             fill_mode: FillMode::Triangle,
             fill_hit_test: Default::default(),
             fill_visible_only: default_fill_visible_only(),
@@ -457,13 +461,13 @@ pub(crate) struct DisplayStrokeEnd {
     pub previous_revision: u64,
     pub revision: u64,
     pub tiles: BTreeSet<(u32, u32)>,
+    /// The other texture sets the stroke fed: set, revision before and revision after.
+    pub fed: Vec<(usize, u64, u64)>,
 }
 
 pub(crate) struct ActiveStroke {
     pub display_id: u64,
     pub display_tiles: BTreeSet<(u32, u32)>,
-    /// Gray used for the most recently queued display of a mask stroke.
-    pub displayed_mask_value: f32,
     pub ts: usize,
     /// None: the stroke edits the quick mask.
     pub target: Option<PaintTarget>,
@@ -480,6 +484,8 @@ pub(crate) struct ActiveStroke {
     pub camera: OrbitCamera,
     pub viewport: Vec2,
     pub values: BTreeMap<Channel, [f32; 3]>,
+    /// What a mask stroke paints, resolved once so staging, preview and commit read one image
+    pub mask_gray: texturecraft_compose::MaskGray,
     pub erase: bool,
     /// Projection tool: the stencil captured with the stroke's camera.
     pub stencil: Option<texturecraft_compose::Stencil>,
@@ -583,8 +589,12 @@ pub struct Session {
     pub(crate) display_stroke_end: Option<DisplayStrokeEnd>,
     /// Layer clipboard: a document snapshot and the copied layer (or effect).
     pub clipboard: Option<(Document, LayerId)>,
+    /// Channel blending copied from an effect (see [`crate::effect_blending_cmds`])
+    pub blending_clipboard: Option<crate::effect_blending_cmds::CopiedBlending>,
     /// Decoded image resources (rebuilt from `doc.resources` by `Session::sync_images`).
     pub images: texturecraft_compose::ImageStore,
+    /// Resource names whose decoded pixels match a library alpha.
+    pub(crate) library_alphas: BTreeSet<String>,
     /// Temporary texel mask limiting paint strokes (not saved, not in the history).
     pub quick_mask: crate::quick_mask::QuickMask,
     /// A path sublayer is being repainted from its paths (the only way to paint into one).
@@ -670,7 +680,9 @@ impl Session {
             stroke: None,
             display_stroke_end: None,
             clipboard: None,
+            blending_clipboard: None,
             images: Default::default(),
+            library_alphas: BTreeSet::new(),
             quick_mask: Default::default(),
             painting_paths: false,
             path_cache: None,
@@ -894,26 +906,44 @@ impl Session {
             self.path_cache = None;
         }
 
+        // Cached path pixels were painted with the mask images their paths name
+        let resource_changed = |name: &str| match (previous_document.resources.get(name), self.doc.resources.get(name)) {
+            (Some(previous), Some(current)) => !Arc::ptr_eq(previous, current),
+            (previous, current) => previous.is_some() != current.is_some(),
+        };
+        if self.path_cache.as_ref().is_some_and(|cache| cache.images().any(resource_changed)) {
+            self.path_cache = None;
+        }
+
         // Removed or replaced resources may change any set's rendered content
         let removed_or_replaced_resource =
             previous_document.resources.iter().any(|(name, previous)| !self.doc.resources.get(name).is_some_and(|current| Arc::ptr_eq(previous, current)));
-        let added_resource_names: BTreeSet<_> = self.doc.resources.keys().filter(|name| !previous_document.resources.contains_key(*name)).collect();
-        let uses_added_resource = |texture_set_index: usize| {
-            use texturecraft_core::{EffectKind, Fill, Source};
+        if removed_or_replaced_resource {
+            for cache in &mut self.caches {
+                cache.invalidate_all();
+            }
 
-            let uses_source = |source: &Source| source.images().into_iter().any(|name| added_resource_names.iter().any(|added| added.as_str() == name));
-            let uses_fill =
-                |fill: &Fill| fill.sources.values().any(uses_source) || fill.link.as_ref().is_some_and(|link| added_resource_names.contains(&link.package));
+            return;
+        }
+
+        let added_resource_names: BTreeSet<&str> =
+            self.doc.resources.keys().filter(|name| !previous_document.resources.contains_key(*name)).map(String::as_str).collect();
+        let is_added = |name: &str| added_resource_names.contains(name);
+        let added_environment = self.doc.project.display.environment_resource().is_some_and(is_added);
+        let uses_added_resource = |texture_set_index: usize| {
+            use texturecraft_core::{EffectKind, Fill, Filter};
+
+            let uses_link = |fill: &Fill| fill.link.as_ref().is_some_and(|link| is_added(&link.package));
+            let uses_fill = |fill: &Fill| fill.sources.values().any(|source| source.images().into_iter().any(is_added)) || uses_link(fill);
             let project = &self.doc.project;
             !added_resource_names.is_empty()
                 && project.texture_sets.get(texture_set_index).is_some_and(|set| {
                     project.render_tree(&set.stack).iter().filter_map(|id| project.layers.get(id)).any(|layer| {
                         matches!(&layer.kind, LayerKind::Fill(fill) if uses_fill(fill))
-                            || layer.mask.iter().flat_map(|mask| &mask.effects).chain(&layer.content_effects).any(|effect| match &effect.kind {
-                                EffectKind::Fill { source, .. } => uses_source(source),
-                                EffectKind::Material(fill) => uses_fill(fill),
-                                EffectKind::Generator(generator) => generator.inputs.values().any(uses_source),
-                                _ => false,
+                            || layer.mask.iter().flat_map(|mask| &mask.effects).chain(&layer.content_effects).any(|effect| {
+                                effect.images_read().any(is_added)
+                                    || matches!(&effect.kind, EffectKind::Material(fill) if uses_link(fill))
+                                    || (added_environment && matches!(effect.kind, EffectKind::Filter(Filter::EnvironmentLighting { .. })))
                             })
                     })
                 })
@@ -930,19 +960,14 @@ impl Session {
                 stack,
             )
         };
-        for texture_set_index in 0..self.caches.len() {
-            let before = stack_key(previous_document, texture_set_index);
-            let after = stack_key(&self.doc, texture_set_index);
-            let resource_changed = removed_or_replaced_resource || uses_added_resource(texture_set_index);
-            let Some(cache) = self.caches.get_mut(texture_set_index) else {
-                continue;
-            };
-
-            if resource_changed {
+        for (texture_set_index, cache) in self.caches.iter_mut().enumerate() {
+            if uses_added_resource(texture_set_index) {
                 cache.invalidate_all();
                 continue;
             }
 
+            let before = stack_key(previous_document, texture_set_index);
+            let after = stack_key(&self.doc, texture_set_index);
             if before == after {
                 continue;
             }
@@ -1201,7 +1226,7 @@ impl Session {
                 opacity: stroke.stroke.settings.opacity,
                 erase: stroke.erase,
                 values: stroke.values.clone(),
-                mask_value: self.tool.mask_value,
+                mask_gray: stroke.mask_gray.clone(),
                 stencil: stroke.stencil.clone(),
                 carried_mask: stroke.canvas.pickup.as_ref().and_then(|pickup| pickup.mask_values()).cloned(),
                 carried: stroke.canvas.pickup.as_ref().map(|pickup| pickup.values.clone()).unwrap_or_default(),
@@ -1435,10 +1460,17 @@ impl Session {
 
     /// Histogram (`bins` buckets over 0..1) of the values entering effect `effect`: its layer's
     /// mask, or for a content effect the layer's `channel` (None for an unknown effect).
-    pub fn effect_histogram(&self, effect: LayerId, channel: Channel, bins: usize) -> Option<Vec<u32>> {
+    pub fn effect_histogram(&self, effect: LayerId, channel: Channel, bins: usize) -> Option<texturecraft_compose::EffectHistogram> {
         let (owner, _) = self.doc.project.effect(effect)?;
         let (ts, _, _) = self.doc.project.locate(owner)?;
         self.with_inputs(ts, |inp| texturecraft_compose::effect_histogram(inp, effect, channel, bins))
+    }
+
+    /// Histograms (`bins` buckets over 0..1) of what the two sides of compare mask `effect` read, left then right (None for an unknown effect or one that is no compare mask)
+    pub fn compare_histograms(&self, effect: LayerId, bins: usize) -> Option<[Vec<u32>; 2]> {
+        let (owner, _) = self.doc.project.effect(effect)?;
+        let (ts, _, _) = self.doc.project.locate(owner)?;
+        self.with_inputs(ts, |inp| texturecraft_compose::compare_histograms(inp, effect, bins))
     }
 
     pub fn baked(&self, ts: usize) -> Option<&BakedMaps> {

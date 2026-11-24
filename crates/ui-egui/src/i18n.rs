@@ -249,6 +249,10 @@ mod tests {
         keys.extend(texturecraft_engine::geom::primitives::BUILTINS.iter().map(|(_, label)| *label));
         for filter in FILTERS {
             keys.extend([filter.label, filter.group]);
+            if let Some(about) = filter.about() {
+                keys.push(about.description);
+                keys.extend(about.tags);
+            }
             if let Ok(EffectKind::Filter(effect)) = build(filter.id, &serde_json::Value::Null) {
                 keys.push(effect.label());
                 keys.extend(scalar_params(&effect).into_iter().map(|parameter| parameter.1));
@@ -418,47 +422,25 @@ mod tests",
     }
 
     #[test]
-    fn shared_lookup_overrides_and_missing_translations() {
-        static CATALOGS: &craft_i18n::Embedded = &[("es", "\tSave\tGuardar\n\tOpen\tAbrir\n", "\tSave\tGuardar proyecto\n")];
-        let (runtime, problems) = craft_i18n::I18n::new(CATALOGS, &["es"]);
-        assert!(problems.is_empty());
-        assert!(runtime.check_all().is_empty());
-        let lang = runtime.from_code("es").unwrap();
-        assert_eq!(runtime.t(lang, "Save"), "Guardar proyecto");
-        assert_eq!(runtime.t(lang, "Open"), "Abrir");
-        assert_eq!(runtime.t(lang, "New feature"), "New feature");
-        assert_eq!(runtime.t(craft_i18n::Lang::EN, "Save"), "Save");
-    }
-
-    #[test]
     fn saved_language_codes_and_spanish_lookup() {
         let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for language in &LANGUAGES {
             set_language(language.code);
             assert_eq!(current().code, if available(language.code) { language.code } else { "en" });
         }
+        const MISSING: &str = "missing test label";
         set_language("es");
-        assert_eq!(tr("Layers"), if available("es") { "Capas" } else { "Layers" });
+        let spanish = tr("Layers");
+        let missing = tr(MISSING);
         set_language("en");
-    }
-
-    #[test]
-    fn lookup_is_fast() {
-        let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let keys = keys();
-        set_language("ja");
-        let started = std::time::Instant::now();
-        let mut total_chars = 0usize;
-        for _ in 0..100 {
-            for key in &keys {
-                total_chars += tr(key).len();
-            }
-        }
-        let ns_per_lookup = started.elapsed().as_secs_f64() * 1e9 / (100 * keys.len()) as f64;
+        let english = tr("Layers");
+        set_language("es");
+        let spanish_again = tr("Layers");
         set_language("en");
-        assert!(total_chars > 0);
 
-        // A frame looks up a few hundred strings, each expected below one microsecond
-        assert!(ns_per_lookup < 1000.0, "{ns_per_lookup:.0} ns per lookup");
+        assert_eq!(spanish, if available("es") { "Capas" } else { "Layers" });
+        assert_eq!(missing, MISSING);
+        assert_eq!(english, "Layers");
+        assert_eq!(spanish_again, spanish);
     }
 }

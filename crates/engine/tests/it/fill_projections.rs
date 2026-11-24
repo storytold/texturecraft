@@ -555,7 +555,7 @@ fn an_axis_planar_reading_a_pattern_is_not_placed() {
 
     let added = execute(&mut s, "effect.add.fill", &json!({"layer": layer.0, "target": "mask", "projection": "planar"})).unwrap();
     let effect = added["effect"].as_u64().unwrap();
-    execute(&mut s, "effect.set", &json!({"effect": effect, "procedural": "Checker"})).unwrap();
+    execute(&mut s, "layer.fill.set", &json!({"effect": effect, "procedural": "Checker"})).unwrap();
 
     assert!(execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "effect": effect})).is_err(), "a mask fill's pattern keeps its axis too");
 }

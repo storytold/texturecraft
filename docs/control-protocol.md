@@ -47,6 +47,32 @@ template. `enabled: false` suppresses that file while reserving its name. When s
 sets produce the same name (ignoring case), programmatic and browser exports keep the first file
 and warn about later duplicates. The desktop export window reports the collision before writing.
 
+`file.exportTextures` with `usdAsset` also writes `<mesh>.usd` (binary USD, Crate) next to the textures: the whole mesh
+(every texture set, whatever `ts` selects) with one UsdPreviewSurface material per texture set. A
+material's inputs read the texture files the export planned for that set with its output template
+(`usdAsset: true`: the sets, options and `reservedNames` of this command; a list of export params such as
+`[{"ts": 0, "preset": "..."}, {"ts": 1}]`, not empty, every entry an object: each entry's sets, options and `reservedNames`, the way the export window,
+which runs one command per texture set, passes the params of all its commands with the last one).
+Bound inputs: `diffuseColor`, `roughness`, `metallic`, `normal`, `emissiveColor`, `opacity`,
+`clearcoat` and `clearcoatRoughness`, each reading the `rgb`, `r`, `g`, `b` or `a` output of the
+file that holds it; other maps (ambient occlusion, height, specular...) are not bound, a UDIM map that lost a tile to an earlier
+set's file name or to an entry's `reservedNames` is not bound, a mesh with no materials gets one implicit `default` material bound to the Default set, and a texture set outside the export has
+no textures. A file name is relative to the file (`./<file>`, with `<UDIM>` for UV tiles). A failure
+to build or write it is named in `warnings` and the command still succeeds. The file is in `files`.
+
+`file.exportTextures` with `materialX: true` also writes an OpenPBR `.mtlx` beside each texture
+set's maps. It reuses compatible maps with OpenPBR names and writes dedicated maps for remaining
+inputs with data. A named OpenPBR map explicitly disabled in `maps` stays disabled. Dedicated maps
+use the effective size, padding and color space. A dedicated replacement for a named map keeps
+its file settings where supported. PSD, JNG, PGM and WebP fall back to the OpenPBR template's PNG
+format and bit depth. MaterialX uses OpenGL normals.
+
+`reservedNames: [file names]` takes the basenames and `materialUdimPatterns` returned by earlier
+`file.exportTextures` calls in the same export. The desktop window passes both when exporting
+one set at a time. Comparisons ignore case. If a name is reserved, the command skips the file
+and names it in `warnings`. Materials omit any map with incomplete tiles or a UDIM pattern
+shared by different sets.
+
 `format` accepts the export window's names (`bmp`, `jpeg`, `jng`, `pgm`, `png`, `targa`, `tiff`,
 `hdr`, `exr`, `webp`, `psd`) and their extensions. `bitDepth: 32` selects floating point for
 TIFF, EXR and HDR. `dithering: true` dithers 8-bit integer output with an ordered pattern, and
@@ -61,6 +87,28 @@ parameters. Default effect names follow the new filter, custom names remain, and
 content-only filters. `filter.list` lists the available IDs; levels and material finishes
 must be added separately with `effect.add.filter`. A successful replacement is one undo step;
 a rejected replacement changes nothing.
+
+Warp (`warp`) and Blur Slope (`blurSlope`) work on layer content or masks. Use these IDs with
+`effect.add.filter` and `effect.set`, including when replacing a saved filter. They share
+normalized `intensity` (0..1), `divider` (1, 10, 100, 1000), and `seed`.
+
+- Warp accepts `warpMode: "warp" | "directional" | "multiDirectional"`. The directional
+  modes take `angle` in degrees. Multidirectional Warp also takes `directions` (1, 2, 4)
+  and `blendingMode: "average" | "min" | "max" | "chain"`.
+- Blur Slope accepts `blendingMode: "blur" | "min" | "max"` and normalized `quality` (0..1).
+- Both take `sourceMode: "defaultNoise" | "previousInput" | "customNoise"`, normalized
+  `sourceBlur`, `sourceBalance` and `sourceContrast`, and `sourceTiling` (0.01..16).
+  Source Tiling sets the noise frequency or repeats a sampled source within each UV tile.
+  In Custom Noise mode, set the grayscale source through `layer.fill.set
+  {effect, input: "customNoise", ...}`. Blur Slope can read an anchor through that slot.
+
+For directional Warp, use `effect.add.filter {target: "content", filter: "warp",
+warpMode: "directional", angle: 45, intensity: 0.05, divider: 1}`. To replace that effect,
+use `effect.set {effect, filter: "blurSlope", quality: 0.5}`.
+
+This changes the automation contract. `warp` uses normalized intensity, and the
+`warpDirectional` and `slopeBlur` selectors return an unknown-filter error. Saved filter
+settings still load as stored. Restore Defaults applies to the current catalog entries.
 
 `edit.undo {steps?}` and `edit.redo {steps?}` go back or forward several steps at once (as far
 as the history reaches); `edit.history` lists the steps done and the undone ones, next first. Step names are English; a stroke is named by tool and layer (`Paint on Rust`,
@@ -564,6 +612,50 @@ and Height are shaded on a lit neutral material in the 3D view. `viewport.nextCh
 the shading uses (mesh normal, Height channel slope and Normal channel), unlit; the 2D view shows its
 tangent-space form.
 
+## Colour swatches
+
+The project's swatches (`Project.swatches`, linear RGB, stored in the `.tcraft` file; projects without any
+save none) are the Swatches row under the colour picker. `swatch.list` lists them, `swatch.add {color}`
+(`[r, g, b]` linear or `"#rrggbb"`, clamped to 0..1, at most 64) adds one at the end and
+`swatch.remove {index}` removes one; `project.inspect` shows them as `swatches`. Applying a swatch is an
+ordinary colour edit (`layer.fill.set {color}`).
+
+## A fill's whole material
+
+A fill layer or content fill effect can hold one built-in plain material whole (the Material side of
+its Material section). `layer.fill.material {layer? | effect?, material}` sets every channel the
+material writes from it, turns those channels on and the others off, and keeps the fill's projection;
+`material: null` returns the channels to their defaults (a content fill effect keeps the channels it
+changes, at their defaults); setting what the fill already holds adds no undo step. Smart materials (folders of layers) are added
+with `material.apply` instead. The command rejects linked MaterialCraft fills. The fill remembers the material (`Fill.material`, saved only when set;
+`project.inspect` shows it as `material`) until a channel's source is set on its own with
+`layer.fill.set`. A plain material added from the shelf names its fill the same way.
+
+## Folders, effect blending and masks
+
+- `folder.contents.set {layer?, scale?, rotation?}` lays a Scale (multiplying every fill's tiling inside)
+  and a Rotation (degrees added to every fill's angle) on a folder's contents, never written into the fills;
+  `folder.contents.reset {layer?}` drops them and puts back the seeds `folder.randomizeSeeds {layer?}` changed.
+  `folder.randomizeSeeds` gives every pattern, generator and noise filter inside a new seed (seeds that were
+  equal stay equal) and returns `{seeds}`, how many changed.
+- `effect.blending.modeToEveryChannel`, `opacityToEveryChannel` and `bothToEveryChannel {effect?, channel?}`
+  give every channel of a content effect one channel's blend mode, opacity or both; `effect.blending.copy`
+  and `effect.blending.paste {effect?}` carry every channel's blending between effects (a mask effect takes
+  the shared one). `effect.set {effect, channel, blend?, opacity?}` sets one channel's blending and
+  `effect.set {effect, channels: {roughness: false}}` switches a content effect's channels on or off.
+- `mask.add.bitmap {layer?, image | alpha, projection?}` adds a mask fill reading an image's gray;
+  `effect.set {effect, idMap: image resource | null}` gives a colour selection its own ID map in place of
+  the baked one; `tool.material {maskImage: image resource | null}` paints an image's gray into masks.
+- `effect.add.colorSelection {layer?, color?, tolerance?}` and `mask.add.heightCombination {layer?}` add a
+  colour selection or a compare mask (this layer's height against the layers below) to a layer's mask,
+  making the mask first when it has none; both return `{effect}`.
+- `effect.filter.restoreDefaults {effect?}` puts a filter's parameters back to its defaults (name,
+  channels and blending stay) and returns `{changed}`.
+- `layer.fill.resetProjection {layer? | effect?}` puts the Fill section back to a new fill's (same
+  projection kind; a placed frame, the symmetry and the sources stay); `layer.fill.resetFrame` puts a
+  warp's frame back around the mesh with its corners unpulled. Each is one undo step, or none when
+  nothing changes.
+
 ## MaterialCraft materials
 
 A v3 `.mcmat` holds a published SBS graph and its source assets. TextureCraft uses the shared `craft-mcmat` reader and cooks the archive through `materialcraft-cli`. The resulting fill stores its channel textures and the original archive in the project. Linked cooks use the Settings percentage of available RAM. A cook that exceeds the estimated budget reports the required and configured byte counts without replacing the current fill. Its exposed values, presets and mesh-map inputs appear in `project.inspect`. Republish older MCMAT files from their original authoring project. Procedural imports and re-cooks require the desktop CLI. Saved projects retain their baked maps for use in the browser.
@@ -577,7 +669,9 @@ operation returns a busy error and can be retried.
 | `material.load` | `{path, above?, inside?, index?}`: `.tcmat`, `.mcmat` or `.mcraft` (cooked first) |
 | `material.link.set` | `{layer?, id, value, cook?: true}`: a number, `[..]`, a bool, `"#rrggbb"` or a typed `{"t", "v"}`; re-cooks unless `cook: false` |
 | `material.link.preset` | `{layer?, name, cook?: true}` |
-| `material.link.cook` | `{layer?}`: re-cook at the texture set's resolution with its baked mesh maps (after a bake or a resize) |
+| `material.link.map` | `{layer?, channel, output}`: the channel reads another output of the material |
+| `material.link.resolution` | `{layer?, relative: -3..3 \| fixed: 128..8192, cook?: true}`: the size the material cooks at |
+| `material.link.cook` | `{layer?}`: re-cook at its picked resolution (default: the texture set's) with its baked mesh maps (after a bake or a resize) |
 | `material.link.saveSource` | `{layer?, path}`: the original linked source with its `.mcmat`, `.mcraft` or `.sbs` extension |
 
 For a 1024-pixel texture set, TextureCraft requests `materialcraft-cli export source.mcmat maps --profile maps --size 1024x1024` with repeated `--set` and `--input` arguments. It discovers the published image inputs through `info` when the texture set supplies mesh maps. The desktop worker decodes the returned maps before installing the fill at its original drop target. The executable is resolved from

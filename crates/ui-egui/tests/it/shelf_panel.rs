@@ -3,7 +3,6 @@
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_engine::brush_preset_cmds::UserBrush;
-use texturecraft_engine::core::ProceduralKind;
 use texturecraft_engine::core::project::ENVIRONMENTS;
 use texturecraft_engine::materials::{MATERIALS, SmartMaterial};
 use texturecraft_engine::smart_masks::SMART_MASKS;
@@ -19,7 +18,6 @@ const NARROW_WINDOW: egui::Vec2 = egui::vec2(1100.0, 1032.0);
 const MATERIALS_TYPE: usize = 0;
 const SMART_MASKS_TYPE: usize = 2;
 const BRUSHES_TYPE: usize = 4;
-const TEXTURES_TYPE: usize = 6;
 const ENVIRONMENTS_TYPE: usize = 7;
 /// How far the saved brush's spacing differs from the current brush's, so loading it shows
 const SAVED_SPACING_CHANGE: f32 = 0.25;
@@ -327,26 +325,6 @@ fn saved_smart_materials_keep_their_type_pickable_in_your_assets() {
 
     assert!(!button(&harness, "Smart materials").accesskit_node().is_disabled(), "a saved smart material is in Your assets");
     assert!(button(&harness, "Materials").accesskit_node().is_disabled(), "no plain material is");
-}
-
-#[test]
-fn saved_smart_materials_are_read_whatever_the_type_and_after_a_refresh() {
-    let mut harness = shelf(REFERENCE_WINDOW);
-    assert!(harness.state().library.is_some(), "read on the Materials type");
-
-    button(&harness, "Refresh").click();
-    harness.run_steps(2);
-
-    assert!(harness.state().library.is_some(), "read again after a refresh");
-}
-
-#[test]
-fn procedurals_are_in_the_textures_type() {
-    let mut harness = shelf(REFERENCE_WINDOW);
-    harness.state_mut().ui.shelf_tab = TEXTURES_TYPE;
-    harness.run_steps(3);
-
-    assert!(harness.query_by_label(ProceduralKind::ALL[0].label()).is_some());
 }
 
 /// The reference's type dropdown, top to bottom

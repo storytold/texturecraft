@@ -13,6 +13,9 @@ struct Operation {
     spatial: vec4<u32>,
     // Geometry lookup offset, Height operation plus one, contrast and offset.
     constraints: vec4<u32>,
+    // GPU port packages: side-table offset (0: none, read with `param`), P1 projection flags,
+    // P2/P3/P6/P7 flag bytes, P8 word. Zero for every operation the packages do not emit.
+    ext: vec4<u32>,
 }
 
 struct Params {
@@ -31,11 +34,31 @@ struct Params {
     // The high bit of the last word selects the mask stack.
     filter_stage: vec4<u32>,
     filter_chunk: vec4<u32>,
-    // Original ID bake dimensions, both zero when absent.
+    // Original ID bake dimensions, both zero when absent; bake rows per block (0: one block, the
+    // whole texture) and the second block's presence bits (bake_has).
     id_bake: vec4<u32>,
     // Channel, start of anchor owner's draws, content cut, mask preview draw.
     anchor: vec4<u32>,
     anchor_default: vec4<f32>,
+    // Words per field texel (5, or 6 with the input word), input word present, the prepare
+    // pass's input operation plus one, the prepare pass's stage flags (bit 0: the stage wraps).
+    // The fields' origin, filter_region.xy, is i32 bits: it lies below zero with a wrapping stage.
+    field_layout: vec4<u32>,
+    // One vec4 per GPU port package, P1 to P8, written by its `band_uniform` in Rust.
+    packages: array<vec4<u32>, 8>,
+    // The whole-set pre-pass's outputs the bands read instead of a band field: stage slot plus
+    // one (0: none), their first word in the scratch buffer, and the region they cover in source
+    // texels (origin as i32 bits, size). FilterPlan::whole_set in Rust.
+    whole_slots: vec4<u32>,
+    whole_bases: vec4<u32>,
+    whole_rect: vec4<u32>,
+    // In a pre-pass with compact slots (WholePass::compact in Rust): its first stage slot, its
+    // stage count, the program's first working field, and 1 when active. Zero in the bands.
+    whole_compact: vec4<u32>,
+    // While preparing a lit Base Color's material and its first mask (FilterPlan::
+    // add_lit_mask_views): the layer's mask base plus one, the first mask's base plus one, and
+    // the This Layer stages (plus one) of the first and of the layer's mask. Zero otherwise.
+    mask_view: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -49,6 +72,8 @@ struct SurfaceVertex {
     position: vec4<f32>,
     normal: vec4<f32>,
 }
+// Three vertices per triangle (position and U, normal and V), then their tangents (xyz and the
+// bitangent sign) two per element: GpuCompositor::uv_surface.
 @group(0) @binding(7) var<storage, read> surface_vertices: array<SurfaceVertex>;
 @group(0) @binding(8) var bake_maps: texture_2d<u32>;
 @group(0) @binding(9) var brush_alpha: texture_2d<u32>;
@@ -69,6 +94,26 @@ struct Surface {
     position: vec3<f32>,
     normal: vec3<f32>,
     valid: bool,
+    // The MikkTSpace tangent (unit xyz) and the bitangent sign in w, as the CPU g-buffer's
+    // surface_at gives them: xyz interpolated and normalised, the sign of the triangle's first vertex.
+    tangent: vec4<f32>,
+}
+
+const NO_SURFACE = Surface(vec3(0.0), vec3(0.0, 1.0, 0.0), false, vec4(1.0, 0.0, 0.0, 1.0));
+
+// The tangent of vertex `vertex` from the block after the vertices.
+fn surface_tangent(vertex: u32) -> vec4<f32> {
+    let vertices = arrayLength(&surface_vertices) * 2u / 3u;
+    let pair = surface_vertices[vertices + vertex / 2u];
+    return select(pair.position, pair.normal, (vertex & 1u) == 1u);
+}
+
+// glam's Vec3::any_orthonormal_vector: the tangent the CPU takes where the interpolated one vanishes.
+fn any_orthonormal(n: vec3<f32>) -> vec3<f32> {
+    let sign = select(1.0, -1.0, (bitcast<u32>(n.z) >> 31u) == 1u);
+    let a = -1.0 / (sign + n.z);
+    let b = n.x * n.y * a;
+    return vec3(b, sign + n.y * n.y * a, -n.y);
 }
 
 fn edge(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> f32 {
@@ -79,11 +124,11 @@ fn edge(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> f32 {
 
 fn surface_at(pixel: vec2<u32>) -> Surface {
     if (params.coverage.w & 1u) == 0u || any(pixel >= params.source.xy) {
-        return Surface(vec3(0.0), vec3(0.0, 1.0, 0.0), false);
+        return NO_SURFACE;
     }
     let hit = textureLoad(surface_uv, vec2<i32>(pixel), 0).xy;
     if hit.x == 0xffffffffu {
-        return Surface(vec3(0.0), vec3(0.0, 1.0, 0.0), false);
+        return NO_SURFACE;
     }
     let a = surface_vertices[hit.x * 3u];
     let b = surface_vertices[hit.x * 3u + 1u];
@@ -103,17 +148,53 @@ fn surface_at(pixel: vec2<u32>) -> Surface {
     let w = 1.0 - weight.x - weight.y;
     let position = a.position.xyz * w + b.position.xyz * weight.x + c.position.xyz * weight.y;
     let normal = a.normal.xyz * w + b.normal.xyz * weight.x + c.normal.xyz * weight.y;
-    return Surface(position, select(normal / max(length(normal), 1e-6), vec3(0.0, 1.0, 0.0), dot(normal, normal) <= 1e-12), true);
+    let unit = select(normal / max(length(normal), 1e-6), vec3(0.0, 1.0, 0.0), dot(normal, normal) <= 1e-12);
+    let ta = surface_tangent(hit.x * 3u);
+    let tangent = ta.xyz * w + surface_tangent(hit.x * 3u + 1u).xyz * weight.x + surface_tangent(hit.x * 3u + 2u).xyz * weight.y;
+    let length_squared = dot(tangent, tangent);
+    let direction = select(any_orthonormal(unit), tangent * inverseSqrt(length_squared), length_squared > 0.0 && length_squared < 3.4e38);
+    return Surface(position, unit, true, vec4(direction, select(1.0, -1.0, ta.w < 0.0)));
+}
+
+// One row block of the bake texture: the whole texture, or params.id_bake.z rows when the
+// program has the second block (BakedInputs::blocks in Rust).
+fn bake_block_size() -> vec2<u32> {
+    let size = textureDimensions(bake_maps);
+    return vec2(size.x, select(params.id_bake.z, size.y, params.id_bake.z == 0u));
 }
 
 fn bake_pixel_at(pixel: vec2<u32>) -> vec2<u32> {
-    let size = textureDimensions(bake_maps);
-    let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
+    let size = bake_block_size();
+    // P8: a UV tile smaller than its atlas block reads its own share of the bake (BlockScales::bake_uv)
+    let uv = udim_bake_uv((vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy)).xy;
     return min(vec2<u32>(uv * vec2<f32>(size)), size - 1u);
 }
 
+// The second bake row block's maps (ProceduralInputs::read_bake_rows): bits of params.id_bake.w.
+const BAKED_HEIGHT: u32 = 1u;
+const BAKED_WORLD_NORMAL: u32 = 2u;
+
+fn bake_has(maps: u32) -> bool {
+    return (params.id_bake.w & maps) == maps;
+}
+
+// Row block `block` at the texel: 0 the built-in maps (baked_at), 1 the baked Height in x and the
+// stored World Normal in yzw (f32 bits; zeros where bake_has says a map is missing).
+fn baked_block_at(pixel: vec2<u32>, block: u32) -> vec4<u32> {
+    // P8: no bake where a smaller UV tile leaves its block empty
+    if !udim_bake_valid(pixel) {
+        return udim_absent_bake(block);
+    }
+    // P8: maps of different heights in rows of their own (params.packages[7].y)
+    if params.packages[7].y != 0u {
+        return udim_separate_bake(pixel, block);
+    }
+    let at = bake_pixel_at(pixel) + vec2(0u, block * bake_block_size().y);
+    return textureLoad(bake_maps, vec2<i32>(at), 0);
+}
+
 fn baked_at(pixel: vec2<u32>) -> vec4<u32> {
-    return textureLoad(bake_maps, vec2<i32>(bake_pixel_at(pixel)), 0);
+    return baked_block_at(pixel, 0u);
 }
 
 fn unpack_baked_normal(packed: u32) -> vec3<f32> {
@@ -184,10 +265,17 @@ fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
 }
 
 fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
-    if !enable_authored_images || layer.procedural.w != DECAL_PROJECTION {
-        return vec4(value(layer, uv, surface), 1.0);
+    // P8: a reduced pattern's texels per repeat follow the UV tile at the texel
+    let placed = udim_placed(layer, uv);
+    // P1 (composite_projection.wgsl) evaluates fills that carry projection or sampling flags
+    if placed.ext.y != 0u {
+        return projection_fill_value(placed, uv, surface);
     }
-    return decal_fill_value(layer, uv, surface);
+    if !enable_authored_images || placed.procedural.w != DECAL_PROJECTION {
+        // P8: the mesh's own UV on a UV tile atlas, so projections repeat per tile
+        return vec4(value(placed, udim_value_uv(placed, uv), surface), 1.0);
+    }
+    return decal_fill_value(placed, uv, surface);
 }
 
 fn stored_sample(layer: Operation, table: u32, origin: vec2<u32>, size: vec2<u32>, pixel: vec2<u32>, empty: vec4<f32>) -> vec4<f32> {
@@ -273,7 +361,12 @@ fn painted(layer: Operation, pixel: vec2<u32>, projected: ProjectedBrush) -> vec
         if (params.coverage.w & PROJECTED_BRUSH) == 0u {
             m = brush_coverage(pixel) * layer.uv.w;
         }
-        if m > 0.0 {
+        if m > 0.0 && (layer.ext.z & BRUSH_OP_BITS) != 0u {
+            // P7 (composite_brush.wgsl) previews the live stroke modes it flags, at the texel's
+            // pixel and UV (a mask stroke's image value, MaskGray::at)
+            let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
+            stored = live_brush_paint(layer, stored, m, projected, pixel, uv);
+        } else if m > 0.0 {
             // Match the paint commit's premultiplied over and 16-bit channel encoding.
             let value = select(layer.uv.xxx, layer.uv.xyz, layer.ids.w == 4u);
             let pigment = select(value, projected.rgba.rgb, layer.projection.w == 2.0);
@@ -358,11 +451,24 @@ fn replace_color(op: Operation, c: vec3<f32>) -> vec3<f32> {
 fn scalar_filter(op: Operation, x: f32) -> f32 {
     switch op.ids.y {
         case 20u: {
-            let t = clamp((x - op.low.x) / max(op.low.y - op.low.x, 1e-5), 0.0, 1.0);
-            return lerp(op.high.x, op.high.y, pow(t, 1.0 / max(op.low.z, 1e-3)));
+            // Levels: high.z is 1 when it clamps; unclamped, values outside the input range stay on the line through it
+            let range = op.low.y - op.low.x;
+            let between = (x - op.low.x) / select(1e-5, range, range > 0.0);
+            var t = between;
+            if op.high.z > 0.5 || (between >= 0.0 && between <= 1.0) {
+                t = pow(clamp(between, 0.0, 1.0), 1.0 / max(op.low.z, 1e-3));
+            }
+            return lerp(op.high.x, op.high.y, t);
         }
         case 21u: { return 1.0 - x; }
-        case 22u: { return select(0.0, 1.0, x >= op.low.x); }
+        case 22u: {
+            // Threshold: ids.z picks at or above, above, below, or at or below the level
+            var passes = x >= op.low.x;
+            if op.ids.z == 1u { passes = x > op.low.x; }
+            if op.ids.z == 2u { passes = x < op.low.x; }
+            if op.ids.z == 3u { passes = x <= op.low.x; }
+            return select(0.0, 1.0, passes);
+        }
         case 23u: { return clamp((x - 0.5) * (1.0 + clamp(op.low.x, -1.0, 1.0)) + 0.5 + op.low.y, 0.0, 1.0); }
         case 24u: {
             let steps = max(floor(clamp(op.low.x, 2.0, 64.0) + 0.5) - 1.0, 1.0);
@@ -396,11 +502,15 @@ fn scalar_filter(op: Operation, x: f32) -> f32 {
             if op.ids.z == 2u { passes = x > op.low.x; }
             return select(0.0, 1.0, passes);
         }
-        default: { return x; }
+        // Opcodes without a scalar form here, and the GPU port packages' opcodes
+        default: { return extended_scalar_filter(op, x); }
     }
 }
 
 fn effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> {
+    if is_extended_effect(op.ids.y) {
+        return extended_effect_color(op, c, channel, surface, baked_ao);
+    }
     if op.ids.y == 35u {
         if channel != 0u { return c; }
         let facing = max(0.0, dot(surface.normal, op.high.xyz));
@@ -553,7 +663,8 @@ struct LayerTexel {
 }
 
 fn color_selection(effect: Operation, pixel: vec2<u32>) -> f32 {
-    if params.id_bake.x == 0u || effect.procedural.z == 0u { return 0.0; }
+    // P8: no baked ID where a smaller UV tile leaves its block empty
+    if params.id_bake.x == 0u || effect.procedural.z == 0u || !udim_bake_valid(pixel) { return 0.0; }
     let color = id_color_at(pixel);
     for (var i = 0u; i < effect.procedural.z; i++) {
         let at = effect.procedural.y + i * 3u;
@@ -698,13 +809,8 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let index = id.y * params.program.y + id.x;
     let texel = LayerTexel(pixel, uv, surface, mask_bakes, projected);
-    if composite_mask_preview {
-        var gray = 0u;
-        if covered {
-            let layer = layers[params.anchor.w];
-            gray = u32(layer_mask(layer, texel, layer.effects.y) * 255.0 + 0.5);
-        }
-        output[index] = (gray * 0x00010101u) | 0xff000000u;
+    if composite_mask_preview && !covered {
+        output[index] = 0xff000000u;
         return;
     }
     var base = vec3(0.5);
@@ -720,14 +826,45 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         triangle = textureLoad(surface_uv, vec2<i32>(pixel), 0).x;
     }
     var group_depth = 0u;
-    for (var i = 0u; covered && i < params.program.x; i++) {
+    // The mask preview runs the loop over its one layer, for its mask alone: every mask goes
+    // through the one layer_mask call below, which the driver inlines once
+    var first = 0u;
+    var end = params.program.x;
+    if composite_mask_preview {
+        first = params.anchor.w;
+        end = first + 1u;
+    }
+    for (var i = first; covered && i < end; i++) {
         let layer = layers[i];
-        if composite_groups {
-            if layer.ids.y == BEGIN_GROUP {
-                var mask = 0.0;
-                if geometry_allows(layer.constraints.x, triangle) {
-                    mask = mask_with_height(layer, texel, layer_mask(layer, texel, layer.effects.y));
+        let group = composite_groups && layer.ids.y == BEGIN_GROUP;
+        if composite_groups && layer.ids.y == END_GROUP {
+            group_depth -= 1u;
+            let mixed = mix_group_parent(group_depth, index, layer.ids.z, MaterialValues(base, normal, scalars, lobe_colors, lobe_values));
+            base = mixed.base;
+            normal = mixed.normal;
+            scalars = mixed.scalars;
+            lobe_colors = mixed.lobe_colors;
+            lobe_values = mixed.lobe_values;
+            continue;
+        }
+        if !group && (layer.ids.x == 0xffffffffu || !geometry_allows(layer.constraints.x, triangle)) && !composite_mask_preview { continue; }
+        // A folder's mask, or a layer's mask when its mask range changes
+        if composite_mask_preview || group || (layer.effects.y != 0u && last_mask != layer.effects.x) {
+            var mask = 0.0;
+            if composite_mask_preview || !group || geometry_allows(layer.constraints.x, triangle) {
+                mask = layer_mask(layer, texel, layer.effects.y);
+                if !composite_mask_preview {
+                    mask = mask_with_height(layer, texel, mask);
                 }
+            }
+            if composite_mask_preview {
+                output[index] = (u32(mask * 255.0 + 0.5) * 0x00010101u) | 0xff000000u;
+                return;
+            }
+            if !group {
+                last_mask = layer.effects.x;
+                mask_value = mask;
+            } else {
                 if mask <= 0.0 {
                     // The instruction stores the first operation after its END_GROUP.
                     i = layer.ids.w - 1u;
@@ -737,28 +874,12 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
                 group_depth += 1u;
                 continue;
             }
-            if layer.ids.y == END_GROUP {
-                group_depth -= 1u;
-                let mixed = mix_group_parent(group_depth, index, layer.ids.z, MaterialValues(base, normal, scalars, lobe_colors, lobe_values));
-                base = mixed.base;
-                normal = mixed.normal;
-                scalars = mixed.scalars;
-                lobe_colors = mixed.lobe_colors;
-                lobe_values = mixed.lobe_values;
-                continue;
-            }
         }
-        if layer.ids.x == 0xffffffffu { continue; }
-        if !geometry_allows(layer.constraints.x, triangle) { continue; }
         let mode = u32(layer.balance.z);
         var weight = layer.low.w;
         if layer.effects.y == 0u {
             weight *= layer.balance.y;
         } else {
-            if last_mask != layer.effects.x {
-                last_mask = layer.effects.x;
-                mask_value = mask_with_height(layer, texel, layer_mask(layer, texel, layer.effects.y));
-            }
             weight *= mask_value;
         }
         if weight <= 0.0 { continue; }
@@ -821,9 +942,9 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         output[display_index(6u, index)] = pack_srgb(lobe_colors[0], lobe_values[0]);
     }
     if writes_display(7u) {
-        // The GPU compositor uses one full-resolution UV block, so tile scale is zero.
+        // P8: the alpha holds the UV tile's scale (zero but in a smaller tile of a UV tile atlas)
         let signed_xy = quantized_color(lobe_colors[3]).xy * 2.0 - 1.0;
         let packed = vec2<u32>(clamp(128.0 + 127.0 * signed_xy, vec2(0.0), vec2(255.0)) + 0.5);
-        output[display_index(7u, index)] = packed.x | (packed.y << 8u) | ((to_u16(lobe_values[7]) >> 8u) << 16u);
+        output[display_index(7u, index)] = packed.x | (packed.y << 8u) | ((to_u16(lobe_values[7]) >> 8u) << 16u) | (udim_extra_scale(sample_pixel) << 24u);
     }
 }

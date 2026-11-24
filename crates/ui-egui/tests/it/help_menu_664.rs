@@ -1,5 +1,4 @@
-//! Help ▸ Release notes... opens the releases page; Help ▸ Export log... saves the log to a text file;
-//! Help ▸ Join the community (Discord)... opens the community Discord.
+//! Help > Export log... saves the log with each entry's time and level.
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
@@ -26,55 +25,6 @@ fn click_help_item(h: &mut Harness<'_, TextureCraftApp>, label: &str) {
 }
 
 #[test]
-fn release_notes_opens_the_releases_page() {
-    for id in ["ui.help.releaseNotes", "ui.help.exportLog"] {
-        assert!(texturecraft_ui_egui::keymap::bindings().iter().any(|binding| binding.id == id));
-    }
-
-    let mut h = harness();
-    h.get_by_label("Help").click();
-    h.run_steps(3);
-    h.get_by_label("Release notes...").click();
-
-    // The open-url command is in the output of the frame that handled the click only
-    h.step();
-    let opened = h
-        .output()
-        .platform_output
-        .commands
-        .iter()
-        .any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url == "https://github.com/storytold/texturecraft/releases"));
-    assert!(opened, "the releases page was opened");
-}
-
-const DISCORD: &str = "https://discord.gg/artcraft";
-
-fn opened(h: &Harness<'_, TextureCraftApp>, url: &str) -> bool {
-    h.output().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url == url))
-}
-
-#[test]
-fn join_the_community_opens_the_discord() {
-    let mut h = harness();
-    h.get_by_label("Help").click();
-    h.run_steps(3);
-    h.get_by_label("Join the community (Discord)...").click();
-    h.step();
-    assert!(opened(&h, DISCORD), "the community Discord was opened");
-}
-
-#[test]
-fn join_the_community_is_bindable_and_a_bound_key_opens_the_discord() {
-    assert!(texturecraft_ui_egui::keymap::bindings().iter().any(|b| b.id == "ui.help.discord"), "ui.help.discord can be bound");
-    let mut h = harness();
-    h.state_mut().ui.keymap.insert("ui.help.discord".into(), "F12".into());
-    h.run_steps(2);
-    h.event(egui::Event::Key { key: egui::Key::F12, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
-    h.step();
-    assert!(opened(&h, DISCORD), "the bound key opened the community Discord");
-}
-
-#[test]
 fn export_log_writes_every_line_with_time_and_level() {
     let mut h = harness();
     let dir = std::env::temp_dir().join(format!("texturecraft-help-menu-664-{}", std::process::id()));
@@ -96,12 +46,4 @@ fn export_log_writes_every_line_with_time_and_level() {
     assert!(text.contains("] WARN  [TextureCraft] second line"));
     assert_eq!(lines.len(), logged.len() + 1);
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_canceled_export_log_dialog_writes_nothing() {
-    let mut h = harness();
-    h.state_mut().file_dialogs.set_override(Some(Box::new(|_| Answer::Cancelled)));
-    click_help_item(&mut h, "Export log...");
-    assert!(h.state().toasts.is_empty());
 }

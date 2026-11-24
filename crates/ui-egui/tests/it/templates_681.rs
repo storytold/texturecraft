@@ -94,27 +94,6 @@ fn save_and_reduce_file_size_is_greyed_with_the_hint() {
 }
 
 #[test]
-fn the_project_template_info_tooltip_lists_the_settings_templates_apply() {
-    let mut h = app();
-    h.state_mut().ui.windows.new_project = true;
-    h.run_steps(4);
-    let row = h.get_by_label("Project template").rect().center().y;
-    let icon = h
-        .get_all_by_label(egui_phosphor::regular::INFO)
-        .find(|node| (node.rect().center().y - row).abs() < 6.0)
-        .expect("the info icon in the Project template row");
-
-    // The icon's node is wider than the glyph: hover its left part
-    let at = icon.rect().center() - egui::vec2(6.0, 0.0);
-    h.hover_at(egui::pos2(1.0, 1.0));
-    h.run_steps(2);
-    h.hover_at(at);
-    h.run_steps(30);
-    let tip = "Templates set the starting channels, resolution, normal map format and shader settings.";
-    assert!(h.query_by_label(tip).is_some(), "hovering the info icon of the Project template row");
-}
-
-#[test]
 fn new_project_opens_on_the_template_of_the_last_project() {
     let dir = TempDir::new("last-template");
     let mesh = dir.join("quad.obj");

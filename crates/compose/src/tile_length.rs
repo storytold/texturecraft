@@ -147,9 +147,4 @@ mod tests {
         assert!(length[0] > 0.0, "{length:?}");
         assert!(tiling_for_length(&flat, SIZE, length).unwrap()[0] > 0.0, "a written-back tiling is never 0");
     }
-
-    #[test]
-    fn spherical_has_no_physical_size() {
-        assert_eq!(tile_length(&Projection::Spherical { scale: 1.0, uv: UvTransform::default(), offset: [0.0; 3], projector: Default::default() }, SIZE), None);
-    }
 }

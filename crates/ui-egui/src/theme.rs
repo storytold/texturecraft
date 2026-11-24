@@ -400,10 +400,43 @@ pub const SHAFT_HALO_EXTRA_WIDTH: f32 = 3.0;
 /// The axes' letters, as the Axis switches and the 3D fields' tags show them
 pub const AXIS_NAMES: [&str; 3] = ["X", "Y", "Z"];
 
+/// Cyan, magenta and yellow: the opposites of [`AXIS_COLORS`] at the same brightness (Color Balance's color names)
+pub const OPPOSITE_COLORS: [Color32; 3] = [Color32::from_rgb(0x52, 0xb8, 0xc4), Color32::from_rgb(0xc4, 0x6a, 0xc8), Color32::from_rgb(0xd2, 0xb8, 0x52)];
+
 /// `from` moved `amount` of the way to `to` in gamma space, opaque
 pub(crate) fn lerp_color(from: Color32, to: Color32, amount: f32) -> Color32 {
     let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount).round().clamp(0.0, 255.0) as u8;
     Color32::from_rgb(mix(from.r(), to.r()), mix(from.g(), to.g()), mix(from.b(), to.b()))
+}
+
+/// Least contrast a tinted color name keeps against its background (the WCAG ratio for normal text: the names are regular 12 pt lettering)
+const TINT_MIN_CONTRAST: f32 = 4.5;
+
+/// How finely [`legible_tint`] walks from the tint to the text colour: a tenth of the way at a time keeps as much of the tint as reads
+const TINT_STEPS: u8 = 10;
+
+/// `tint` moved toward `text` just enough to read on `background` (Color Balance's yellow and cyan names on a light card); a tint that already reads stays as it is
+pub fn legible_tint(tint: Color32, background: Color32, text: Color32) -> Color32 {
+    (0..=TINT_STEPS)
+        .map(|step| tint.lerp_to_gamma(text, f32::from(step) / f32::from(TINT_STEPS)))
+        .find(|color| contrast_ratio(*color, background) >= TINT_MIN_CONTRAST)
+        .unwrap_or(text)
+}
+
+/// WCAG's flare term, added to both luminances so black still has a ratio
+const WCAG_FLARE: f32 = 0.05;
+
+/// The WCAG contrast ratio of two opaque colors (1..21)
+fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let luminance = |color: Color32| {
+        let linear = egui::Rgba::from(color);
+
+        // Rec. 709 luminance
+        0.2126 * linear.r() + 0.7152 * linear.g() + 0.0722 * linear.b()
+    };
+    let (first, second) = (luminance(a), luminance(b));
+    let (high, low) = (first.max(second), first.min(second));
+    (high + WCAG_FLARE) / (low + WCAG_FLARE)
 }
 
 /// A section caption inside a panel: semibold in the strong colour, as written (no capitals).
@@ -414,6 +447,23 @@ pub fn caption(text: &str) -> egui::RichText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tint_names_reach_normal_text_contrast_and_a_tint_that_already_reads_stays_as_it_is() {
+        for theme in [Brightness::Light, Brightness::MediumLight, Brightness::MediumDark, Brightness::Dark] {
+            let tokens = Tokens::for_brightness(theme);
+            for tint in OPPOSITE_COLORS.into_iter().chain(AXIS_COLORS) {
+                let shown = legible_tint(tint, tokens.row, tokens.text);
+                assert!(contrast_ratio(shown, tokens.row) >= TINT_MIN_CONTRAST, "{theme:?} {tint:?} -> {shown:?}");
+                if contrast_ratio(tint, tokens.row) >= TINT_MIN_CONTRAST {
+                    assert_eq!(shown, tint, "{theme:?}: a tint that already reads stays as it is");
+                }
+            }
+        }
+
+        let light = Tokens::for_brightness(Brightness::Light);
+        assert_ne!(legible_tint(OPPOSITE_COLORS[2], light.row, light.text), OPPOSITE_COLORS[2], "yellow darkens on a light card");
+    }
 
     #[test]
     fn settings_round_trip_and_unknown_values_load_the_defaults() {
@@ -432,18 +482,7 @@ mod tests {
 
     #[test]
     fn every_brightness_and_accent_reads() {
-        // Use WCAG relative luminance for the contrast ratio
-        let lum = |c: Color32| {
-            let ch = |v: u8| {
-                let v = f32::from(v) / 255.0;
-                if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-            };
-            0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
-        };
-        let contrast = |a: Color32, b: Color32| {
-            let (x, y) = (lum(a), lum(b));
-            (x.max(y) + 0.05) / (x.min(y) + 0.05)
-        };
+        let contrast = contrast_ratio;
         for b in Brightness::ALL {
             for a in Accent::ALL {
                 let t = Tokens::for_brightness(b).with_accent(a);

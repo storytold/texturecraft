@@ -49,7 +49,7 @@ pub(crate) fn open_on_right_click(app: &mut TextureCraftApp, ui: &Ui, response: 
     }
 }
 
-/// Draws the open popup and closes it on a press outside it or when the app leaves Painting
+/// Draws the open popup and closes it on a press outside it (but not an eyedropper pick's) or when the app leaves Painting
 pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let (any_down, pressed_at) = ctx.input(|input| (input.pointer.any_down(), input.pointer.press_origin().filter(|_| input.pointer.any_pressed())));
 
@@ -58,10 +58,11 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
         Some(PropertiesPopup::Closing) if !any_down => app.properties_popup = None,
         Some(PropertiesPopup::Open { .. }) => {
             let shown = ctx.memory(|memory| memory.area_rect(area_id()));
-            let outside = pressed_at.is_some_and(|at| shown.is_some_and(|rect| !rect.contains(at)));
+            let in_picker = |at: egui::Pos2| crate::color_picker::open_window(ctx).is_some_and(|picker| picker.contains(at));
+            let outside = pressed_at.is_some_and(|at| shown.is_some_and(|rect| !rect.contains(at)) && !in_picker(at));
 
-            // A press in one of the popup's own dropdowns lands outside its area
-            if outside && !egui::Popup::is_any_open(ctx) {
+            // A child picker or an eyedropper press can land outside the panel
+            if outside && !egui::Popup::is_any_open(ctx) && app.picking_color.is_none() {
                 app.properties_popup = Some(PropertiesPopup::Closing);
             }
         }

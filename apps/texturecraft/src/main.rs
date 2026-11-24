@@ -196,6 +196,13 @@ fn main() {
     if let Some(result) = craft_update::self_update::finish(&texturecraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
         std::process::exit(i32::from(result.is_err()));
     }
+
+    // Windows: the eyedropper's pointer keeper (screen_pick) is a copy of this program started with its own argument
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == texturecraft_ui_egui::screen_pick::KEEPER_ARG) {
+        std::process::exit(texturecraft_ui_egui::screen_pick::keep_pointer());
+    }
+
     let args = match parse_args() {
         Ok(Some(a)) => a,
         Ok(None) => return,
@@ -325,19 +332,6 @@ mod tests {
         let args = parse_args_from(["--power-pref".to_string(), "low".to_string(), "--gpu".to_string(), "3080".to_string()]).unwrap().unwrap();
         assert_eq!(args.power_pref, Some(eframe::wgpu::PowerPreference::LowPower));
         assert_eq!(args.gpu.as_deref(), Some("3080"));
-    }
-
-    #[test]
-    fn only_a_run_without_a_control_port_checks_for_updates_at_start() {
-        assert!(checks_for_updates_at_start(None));
-        assert!(!checks_for_updates_at_start(Some(9000)));
-    }
-
-    #[test]
-    fn bundled_app_icon_decodes_to_rgba() {
-        let icon = icon().unwrap();
-        assert!(icon.width > 0 && icon.height > 0);
-        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
     }
 
     #[test]

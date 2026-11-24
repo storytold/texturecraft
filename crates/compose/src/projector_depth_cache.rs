@@ -17,14 +17,11 @@ pub struct ProjectorDepthCache {
 }
 
 impl ProjectorDepthCache {
-    pub(crate) fn bind(&mut self, mesh: &Arc<Mesh>) -> bool {
+    pub(crate) fn bind(&mut self, mesh: &Arc<Mesh>) {
         if !std::ptr::eq(self.mesh.as_ptr(), mesh.as_ref()) {
             self.maps.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
             self.mesh = Arc::downgrade(mesh);
-            return true;
         }
-
-        false
     }
 
     pub(crate) fn get(&self, mesh: &Mesh, key: FillDepthKey) -> Option<Arc<FillDepth>> {

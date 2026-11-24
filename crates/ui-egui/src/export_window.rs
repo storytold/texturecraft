@@ -222,20 +222,23 @@ fn start_export(app: &mut TextureCraftApp) {
     let dir = app.ui.export.dir.clone();
     let pending: Vec<(usize, serde_json::Value)> = selection
         .into_iter()
-        .map(|ts| {
-            let mut p = set_params(app, ts);
-            p["dir"] = json!(dir);
+        .map(|set_index| {
+            let mut params = set_params(app, set_index);
+            params["dir"] = json!(dir);
 
             // Capture the template so edits during export cannot change the files
-            let preset = p.get("preset").and_then(serde_json::Value::as_str).and_then(|name| app.session.export_preset(name));
-            if let Some(v) = preset.and_then(|t| serde_json::to_value(t).ok()) {
-                p["preset"] = v;
+            let preset = params.get("preset").and_then(serde_json::Value::as_str).and_then(|name| app.session.export_preset(name));
+            if let Some(preset) = preset.and_then(|preset| serde_json::to_value(preset).ok()) {
+                params["preset"] = preset;
             }
-            (ts, p)
+
+            (set_index, params)
         })
         .collect();
+
     let preview: Vec<_> = pending.iter().filter_map(|(index, params)| plan_set(app, *index, params)).collect();
     let error = preview.iter().find_map(|plan| plan.files.as_ref().err().cloned()).or_else(|| name_clash(&preview));
+
     let e = &mut app.ui.export;
     e.tab = 2;
     e.console = vec![ConsoleLine::Step(tr("Preparing texture export").into())];
@@ -245,7 +248,7 @@ fn start_export(app: &mut TextureCraftApp) {
         return;
     }
 
-    e.job = Some(crate::state::ExportJob { total: pending.len(), pending, preview, directory: dir, written: Vec::new(), frame: 0 });
+    e.job = Some(crate::state::ExportJob { total: pending.len(), pending, preview, directory: dir, usd_asset: e.usd_asset, ..Default::default() });
 }
 
 /// Two texture sets that would write a file of the same name (ignoring case, as Windows and macOS
@@ -295,14 +298,19 @@ fn export_step(app: &mut TextureCraftApp, frame: u64) {
     job.frame = frame;
     if job.pending.is_empty() {
         let written = std::mem::take(&mut job.written);
-        let mut lines = vec![
-            ConsoleLine::Step(tr("All selected texture sets processed").into()),
-            ConsoleLine::Step(tr("Collecting the exported files").into()),
-            ConsoleLine::Done(tr("Texture export complete").into()),
-            ConsoleLine::Done(tr("Files saved").into()),
-        ];
-        lines.extend(written.into_iter().map(ConsoleLine::Done));
-        app.ui.export.console.extend(lines);
+        let console = &mut app.ui.export.console;
+        console.push(ConsoleLine::Step(tr("All selected texture sets processed").into()));
+        if written.is_empty() {
+            console.push(ConsoleLine::Step(tr("No files were written").into()));
+        } else {
+            console.extend([
+                ConsoleLine::Step(tr("Collecting the exported files").into()),
+                ConsoleLine::Done(tr("Texture export complete").into()),
+                ConsoleLine::Done(tr("Files saved").into()),
+            ]);
+            console.extend(written.into_iter().map(ConsoleLine::Done));
+        }
+
         app.ui.export.job = None;
         return;
     }
@@ -326,55 +334,97 @@ fn export_step(app: &mut TextureCraftApp, frame: u64) {
     let set = || ConsoleLine::Set(name.clone());
     app.ui.export.console.extend([set(), set(), ConsoleLine::Step(tr("Rendering the selected maps").into())]);
 
+    // Protect concrete files and UDIM references from earlier texture sets
+    if let Some(job) = app.ui.export.job.as_ref().filter(|job| !job.written.is_empty()) {
+        params["reservedNames"] = job.written.iter().chain(&job.material_udim_patterns).map(|name| json!(name)).collect();
+    }
+
+    // The last command writes the USD asset from the params of every command, so a canceled or failed export writes none
+    if let Some(job) = app.ui.export.job.as_mut().filter(|job| job.usd_asset) {
+        job.sent.push(params.clone());
+        if job.pending.is_empty() {
+            params["usdAsset"] = json!(job.sent);
+        }
+    }
+
     let Some(response) = app.run("file.exportTextures", params) else {
         app.ui.export.job = None;
         return;
     };
 
-    let files: Vec<String> = response
-        .get("files")
-        .and_then(|file| file.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|file| file.as_str())
+    // A USD asset that could not be written also shows as an error toast
+    let usd_failure = response_strings(&response, "warnings").find(|warning| warning.starts_with(texturecraft_engine::file_cmds::USD_ASSET_FAILED));
+    if let Some(warning) = usd_failure {
+        app.toast(warning.to_string(), true);
+    }
+
+    let files: Vec<String> = response_strings(&response, "files")
         .map(|file| std::path::Path::new(file).file_name().map_or_else(|| file.to_string(), |n| n.to_string_lossy().into_owned()))
         .collect();
     let mut lines = vec![set(), ConsoleLine::Step(tr("Saving texture files").into())];
-    for file in &files {
+    // The USD asset is no texture: it stays in the list of written files only
+    for file in files.iter().filter(|file| !file.to_ascii_lowercase().ends_with(".usd")) {
         let stem = file.rsplit_once('.').map_or(file.as_str(), |(stem, _)| stem);
         lines.push(set());
         lines.push(ConsoleLine::Step(trf("Saved texture {file}", &[("file", &stem)])));
     }
+
+    // The export's warnings go to the console and the log, each once per export
+    let warnings = response_strings(&response, "warnings");
+    for warning in warnings {
+        let Some(job) = app.ui.export.job.as_mut() else { break };
+        if job.shown_warnings.iter().any(|seen| seen == warning) {
+            continue;
+        }
+
+        job.shown_warnings.push(warning.to_string());
+        app.session.log.warn("MapExporter", warning);
+        lines.push(set());
+        lines.push(ConsoleLine::Step(trf("Warning: {message}", &[("message", &warning)])));
+    }
+
     lines.extend([set(), ConsoleLine::Step(tr("Finished writing this texture set").into())]);
     app.ui.export.console.extend(lines);
     if let Some(job) = app.ui.export.job.as_mut() {
         job.written.extend(files);
+        job.material_udim_patterns.extend(response_strings(&response, "materialUdimPatterns").map(str::to_owned));
     }
+}
+
+fn response_strings<'a>(response: &'a serde_json::Value, field: &str) -> impl Iterator<Item = &'a str> {
+    response.get(field).and_then(|items| items.as_array()).into_iter().flatten().filter_map(|item| item.as_str())
 }
 
 /// The `file.exportTextures` / `export.plan` parameters of the window's global settings
 pub(crate) fn export_params(app: &TextureCraftApp) -> serde_json::Value {
-    let e = &app.ui.export;
-    let mut p = json!({"preset": e.preset, "padding": e.padding, "dilation": e.dilation});
-    if !e.format.is_empty() {
-        p["format"] = json!(e.format);
+    let settings = &app.ui.export;
+    let mut params = json!({"preset": settings.preset, "padding": settings.padding, "dilation": settings.dilation});
+    if !settings.format.is_empty() {
+        params["format"] = json!(settings.format);
     }
-    if !e.format.is_empty() && e.bit_depth > 0 {
-        p["bitDepth"] = json!(e.bit_depth);
-        p["dithering"] = json!(e.dithering);
+    if !settings.format.is_empty() && settings.bit_depth > 0 {
+        params["bitDepth"] = json!(settings.bit_depth);
+        params["dithering"] = json!(settings.dithering);
     }
-    match e.size {
+    match settings.size {
         0 => {}
-        SIZE_OF_LARGEST_SET => p["size"] = json!(largest_set(app)),
-        n => p["size"] = json!(n),
+        SIZE_OF_LARGEST_SET => params["size"] = json!(largest_set(app)),
+        size => params["size"] = json!(size),
     }
-    if !e.normal_format.is_empty() {
-        p["normalFormat"] = json!(e.normal_format);
+    if !settings.normal_format.is_empty() {
+        params["normalFormat"] = json!(settings.normal_format);
     }
-    if !e.color_space.is_empty() {
-        p["colorSpace"] = json!(e.color_space);
+    if !settings.color_space.is_empty() {
+        params["colorSpace"] = json!(settings.color_space);
     }
-    p
+
+    // The browser downloads the textures only
+    #[cfg(not(target_arch = "wasm32"))]
+    if settings.materialx {
+        params["materialX"] = json!(true);
+    }
+
+    params
 }
 
 /// The parameters exporting texture set `ts`: the global settings with the set's overrides
@@ -629,11 +679,34 @@ fn global_page(app: &mut TextureCraftApp, ui: &mut Ui, builtins: &[ExportPreset]
         reset = icon_button(ui, ic::ARROW_COUNTER_CLOCKWISE, tr("Restore the default export parameters"), false, ICON).clicked();
     });
     if reset {
-        let d = ExportUi::default();
-        let e = &mut app.ui.export;
-        (e.dir, e.format, e.bit_depth, e.dithering, e.size, e.padding, e.dilation, e.normal_format, e.color_space) =
-            (d.dir, d.format, d.bit_depth, d.dithering, d.size, d.padding, d.dilation, d.normal_format, d.color_space);
-        crate::export_templates::select(app, d.preset);
+        let defaults = ExportUi::default();
+        let settings = &mut app.ui.export;
+        (
+            settings.dir,
+            settings.format,
+            settings.bit_depth,
+            settings.dithering,
+            settings.size,
+            settings.padding,
+            settings.dilation,
+            settings.normal_format,
+            settings.color_space,
+            settings.usd_asset,
+            settings.materialx,
+        ) = (
+            defaults.dir,
+            defaults.format,
+            defaults.bit_depth,
+            defaults.dithering,
+            defaults.size,
+            defaults.padding,
+            defaults.dilation,
+            defaults.normal_format,
+            defaults.color_space,
+            defaults.usd_asset,
+            defaults.materialx,
+        );
+        crate::export_templates::select(app, defaults.preset);
     }
     let (first, rest) = template_groups(app, builtins);
     egui::Grid::new("exp_grid").num_columns(2).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
@@ -648,57 +721,68 @@ fn global_page(app: &mut TextureCraftApp, ui: &mut Ui, builtins: &[ExportPreset]
         ui.end_row();
         ui.label(tr("File type"));
         ui.horizontal(|ui| {
-            let e = &mut app.ui.export;
-            file_type_lists(ui, ("exp_global", 0, 0), true, &mut e.format, &mut e.bit_depth, &mut e.dithering);
+            let settings = &mut app.ui.export;
+            file_type_lists(ui, ("exp_global", 0, 0), true, &mut settings.format, &mut settings.bit_depth, &mut settings.dithering);
         });
         ui.end_row();
         ui.label(tr("Size"));
-        let e = &mut app.ui.export;
-        egui::ComboBox::from_id_salt("exp_size").width(VALUE_WIDTH).selected_text(size_label(e.size)).show_ui(ui, |ui| {
-            ui.selectable_value(&mut e.size, 0, size_label(0));
+        let settings = &mut app.ui.export;
+        egui::ComboBox::from_id_salt("exp_size").width(VALUE_WIDTH).selected_text(size_label(settings.size)).show_ui(ui, |ui| {
+            ui.selectable_value(&mut settings.size, 0, size_label(0));
             ui.separator();
-            ui.selectable_value(&mut e.size, SIZE_OF_LARGEST_SET, size_label(SIZE_OF_LARGEST_SET));
-            for r in SIZES {
-                ui.selectable_value(&mut e.size, r, size_label(r));
+            ui.selectable_value(&mut settings.size, SIZE_OF_LARGEST_SET, size_label(SIZE_OF_LARGEST_SET));
+            for size in SIZES {
+                ui.selectable_value(&mut settings.size, size, size_label(size));
             }
         });
         ui.end_row();
         ui.label(tr("Padding"));
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("exp_pad").width(260.0).selected_text(tr(padding_label(&e.padding))).show_ui(ui, |ui| {
-                for (v, l) in PADDINGS {
-                    ui.selectable_value(&mut e.padding, v.to_string(), tr(l));
+            egui::ComboBox::from_id_salt("exp_pad").width(260.0).selected_text(tr(padding_label(&settings.padding))).show_ui(ui, |ui| {
+                for (value, label) in PADDINGS {
+                    ui.selectable_value(&mut settings.padding, value.to_string(), tr(label));
                 }
             });
-            dilation_button(ui, &e.padding, &mut e.dilation);
+            dilation_button(ui, &settings.padding, &mut settings.dilation);
         });
         ui.end_row();
     });
 
-    // Unavailable export controls stay disabled
+    // The browser downloads the textures only, so it has no USD asset to add
+    #[cfg(not(target_arch = "wasm32"))]
+    ui.checkbox(&mut app.ui.export.usd_asset, tr("Export USD asset")).on_hover_text(tr("Package the mesh, materials and textures together as USD"));
+    #[cfg(target_arch = "wasm32")]
     unavailable_checkbox(ui, tr("Export USD asset"), tr("Package the mesh, materials and textures together as USD"));
+
+    // The browser downloads the textures only
+    #[cfg(not(target_arch = "wasm32"))]
+    ui.checkbox(&mut app.ui.export.materialx, tr("Export MaterialX"));
+    #[cfg(target_arch = "wasm32")]
+    crate::unavailable::checkbox(ui, false, tr("Export MaterialX"));
+
+    // Unavailable export controls stay disabled
     unavailable_checkbox(ui, tr("Export shader settings"), tr("Save the settings of each shader instance in a JSON file"));
     ui.add_space(8.0);
     egui::Grid::new("exp_grid_more").num_columns(2).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
-        let e = &mut app.ui.export;
+        let settings = &mut app.ui.export;
         ui.label(tr("Normal map format"));
-        let nf = match e.normal_format.as_str() {
+        let normal_label = match settings.normal_format.as_str() {
             "openGl" => "OpenGL",
             "directX" => "DirectX",
             _ => tr("From template / project"),
         };
-        egui::ComboBox::from_id_salt("exp_nf").selected_text(nf).show_ui(ui, |ui| {
-            for (v, l) in [("", tr("From template / project")), ("openGl", "OpenGL"), ("directX", "DirectX")] {
-                ui.selectable_value(&mut e.normal_format, v.to_string(), l);
+        egui::ComboBox::from_id_salt("exp_nf").selected_text(normal_label).show_ui(ui, |ui| {
+            for (value, label) in [("", tr("From template / project")), ("openGl", "OpenGL"), ("directX", "DirectX")] {
+                ui.selectable_value(&mut settings.normal_format, value.to_string(), label);
             }
         });
         ui.end_row();
         ui.label(tr("Color space"));
-        let shown = if e.color_space.is_empty() { tr("Default") } else { e.color_space.as_str() };
+        let shown = if settings.color_space.is_empty() { tr("Default") } else { settings.color_space.as_str() };
         egui::ComboBox::from_id_salt("exp_cs").selected_text(shown).show_ui(ui, |ui| {
-            ui.selectable_value(&mut e.color_space, String::new(), tr("Default"));
+            ui.selectable_value(&mut settings.color_space, String::new(), tr("Default"));
             for name in ["sRGB", "Linear Rec.709", "ACEScg", "ACES2065-1"] {
-                ui.selectable_value(&mut e.color_space, name.to_string(), name);
+                ui.selectable_value(&mut settings.color_space, name.to_string(), name);
             }
         });
         ui.end_row();
@@ -1083,6 +1167,17 @@ fn follow_texture_sets(app: &mut TextureCraftApp) {
             for set in &mut job.preview {
                 set.index = set.index.and_then(moved);
             }
+
+            // The sets already written follow too (the USD asset reads their params); a removed one leaves
+            job.sent = std::mem::take(&mut job.sent)
+                .into_iter()
+                .filter_map(|mut params| {
+                    let Some(index) = params.get("ts").and_then(serde_json::Value::as_u64) else { return Some(params) };
+                    let index = moved(usize::try_from(index).ok()?)?;
+                    params["ts"] = json!(index);
+                    Some(params)
+                })
+                .collect();
 
             // Removed sets leave the count too, so the bar keeps its pace
             job.total -= queued - job.pending.len();

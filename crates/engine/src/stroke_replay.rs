@@ -8,7 +8,7 @@ use std::sync::{
 
 use serde::{Deserialize, Serialize};
 use texturecraft_bake::Progress;
-use texturecraft_compose::{PaintTarget, PixelStore};
+use texturecraft_compose::{MaskGray, PaintTarget, PixelStore};
 use texturecraft_core::{Channel, EffectKind, LayerId, LayerKind, Project};
 use texturecraft_formats::{FormatError, StrokeReplayData};
 use texturecraft_geom::{Bvh, Mesh, UvGBuffer, glam::Vec2};
@@ -672,7 +672,7 @@ impl RecordedPaint {
             };
             match target {
                 PaintTarget::Layer(id) => commit_layer(pixels, id, size, &self.values, source, &mut staging),
-                PaintTarget::Mask(id) => commit_mask(pixels, id, size, self.mask_value, source, &mut staging),
+                PaintTarget::Mask(id) => commit_mask(pixels, id, size, &MaskGray::Value(self.mask_value), source, &mut staging),
             }
         }
         Ok(())

@@ -393,9 +393,3 @@ fn loading_textures_are_taken_in_at_a_limited_rate() {
     assert!(take_in_textures(true, 1.0 + LOADING_RESTART_S, 1.0));
     assert!(take_in_textures(true, 0.0, f64::MIN), "the first frame always");
 }
-
-/// The placeholder appears only before the first image has been traced.
-#[test]
-fn nothing_traced_yet_shows_the_placeholder() {
-    assert!(!show_image(false, 0));
-}

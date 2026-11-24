@@ -1,4 +1,4 @@
-use texturecraft_core::Fill;
+use texturecraft_core::{Fill, Projection};
 
 use crate::fill_depth::FillDepth;
 
@@ -6,6 +6,7 @@ use crate::fill_depth::FillDepth;
 #[derive(Clone, Copy)]
 pub(crate) struct FillPlace<'f> {
     pub fill: &'f Fill,
+    pub projection: &'f Projection,
     pub depth: Option<&'f FillDepth>,
     /// Decided once per tile, so a texel never works its coverage out
     pub covers_all: bool,

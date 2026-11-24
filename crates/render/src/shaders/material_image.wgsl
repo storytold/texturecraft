@@ -62,13 +62,19 @@ fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> {
 fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
     let image = layer.ids.z;
     let mode = layer.procedural.w;
+    if mode == P1_POINT_PROJECTION {
+        return p1_image_at(image, uv, layer);
+    }
+
     let p = surface.position * layer.projection.w + layer.projection.xyz;
     if mode == 1u {
+        // The three planes through one material_image_at call (the driver inlines each call site)
         let w = triplanar_weights(surface.normal, layer.balance.w);
+        let points = array<vec2<f32>, 3>(vec2(p.z, -p.y), p.xz, vec2(p.x, -p.y));
         var sampled = vec4(0.0);
-        if w.x > 0.0 { sampled += w.x * material_image_at(image, vec2(p.z, -p.y)); }
-        if w.y > 0.0 { sampled += w.y * material_image_at(image, p.xz); }
-        if w.z > 0.0 { sampled += w.z * material_image_at(image, vec2(p.x, -p.y)); }
+        for (var plane = 0u; plane < 3u; plane++) {
+            if w[plane] > 0.0 { sampled += w[plane] * material_image_at(image, points[plane]); }
+        }
         return sampled;
     }
     var point = uv;
@@ -146,7 +152,12 @@ fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> ve
     if layer.ids.z == MISSING_IMAGE {
         return vec3(0.5);
     }
-    return decode_image_sample(layer, image_projection(layer, uv, surface).rgb);
+    let sampled = image_projection(layer, uv, surface);
+    if layer.ids.w == P1_ALPHA_KIND {
+        return vec3(sampled.a);
+    }
+
+    return decode_image_sample(layer, sampled.rgb);
 }
 
 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {

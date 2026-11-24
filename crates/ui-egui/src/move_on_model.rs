@@ -357,6 +357,33 @@ mod tests {
         assert_eq!(projection(&harness, layer), slid, "no mode is left on");
     }
 
+    /// A mask fill's warp frame moves with the hold as a fill layer's does: the frame slides, not only the image inside it
+    #[test]
+    fn holding_a_mask_fills_pad_slides_its_frame() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut harness, layer) = fill_app("triplanar");
+        harness.state_mut().run("mask.add.black", json!({"layer": layer.0})).unwrap();
+        let effect = harness.state_mut().run("effect.add.fill", json!({"layer": layer.0, "target": "mask"})).unwrap()["effect"].as_u64().unwrap();
+        harness.state_mut().run("layer.fill.projection", json!({"effect": effect, "projection": "warp"})).unwrap();
+        harness.state_mut().run("layer.select", json!({"layer": layer.0, "target": effect})).unwrap();
+        harness.run_steps(4);
+        let mask_projection = |harness: &Harness| match &harness.state().session.doc.project.effect(LayerId(effect)).unwrap().1.kind {
+            EffectKind::Fill { projection, .. } => projection.clone(),
+            other => panic!("a mask fill: {other:?}"),
+        };
+        let Projection::Warp { frame: before, uv: uv_before, .. } = mask_projection(&harness) else { panic!("a warp") };
+
+        let mut pointer = press_the_button(&mut harness);
+        assert_eq!(harness.state().moving_on_model, Some(MoveOnModel { layer, effect: Some(LayerId(effect)) }), "a press starts the hold");
+
+        pointer.drags(&mut harness, vec2(-60.0, 0.0), 10, Modifiers::NONE);
+        let_go(&mut harness, &mut pointer);
+
+        let Projection::Warp { frame: after, uv: uv_after, .. } = mask_projection(&harness) else { panic!("still a warp") };
+        assert_ne!(after.offset, before.offset, "the frame slid");
+        assert_eq!(uv_after, uv_before, "not only the image inside it");
+    }
+
     /// Losing the focus mid-hold (Alt+Tab) ends it as letting go does: one undo step, the pointer shown, and moves after it (egui still has the button down) leave the projection alone
     #[test]
     fn losing_the_window_focus_mid_hold_ends_it_as_letting_go_does() {
