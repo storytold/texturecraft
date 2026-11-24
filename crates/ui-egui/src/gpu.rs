@@ -2799,6 +2799,53 @@ pub(crate) mod tests {
         assert!(live.iter().zip(&committed).all(|(a, b)| close(a, b)), "live {live:?}, committed {committed:?}");
     }
 
+    /// The Projection tool in the 2D view runs on the GPU brush: the stencil the 3D camera lays
+    /// colours the live stroke as its release does
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_2d_view_projection_stroke_previews_its_stencil_on_the_gpu() {
+        let Ok(gpu) = Headless::new() else { return };
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let (mut session, layer) = projection_session(128, false);
+        let uvs = [144.0, 200.0, 256.0].map(|x| session.pick(Vec2::new(x, 200.0), session.viewport).unwrap().uv);
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.brush_device = Some(brush.clone());
+        let display = |link: &mut GpuLink, session: &mut Session| -> [[u8; 4]; 3] {
+            let scene = link.sync(session, None, None, 0, 0.0);
+            let gpu = &mut *brush.0.lock().unwrap();
+            if let Some((mesh, id)) = &scene.mesh {
+                gpu.renderer.set_mesh(&gpu.device, &gpu.queue, mesh, *id);
+            }
+            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert!(errors.is_empty(), "{errors:?}");
+            let texture = gpu.renderer.display_textures()[0][0];
+            let extent = texture.width();
+            uvs.map(|uv| {
+                let pixel = (uv * extent as f32).as_uvec2();
+                read_pixel(gpu, texture, pixel.x.min(extent - 1), pixel.y.min(extent - 1))
+            })
+        };
+        let baseline = display(&mut link, &mut session);
+
+        session.brush_device = link.brush_device(&session);
+        session.begin_stroke_uv(uvs[0], 1.0).unwrap();
+        for uv in &uvs[1..] {
+            session.continue_stroke_uv(*uv, 1.0);
+        }
+        assert!(session.device_stroke().is_some(), "the 2D view projection runs on the device");
+        let live = display(&mut link, &mut session);
+        assert!(session.doc.pixels.layer(layer, Channel::BaseColor).is_none(), "live GPU painting keeps the document untouched");
+        session.end_stroke().unwrap();
+        let committed = display(&mut link, &mut session);
+
+        assert_ne!(live[1], baseline[1]);
+        assert!(live[1][0] > live[1][1] && live[2][1] > live[2][0], "the material takes the stencil's two ink colors: {live:?}");
+        for (live, committed) in live.into_iter().zip(committed) {
+            assert!(live.into_iter().zip(committed).all(|(a, b)| a.abs_diff(b) <= 2), "live {live:?}, committed {committed:?}");
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_mask_brush_previews_commits_and_cancels_in_both_views() {
