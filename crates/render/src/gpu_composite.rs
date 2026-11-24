@@ -628,18 +628,26 @@ impl FilterPlan {
         (stages, done): (&mut BTreeMap<(u32, Channel), u32>, &mut BTreeSet<usize>),
     ) {
         let layer = &layers[index];
-        let [mask, mask_count, content, content_count] = layer.effects.map(|word| word as usize);
-        let reads: Vec<usize> = (mask..mask + mask_count)
-            .chain(content..content + content_count)
-            .filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2]) && !done.contains(&effect))
-            .collect();
-        if reads.is_empty() {
-            return;
-        }
         // The layer's operations: the run sharing its mask range
         let same_layer = |op: &Operation| op.effects[..2] == layer.effects[..2] && !groups::is_group(op) && op.ids[1] != ANCHOR_PUBLISH_LAYER;
         let first = (0..index).rev().take_while(|&earlier| same_layer(&layers[earlier])).last().unwrap_or(index);
         let end = (index..layers.len()).take_while(|&later| same_layer(&layers[later])).last().map_or(index + 1, |last| last + 1);
+        // Reads of the layer's own material (every operation's copy) bind at the operation they end at, so their capture follows the stacks of the other channels
+        let own_end = (first..end).find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor)).unwrap_or(end - 1);
+        let ranges = |op: &Operation| {
+            let [mask, mask_count, content, content_count] = op.effects.map(|word| word as usize);
+            (mask..mask + mask_count).chain(content..content + content_count)
+        };
+        let own = if index == own_end { (first..end).flat_map(|own| ranges(&layers[own])).collect() } else { Vec::new() };
+        // A set: operations sharing a content range list its effects once each
+        let reads: BTreeSet<usize> = ranges(layer)
+            .filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] != 1))
+            .chain(own.into_iter().filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] == 1)))
+            .filter(|effect| !done.contains(effect))
+            .collect();
+        if reads.is_empty() {
+            return;
+        }
         for effect in reads {
             done.insert(effect);
             let op = &mut effects[effect];
