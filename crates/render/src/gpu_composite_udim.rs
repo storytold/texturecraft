@@ -233,6 +233,8 @@ mod tests {
     /// a quarter): three tile scales.
     const UNIFORM: [u32; 4] = [BLOCK; 4];
     const SCALED: [u32; 4] = [BLOCK, BLOCK / 2, BLOCK, BLOCK / 4];
+    /// Tile sides that do not divide the block (three quarters and three eighths of it).
+    const UNEVEN: [u32; 4] = [BLOCK, 3 * BLOCK / 4, BLOCK, 3 * BLOCK / 8];
 
     /// A set of the four tiles of [`TILES`] in a 2 × 2 atlas of `block` texels per block, each
     /// tile at its resolution in `resolutions` (its block's when equal), and a mesh of four planes,
@@ -468,6 +470,17 @@ mod tests {
         ];
 
         check_stacks(&mut gpu, &cases, DECISIONS);
+
+        // Tiles whose sides do not divide their block: each starts at its block, not at a multiple of its side
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        for (label, stack) in &cases {
+            let (project, mesh, pixels, owner, _) = painted_of((BLOCK, UNEVEN), &[Channel::BaseColor, Channel::Roughness, Channel::Height], stack);
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+            case.region = Some(BLOCK_CORNER);
+
+            assert_matches_cpu(&mut gpu, &case, DECISIONS, &format!("{label}, uneven tiles"));
+        }
     }
 
     /// A mask generator at a coarser resolution and blurred takes each tile's cells and blur.
@@ -672,8 +685,8 @@ mod tests {
     }
 
     /// Whole-set stages take one pre-pass entry per filter whatever the tile scales: a Mirror
-    /// and a Transform on the three-scale atlas and a Mirror on a four-scale one both run in the
-    /// pre-pass, at a block of 512 texels.
+    /// and a Transform in the content and in the mask, on a three-scale and a four-scale atlas,
+    /// all run in the pre-pass, at a block of 512 texels.
     #[test]
     fn whole_set_filters_keep_the_pre_pass_on_atlases_of_many_scales() {
         let Some(mut gpu) = headless() else { return };
@@ -685,18 +698,21 @@ mod tests {
         let four = [LARGE, LARGE / 2, LARGE / 4, LARGE / 8];
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
         let cases = [
-            ("Mirror and Transform, three scales", three, vec![(mirror.clone(), 1.0, normal), (transform, 0.8, normal)]),
-            ("Mirror, four scales", four, vec![(mirror, 1.0, normal)]),
+            ("Mirror and Transform, three scales", three, vec![(mirror.clone(), 1.0, normal), (transform.clone(), 0.8, normal)]),
+            ("Mirror and Transform, four scales", four, vec![(mirror, 1.0, normal), (transform, 0.8, normal)]),
         ];
 
         for (label, resolutions, stack) in cases {
+            let scales = resolutions.iter().collect::<std::collections::BTreeSet<_>>().len();
             let (project, mesh, pixels, owner, _) = painted_of((LARGE, resolutions), &[Channel::BaseColor], &stack);
             let program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
             let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
             case.mask_owner = Some(owner);
             case.region = Some(CompositeRegion { min: [LARGE - 40, LARGE - 24], max: [LARGE + 24, LARGE + 40] });
 
-            assert!(!program.whole_set_passes().is_empty(), "{label}: the whole-set filters run in the pre-pass");
+            // Both filters at every scale, in the content and in the mask
+            let whole: usize = program.whole_set_passes().iter().map(|&(stages, _)| stages).sum();
+            assert_eq!(whole, 2 * stack.len() * scales, "{label}: every whole-set filter runs in the pre-pass");
             assert_matches_cpu(&mut gpu, &case, DECISIONS, label);
         }
     }
