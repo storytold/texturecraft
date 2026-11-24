@@ -348,7 +348,8 @@ impl SetCompositor {
         });
         let pixels = preview.as_ref().unwrap_or(&session.doc.pixels);
         #[cfg(not(target_arch = "wasm32"))]
-        let brush = if let Some(brush) = session.device_stroke().filter(|brush| brush.ts == ts && stroke.is_some()) {
+        // The stroke's coverage serves every set it feeds, in the same texels
+        let brush = if let Some(brush) = session.device_stroke().filter(|_| stroke.is_some()) {
             let coverage = brush.stroke.as_any().downcast_ref::<GpuBrushStroke>().ok_or(n_("This painting tool uses CPU compositing."))?;
             let target = match brush.target {
                 PaintTarget::Layer(layer) if brush.erase => LiveBrushTarget::Layer { layer, values: erased_channels(&session.doc.pixels, layer, brush.values) },
@@ -654,7 +655,9 @@ impl GpuLink {
                     ""
                 }
                 Err(reason) => {
-                    if session.stroke_texture_set() == Some(ts) && !(gpu_quick_mask && session.quick_mask_stroke(ts).is_some()) {
+                    // A set the device stroke feeds shows it on the CPU only from the stroke's alpha
+                    let feeds = session.stroke_texture_set() == Some(ts) || session.pending_display_stroke(ts).is_some();
+                    if feeds && !(gpu_quick_mask && session.quick_mask_stroke(ts).is_some()) {
                         session.materialize_device_stroke(Some(reason));
                     }
                     state.stroke = None;
@@ -2797,6 +2800,50 @@ pub(crate) mod tests {
         assert!(live.iter().zip(neutral).all(|(live, neutral)| *live != neutral), "both the stroke and its copy show live: {live:?}");
         let close = |a: &[u8; 4], b: &[u8; 4]| a.iter().zip(b).all(|(a, b)| a.abs_diff(*b) <= 1);
         assert!(live.iter().zip(&committed).all(|(a, b)| close(a, b)), "live {live:?}, committed {committed:?}");
+    }
+
+    /// One device stroke feeds every texture set of its size drawing the painted layer: an
+    /// instance on another set shows the stroke live as it shows the release
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_gpu_stroke_feeds_an_instance_on_another_texture_set() {
+        const SIZE: u32 = 128;
+        let Ok(gpu) = Headless::new() else { return };
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let mut s = Session::new_project("GPU instance stroke", primitives::material_ball(), "builtin:material_ball", None, SIZE).unwrap();
+        let paint = s.selected_layer().unwrap();
+        execute(&mut s, "layer.instance", &json!({"layer": paint.0, "ts": 1})).unwrap();
+        execute(&mut s, "textureSet.select", &json!({"ts": 0})).unwrap();
+        execute(&mut s, "layer.select", &json!({"layer": paint.0})).unwrap();
+        execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [0.9, 0.1, 0.6]})).unwrap();
+        execute(&mut s, "tool.brush", &json!({"size": 10})).unwrap();
+        let covered = |s: &Session, ts: usize, index: usize| s.caches[ts].gbuf.tri.get(index).is_some_and(|&tri| tri != texturecraft_engine::geom::NO_TRI);
+        let index = (0..(SIZE * SIZE) as usize).find(|&index| covered(&s, 0, index) && covered(&s, 1, index)).expect("both sets cover a texel");
+        let (x, y) = (index as u32 % SIZE, index as u32 / SIZE);
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.brush_device = Some(brush.clone());
+        let display = |link: &mut GpuLink, s: &mut Session| -> [[u8; 4]; 2] {
+            let scene = link.sync(s, None, None, 0, 0.0);
+            let gpu = &mut *brush.0.lock().unwrap();
+            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert!(errors.is_empty(), "{errors:?}");
+            let gpu: &Headless = gpu;
+            [0, 1].map(|ts| read_pixel(gpu, gpu.renderer.display_textures()[ts][0], x, y))
+        };
+        let before = display(&mut link, &mut s);
+
+        s.brush_device = link.brush_device(&s);
+        s.begin_stroke_uv(Vec2::new(x as f32 + 0.5, y as f32 + 0.5) / SIZE as f32, 1.0).unwrap();
+        assert!(s.device_stroke().is_some(), "an instance on a set of the same size keeps the stroke on the device");
+        let live = display(&mut link, &mut s);
+        s.end_stroke().unwrap();
+        let committed = display(&mut link, &mut s);
+
+        assert!(live.iter().zip(before).all(|(live, before)| *live != before), "both sets show the stroke live: {live:?}");
+        for (live, committed) in live.into_iter().zip(committed) {
+            assert!(live.into_iter().zip(committed).all(|(a, b)| a.abs_diff(b) <= 1), "live {live:?}, committed {committed:?}");
+        }
     }
 
     /// A stroke carrying picked-up values (here the brush material's pattern) rasterises on the

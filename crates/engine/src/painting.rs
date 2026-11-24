@@ -358,13 +358,7 @@ impl Session {
             && let Some(backend) = &self.brush_device
             && let Some(cache) = self.caches.get(ts)
             && backend.surface.ptr_eq(&std::sync::Arc::downgrade(&cache.gbuf))
-            && target.is_none_or(|target| {
-                self.doc
-                    .project
-                    .sets_drawing(self.paint_owner(target))
-                    .into_iter()
-                    .all(|other| other == ts || self.caches.get(other).is_none_or(|other| other.size != size))
-            }) {
+        {
             let surface = crate::brush_device::BrushSurface {
                 mesh: self.mesh.clone(),
                 bvh: self.bvh.clone(),
@@ -736,13 +730,27 @@ impl Session {
         valid.then_some(device)
     }
 
-    /// Identity and tiles of a supported live stroke since the display last drew it. A pickup
-    /// (clone, smudge, brush material) shows through [`Session::display_stroke_pixels`].
+    /// Identity and tiles of a supported live stroke since the display last drew it, on its own
+    /// texture set or another one it feeds. A pickup (clone, smudge, brush material) shows
+    /// through [`Session::display_stroke_pixels`].
     pub fn pending_display_stroke(&self, ts: usize) -> Option<(u64, &BTreeSet<(u32, u32)>)> {
         let stroke = self.stroke.as_ref()?;
         let tiles = &stroke.display_tiles;
         let can_preview = stroke.stencil.is_none() || stroke.device.is_some();
-        (stroke.ts == ts && stroke.target.is_some() && can_preview).then_some((stroke.display_id, tiles))
+        (self.stroke_feeds(ts) && stroke.target.is_some() && can_preview).then_some((stroke.display_id, tiles))
+    }
+
+    /// Whether texture set `ts` shows the active stroke live: the set it paints, or another set of
+    /// the same size drawing the painted layer (an instance), whose texels are the same pixels
+    fn stroke_feeds(&self, ts: usize) -> bool {
+        let Some(stroke) = self.stroke.as_ref() else { return false };
+        if stroke.ts == ts {
+            return true;
+        }
+
+        let size = |set: usize| self.caches.get(set).map(|cache| cache.size);
+        let same_size = size(ts).is_some() && size(ts) == size(stroke.ts);
+        same_size && stroke.target.is_some_and(|target| self.doc.project.sets_drawing(self.paint_owner(target)).contains(&ts))
     }
 
     /// Copy-on-write material pixels for display. The staged blends are the same tiles the
