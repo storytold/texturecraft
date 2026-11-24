@@ -567,4 +567,75 @@ mod tests {
             [(Filter::Invert, 1.0, BlendMode::Normal, false), on_base(&changed), (Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal, true)];
         assert_lit_matches(&mut gpu, &lit_project(&chain, |_| {}), &baked, true, "after Invert and before a Blur");
     }
+
+    /// The lit sphere's whole material at 2K and 4K, on the CPU and the GPU (warm), for each
+    /// lighting filter. `cargo test … -- --ignored --nocapture bench_lighting`.
+    #[test]
+    #[ignore = "GPU benchmark"]
+    fn bench_lighting() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles};
+        use texturecraft_compose::{ImageStore, PixelStore};
+        use texturecraft_core::{BlendMode, StylizedLighting};
+        use texturecraft_geom::{UvGBuffer, primitives};
+        use texturecraft_texel::TILE;
+
+        use crate::gpu_composite::CompositeProgram;
+        use crate::gpu_composite::oracle::headless;
+
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::sphere(1.0, 64, 32));
+        let baked = lit_bakes(true, true);
+        let environment = Filter::EnvironmentLighting {
+            horizontal: 75.0,
+            vertical: 30.0,
+            exposure: -1.5,
+            height_intensity: 2.5,
+            ambient_occlusion: 0.4,
+            specular_occlusion: 0.8,
+        };
+        let filters = [("stylized", stylized_lighting(StylizedLighting::library())), ("environment", environment)];
+        let (pixels, images) = (PixelStore::default(), ImageStore::default());
+        for size in [2048u32, 4096] {
+            let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, size, size));
+            gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((size, size), 0)], 1);
+            for (name, filter) in &filters {
+                let (project, _) = lit_project(&[(filter.clone(), 1.0, BlendMode::Normal, true)], |project| project.texture_sets[0].resolution = size);
+                let set = &project.texture_sets[0];
+                let inputs = Inputs {
+                    project: &project,
+                    ts: 0,
+                    mesh: &mesh,
+                    gbuf: &gbuf,
+                    pixels: &pixels,
+                    baked: &baked,
+                    block_scales: set.block_scales(),
+                    preview: None,
+                    images: &images,
+                    bounds: mesh.bounds(),
+                };
+                let channels: Vec<_> = set.channels.iter().map(|&(channel, _)| channel).collect();
+                let tiles: Vec<_> = (0..size / TILE).flat_map(|y| (0..size / TILE).map(move |x| (x, y))).collect();
+                let started = Instant::now();
+                let mut oracle = Composite::new(&channels, size);
+                composite_tiles(&inputs, &mut oracle, &tiles);
+                let cpu_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+                let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+                program.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
+                program.set_tile_images(&images);
+                let mut times = Vec::new();
+                for _ in 0..4 {
+                    let started = Instant::now();
+                    gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+                    gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+                    times.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                let warm = times[1..].iter().copied().fold(f64::MAX, f64::min);
+                println!("BENCH {name} {size}²: CPU {cpu_ms:.0} ms, GPU first {:.0} ms, warm {warm:.0} ms", times[0]);
+            }
+        }
+    }
 }
