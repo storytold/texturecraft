@@ -52,6 +52,9 @@ struct Params {
     whole_slots: vec4<u32>,
     whole_bases: vec4<u32>,
     whole_rect: vec4<u32>,
+    // In a pre-pass with compact slots (WholePass::compact in Rust): its first stage slot, its
+    // stage count, the program's first working field, and 1 when active. Zero in the bands.
+    whole_compact: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;

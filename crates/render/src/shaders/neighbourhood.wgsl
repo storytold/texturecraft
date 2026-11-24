@@ -10,7 +10,8 @@ struct Params {
     // the GPU port packages (NeighbourhoodFilter::words).
     field_layout: vec4<u32>,
     extra: array<vec4<f32>, 2>, // The packages' parameters (NeighbourhoodFilter::extra).
-    // What the stage filters (stage_context), whether it wraps (bit 0), reserved.
+    // What the stage filters (stage_context), whether it wraps (bit 0), the first row of an apply
+    // dispatch split by rows (NeighbourhoodGpu::run), reserved.
     stage: vec4<u32>,
     // The set in field-local texels [x0, y0, x1, y1] (NeighbourhoodRegion::bounds). In a wrapping
     // program the field holds periodic copies past the set's edges; a stage that does not wrap
@@ -325,7 +326,8 @@ fn gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
 
 @compute @workgroup_size(8, 8)
 fn apply_neighbourhood(@builtin(global_invocation_id) id: vec3<u32>) {
-    let point = id.xy;
+    // A dispatch split by rows (NeighbourhoodGpu::run under a work budget) starts at row stage.z
+    let point = vec2(id.x, id.y + params.stage.z);
     if any(point >= params.rect.zw) { return; }
     let original = original_at(point);
     var filtered = original.value;

@@ -49,7 +49,10 @@ const PACKAGE_SLOTS: usize = 48;
 /// `whole_rect`), after the package vec4s.
 pub(super) const WHOLE_SET: usize = PACKAGE_SLOTS + 8 * 4;
 /// Words of the band uniform.
-pub(super) const UNIFORM_WORDS: usize = WHOLE_SET + 3 * 4;
+pub(super) const UNIFORM_WORDS: usize = WHOLE_COMPACT + 4;
+/// The whole-set pre-pass's compact slots (`whole_compact` in composite.wgsl): the first stage
+/// slot of the pass, its stage count, the program's first working field, and 1 when active.
+pub(super) const WHOLE_COMPACT: usize = WHOLE_SET + 3 * 4;
 
 /// Opcodes of the packages' effects (`is_extended_effect` in WGSL).
 pub(super) const EXTENDED_EFFECTS: Range<u32> = 128..192;
@@ -1165,8 +1168,10 @@ mod tests {
         let pass = pass.with_stripes(limit - results).expect("the stripes fit beside the results");
         assert!(pass.stripe_bytes() + results <= limit && pass.stripe_rows >= 1);
         // Every stripe's field stays inside the set
-        let rect = pass.field_rect(0, pass.stripe_rows);
-        assert!(rect[0] == 0 && rect[1] == 0 && rect[2] == SIZE && rect[3] <= SIZE, "{rect:?}");
+        for stack in &pass.stages.passes {
+            let rect = pass.field_rect(stack, 0, pass.stripe_rows);
+            assert!(rect[0] == 0 && rect[1] == 0 && rect[2] == SIZE && rect[3] <= SIZE, "{rect:?}");
+        }
     }
 
     #[test]

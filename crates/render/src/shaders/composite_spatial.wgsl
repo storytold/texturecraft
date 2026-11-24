@@ -1,9 +1,22 @@
 // Each scratch texel holds four float components followed by UV coverage, and a sixth word (the
 // stage's input, FilterStage::input in Rust) when params.field_layout.y is set, or three words
 // (the input's colour) when the stride is eight.
+// A whole-set pre-pass keeps only its own stages and the working fields (whole_compact): a slot
+// outside them has no field there (u32 max).
 fn field_word(slot: u32, local: vec2<u32>) -> u32 {
     let size = params.filter_region.zw;
-    return params.filter_stage.x + (slot * size.x * size.y + local.y * size.x + local.x) * params.field_layout.x;
+    var compact = slot;
+    let table = params.whole_compact;
+    if table.w != 0u {
+        if slot >= table.z {
+            compact = table.y + slot - table.z;
+        } else if slot >= table.x && slot - table.x < table.y {
+            compact = slot - table.x;
+        } else {
+            return 0xffffffffu;
+        }
+    }
+    return params.filter_stage.x + (compact * size.x * size.y + local.y * size.x + local.x) * params.field_layout.x;
 }
 
 // The fields' origin in source texels. It lies below zero when the program has a wrapping
