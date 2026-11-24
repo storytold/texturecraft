@@ -37,5 +37,6 @@ tokio = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
+craft-usd.workspace = true
 image = { workspace = true }
 zip = { workspace = true }

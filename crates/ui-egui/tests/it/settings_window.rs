@@ -445,3 +445,31 @@ fn the_baking_options_say_when_there_is_no_gpu_to_trace_on() {
     let no_gpu = h.query_by_label("no GPU").is_some();
     assert_eq!(h.query_by_label(GPU_RAYTRACING_UNAVAILABLE).is_some(), no_gpu, "the note shows with no GPU and only then");
 }
+
+#[test]
+fn recent_project_limit_applies_on_ok_and_persists() {
+    let mut h = harness(Session::closed().unwrap());
+    h.state_mut().ui.recent = (0..8).map(|i| format!("/projects/{i}.tcraft")).collect();
+    open_settings(&mut h);
+    h.get_by_label("Recent projects limit").scroll_to_me();
+    h.run_steps(3);
+    assert!(!h.get_by_label("Recent projects limit").accesskit_node().is_disabled());
+    h.state_mut().ui.windows.settings_draft.as_mut().unwrap().prefs.recent_projects_limit = 3;
+    click(&mut h, "Cancel");
+    assert_eq!(h.state().ui.recent.len(), 8);
+    open_settings(&mut h);
+    h.state_mut().ui.windows.settings_draft.as_mut().unwrap().prefs.recent_projects_limit = 3;
+    click(&mut h, "OK");
+    assert_eq!(h.state().ui.recent, ["/projects/0.tcraft", "/projects/1.tcraft", "/projects/2.tcraft"]);
+    texturecraft_ui_egui::windows::remember(h.state_mut(), "/projects/new.tcraft");
+    assert_eq!(h.state().ui.recent, ["/projects/new.tcraft", "/projects/0.tcraft", "/projects/1.tcraft"]);
+    let mut storage = MemoryStorage::default();
+    eframe::App::save(h.state_mut(), &mut storage);
+    let restored: UiState = serde_json::from_str(&storage.values["ui.json"]).unwrap();
+    assert_eq!(restored.prefs.recent_projects_limit, 3);
+    let ctx = h.ctx.clone();
+    let reply = texturecraft_ui_egui::control::handle(h.state_mut(), &ctx, "ui.set", &serde_json::json!({"prefs":{"recent_projects_limit":0}}));
+    assert_eq!(reply["ok"], true);
+    texturecraft_ui_egui::windows::remember(h.state_mut(), "/projects/another.tcraft");
+    assert!(h.state().ui.recent.is_empty());
+}

@@ -18,7 +18,10 @@ use crate::widgets::{chip, icon_button};
 
 const ICON: f32 = 20.0;
 const LIST_WIDTH: f32 = 190.0;
-const INPUTS_WIDTH: f32 = 170.0;
+/// Width of the input maps column; its naming-pattern row (label, dropdown, info icon) needs about 210
+const INPUTS_WIDTH: f32 = 210.0;
+/// Inner margin of an output map's card
+const CARD_MARGIN: f32 = 6.0;
 const RENAME_ID: &str = "exp_rename";
 /// The name "+" gives a new template, as in the reference
 const NEW_PRESET: &str = "new_export_preset";
@@ -432,13 +435,13 @@ pub(crate) fn ask(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let mut yes = false;
     let (title, text, yes_label, no_label) = match &question {
         Ask::Delete(name) => (
-            tr("Delete template"),
+            tr("Delete Template"),
             trf("Delete the template \"{name}\"? Its file is removed and this cannot be undone.", &[("name", name)]),
             tr("Delete"),
             tr("Cancel"),
         ),
         Ask::Leave(_) => (
-            tr("Unfinished template edit"),
+            tr("Unfinished Template Edit"),
             trf(
                 "The last edit of the template \"{name}\" is not saved: {error}. Switching away drops it.",
                 &[("name", &app.ui.export.preset), ("error", &unfinished(app).unwrap_or_default())],
@@ -447,27 +450,22 @@ pub(crate) fn ask(app: &mut TextureCraftApp, ctx: &egui::Context) {
             tr("Keep editing"),
         ),
     };
-    egui::Window::new(title)
-        .id(egui::Id::unique("export_template_ask"))
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
-        .show(ctx, |ui| {
-            ui.set_max_width(360.0);
-            ui.label(text);
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                yes = ui.button(yes_label).clicked();
-                cancel |= ui.button(no_label).clicked();
-            });
+    let mut open = true;
+    crate::windows::dialog(ctx, "export_template_ask", title, &mut open).default_width(360.0).show(ctx, |ui| {
+        ui.label(text);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            yes = ui.button(yes_label).clicked();
+            cancel |= ui.button(no_label).clicked();
         });
+    });
     if yes {
         app.ui.export.ask = None;
         match question {
             Ask::Delete(name) => remove(app, name),
             Ask::Leave(act) => perform(app, ctx, act),
         }
-    } else if cancel {
+    } else if cancel || !open {
         app.ui.export.ask = None;
     }
 }
@@ -643,9 +641,11 @@ fn outputs(app: &mut TextureCraftApp, ui: &mut Ui) {
             ui.label(RichText::new(tr("No outputs yet: add one above, then drag input maps onto its channels.")).color(tokens.text_dim));
         }
         ui.add_enabled_ui(editable, |ui| {
+            // Every card takes the column's width, not the width a wider card before it left
+            let card_width = ui.available_width();
             for (map_index, map) in preset.maps.iter_mut().enumerate() {
                 let file = preview.as_ref().ok().and_then(|names| names.get(map_index).cloned().flatten());
-                changed |= output_card(ui, map_index, map_count, map, file.as_deref(), &mut action);
+                changed |= output_card(ui, card_width, map_index, map_count, map, file.as_deref(), &mut action);
                 ui.add_space(4.0);
             }
         });
@@ -726,11 +726,11 @@ fn preview_names(app: &mut TextureCraftApp, preset: &ExportPreset) -> Result<Vec
 }
 
 /// One output file: name template, format, bit depth, layout and its channel sources.
-fn output_card(ui: &mut Ui, mi: usize, n: usize, map: &mut MapSpec, file: Option<&str>, action: &mut Option<MapAction>) -> bool {
+fn output_card(ui: &mut Ui, card_width: f32, mi: usize, n: usize, map: &mut MapSpec, file: Option<&str>, action: &mut Option<MapAction>) -> bool {
     let tk = Tokens::get(ui.ctx());
     let mut changed = false;
-    egui::Frame::new().fill(tk.row).corner_radius(tk.radius).inner_margin(6.0).show(ui, |ui| {
-        ui.set_width(ui.available_width());
+    egui::Frame::new().fill(tk.row).corner_radius(tk.radius).inner_margin(CARD_MARGIN).show(ui, |ui| {
+        ui.set_width((card_width - 2.0 * CARD_MARGIN).max(0.0));
         ui.horizontal(|ui| {
             let width = ui.available_width() - 4.0 * (ICON + ui.spacing().item_spacing.x);
             changed |= ui

@@ -1,4 +1,4 @@
-//! Window > Layouts: save the panel arrangement under a name and switch to it from the menu.
+//! Saved named-layout commands remain available to shortcuts and automation after their menu is removed.
 
 use egui::Role;
 use egui_kittest::Harness;
@@ -15,14 +15,23 @@ fn app() -> Harness<'static, TextureCraftApp> {
     harness
 }
 
-/// Open Window > Layouts, click `entry`, and let the app answer
+/// Exercise the existing dialog through a bound shortcut; named layouts are no longer in the menu.
 fn layouts_menu(harness: &mut Harness<'_, TextureCraftApp>, entry: &str) {
-    harness.get_by_role_and_label(Role::Button, "Window").click();
+    let id = match entry {
+        "Save current layout as..." => "ui.layout.saveAs",
+        "Manage layouts..." => "ui.layout.manage",
+        name => {
+            let reply = invoke(harness, serde_json::json!({"id": "ui.layout.apply", "name": name}));
+            assert_eq!(reply["ok"], true);
+            harness.run_steps(3);
+            return;
+        }
+    };
+    harness.state_mut().ui.keymap.insert(id.into(), "F12".into());
+    harness.run_steps(2);
+    harness.key_press(egui::Key::F12);
     harness.run_steps(3);
-    harness.get_by_role_and_label(Role::Button, "Layouts").click();
-    harness.run_steps(3);
-    harness.get_by_role_and_label(Role::Button, entry).click();
-    harness.run_steps(3);
+    harness.state_mut().ui.keymap.remove(id);
 }
 
 /// The dialog's text field: the one nearest the window center, where dialogs open (the shelf search is another)
@@ -43,7 +52,7 @@ fn save_as(harness: &mut Harness<'_, TextureCraftApp>, name: &str) {
 }
 
 #[test]
-fn a_layout_saved_from_the_menu_comes_back_from_the_menu() {
+fn a_layout_saved_from_a_shortcut_comes_back_through_automation() {
     let mut harness = app();
     harness.state_mut().ui.dock.close(Panel::Assets);
     save_as(&mut harness, "No shelf");

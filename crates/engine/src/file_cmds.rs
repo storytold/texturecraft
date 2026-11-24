@@ -58,7 +58,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export textures",
             ["File"],
             None,
-            "{dir, preset?: built-in or user preset name, or a preset object {name, maps}, ts?: index|[indexes]|\"all\", format?: bmp|jpeg|jng|pgm|png|targa|tiff|hdr|exr|webp|psd (or the extension), bitDepth?: 8|16|32 (32 is float for tiff, hdr and exr; 16 is half float for exr), dithering?: bool (8-bit files), padding?: none|dilation|dilationDefault|diffusion|infinite, dilation?: px, size?: px, normalFormat?: openGl|directX, maps?: [{map: index into the preset's maps, enabled?: bool (false leaves the map out), format?, bitDepth?, dithering?}] (per map file type and bit depth), colorSpace?: sRGB (default for 8/16-bit files)|Linear Rec.709 (default for exr, hdr)|ACEScg|ACES2065-1 (colour maps are converted, data maps never are; 8/16-bit files clamp to 0-1; a chosen space is also recorded in the colour maps: an ICC profile in PNG, JPEG, TIFF and WebP, the chromaticities in EXR; TGA, BMP, HDR, JNG, PGM and PSD exports warn about missing metadata), reservedNames?: [file names or UDIM patterns] (from earlier commands of the same export, compared ignoring case), materialX?: bool (also write an OpenPBR .mtlx per texture set, reusing compatible OpenPBR maps and writing dedicated textures for the remaining inputs)} → {files, warnings, materialUdimPatterns?}",
+            "{dir, preset?: built-in or user preset name, or a preset object {name, maps}, ts?: index|[indexes]|\"all\", format?: bmp|jpeg|jng|pgm|png|targa|tiff|hdr|exr|webp|psd (or the extension), bitDepth?: 8|16|32 (32 is float for tiff, hdr and exr; 16 is half float for exr), dithering?: bool (8-bit files), padding?: none|dilation|dilationDefault|diffusion|infinite, dilation?: px, size?: px, normalFormat?: openGl|directX, maps?: [{map: index into the preset's maps, enabled?: bool (false leaves the map out), format?, bitDepth?, dithering?}] (per map file type and bit depth), colorSpace?: sRGB (default for 8/16-bit files)|Linear Rec.709 (default for exr, hdr)|ACEScg|ACES2065-1 (colour maps are converted, data maps never are; 8/16-bit files clamp to 0-1; a chosen space is also recorded in the colour maps: an ICC profile in PNG, JPEG, TIFF and WebP, the chromaticities in EXR; TGA, BMP, HDR, JNG, PGM and PSD exports warn about missing metadata), reservedNames?: [file names or UDIM patterns] (from earlier commands of the same export, compared ignoring case), materialX?: bool (also write an OpenPBR .mtlx per texture set, reusing compatible OpenPBR maps and writing dedicated textures for the remaining inputs), usdAsset?: true|[export params, one object per texture set (not empty)] (also write <mesh>.usd, a binary USD file, next to the textures: the whole mesh, a UsdPreviewSurface material per texture set whose inputs read the files the export wrote with its output template (base color, roughness, metallic, normal, emissive, opacity, clear coat; packed maps read their own channels); a texture set outside the export has none; true takes this command's ts, options and reservedNames, a list gives each texture set's own `ts`, options and `reservedNames`, a file the texture export skipped is not read, the export window sends it with the last command; a failure is a warning)} → {files, warnings, materialUdimPatterns?}",
             always,
             export_textures
         ),
@@ -662,12 +662,13 @@ fn export_textures(session: &mut Session, params: &Value) -> Result<Value> {
     let mut taken_names = reserved_names(params)?;
     let reserved_patterns: Vec<_> = taken_names.keys().filter(|name| name.contains("<udim>")).cloned().collect();
     let material = params.get("materialX").and_then(Value::as_bool).unwrap_or(false);
+    let usd_asset = usd_asset_param(session, params, &options, &sets)?;
     let mut warnings = Vec::new();
     let mut udim_patterns = Vec::new();
 
     std::fs::create_dir_all(dir).map_err(|error| bad("file.exportTextures", format!("cannot create {}: {error}", dir.display())))?;
 
-    let written = if material {
+    let mut written = if material {
         let (fallback, selected_inputs, fallback_inputs) = material_map_options(&options, session.doc.project.normal_format)?;
         let mut textures = BTreeMap::new();
 
@@ -718,6 +719,10 @@ fn export_textures(session: &mut Session, params: &Value) -> Result<Value> {
         texturecraft_formats::write_files(&files, dir).map_err(fe)?
     };
 
+    if let Some(exports) = &usd_asset {
+        written.extend(write_usd_asset(session, dir, exports, &mut warnings));
+    }
+
     session.log.info("MapExporter", format!("Exported {} textures to {}", written.len(), dir.display()));
     let mut response = json!({ "files": written.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(), "warnings": warnings });
     if !udim_patterns.is_empty() {
@@ -725,6 +730,85 @@ fn export_textures(session: &mut Session, params: &Value) -> Result<Value> {
     }
 
     Ok(response)
+}
+
+/// What the warning of a USD asset that could not be written starts with (`file.exportTextures`).
+pub const USD_ASSET_FAILED: &str = "The USD asset was not written";
+
+/// The texture sets, options and `reservedNames` of one export a USD asset refers to.
+#[cfg(not(target_arch = "wasm32"))]
+type UsdAssetExport = (Vec<usize>, ExportOptions, HashMap<String, Option<usize>>);
+
+/// What `usdAsset` asks for: the texture sets, options and `reservedNames` of each export whose
+/// textures the USD asset refers to. `true` is this command's own; a list gives every entry's.
+#[cfg(not(target_arch = "wasm32"))]
+fn usd_asset_param(session: &Session, params: &Value, options: &ExportOptions, sets: &[usize]) -> Result<Option<Vec<UsdAssetExport>>> {
+    match params.get("usdAsset") {
+        None | Some(Value::Null | Value::Bool(false)) => Ok(None),
+        Some(Value::Bool(true)) => Ok(Some(vec![(sets.to_vec(), options.clone(), reserved_names(params)?)])),
+        Some(Value::Array(exports)) if !exports.is_empty() && exports.iter().all(Value::is_object) => exports
+            .iter()
+            .map(|export| {
+                Ok((sets_param(session, export, "file.exportTextures")?, export_options(session, export, "file.exportTextures")?, reserved_names(export)?))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+        Some(_) => Err(bad("file.exportTextures", "`usdAsset` must be true, false or a non-empty list of export param objects")),
+    }
+}
+
+/// `<mesh>.usd` (binary USD) next to the textures: the whole mesh (every texture set, not only the sets of this
+/// command) with a UsdPreviewSurface material per texture set that reads the files `exports`
+/// wrote (see `texturecraft_formats::usd_texture_bindings`). A failure to build or write it is a
+/// warning: the textures of the command are already written.
+#[cfg(not(target_arch = "wasm32"))]
+fn write_usd_asset(session: &Session, dir: &std::path::Path, exports: &[UsdAssetExport], warnings: &mut Vec<String>) -> Option<std::path::PathBuf> {
+    match build_usd_asset(session, dir, exports) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            warnings.push(format!("{USD_ASSET_FAILED}: {error}"));
+            None
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_usd_asset(session: &Session, dir: &std::path::Path, exports: &[UsdAssetExport]) -> Result<std::path::PathBuf> {
+    use texturecraft_formats::{list_outputs, usd_layer_with_textures, usd_texture_bindings};
+    let project = &session.doc.project;
+    let mesh_name = stem_of(project.mesh.trim_start_matches("builtin:"));
+
+    // Keep the files each export kept, by the rule `file.exportTextures` applies to its reserved and earlier names
+    let mut taken_names = HashMap::new();
+    let mut by_set = HashMap::new();
+    for (sets, options, reserved) in exports {
+        for name in reserved.keys() {
+            taken_names.entry(name.clone()).or_insert(None);
+        }
+        let reserved_patterns: Vec<_> = reserved.keys().filter(|name| name.contains("<udim>")).cloned().collect();
+
+        for &set in sets {
+            let texture_set = project.texture_set(set).map_err(|error| EngineError::Other(error.to_string()))?;
+            let mut kept = list_outputs(project, set, &mesh_name, options).map_err(fe)?;
+            let skipped_maps = reserve_export_names(set, &mut kept, &mut taken_names, &reserved_patterns, &mut Vec::new(), false);
+
+            // A map that lost any file (a tile of a UDIM map) is not bound: its `<UDIM>` name would read a file it does not own
+            kept.retain(|file| !skipped_maps.contains(&file.map));
+            by_set.entry(set).or_insert_with(|| usd_texture_bindings(texture_set, options, project.normal_format, &kept));
+        }
+    }
+
+    // A mesh without materials has one implicit material (and texture set)
+    let mut mesh = session.source_mesh();
+    if mesh.materials.is_empty() {
+        mesh.materials.push("default".into());
+    }
+    let bindings: Vec<_> =
+        (0..mesh.materials.len()).map(|material| session.texture_set_of_material(material).and_then(|set| by_set.remove(&set)).unwrap_or_default()).collect();
+    let layer = usd_layer_with_textures(&mesh, &project.name, &bindings).map_err(fe)?;
+    let path = dir.join(format!("{}.usd", texturecraft_formats::export::sanitize_file_stem(&mesh_name)));
+    texturecraft_formats::write_atomic(&path, &layer).map_err(fe)?;
+    Ok(path)
 }
 
 /// Reserve paths and UDIM patterns from earlier commands without assigning them to a current set.

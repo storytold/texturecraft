@@ -76,6 +76,25 @@ fn a_canceled_dialog_changes_nothing() {
 }
 
 #[test]
+fn the_sample_picker_asks_to_save_only_after_a_path_is_chosen() {
+    let mut h = harness(true);
+    answer(&mut h, |_| Answer::Cancelled);
+    invoke(&mut h, "project.sample");
+    assert_eq!(h.state().file_dialogs.pending(), 1);
+    h.run_steps(3);
+    assert!(h.state().ui.windows.unsaved.is_none());
+    assert!(h.state().session.modified);
+
+    let path = PathBuf::from("chosen.tcraft");
+    let selected = path.clone();
+    answer(&mut h, move |_| Answer::Paths(vec![selected.clone()]));
+    invoke(&mut h, "project.sample");
+    h.run_steps(3);
+    assert_eq!(h.state().ui.windows.unsaved, Some(Unsaved::Open(path.display().to_string())));
+    assert!(h.state().session.modified);
+}
+
+#[test]
 fn a_dialog_that_cannot_show_is_reported() {
     let mut h = harness(false);
     answer(&mut h, |_| Answer::Unavailable("no portal".into()));

@@ -92,6 +92,7 @@ fn refresh_draft_preferences(draft: &mut Prefs, previous: &Prefs, current: &Pref
     refresh_fields!(
         ui_scale,
         autosave_minutes,
+        recent_projects_limit,
         language,
         viewport_texture,
         brightness,
@@ -227,6 +228,7 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
                 .map(|item| json!({
                     "menu": item.menu, "submenu": item.sub, "label": item.label, "id": item.id, "shortcut": crate::keymap::shortcut_of(&app.ui.keymap, item.id),
                     "implemented": crate::menus::implemented(item.id), "enabled": crate::menus::enabled(app, item.id),
+                    "checked": crate::menus::checked(app, item.id),
                 }))
                 .collect::<Vec<_>>()
         )),
@@ -283,6 +285,7 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
                         refresh_draft_preferences(&mut draft.prefs, &app.ui.prefs, &ui.prefs);
                     }
 
+                    ui.trim_recent();
                     app.ui = ui;
                     app.reschedule_autosave_if_changed(previous_autosave_minutes);
                     app.ui.prefs.apply_resource_limits();

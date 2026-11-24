@@ -1603,6 +1603,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "web-time",
+ "webbrowser",
  "windows-sys 0.61.2",
  "winit",
 ]
@@ -5173,6 +5174,7 @@ name = "texturecraft-engine"
 version = "0.6.1"
 dependencies = [
  "chrono",
+ "craft-usd",
  "epaint_default_fonts",
  "image",
  "processkit",
@@ -5292,7 +5294,9 @@ dependencies = [
  "craft-quit",
  "craft-ui",
  "craft-update",
+ "craft-usd",
  "craft-window",
+ "craft-zip 0.1.0 (git+https://github.com/storytold/craft-libs?rev=c376774f15ae7cd3b06a7ac664f01a8645af4b83)",
  "eframe",
  "egui",
  "egui-phosphor",
@@ -6017,6 +6021,22 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webbrowser"
+version = "1.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73e91ccd4698f2647d6137e8eb17a3f1dcfd63810be9029fb2398f507279b95b"
+dependencies = [
+ "jni",
+ "log",
+ "ndk-context",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "url",
+ "web-sys",
 ]
 
 [[package]]
@@ -7079,9 +7099,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.8.1"
+version = "9.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9534624d547e3f516ecde0ed9a70d37788f01d340efcfdd03bf3ea8e163c1d0"
+checksum = "2d8dbe089cf6b0448b78f5fc50139ab5aaa40d08ac07cdc1baf2c13add35fcce"
 dependencies = [
  "constant_time_eq",
  "crc32fast",

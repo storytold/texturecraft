@@ -66,5 +66,6 @@ mod tool_availability;
 mod tool_settings;
 mod tools;
 mod udim;
+mod usd_asset;
 mod user_smart_mask;
 mod uv_strokes;

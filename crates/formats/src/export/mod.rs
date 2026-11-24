@@ -589,7 +589,7 @@ fn normal_present(set: &TextureSet) -> bool {
 }
 
 /// A source with real data in this texture set (constants never count).
-fn source_present(set: &TextureSet, s: &SourceRef) -> bool {
+pub(crate) fn source_present(set: &TextureSet, s: &SourceRef) -> bool {
     match s {
         SourceRef::Channel { channel: Channel::Normal, .. } => normal_present(set),
         SourceRef::Channel { channel, .. } => set.has_channel(*channel),

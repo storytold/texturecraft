@@ -68,9 +68,11 @@ that closes it back onto the bar; the float is saved with the UI state.
   *Send to compositing app* and *Send to 3D staging app*. EXPORT has *Export Mesh...* (the
   *Mesh Export Options* prompt, then the file choice) and *Export Textures...* (the Export textures
   window: *Global settings* above the texture sets, *General Export Parameters*, *Export USD asset*
-  and *Export shaders parameters* greyed, *Include all*, *Save settings* and "N textures selected
-  for export"). *Export MaterialX* beside them is a TextureCraft addition: it adds `materialX: true`
-  to the export. The prompt's *With displacement/tessellation* choice and both option checkboxes are
+  (off by default; it adds `usdAsset` to the last texture set's export, which writes `<mesh>.usd`
+  with materials that refer to the exported textures; greyed in the browser), *Export shaders
+  parameters* greyed, *Include all*, *Save settings* and "N textures selected for export").
+  *Export MaterialX* beside them is a TextureCraft addition: it adds `materialX: true` to the
+  export. The prompt's *With displacement/tessellation* choice and both option checkboxes are
   greyed; TextureCraft exports the mesh as it is.
 - **Window menu:** Views lists *Renderer Settings* (a panel of its own: the tracer in use, the
   samples so far and a note; it floats when first opened and is not opened by itself in Rendering

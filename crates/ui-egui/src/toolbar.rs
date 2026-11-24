@@ -6,7 +6,6 @@ use serde_json::json;
 use texturecraft_engine::Tool;
 
 use crate::TextureCraftApp;
-use crate::docking::Panel;
 use crate::drawn_icon::DrawnIcon;
 use crate::i18n::{tr, trf};
 use crate::keymap::{shortcut_of, tip};
@@ -459,10 +458,14 @@ pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
             ui.spacing_mut().item_spacing.y = SHELF_BUTTON_SPACING;
 
             // Rendering has nothing to paint, so its shelf keeps only the buttons below the tools
-            let tools: &[Tool] = match app.ui.mode {
-                Mode::Painting => &SHELF_TOOLS,
-                Mode::Baking => &BAKING_SHELF_TOOLS,
-                Mode::Rendering => &[],
+            let tools: &[Tool] = if !app.ui.toolbar_tools {
+                &[]
+            } else {
+                match app.ui.mode {
+                    Mode::Painting => &SHELF_TOOLS,
+                    Mode::Baking => &BAKING_SHELF_TOOLS,
+                    Mode::Rendering => &[],
+                }
             };
             if !tools.is_empty() {
                 for &tool in tools {
@@ -496,26 +499,10 @@ pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                 ui.add_space(SHELF_GROUP_GAP);
             }
 
-            let quick_mask = &app.session.quick_mask;
-            for (command, icon, label, selected) in [
-                ("viewport.quickMask", ic::SELECTION_BACKGROUND, tr("Quick mask"), quick_mask.enabled),
-                ("viewport.quickMask.edit", ic::SELECTION, tr("Edit quick mask"), quick_mask.editing),
-                ("viewport.quickMask.invert", ic::SELECTION_INVERSE, tr("Invert quick mask"), quick_mask.inverted),
-            ] {
-                let hint = tip(&app.ui.keymap, label, command);
-                let button = ui.add_enabled_ui(crate::menus::enabled(app, command), |ui| icon_button(ui, icon, &hint, selected, SHELF_BUTTON_SIZE)).inner;
-                if button.on_disabled_hover_text(label).clicked() {
-                    app.run(command, json!({}));
-                }
-            }
-
-            ui.add_space(SHELF_GROUP_GAP);
-            ui.separator();
-            ui.add_space(SHELF_GROUP_GAP);
-            let painting = app.ui.mode == Mode::Painting;
-            if ui.add_enabled_ui(painting, |ui| icon_button(ui, ic::SPHERE, tr("Add smart material from the shelf"), false, SHELF_BUTTON_SIZE)).inner.clicked()
-            {
-                app.ui.dock.focus(Panel::Assets);
+            for (icon, label) in [(ic::HOURGLASS, "Snooze Autosave"), (ic::ARROWS_CLOCKWISE, "Resources Updater")] {
+                ui.add_enabled_ui(false, |ui| icon_button(ui, icon, tr(label), false, SHELF_BUTTON_SIZE))
+                    .inner
+                    .on_disabled_hover_text(tr(crate::unavailable::NOT_AVAILABLE));
             }
         });
     });

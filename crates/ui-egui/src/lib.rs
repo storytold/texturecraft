@@ -74,6 +74,8 @@ mod material_orb;
 mod material_preview_image;
 pub mod menus;
 mod mesh_export_options;
+#[cfg(not(target_arch = "wasm32"))]
+mod mode_layout;
 mod move_hold;
 pub mod move_on_model;
 mod name_error;
@@ -128,6 +130,8 @@ pub mod saved_search;
 mod screen_color_pick;
 pub mod screen_pick;
 mod section_page;
+#[cfg(not(target_arch = "wasm32"))]
+mod session_log_file;
 pub mod settings_window;
 pub mod shader_settings;
 pub mod shelf;
@@ -235,6 +239,8 @@ pub struct Toast {
 
 pub struct TextureCraftApp {
     pub session: Session,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) session_log_file: Option<session_log_file::SessionLogFile>,
     viewport_mesh_bounds: viewport_mesh_bounds::ViewportMeshBounds,
     /// A smooth move to a saved camera in progress.
     camera_glide: Option<CameraGlide>,
@@ -369,6 +375,7 @@ impl TextureCraftApp {
         // The first run speaks the OS (or browser) language
         let mut ui_store = ui_state_store::UiStateStore::new(ui_state_store::FILE.get().cloned());
         let mut ui = start_ui(ui_store.load(cc.storage), &mut session);
+        ui.trim_recent();
 
         // No window opens by itself with no project (a saved layout may have left Export open)
         if !session.project_open {
@@ -385,6 +392,8 @@ impl TextureCraftApp {
             uv_rotation_snap: None,
             uv_view_reset: false,
             session,
+            #[cfg(not(target_arch = "wasm32"))]
+            session_log_file: None,
             viewport_mesh_bounds: viewport_mesh_bounds::ViewportMeshBounds::default(),
             ui,
             ui_store,
@@ -456,6 +465,13 @@ impl TextureCraftApp {
         {
             // The first window of the process fixes it; a new folder applies on restart
             let _ = DATA_FOLDER.set(data_folder(&app.ui.prefs.data_folder));
+
+            if cc.winit_window().is_some() {
+                match session_log_file::SessionLogFile::start(&crate::data_dir().join("logs")) {
+                    Ok(file) => app.session_log_file = Some(file),
+                    Err(error) => app.toast(format!("{}: {error}", i18n::tr("Could not create the session log")), true),
+                }
+            }
 
             // An export folder still at the default follows the data folder
             if app.ui.export.dir == data_folder("").join("export").display().to_string() {
@@ -1132,6 +1148,13 @@ impl eframe::App for TextureCraftApp {
         }
         profile::drive(self, ctx);
         self.toasts.retain(|toast| toast.until > now);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(file) = &mut self.session_log_file
+            && let Err(error) = file.sync(self.session.log_id, &self.session.log)
+        {
+            self.session_log_file = None;
+            self.toast(format!("{}: {error}", i18n::tr("Could not update the session log")), true);
+        }
         self.profiler.logic_ms = (now_ms() - logic_start_ms) as f32;
 
         // Last, so it sees every close request this frame's work made
@@ -1152,9 +1175,7 @@ impl eframe::App for TextureCraftApp {
             titlebar::show(self, ui);
             banner(self, ui);
             toolbar::status_bar(self, ui);
-            if self.ui.toolbar_tools {
-                toolbar::tool_shelf(self, ui);
-            }
+            toolbar::tool_shelf(self, ui);
             self.ui.sync_mode_dock();
             if self.ui.mode != state::Mode::Baking && self.ui.toolbar_docks {
                 toolbar::rail(self, ui);

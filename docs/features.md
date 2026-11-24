@@ -179,6 +179,22 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   file type, size or padding, and each output map's file type and bit depth, or leaves a map out;
   Export shows the progress, a console of its steps, the written files and the export's
   warnings (each once), and can be canceled between texture sets).
+- **USD asset export:** the *Export USD asset* checkbox on the Export textures window's Global
+  settings (off by default, remembered with the other settings) also writes `<mesh>.usd` (binary USD) next to
+  the exported textures when the last selected texture set is written. It holds the whole mesh with
+  one UsdPreviewSurface material per texture set; each material refers to the textures that texture
+  set was exported with (its own output template, file type, size and normal format) by relative
+  file name. Base colour, roughness, metallic, normal, emissive colour, opacity, clear coat and clear
+  coat roughness are bound; a packed template (ORM, mask map) binds several inputs to different
+  channels of one file. A UDIM map that lost a tile to an earlier texture set's file name or to a
+  UDIM pattern an earlier MaterialX document of the export uses gets no binding, and a mesh with no materials gets one implicit "default" material bound to the Default
+  texture set. Ambient occlusion, height and specular are not bound (the material has occlusion,
+  displacement and specularColor inputs, but TextureCraft does not fill them), nor are glossiness
+  (no matching input) and baked maps; sheen, anisotropy, transmission, scatter and coat normal have no
+  UsdPreviewSurface input. Colour maps written as sRGB are tagged sRGB, other maps raw; a DirectX normal map is
+  flipped back in the material. A texture set outside the export has no textures in the file. A
+  canceled export writes none, and a failure to write it is a warning. In the browser the option is
+  greyed.
 - **MaterialX export:** the *Export MaterialX* checkbox on the Export textures window's Global
   settings (off by default, remembered with the other settings) writes an OpenPBR `.mtlx` for
   each selected texture set with usable maps. Materials reference textures beside the document.
