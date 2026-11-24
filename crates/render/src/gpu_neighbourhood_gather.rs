@@ -2,15 +2,17 @@
 //! no other package edits this file or `shaders/neighbourhood_gather.wgsl`.
 //!
 //! What P5 implements: FXAA, Anisotropic Kuwahara (structure tensor pass, then a sector gather),
-//! Height To Normal (the layer's own Height in the field's sixth word while filtering Normal),
 //! Warp (`SourceWarp`) and Blur Slope (`SourceSlopeBlur`) with every mode, blending and source,
-//! Mirror and Transform (whole-UV-tile reach), and Color Match (the whole set's mean: a reduction
-//! pass, then a point map). Custom inputs read the sixth word that P3's inputs write.
+//! Mirror and Transform (whole-UV-tile reach), and Color Match (the whole set's mean: two
+//! reduction passes, then a point map). Height To Normal still composites on the CPU: its Normal
+//! stage needs the layer's own Height content in the field's sixth word, which no prepare-pass
+//! hook evaluates yet. Image inputs read their unlinked default (mid gray); a linked input still
+//! composites on the CPU (`effect_needs_cpu`).
 //!
 //! P5 also owns the whole-tile and whole-set field path in `GpuCompositor::compose`
 //! (gpu_composite.rs: band planning and the prepare loop; no other package touches `compose`)
-//! and may write `params.packages[4]` there. Whole-set fields do not fit the band scratch (plan
-//! risk 1): plan a pre-pass that writes the stage result into a texture.
+//! and may write `params.packages[4]` there. Stages reading a UV tile or the whole set
+//! ([`whole_set`]) run in P0f's whole-set pre-pass (plan risk 1), so no band carries their reach.
 //!
 //! How:
 //! - [`supports`] and [`new`] take every filter the built-in stages reject. Kinds: `GATHER_KINDS`
@@ -57,6 +59,9 @@ const SOURCE_SLOPE_BLUR: Kind = Kind(GATHER_KINDS.start + 3);
 const MIRROR: Kind = Kind(GATHER_KINDS.start + 4);
 /// Transform: the bilinear read its affine gives in its UV tile (`transform_texel`), whole-set.
 const TRANSFORM: Kind = Kind(GATHER_KINDS.start + 5);
+/// Color Match: every colour moved from its source to its target in OKLab (`color_match` in
+/// eval.rs); Average reads the whole set's mean, summed by two reduction passes of its own.
+const COLOR_MATCH: Kind = Kind(WHOLE_SET_KINDS.start);
 
 /// Texels an FXAA edge search walks each way along an edge at most (`FXAA_SEARCH` in eval.rs).
 const FXAA_SEARCH: u32 = 8;
@@ -71,10 +76,6 @@ const MIRROR_Y: u32 = 2;
 const MIRROR_KEEP_RIGHT: u32 = 4;
 const MIRROR_KEEP_BOTTOM: u32 = 8;
 const MIRROR_DEBUG: u32 = 16;
-
-/// Color Match: every colour moved from its source to its target in OKLab (`color_match` in
-/// eval.rs); Average reads the whole set's mean, summed by two reduction passes of its own.
-const COLOR_MATCH: Kind = Kind(WHOLE_SET_KINDS.start);
 
 /// Flag bits of a Color Match stage's `words[0]` (the same constants in the WGSL file): the source
 /// is the set's mean, and Custom Color Variation.
@@ -153,7 +154,16 @@ fn flag(on: bool, bit: u32) -> u32 {
 
 /// Whether a P5 stage evaluates `filter` as the CPU does.
 pub(super) fn supports(filter: &Filter) -> bool {
-    matches!(filter, Filter::Fxaa { .. } | Filter::AnisotropicKuwahara(_) | Filter::ColorMatch(_) | Filter::SourceWarp(_) | Filter::SourceSlopeBlur(_) | Filter::Mirror(_) | Filter::Transform(_))
+    matches!(
+        filter,
+        Filter::Fxaa { .. }
+            | Filter::AnisotropicKuwahara(_)
+            | Filter::SourceWarp(_)
+            | Filter::SourceSlopeBlur(_)
+            | Filter::Mirror(_)
+            | Filter::Transform(_)
+            | Filter::ColorMatch(_)
+    )
 }
 
 /// The P5 stage for `filter`, None when its size reaches nothing.
@@ -387,7 +397,7 @@ pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
         COLOR_MATCH => COLOR_MATCH_WORK,
         // The four texels round the read, one at a time
         TRANSFORM => 4 * SAMPLE_WORK,
-        _ => 8,
+        _ => SAMPLE_WORK,
     }
 }
 
@@ -457,9 +467,9 @@ mod tests {
 
     use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
     use texturecraft_core::{
-        AnisotropicKuwahara, BlendMode, ColorMatch, SourceColorMode, TargetColorMode, Channel, ContentsOffset, Effect, EffectKind, Filter, FlipMode, HeightToNormal, Layer, LayerId, LayerKind, Mask, MaskBackground, Mirror,
-        MirrorCorner, MirrorMode, Project, RepeatMode, SlopeBlending, SourceSlopeBlur, SourceWarp, TextureSet, TileTransform, WarpBlending, WarpMode,
-        WarpSource, WarpSourceMode,
+        AnisotropicKuwahara, BlendMode, Channel, ColorMatch, ContentsOffset, Effect, EffectKind, Filter, FlipMode, HeightToNormal, Layer, LayerId, LayerKind,
+        Mask, MaskBackground, Mirror, MirrorCorner, MirrorMode, Project, RepeatMode, SlopeBlending, SourceColorMode, SourceSlopeBlur, SourceWarp,
+        TargetColorMode, TextureSet, TileTransform, WarpBlending, WarpMode, WarpSource, WarpSourceMode,
     };
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TileImage, to_u16, to_u16_signed};
@@ -838,48 +848,23 @@ mod tests {
     #[test]
     fn mirror_matches_the_cpu() {
         let Some(mut gpu) = headless() else { return };
-        let normal = BlendMode::Normal;
-        let mut cases: Vec<(String, Stack, BlendMode)> =
-            mirrors().into_iter().map(|mirror| (format!("{mirror:?}"), vec![(Filter::Mirror(mirror), 1.0, normal)], normal)).collect();
-        let library = Filter::Mirror(Mirror::LIBRARY);
-        cases.extend([
-            ("Mirror under Multiply".to_string(), vec![(library.clone(), 0.7, normal)], BlendMode::Multiply),
-            ("Mirror disabled".to_string(), vec![(library.clone(), 1.0, BlendMode::Disable)], normal),
-            (
-                "Mirror between filters".to_string(),
-                vec![(Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal), (library.clone(), 0.85, normal), (Filter::Invert, 1.0, normal)],
-                normal,
-            ),
-            ("Mirror before a blur".to_string(), vec![(Filter::Invert, 1.0, normal), (library, 0.85, normal), (Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal)], normal),
-        ]);
-        let cases: Vec<(&str, Stack, BlendMode)> = cases.iter().map(|(label, stack, blend)| (label.as_str(), stack.clone(), *blend)).collect();
+        let cases = filter_cases(mirrors().into_iter().map(Filter::Mirror), &Filter::Mirror(Mirror::LIBRARY));
 
-        assert!(check_cases(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
+        assert!(check_labelled(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
     }
 
     /// Transform matches the CPU turning, scaling, moving and flipping, repeating and not, through
-    /// the whole-set pre-pass: below full opacity under Multiply, disabled, between filters and in
-    /// a partial update.
+    /// the whole-set pre-pass: below full opacity under Multiply, disabled, between filters, before
+    /// a mirror and in a partial update.
     #[test]
     fn transform_matches_the_cpu() {
         let Some(mut gpu) = headless() else { return };
         let normal = BlendMode::Normal;
-        let mut cases: Vec<(String, Stack, BlendMode)> =
-            transforms().into_iter().map(|transform| (format!("{transform:?}"), vec![(Filter::Transform(transform), 1.0, normal)], normal)).collect();
         let turned = Filter::Transform(TileTransform { rotation: 30.0, tile_safe: false, ..TileTransform::LIBRARY });
-        cases.extend([
-            ("Transform under Multiply".to_string(), vec![(turned.clone(), 0.7, normal)], BlendMode::Multiply),
-            ("Transform disabled".to_string(), vec![(turned.clone(), 1.0, BlendMode::Disable)], normal),
-            (
-                "Transform between filters".to_string(),
-                vec![(Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal), (turned.clone(), 0.85, normal), (Filter::Invert, 1.0, normal)],
-                normal,
-            ),
-            ("Transform before a mirror".to_string(), vec![(turned, 1.0, normal), (Filter::Mirror(Mirror::LIBRARY), 0.9, normal)], normal),
-        ]);
-        let cases: Vec<(&str, Stack, BlendMode)> = cases.iter().map(|(label, stack, blend)| (label.as_str(), stack.clone(), *blend)).collect();
+        let mut cases = filter_cases(transforms().into_iter().map(Filter::Transform), &turned);
+        cases.push(("Transform before a mirror".to_string(), vec![(turned, 1.0, normal), (Filter::Mirror(Mirror::LIBRARY), 0.9, normal)], normal));
 
-        assert!(check_cases(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
+        assert!(check_labelled(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
     }
 
     /// Mirror and Transform under a wrapping Blur, on paint across the set's edges: the pre-pass
