@@ -358,7 +358,11 @@ impl SetCompositor {
         let brush = if let Some(brush) = session.device_stroke().filter(|_| stroke.is_some()) {
             let coverage = brush.stroke.as_any().downcast_ref::<GpuBrushStroke>().ok_or(n_("This painting tool uses CPU compositing."))?;
             let target = match brush.target {
-                PaintTarget::Layer(layer) if brush.erase => LiveBrushTarget::Layer { layer, values: erased_channels(&session.doc.pixels, layer, brush.values) },
+                PaintTarget::Layer(layer) if brush.erase => {
+                    // The channels the commit erases; their values are unused
+                    let channels = texturecraft_engine::paint::commit::commit_channels(&session.doc.pixels, layer, brush.values, true);
+                    LiveBrushTarget::Layer { layer, values: channels.into_iter().map(|channel| (channel, [0.0; 3])).collect() }
+                }
                 PaintTarget::Layer(layer) => LiveBrushTarget::Layer { layer, values: brush.values.clone() },
                 PaintTarget::Mask(effect) => LiveBrushTarget::Mask { effect, value: brush.mask_value },
             };
@@ -400,14 +404,6 @@ impl SetCompositor {
         self.stroke = stroke_id;
         Ok(Some(program))
     }
-}
-
-/// The channels an erase stroke on paint layer `layer` clears, as its commit does: every painted
-/// channel, or only those in `values` when it lists any. Their values are unused.
-#[cfg(not(target_arch = "wasm32"))]
-fn erased_channels(pixels: &texturecraft_engine::compose::PixelStore, layer: LayerId, values: &BTreeMap<Channel, [f32; 3]>) -> BTreeMap<Channel, [f32; 3]> {
-    let erased = |(id, channel): &&(LayerId, Channel)| *id == layer && (values.is_empty() || values.contains_key(channel));
-    pixels.layers.keys().filter(erased).map(|(_, channel)| (*channel, [0.0; 3])).collect()
 }
 
 struct MaskPreview {
