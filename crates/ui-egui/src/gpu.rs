@@ -2741,7 +2741,8 @@ pub(crate) mod tests {
         let close = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 1);
 
         // (case, paints a mask, erases Height only, mask view)
-        let cases = [("layer", false, false, false), ("layer, Height only", false, true, false), ("mask", true, false, false), ("mask view", true, false, true)];
+        let cases =
+            [("layer", false, false, false), ("layer, Height only", false, true, false), ("mask", true, false, false), ("mask view", true, false, true)];
         for (case, on_mask, height_only, mask_view) in cases {
             let mut s = Session::new_project("GPU eraser", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
             if on_mask {
@@ -2801,7 +2802,8 @@ pub(crate) mod tests {
         let paint_path = |s: &mut Session| {
             execute(s, "tool.path", &json!({"uvPoints": [[0.2, 0.5], [0.5, 0.45], [0.8, 0.5]], "commit": true})).unwrap();
         };
-        let base_color = |s: &Session| s.doc.pixels.layers.iter().find(|((_, channel), _)| *channel == Channel::BaseColor).map(|(_, image)| image.clone()).unwrap();
+        let base_color =
+            |s: &Session| s.doc.pixels.layers.iter().find(|((_, channel), _)| *channel == Channel::BaseColor).map(|(_, image)| image.clone()).unwrap();
         let mut cpu = new_session();
         paint_path(&mut cpu);
         let mut s = new_session();

@@ -866,6 +866,7 @@ impl Session {
         } else {
             commit(&stroke.canvas.dirty, None);
         }
+        let fed_before = self.fed_revisions(&stroke);
         self.undo.push((stroke.label.clone(), stroke.before));
         if self.undo.len() > crate::session::MAX_HISTORY {
             self.undo.remove(0);
@@ -875,7 +876,6 @@ impl Session {
         self.revision = self.revision.wrapping_add(1);
 
         let previous_revision = self.caches.get(stroke.ts).map_or(0, |cache| cache.material_revision);
-        let fed_before = self.fed_revisions(&stroke);
         // Recompute committed tiles at low priority because the live preview already shows them
         self.mark_settle(stroke.ts, stroke.target, stroke.canvas.dirty.iter().copied());
         let revision_of = |set: usize| self.caches.get(set).map_or(0, |cache| cache.material_revision);

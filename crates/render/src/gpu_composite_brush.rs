@@ -140,7 +140,9 @@ mod tests {
 
         // The layer erases its Height only; the content effect every channel it painted
         let height_only = BTreeMap::from([(Channel::Height, [0.0; 3])]);
-        for (target, values) in [(PaintTarget::Layer(layer_id), height_only), (PaintTarget::Layer(content_id), BTreeMap::new()), (PaintTarget::Mask(mask_id), BTreeMap::new())] {
+        for (target, values) in
+            [(PaintTarget::Layer(layer_id), height_only), (PaintTarget::Layer(content_id), BTreeMap::new()), (PaintTarget::Mask(mask_id), BTreeMap::new())]
+        {
             let preview = StrokePreview {
                 target,
                 alpha: stroke_alpha.clone(),
