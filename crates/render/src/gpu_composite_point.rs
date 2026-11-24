@@ -38,7 +38,8 @@
 //! for each setting value, set to Disable too, at opacity below 1 with a non-Normal blend.
 
 use texturecraft_core::{
-    ChannelKind, ConversionMode, CurvePreset, Effect, Filter, GradientInput, GrayscaleMode, ImageInput, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, finite_unit, lum,
+    ChannelKind, ConversionMode, CurvePreset, Effect, Filter, GradientInput, GrayscaleMode, ImageInput, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN,
+    finite_unit, lum,
 };
 use texturecraft_texel::linear_to_srgb;
 

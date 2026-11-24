@@ -11,9 +11,8 @@ use rayon::prelude::*;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, ContentsOffset, CurvatureDetail, CurvatureMode, Effect, EffectKind,
-    Filter, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Sampling, Source,
-    ThresholdMode,
+    BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, ContentsOffset, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter,
+    Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Sampling, Source, ThresholdMode,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};

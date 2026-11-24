@@ -45,7 +45,8 @@ use texturecraft_core::{
 
 use super::packages::{STACK_OP_BITS, STACK_OPCODES};
 use super::{
-    CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, NEIGHBOURHOOD_OPCODE, Operation, ProceduralInputs, bind_tile_source, channel_slot, source_operation,
+    CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, NEIGHBOURHOOD_OPCODE, Operation, ProceduralInputs, bind_tile_source, channel_slot,
+    source_operation,
 };
 use crate::gpu_image_source::ImageUse;
 use crate::gpu_tile_pattern::TilePatterns;
@@ -170,7 +171,9 @@ fn reads_own_layer(op: &Operation) -> bool {
 /// that comparison reads would lack its filters (the hub orders them later).
 pub(super) fn reads_own_layer_before_stage(mask: &[Operation]) -> bool {
     let Some(first) = mask.iter().position(reads_own_layer) else { return false };
-    mask[first + 1..].iter().any(|op| op.ids[1] == NEIGHBOURHOOD_OPCODE || ((FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]) && op.spatial[1] != 0))
+    mask[first + 1..]
+        .iter()
+        .any(|op| op.ids[1] == NEIGHBOURHOOD_OPCODE || ((FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]) && op.spatial[1] != 0))
 }
 
 /// A folder mask's comparison: the CPU's This Layer of a folder is the stack below the folder
@@ -295,7 +298,6 @@ mod tests {
         assert!(compile_effects(Some(image_input.clone()), None, none).0.is_err());
         let (material, mask) = compile_effects(None, Some(image_input), none);
         assert!(material.is_err() && mask.is_err());
-
 
         // A mask filter stage after This Layer: the prepare pass builds the mask's fields before the
         // layer's content fields, so the filtered content is not there yet (the hub orders them later)
@@ -822,7 +824,11 @@ mod tests {
         for y in 22..103 {
             for x in 23..98 {
                 let gain = if x >= 63 { 1.0 } else { 0.65 };
-                pixels.layer_mut(owner, Channel::BaseColor, (SIZE, SIZE)).set(x, y, &[to_u16(0.7 * gain), to_u16(0.2 * gain), to_u16(0.3 * gain), to_u16(gain)]);
+                pixels.layer_mut(owner, Channel::BaseColor, (SIZE, SIZE)).set(
+                    x,
+                    y,
+                    &[to_u16(0.7 * gain), to_u16(0.2 * gain), to_u16(0.3 * gain), to_u16(gain)],
+                );
                 pixels.layer_mut(owner, Channel::Roughness, (SIZE, SIZE)).set(x, y, &[to_u16(0.8 * gain), to_u16(gain)]);
                 pixels.layer_mut(owner, Channel::Height, (SIZE, SIZE)).set(x, y, &[to_u16_signed(0.5 * gain), to_u16(gain)]);
                 pixels.layer_mut(owner, Channel::Normal, (SIZE, SIZE)).set(x, y, &[to_u16(0.3 * gain), to_u16(0.6 * gain), to_u16(0.9 * gain), to_u16(gain)]);
@@ -1013,7 +1019,11 @@ mod tests {
         let anchored = || Some(Source::Anchor { anchor: BELOW_ANCHOR, channel: Channel::BaseColor, ramp: Vec::new() });
         let tiles = || {
             let tile = texturecraft_core::TileGenerator { amount: [6, 6], ..texturecraft_core::TileGenerator::default() };
-            let pattern = texturecraft_core::Procedural { tile: Some(Box::new(tile)), seed: 73, ..texturecraft_core::Procedural::new(texturecraft_core::ProceduralKind::TileGenerator) };
+            let pattern = texturecraft_core::Procedural {
+                tile: Some(Box::new(tile)),
+                seed: 73,
+                ..texturecraft_core::Procedural::new(texturecraft_core::ProceduralKind::TileGenerator)
+            };
             Some(Source::Procedural { pattern, low: [0.1, 0.2, 0.3], high: [0.9, 0.7, 0.5], ramp: Vec::new() })
         };
         use texturecraft_core::ConversionMode::*;
