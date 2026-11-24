@@ -5,6 +5,8 @@
 
 // The P5 kinds (gpu_neighbourhood_gather.rs)
 const GATHER_FXAA: u32 = 32u;
+const GATHER_MIRROR: u32 = 36u;
+const GATHER_TRANSFORM: u32 = 37u;
 
 // FXAA (fxaa_texel in eval.rs): the edge search, the least contrast it smooths and the most a
 // lone texel blends in
@@ -14,6 +16,14 @@ const GATHER_FXAA_EDGE_RELATIVE: f32 = 0.125;
 const GATHER_FXAA_SUBPIXEL: f32 = 0.75;
 // Flag bit of an FXAA stage's words[0]: Affect Alpha Channel
 const GATHER_FXAA_ALPHA: u32 = 1u;
+
+// Flag bits of a Mirror stage's words[0]: the axes it mirrors across, whether each copies its
+// right (bottom) side, and Display Debug
+const GATHER_MIRROR_X: u32 = 1u;
+const GATHER_MIRROR_Y: u32 = 2u;
+const GATHER_MIRROR_KEEP_RIGHT: u32 = 4u;
+const GATHER_MIRROR_KEEP_BOTTOM: u32 = 8u;
+const GATHER_MIRROR_DEBUG: u32 = 16u;
 
 const GATHER_LARGEST_FINITE: f32 = 3.402823466e38;
 
@@ -150,6 +160,120 @@ fn gather_fxaa(home: vec2<f32>, center: vec4<f32>) -> Texel {
     return EMPTY;
 }
 
+// value.rem_euclid(modulus) as Rust computes it for a positive modulus: the truncated remainder,
+// moved up by the modulus when below zero
+fn gather_rem_euclid(value: f32, modulus: f32) -> f32 {
+    let remainder = value - modulus * trunc(value / modulus);
+    return select(remainder, remainder + modulus, remainder < 0.0);
+}
+
+// Rounding half away from zero, as Rust's f32::round (WGSL's round goes to even)
+fn gather_round(value: f32) -> f32 {
+    let whole = floor(abs(value));
+    return sign(value) * (whole + select(0.0, 1.0, abs(value) - whole >= 0.5));
+}
+
+// The top left of the UV tile (`side` texels) a home position lies in
+fn gather_tile_origin(home: vec2<f32>, side: f32) -> vec2<f32> {
+    return floor(home / side) * side;
+}
+
+// A tile coordinate folded back into 0..1 at the tile's edges, as a mirror reflects (fold in
+// core's mirror.rs)
+fn gather_fold(at: f32) -> f32 {
+    let wrapped = gather_rem_euclid(at, 2.0);
+    return select(wrapped, 2.0 - wrapped, wrapped > 1.0);
+}
+
+// Where along one axis a mirror reads (Mirror::source): the copied side reads across the axis
+fn gather_mirror_across(at: f32, axis: f32, keep_after: bool) -> f32 {
+    let copied = select(at > axis, at < axis, keep_after);
+    return gather_fold(select(at, 2.0 * axis - at, copied));
+}
+
+// Mirror at home position `home` (mirror_texel in eval.rs): the texel its tile's kept side gives,
+// or white on a debug axis
+fn gather_mirror(home: vec2<f32>, original: vec4<f32>) -> Texel {
+    let flags = params.field_layout.z;
+    let axes = params.extra[0].xy;
+    let line = params.extra[0].z;
+    let side = params.extra[0].w;
+    let origin = gather_tile_origin(home, side);
+    let local = home - origin;
+    if local.x >= side || local.y >= side {
+        return EMPTY;
+    }
+
+    let uv = (local + 0.5) / side;
+    let on_x = (flags & GATHER_MIRROR_X) != 0u && abs(uv.x - axes.x) <= line;
+    let on_y = (flags & GATHER_MIRROR_Y) != 0u && abs(uv.y - axes.y) <= line;
+    if (flags & GATHER_MIRROR_DEBUG) != 0u && (on_x || on_y) {
+        // Content stays premultiplied by its own coverage
+        if gather_is_content() {
+            return Texel(vec4(original.w), 1.0);
+        }
+        return Texel(vec4(1.0, original.yzw), 1.0);
+    }
+
+    var source = uv;
+    if (flags & GATHER_MIRROR_X) != 0u {
+        source.x = gather_mirror_across(uv.x, axes.x, (flags & GATHER_MIRROR_KEEP_RIGHT) != 0u);
+    }
+    if (flags & GATHER_MIRROR_Y) != 0u {
+        source.y = gather_mirror_across(uv.y, axes.y, (flags & GATHER_MIRROR_KEEP_BOTTOM) != 0u);
+    }
+
+    // Whole texels, so an even mirror copies texels exactly
+    let texel = vec2(gather_round(source.x * side - 0.5), gather_round(source.y * side - 0.5));
+    return gather_read(origin + clamp(texel, vec2(0.0), vec2(side - 1.0)));
+}
+
+// Transform at home position `home` (transform_texel in eval.rs): bilinear between the four
+// texels round where its affine reads in the tile, each wrapped round the tile; where it does not
+// repeat, a read past the tile counts as empty
+fn gather_transform(home: vec2<f32>) -> Texel {
+    let columns = params.extra[0];
+    let shift = params.extra[1].xy;
+    let side = params.extra[1].z;
+    let repeats = params.field_layout.z != 0u;
+    let origin = gather_tile_origin(home, side);
+    let local = home - origin;
+    if local.x >= side || local.y >= side {
+        return EMPTY;
+    }
+
+    // Texel space of the tile, centres at whole numbers
+    let uv = (local + 0.5) / side;
+    let at = vec2(columns.x * uv.x + columns.z * uv.y + shift.x, columns.y * uv.x + columns.w * uv.y + shift.y) * side - 0.5;
+    if !gather_finite(at.x) || !gather_finite(at.y) {
+        return EMPTY;
+    }
+
+    let base = floor(at);
+    let t = at - base;
+    var total = EMPTY;
+    for (var corner = 0u; corner < 4u; corner++) {
+        let offset = vec2(f32(corner & 1u), f32(corner >> 1u));
+        let weights = select(1.0 - t, t, offset > vec2(0.5));
+        let weight = weights.x * weights.y;
+        if weight <= 0.0 {
+            continue;
+        }
+        let texel = base + offset;
+        let inside = texel.x >= 0.0 && texel.x < side && texel.y >= 0.0 && texel.y < side;
+        if !repeats && !inside {
+            // Empty: no value, full weight
+            total.coverage += weight;
+            continue;
+        }
+
+        // One whole texel: the read's own weights, so this matches its bilinear read
+        let one = gather_read(origin + vec2(gather_rem_euclid(texel.x, side), gather_rem_euclid(texel.y, side)));
+        total = Texel(total.value + one.value * weight, total.coverage + one.coverage * weight);
+    }
+    return total;
+}
+
 // Whether a P5 kind runs the three box passes first (gather::uses_box must agree).
 fn gather_family_uses_box(kind: u32) -> bool {
     return false;
@@ -172,6 +296,10 @@ fn gather_family_gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
         if (flags & GATHER_FXAA_ALPHA) == 0u {
             acc = gather_keep_coverage(acc, original.w);
         }
+    } else if kind == GATHER_MIRROR {
+        acc = gather_mirror(home, original);
+    } else if kind == GATHER_TRANSFORM {
+        acc = gather_transform(home);
     } else {
         return original;
     }
