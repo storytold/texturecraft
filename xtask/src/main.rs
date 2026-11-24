@@ -145,6 +145,19 @@ fn cmd_wasm() -> Result<(), String> {
     if failed == 0 { Ok(()) } else { Err(format!("{failed} package(s) failed the wasm check")) }
 }
 
+/// `cargo test --workspace`. On Linux with two malloc arenas: the render tests compile many GPU
+/// pipelines on Mesa llvmpipe, which keeps what it compiled until the process ends, and the
+/// default per-thread arenas fragment that memory (the fill_projection tests peak at 3.7 GB
+/// instead of 5.6 GB). A value set by the caller wins.
+fn cmd_test() -> Result<(), String> {
+    let mut c = cargo();
+    c.args(["test", "--workspace"]);
+    if cfg!(target_os = "linux") && std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        c.env("MALLOC_ARENA_MAX", "2");
+    }
+    run(c, "cargo test --workspace")
+}
+
 fn cmd_ci() -> Result<(), String> {
     let cargo_step = |args: &'static [&'static str]| {
         move || {
@@ -159,7 +172,7 @@ fn cmd_ci() -> Result<(), String> {
         ("fmt", Box::new(cargo_step(&["fmt", "--all", "--", "--check"]))),
         ("layers", Box::new(cmd_layers)),
         ("clippy", Box::new(cargo_step(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))),
-        ("test", Box::new(cargo_step(&["test", "--workspace"]))),
+        ("test", Box::new(cmd_test)),
         ("wasm", Box::new(cmd_wasm)),
     ];
     for (i, (name, step)) in steps.iter().enumerate() {

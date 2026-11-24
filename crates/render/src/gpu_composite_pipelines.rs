@@ -177,10 +177,19 @@ enum Slot {
 }
 
 impl Slot {
-    /// The pipeline once compiled
-    fn ready(&mut self) -> Option<wgpu::ComputePipeline> {
+    /// The pipeline once compiled; `wait` waits for a compile in flight (a caller that compiles
+    /// in place, after a pre-warm started one on a worker thread)
+    fn ready(&mut self, wait: bool) -> Option<wgpu::ComputePipeline> {
         if let Slot::Compiling(compiled) = self {
-            let pipeline = compiled.lock().unwrap_or_else(PoisonError::into_inner).take()?;
+            let pipeline = loop {
+                if let Some(pipeline) = compiled.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                    break pipeline;
+                }
+                if !wait {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
             *self = Slot::Ready(pipeline);
         }
         match self {
@@ -286,14 +295,14 @@ impl CompositePipelines {
             Slot::Ready(compile())
         };
         let grouped = program.groups.depth != 0;
-        let render = variants.render[usize::from(grouped)].get_or_insert_with(|| pipeline("compose", "tc_gpu_composite", grouped)).ready();
+        let render = variants.render[usize::from(grouped)].get_or_insert_with(|| pipeline("compose", "tc_gpu_composite", grouped)).ready(!asynchronous);
         // Only material anchor capture needs to walk the group structure while preparing a source.
         let grouped_capture = grouped && features.material_anchors;
         let prepare = match features.spatial {
             true => Some(
                 variants.prepare[usize::from(grouped_capture)]
                     .get_or_insert_with(|| pipeline("prepare_filter", "tc_spatial_source", grouped_capture))
-                    .ready()?,
+                    .ready(!asynchronous)?,
             ),
             false => None,
         };
