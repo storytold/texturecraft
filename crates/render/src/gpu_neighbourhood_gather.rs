@@ -626,6 +626,7 @@ mod tests {
             Mirror { invert: [true, false], offset: [0.3, 0.5], ..library },
             Mirror { mode: MirrorMode::AxisY, offset: [0.5, 0.7], ..library },
             Mirror { mode: MirrorMode::AxisY, invert: [false, true], ..library },
+            Mirror { mode: MirrorMode::Corner, corner: MirrorCorner::TopLeft, ..library },
             Mirror { mode: MirrorMode::Corner, corner: MirrorCorner::TopRight, ..library },
             Mirror { mode: MirrorMode::Corner, corner: MirrorCorner::BottomLeft, ..library },
             Mirror { mode: MirrorMode::Corner, corner: MirrorCorner::BottomRight, debug: true, ..library },
@@ -642,6 +643,7 @@ mod tests {
             TileTransform { scaling: [2.0, 0.5], offset: [0.1, -0.2], repeat: RepeatMode::None, ..library },
             TileTransform { scaling: [0.7, 1.3], rotation: 200.0, tile_safe: false, repeat: RepeatMode::None, ..library },
             TileTransform { flip: FlipMode::Horizontally, offset: [0.25, 0.0], ..library },
+            TileTransform { flip: FlipMode::Vertically, offset: [0.0, 0.3], ..library },
             TileTransform { flip: FlipMode::HorizontallyAndVertically, rotation: 90.0, ..library },
         ]
     }
@@ -696,6 +698,7 @@ mod tests {
                 if !painted {
                     continue;
                 }
+
                 let (alpha, tone) = if across_edges {
                     (if at_y < 64 { 1.0 } else { 0.65 }, if at_x < 64 { 0.8 } else { 0.4 })
                 } else {
@@ -784,6 +787,39 @@ mod tests {
         let cases = filter_cases(color_matches().into_iter().map(Filter::ColorMatch), &Filter::ColorMatch(ColorMatch::LIBRARY));
 
         assert!(check_labelled(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::TRANSCENDENTAL).is_some());
+    }
+
+    /// Color Match's Average over a layer that covers nothing falls back to its target, as the CPU
+    /// does: the mean's passes leave no texel changed, every map and the mask match.
+    #[test]
+    fn color_match_over_nothing_covered_matches_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let normal = BlendMode::Normal;
+        let stack = vec![(Filter::ColorMatch(ColorMatch::LIBRARY), 1.0, normal)];
+        let (project, _, owner) = painted_project(&stack, normal, MIDDLE_PAINT).unwrap();
+        let (pixels, baked, images) = (PixelStore::default(), BakedMaps::default(), ImageStore::default());
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+        case.mask_owner = Some(owner);
+        case.region = Some(MIDDLE);
+
+        assert_matches_cpu(&mut gpu, &case, Tolerance::TRANSCENDENTAL, "Color Match over nothing covered");
+    }
+
+    /// Color Match and Anisotropic Kuwahara under a wrapping Blur, on paint across the set's
+    /// edges: the mean counts each texel of the set once, and the ellipses read each texel's copy.
+    #[test]
+    fn color_match_and_kuwahara_under_a_wrapping_blur_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let normal = BlendMode::Normal;
+        let wrapped = Filter::Blur { radius: 160.0, wrap: true };
+        let widest = AnisotropicKuwahara { radius: AnisotropicKuwahara::MAX_RADIUS, ..AnisotropicKuwahara::LIBRARY };
+        let cases = [
+            ("Color Match under a wrapping Blur", vec![(Filter::ColorMatch(ColorMatch::LIBRARY), 1.0, normal), (wrapped.clone(), 1.0, normal)], normal),
+            ("Kuwahara under a wrapping Blur", vec![(Filter::AnisotropicKuwahara(widest), 1.0, normal), (wrapped, 1.0, normal)], normal),
+        ];
+
+        assert!(check_cases(&mut gpu, &cases, EDGE_PAINT, CORNER, GATHER_DECISIONS).is_some());
     }
 
     /// Anisotropic Kuwahara matches the CPU through its structure tensor pass, at the library's

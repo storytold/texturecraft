@@ -12,8 +12,7 @@ const GATHER_MIRROR: u32 = 36u;
 const GATHER_TRANSFORM: u32 = 37u;
 const GATHER_COLOR_MATCH: u32 = 48u;
 
-// FXAA (fxaa_texel in eval.rs): the edge search, the least contrast it smooths and the most a
-// lone texel blends in
+// FXAA (fxaa_texel in eval.rs): edge search, least contrast and most subpixel blend
 const GATHER_FXAA_SEARCH: i32 = 8;
 const GATHER_FXAA_EDGE_MIN: f32 = 0.0312;
 const GATHER_FXAA_EDGE_RELATIVE: f32 = 0.125;
@@ -21,8 +20,7 @@ const GATHER_FXAA_SUBPIXEL: f32 = 0.75;
 // Flag bit of an FXAA stage's words[0]: Affect Alpha Channel
 const GATHER_FXAA_ALPHA: u32 = 1u;
 
-// Flag bits of a Mirror stage's words[0]: the axes it mirrors across, whether each copies its
-// right (bottom) side, and Display Debug
+// Flag bits of a Mirror stage's words[0]: axes, copied sides and Display Debug
 const GATHER_MIRROR_X: u32 = 1u;
 const GATHER_MIRROR_Y: u32 = 2u;
 const GATHER_MIRROR_KEEP_RIGHT: u32 = 4u;
@@ -33,8 +31,7 @@ const GATHER_MIRROR_DEBUG: u32 = 16u;
 const GATHER_COLOR_MATCH_AVERAGE: u32 = 1u;
 const GATHER_COLOR_MATCH_CUSTOM_VARIATION: u32 = 2u;
 
-// Anisotropic Kuwahara (kuwahara_texel in eval.rs): the ellipse's sample rows each side, its
-// sectors, the least tensor with a direction, the samples' falloff and the spread's 8-bit scale
+// Anisotropic Kuwahara (kuwahara_texel in eval.rs): ellipse steps, sectors and weights
 const GATHER_KUWAHARA_STEPS: i32 = 6;
 const GATHER_KUWAHARA_SECTORS: u32 = 8u;
 const GATHER_MIN_TENSOR: f32 = 1e-12;
@@ -46,8 +43,7 @@ const GATHER_PI: f32 = 3.141592653589793;
 const GATHER_HALF_PI: f32 = 1.5707963267948966;
 const GATHER_TAU: f32 = 6.283185307179586;
 
-// Bit fields of a Warp's or Blur Slope's words[0]: the warp mode, the blending, the directions,
-// the source's mode, whether the source repeats within the UV tile, and the read count
+// Bit fields of a Warp's or Blur Slope's words[0] (gather::source_warp, source_slope_blur)
 const GATHER_WARP_MODE_SHIFT: u32 = 0u;
 const GATHER_BLENDING_SHIFT: u32 = 2u;
 const GATHER_DIRECTION_COUNT_SHIFT: u32 = 4u;
@@ -63,8 +59,7 @@ const GATHER_SLOPE_BLENDING_BLUR: u32 = 0u;
 const GATHER_SLOPE_BLENDING_MAX: u32 = 2u;
 const GATHER_SOURCE_DEFAULT_NOISE: u32 = 0u;
 const GATHER_SOURCE_CUSTOM_NOISE: u32 = 2u;
-// Mid gray, the source value that moves nothing, and how far noise is stretched from it
-// (WarpSource in core)
+// Mid gray moves nothing; noise is stretched from it (WarpSource in core)
 const GATHER_MID_GRAY: f32 = 0.5;
 const GATHER_NOISE_STRETCH: f32 = 1.5;
 // Octaves of a warp's default noise (texel_noise in eval.rs)
@@ -75,8 +70,7 @@ const GATHER_FULL_SLOPE: f32 = 4.0;
 const GATHER_FLAT_STEEPNESS: f32 = 1e-6;
 // A content read covering less alpha than this has no colour (MIN_ALPHA in eval.rs)
 const GATHER_MIN_ALPHA: f32 = 1e-5;
-// The gray an image input reads until one is linked (ImageInput's default): linked inputs still
-// composite on the CPU (effect_needs_cpu)
+// An unlinked image input's gray (ImageInput's default); linked inputs stay on the CPU
 const GATHER_INPUT_DEFAULT: f32 = 0.5;
 
 const GATHER_LARGEST_FINITE: f32 = 3.402823466e38;
@@ -90,10 +84,7 @@ fn gather_is_content() -> bool {
     return stage_context() != STAGE_MASK;
 }
 
-// How far the texel being written lies from its home copy of the set, in texels. A wrapping
-// program's fields hold periodic copies past the set's edges: positions are worked out at home
-// (noise, UV tiles, mirrors) and read in the texel's own copy, as the CPU's wrapped lower stages
-// are evaluated over the set and read periodically
+// Offset of the texel's copy of the set from its home copy (wrapping programs' periodic fields)
 var<private> gather_shift: vec2<f32> = vec2(0.0);
 
 // The home position of the texel at absolute position `point`, which sets gather_shift
@@ -117,15 +108,16 @@ fn gather_luma(value: vec4<f32>) -> f32 {
     if gather_is_content() {
         return 0.3 * value.x + 0.59 * value.y + 0.11 * value.z;
     }
+
     return value.x;
 }
 
-// A read recoloured over the texel's own alpha `own` (keep_coverage in eval.rs; content only):
-// no weight where the read carries no alpha
+// A read laid on the texel's own alpha `own` (keep_coverage in eval.rs; content only)
 fn gather_keep_coverage(acc: Texel, own: f32) -> Texel {
     if !gather_is_content() {
         return acc;
     }
+
     if acc.value.w <= MIN_WEIGHT {
         return EMPTY;
     }
@@ -140,6 +132,7 @@ fn gather_fxaa_luma(home: vec2<f32>, own: f32) -> f32 {
     if found.coverage <= MIN_WEIGHT {
         return own;
     }
+
     return gather_luma(found.value / found.coverage);
 }
 
@@ -157,8 +150,7 @@ fn gather_fxaa_walk(home: vec2<f32>, perp: vec2<f32>, along: vec2<f32>, way: f32
     return end;
 }
 
-// FXAA at home position `home` with premultiplied components `center`: the read across its edge
-// by how near the edge's end is (fxaa_texel in eval.rs); no weight where nothing blends
+// FXAA at `home`: the read across its edge, no weight where nothing blends (fxaa_texel in eval.rs)
 fn gather_fxaa(home: vec2<f32>, center: vec4<f32>) -> Texel {
     let own = gather_luma(center);
     let n = gather_fxaa_luma(home + vec2(0.0, -1.0), own);
@@ -211,6 +203,7 @@ fn gather_fxaa(home: vec2<f32>, center: vec4<f32>) -> Texel {
     if blend > 0.0 {
         return gather_read(home + perp * blend);
     }
+
     return EMPTY;
 }
 
@@ -219,13 +212,12 @@ fn gather_finite_unit(value: f32) -> f32 {
     return select(0.0, clamp(value, 0.0, 1.0), gather_finite(value));
 }
 
-// An image input's gray at home position `home` (the input closure of gather in eval.rs):
-// bilinear over the covered texels, (gray, 1), or (0, 0) where it covers nothing. Until one is
-// linked an input reads its default everywhere it covers
+// An unlinked image input at `home`: (default, 1) where covered, else (0, 0)
 fn gather_input(home: vec2<f32>) -> vec2<f32> {
     if gather_read(home).coverage > MIN_WEIGHT {
         return vec2(GATHER_INPUT_DEFAULT, 1.0);
     }
+
     return vec2(0.0);
 }
 
@@ -235,9 +227,7 @@ fn gather_direction(index: u32) -> vec2<f32> {
     return select(pair.xy, pair.zw, index % 2u == 1u);
 }
 
-// A warp's or slope blur's source at `position` before it is shaped (WarpSourceSample::raw):
-// (value, 1), or (0, 0) where the values it reads cover nothing. `texel` is the home position of
-// the texel being written, whose UV tile a repeating source stays in
+// A warp's source at `position` before shaping, (value, found); `texel` picks the repeat's tile
 fn gather_source_raw(texel: vec2<f32>, position: vec2<f32>) -> vec2<f32> {
     let flags = params.field_layout.z;
     let mode = (flags >> GATHER_SOURCE_MODE_SHIFT) & 3u;
@@ -246,6 +236,7 @@ fn gather_source_raw(texel: vec2<f32>, position: vec2<f32>) -> vec2<f32> {
         if !gather_finite(height) {
             return vec2(GATHER_MID_GRAY, 1.0);
         }
+
         return vec2(clamp(GATHER_MID_GRAY + (height - GATHER_MID_GRAY) * GATHER_NOISE_STRETCH, 0.0, 1.0), 1.0);
     }
 
@@ -274,6 +265,7 @@ fn gather_source_raw(texel: vec2<f32>, position: vec2<f32>) -> vec2<f32> {
     if found.coverage > MIN_WEIGHT {
         return vec2(found.value.x / found.coverage, 1.0);
     }
+
     return vec2(0.0);
 }
 
@@ -308,6 +300,7 @@ fn gather_source_at(texel: vec2<f32>, position: vec2<f32>) -> f32 {
     if steepness == 0.0 {
         return select(0.0, 1.0, balanced >= GATHER_MID_GRAY);
     }
+
     return gather_finite_unit((balanced - GATHER_MID_GRAY) / steepness + GATHER_MID_GRAY);
 }
 
@@ -316,8 +309,7 @@ fn gather_warp_amount(value: f32) -> f32 {
     return select(0.0, clamp(2.0 * value - 1.0, -1.0, 1.0), gather_finite(value));
 }
 
-// The largest (or smallest) of reads, component by component (keep_extreme_read in
-// warp_texel.rs): reads that cover nothing are skipped
+// The per-component extreme of the covered reads (keep_extreme_read in warp_texel.rs)
 struct GatherExtreme {
     picked: vec4<f32>,
     found: bool,
@@ -333,6 +325,7 @@ fn gather_extreme_add(extreme: GatherExtreme, home: vec2<f32>, larger: bool) -> 
     if !extreme.found {
         return GatherExtreme(value, true);
     }
+
     return GatherExtreme(select(min(extreme.picked, value), max(extreme.picked, value), larger), true);
 }
 
@@ -340,6 +333,7 @@ fn gather_extreme_texel(extreme: GatherExtreme) -> Texel {
     if !extreme.found {
         return EMPTY;
     }
+
     return Texel(extreme.picked, 1.0);
 }
 
@@ -428,25 +422,26 @@ fn gather_source_slope_blur(home: vec2<f32>) -> Texel {
     return gather_extreme_texel(extreme);
 }
 
-// atan2 as Rust computes it where y is zero (0, or a half turn for negative x), which WGSL
-// leaves to the implementation at the origin
+// atan2 with Rust's results where y is zero, which WGSL leaves open at the origin
 fn gather_atan2(y: f32, x: f32) -> f32 {
     if y == 0.0 {
         return select(0.0, GATHER_PI, x < 0.0);
     }
+
     return atan2(y, x);
 }
 
-// The gray Kuwahara takes its direction from at home position `home`: its custom input, or the
-// luma of the values it filters; (gray, 1), or (0, 0) off the UV island
+// Kuwahara's direction gray at `home`: its custom input or the luma, (gray, found)
 fn gather_kuwahara_gray(home: vec2<f32>) -> vec2<f32> {
     if (params.field_layout.z & GATHER_KUWAHARA_CUSTOM_INPUT) != 0u {
         return gather_input(home);
     }
+
     let found = gather_read(home);
     if found.coverage <= MIN_WEIGHT {
         return vec2(0.0);
     }
+
     return vec2(gather_luma(found.value / found.coverage), 1.0);
 }
 
@@ -456,9 +451,7 @@ fn gather_kuwahara_gray_or(home: vec2<f32>, offset: vec2<f32>, own: vec2<f32>) -
     return select(own, gray, gray.y > 0.0);
 }
 
-// The ellipse of the texel at home position `home`: (cos, sin) of its direction, then its semi
-// axes along and across it. The structure tensor of the gray's gradients over a 3 × 3 grid
-// spread by Tensor Smoothness, the middle weighing most
+// The ellipse at `home` from the structure tensor: (cos, sin, along, across)
 fn gather_kuwahara_ellipse(home: vec2<f32>) -> vec4<f32> {
     let radius = params.extra[0].x;
     let spread = params.extra[0].y * radius;
@@ -502,8 +495,7 @@ fn gather_kuwahara_ellipse(home: vec2<f32>) -> vec4<f32> {
     return vec4(frame, radius * (1.0 + stretch), radius / (1.0 + stretch));
 }
 
-// Kuwahara's structure tensor pass: each covered texel's ellipse (gather_kuwahara_ellipse) into
-// the field at buffers.z, which the apply pass reads at buffers.y
+// Kuwahara's tensor pass: each covered texel's ellipse into buffers.z
 @compute @workgroup_size(8, 8)
 fn gather_kuwahara_frame(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= params.rect.z || id.y >= params.rect.w {
@@ -518,8 +510,7 @@ fn gather_kuwahara_frame(@builtin(global_invocation_id) id: vec3<u32>) {
     write_at(params.buffers.z, id.xy, Texel(ellipse, 0.0));
 }
 
-// Anisotropic Kuwahara at home position `home` with its ellipse `ellipse` (kuwahara_texel in
-// eval.rs): its sectors' means weighed by their calm
+// Anisotropic Kuwahara at `home`: its sectors' means weighed by their calm (kuwahara_texel in eval.rs)
 fn gather_kuwahara(home: vec2<f32>, ellipse: vec4<f32>) -> Texel {
     let content = gather_is_content();
     let sector_exponent = params.extra[0].z;
@@ -548,6 +539,7 @@ fn gather_kuwahara(home: vec2<f32>, ellipse: vec4<f32>) -> Texel {
             if found.coverage <= MIN_WEIGHT {
                 continue;
             }
+
             var value = found.value / found.coverage;
             var squared = value.x * value.x;
             if content {
@@ -565,6 +557,7 @@ fn gather_kuwahara(home: vec2<f32>, ellipse: vec4<f32>) -> Texel {
                     if facing <= 0.0 {
                         continue;
                     }
+
                     weight = falloff * pow(facing, sector_exponent);
                 }
                 sums[sector] += weight * value;
@@ -583,6 +576,7 @@ fn gather_kuwahara(home: vec2<f32>, ellipse: vec4<f32>) -> Texel {
         if weight <= MIN_WEIGHT {
             continue;
         }
+
         let mean = sums[sector] / weight;
         var mean_squared = mean.x * mean.x;
         if content {
@@ -603,6 +597,7 @@ fn gather_kuwahara(home: vec2<f32>, ellipse: vec4<f32>) -> Texel {
         if weight <= MIN_WEIGHT {
             continue;
         }
+
         let share = exp(logs[sector] - top);
         total = Texel(total.value + share * sums[sector] / weight, total.coverage + share);
     }
@@ -633,9 +628,7 @@ fn gather_read_words(start: u32) -> vec4<f32> {
     return bitcast<vec4<f32>>(vec4(fields[start], fields[start + 1u], fields[start + 2u], fields[start + 3u]));
 }
 
-// Color Match's mean, first pass: one row's premultiplied colour and alpha summed over the
-// texels of the set with alpha (mean_region_color in eval.rs), four words per row at buffers.z.
-// A wrapping program's periodic copies past the set's edges count once, in the set
+// Color Match's mean, pass 1: each row's premultiplied sums over the set, four words per row
 @compute @workgroup_size(64)
 fn gather_color_match_rows(@builtin(global_invocation_id) id: vec3<u32>) {
     let row = id.x;
@@ -656,8 +649,7 @@ fn gather_color_match_rows(@builtin(global_invocation_id) id: vec3<u32>) {
     gather_write_words(params.buffers.z + row * 4u, total.sum);
 }
 
-// Color Match's mean, second pass: the rows' sums at buffers.y totalled into the mean colour and
-// whether any texel had alpha, four words at buffers.z
+// Color Match's mean, pass 2: the rows totalled into the mean and whether any texel had alpha
 @compute @workgroup_size(1)
 fn gather_color_match_total(@builtin(global_invocation_id) id: vec3<u32>) {
     var total = GatherSum(vec4(0.0), vec4(0.0));
@@ -703,19 +695,17 @@ fn gather_linear(lab: vec3<f32>) -> vec3<f32> {
     );
 }
 
-// A colour's reference for the match: its OKLab, polar (lightness, chroma, hue) with Custom
-// Color Variation (PreparedColorMatch in core)
+// A colour's OKLab reference, polar with Custom Color Variation (PreparedColorMatch in core)
 fn gather_color_reference(color: vec3<f32>, polar: bool) -> vec3<f32> {
     let lab = gather_oklab(max(color, vec3(0.0)));
     if !polar {
         return lab;
     }
+
     return vec3(lab.x, sqrt(lab.y * lab.y + lab.z * lab.z), gather_atan2(lab.z, lab.y));
 }
 
-// Color Match on premultiplied `original` (color_match in eval.rs): its colour moved by the step
-// from the source to the target, keeping at most Hue, Chroma and Luma of its difference from the
-// source with Custom Color Variation (ColorMatch::move_polar). Colour content only
+// Color Match on colour content (color_match in eval.rs, ColorMatch::move_polar)
 fn gather_color_match(original: vec4<f32>) -> vec4<f32> {
     let alpha = original.w;
     if stage_context() != STAGE_COLOR || !(alpha > 0.0) || !gather_finite(alpha) {
@@ -756,8 +746,7 @@ fn gather_color_match(original: vec4<f32>) -> vec4<f32> {
     return vec4(result * alpha, alpha);
 }
 
-// value.rem_euclid(modulus) as Rust computes it for a positive modulus: the truncated remainder,
-// moved up by the modulus when below zero
+// Rust's rem_euclid for a positive modulus
 fn gather_rem_euclid(value: f32, modulus: f32) -> f32 {
     let remainder = value - modulus * trunc(value / modulus);
     return select(remainder, remainder + modulus, remainder < 0.0);
@@ -774,8 +763,7 @@ fn gather_tile_origin(home: vec2<f32>, side: f32) -> vec2<f32> {
     return floor(home / side) * side;
 }
 
-// A tile coordinate folded back into 0..1 at the tile's edges, as a mirror reflects (fold in
-// core's mirror.rs)
+// A tile coordinate folded back into 0..1, as a mirror reflects (fold in core's mirror.rs)
 fn gather_fold(at: f32) -> f32 {
     let wrapped = gather_rem_euclid(at, 2.0);
     return select(wrapped, 2.0 - wrapped, wrapped > 1.0);
@@ -787,8 +775,7 @@ fn gather_mirror_across(at: f32, axis: f32, keep_after: bool) -> f32 {
     return gather_fold(select(at, 2.0 * axis - at, copied));
 }
 
-// Mirror at home position `home` (mirror_texel in eval.rs): the texel its tile's kept side gives,
-// or white on a debug axis
+// Mirror at `home`: its tile's kept side, or white on a debug axis (mirror_texel in eval.rs)
 fn gather_mirror(home: vec2<f32>, original: vec4<f32>) -> Texel {
     let flags = params.field_layout.z;
     let axes = params.extra[0].xy;
@@ -808,6 +795,7 @@ fn gather_mirror(home: vec2<f32>, original: vec4<f32>) -> Texel {
         if gather_is_content() {
             return Texel(vec4(original.w), 1.0);
         }
+
         return Texel(vec4(1.0, original.yzw), 1.0);
     }
 
@@ -824,9 +812,7 @@ fn gather_mirror(home: vec2<f32>, original: vec4<f32>) -> Texel {
     return gather_read(origin + clamp(texel, vec2(0.0), vec2(side - 1.0)));
 }
 
-// Transform at home position `home` (transform_texel in eval.rs): bilinear between the four
-// texels round where its affine reads in the tile, each wrapped round the tile; where it does not
-// repeat, a read past the tile counts as empty
+// Transform at `home`: bilinear over its tile, empty past it unless it repeats (transform_texel in eval.rs)
 fn gather_transform(home: vec2<f32>) -> Texel {
     let columns = params.extra[0];
     let shift = params.extra[1].xy;
@@ -855,6 +841,7 @@ fn gather_transform(home: vec2<f32>) -> Texel {
         if weight <= 0.0 {
             continue;
         }
+
         let texel = base + offset;
         let inside = texel.x >= 0.0 && texel.x < side && texel.y >= 0.0 && texel.y < side;
         if !repeats && !inside {
@@ -916,5 +903,6 @@ fn gather_family_gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
     if gather_is_content() {
         return result;
     }
+
     return vec4(result.x, original.yzw);
 }
