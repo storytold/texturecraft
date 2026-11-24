@@ -1327,8 +1327,12 @@ mod tests {
         let radial = FillSymmetry { on: true, kind: SymmetryKind::Radial, axis: 1, count: 64, position: OFF_POLE, ..FillSymmetry::OFF };
         let triplanar = Projection::Triplanar { scale: 2.5, sharpness: 4.0, offset: [0.0; 3], uv: UvTransform::default(), projector: Projector::default() };
         let hq = Sampling { filtering: Filtering::BilinearHq, ..Sampling::SAVED_BEFORE };
+        // Cropped small, no copy covers a texel alone, so every texel evaluates all 64
+        let cropped = Projector { crop: ShapeCrop::Cropped, ..Projector::default() };
+        let small = Projection::Planar { scale: 3.0, axis: 2, offset: [0.0; 3], uv: UvTransform::default(), projector: cropped, placed: None };
         let cases = [
             ("radial 64, tri-planar, bilinear HQ", triplanar, Sampling { symmetry: radial, ..hq }, false),
+            ("radial 64, cropped planar, bilinear HQ", small, Sampling { symmetry: radial, ..hq }, false),
             ("plain bilinear HQ fill", Projection::default(), Sampling::default(), true),
         ];
         println!("adapter: {}", gpu.adapter_name);
