@@ -351,10 +351,11 @@ impl SetCompositor {
         let brush = if let Some(brush) = session.device_stroke().filter(|brush| brush.ts == ts && stroke.is_some()) {
             let coverage = brush.stroke.as_any().downcast_ref::<GpuBrushStroke>().ok_or(n_("This painting tool uses CPU compositing."))?;
             let target = match brush.target {
+                PaintTarget::Layer(layer) if brush.erase => LiveBrushTarget::Layer { layer, values: erased_channels(&session.doc.pixels, layer, brush.values) },
                 PaintTarget::Layer(layer) => LiveBrushTarget::Layer { layer, values: brush.values.clone() },
                 PaintTarget::Mask(effect) => LiveBrushTarget::Mask { effect, value: brush.mask_value },
             };
-            Some(LiveBrush { target, opacity: brush.opacity, alpha: coverage.view(), stencil: coverage.stencil() })
+            Some(LiveBrush { target, opacity: brush.opacity, erase: brush.erase, alpha: coverage.view(), stencil: coverage.stencil() })
         } else {
             None
         };
@@ -392,6 +393,14 @@ impl SetCompositor {
         self.stroke = stroke_id;
         Ok(Some(program))
     }
+}
+
+/// The channels an erase stroke on paint layer `layer` clears, as its commit does: every painted
+/// channel, or only those in `values` when it lists any. Their values are unused.
+#[cfg(not(target_arch = "wasm32"))]
+fn erased_channels(pixels: &texturecraft_engine::compose::PixelStore, layer: LayerId, values: &BTreeMap<Channel, [f32; 3]>) -> BTreeMap<Channel, [f32; 3]> {
+    let erased = |(id, channel): &&(LayerId, Channel)| *id == layer && (values.is_empty() || values.contains_key(channel));
+    pixels.layers.keys().filter(erased).map(|(_, channel)| (*channel, [0.0; 3])).collect()
 }
 
 struct MaskPreview {
@@ -2705,6 +2714,51 @@ pub(crate) mod tests {
         assert!(s.doc.pixels.layer(layer, Channel::BaseColor).is_some());
         let committed = display_at_center(link.sync(&mut s, None, None, 0, 0.0));
         assert!(committed.iter().zip(&live).all(|(a, b)| a.abs_diff(*b) <= 1), "{committed:?} vs {live:?}");
+    }
+
+    /// The Eraser on a paint layer and on a mask runs on the GPU brush, and its live preview shows
+    /// what the release commits
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn gpu_eraser_previews_what_it_commits_on_layers_and_masks() {
+        let Ok(gpu) = Headless::new() else { return };
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let display = |link: &mut GpuLink, s: &mut Session| -> [u8; 4] {
+            let scene = link.sync(s, None, None, 0, 0.0);
+            let gpu = &mut *brush.0.lock().unwrap();
+            let (_, errors) = scene.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
+            assert!(errors.is_empty(), "{errors:?}");
+            let texture = gpu.renderer.display_textures()[0][0];
+            read_center(gpu, texture)
+        };
+        let close = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 1);
+        for on_mask in [false, true] {
+            let mut s = Session::new_project("GPU eraser", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+            if on_mask {
+                execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+                execute(&mut s, "mask.add.black", &json!({})).unwrap();
+            } else {
+                execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [0.9, 0.3, 0.1]})).unwrap();
+            }
+            execute(&mut s, "tool.brush", &json!({"size": 40})).unwrap();
+            s.stroke_uv_points(&[Vec2::splat(0.5)]).unwrap();
+            let mut link = link();
+            link.gpu_composite_enabled = true;
+            link.brush_device = Some(brush.clone());
+            let painted = display(&mut link, &mut s);
+
+            execute(&mut s, "tool.eraser", &json!({})).unwrap();
+            execute(&mut s, "tool.brush", &json!({"opacity": 60})).unwrap();
+            s.brush_device = link.brush_device(&s);
+            s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+            assert!(s.device_stroke().is_some_and(|stroke| stroke.erase), "mask {on_mask}: the Eraser runs on the device");
+            let live = display(&mut link, &mut s);
+            s.end_stroke().unwrap();
+            let committed = display(&mut link, &mut s);
+
+            assert_ne!(live, painted, "mask {on_mask}: the erase shows while it is drawn");
+            assert!(close(live, committed), "mask {on_mask}: live {live:?}, committed {committed:?}");
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]

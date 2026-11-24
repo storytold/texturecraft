@@ -34,6 +34,16 @@ use super::packages::BRUSH_OP_BITS;
 /// Library filter ids P7 still leaves on the CPU (see `gpu_composite_packages.rs`).
 pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
 
+/// The `ext[2]` bit (one of [`BRUSH_OP_BITS`]) of a live paint operation whose stroke erases;
+/// `BRUSH_ERASE` in WGSL
+const BRUSH_ERASE: u32 = 0x0100_0000;
+
+/// The P7 bits of a live paint operation's `ext[2]`: zero leaves the premultiplied over of
+/// `painted()` in composite.wgsl
+pub(super) fn live_paint_bits(erase: bool) -> u32 {
+    if erase { BRUSH_ERASE } else { 0 }
+}
+
 pub(super) const WGSL: &str = include_str!("shaders/composite_brush.wgsl");
 /// The same functions without P7's code, for programs that do not use it.
 pub(super) const WGSL_STUB: &str =

@@ -339,11 +339,11 @@ impl Session {
             history_label(stroke_template(tool, on_mask), &self.stroke_layer_name())
         };
         let settings = &stroke.settings;
-        let gpu_tool = tool == Tool::Paint || (quick_mask && erase) || (tool == Tool::Projection && !uv_mode && stencil.is_some());
+        let gpu_tool = tool == Tool::Paint || erase || (tool == Tool::Projection && !uv_mode && stencil.is_some());
         // Resolved once: staging, both previews and the commit paint this gray
         let mask_gray = self.mask_gray();
-        // The device previews one gray; a mask image paints on the CPU
-        let image_mask = matches!(target, Some(PaintTarget::Mask(_))) && matches!(mask_gray, MaskGray::Image { .. });
+        // The device previews one gray; a mask image paints on the CPU, and erasing reads no gray
+        let image_mask = !erase && matches!(target, Some(PaintTarget::Mask(_))) && matches!(mask_gray, MaskGray::Image { .. });
         if image_mask && gpu_tool && self.brush_device.is_some() {
             self.log.performance("Brush: CPU (mask image)");
         }
@@ -667,11 +667,11 @@ impl Session {
         let stroke = self.stroke.as_ref()?;
         let target = stroke.target?;
 
-        // The gray resolved when the stroke began; a layer stroke paints channel values, so only a mask target reads it
+        // The gray resolved when the stroke began; a layer stroke paints channel values and erasing reads no gray, so only painting a mask reads it
         let mask_value = match (&stroke.mask_gray, target) {
             (MaskGray::Value(value), _) => value.clamp(0.0, 1.0),
-            (MaskGray::Image { .. }, PaintTarget::Layer(_)) => 0.0,
-            (MaskGray::Image { .. }, PaintTarget::Mask(_)) => return None,
+            (MaskGray::Image { .. }, PaintTarget::Mask(_)) if !stroke.erase => return None,
+            (MaskGray::Image { .. }, _) => 0.0,
         };
         Some(DeviceStrokePreview {
             ts: stroke.ts,
@@ -679,6 +679,7 @@ impl Session {
             values: &stroke.values,
             mask_value,
             opacity: stroke.stroke.settings.opacity,
+            erase: stroke.erase,
             stroke: stroke.device.as_deref()?,
         })
     }
