@@ -33,12 +33,13 @@
 //! product) on paint and in a mask, chained, and with a partial region.
 
 use texturecraft_core::{
-    AnisotropicKuwahara, ChannelKind, ColorMatch, Effect, Filter, HeightToNormal, ImageInput, Mirror, MirrorMode, RepeatMode, SlopeBlending, SourceColorMode, SourceSlopeBlur,
-    SourceWarp, TargetColorMode, TileTransform, WarpBlending, WarpMode, WarpSource, WarpSourceMode, finite_unit, oklab,
+    AnisotropicKuwahara, ChannelKind, ColorMatch, Effect, Filter, HeightToNormal, ImageInput, Mirror, MirrorMode, RepeatMode, SlopeBlending, SourceColorMode,
+    SourceSlopeBlur, SourceWarp, TargetColorMode, TileTransform, WarpBlending, WarpMode, WarpSource, WarpSourceMode, finite_unit, oklab,
 };
 
 use super::{
-    APPLY_WORKGROUP, BUDGET, GATHER_KINDS, Kind, LINE_WORKGROUP, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs, WHOLE_SET_KINDS,
+    APPLY_WORKGROUP, BUDGET, GATHER_KINDS, Kind, LINE_WORKGROUP, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs,
+    WHOLE_SET_KINDS,
 };
 
 /// Library filter ids P5 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
@@ -217,14 +218,7 @@ fn kuwahara_stage(stage: StageInputs, kuwahara: &AnisotropicKuwahara) -> Neighbo
     let anisotropy = if kuwahara.anisotropy.is_finite() { kuwahara.anisotropy.clamp(0.0, 1.0) } else { AnisotropicKuwahara::LIBRARY.anisotropy };
 
     let mut out = stage.filter(KUWAHARA, radius * (2.0 + tensor_reach) + 1.0);
-    out.extra[..6].copy_from_slice(&[
-        radius,
-        tensor_reach,
-        kuwahara.sector_exponent(),
-        kuwahara.sharpness_exponent(),
-        anisotropy,
-        kuwahara.angle.to_radians(),
-    ]);
+    out.extra[..6].copy_from_slice(&[radius, tensor_reach, kuwahara.sector_exponent(), kuwahara.sharpness_exponent(), anisotropy, kuwahara.angle.to_radians()]);
     out.words[0] = flag(kuwahara.custom_input, KUWAHARA_CUSTOM_INPUT);
     out
 }
@@ -388,8 +382,8 @@ fn source_warp(stage: StageInputs, warp: &SourceWarp) -> NeighbourhoodFilter {
         // The texels the slope is measured across, in UV tiles (slope_move in core's source_warp.rs)
         out.extra[0] = 2.0 * SourceWarp::probe_texels(resolution) / resolution.max(1) as f32;
     }
-    for (slot, along) in out.extra.chunks_exact_mut(2).zip(&directions) {
-        slot.copy_from_slice(along);
+    for (slot, along) in out.extra.as_chunks_mut::<2>().0.iter_mut().zip(&directions) {
+        *slot = *along;
     }
     out.amount = warp.move_texels(resolution);
     out.seed = warp.seed;
@@ -540,7 +534,13 @@ pub(super) fn encode(
             let [rows, mean] = region.blur;
             let row_work = u64::from(width) * u64::from(LINE_WORKGROUP);
             let sums = params([original, 0, rows, 0]);
-            dispatch_in_rows((device, &mut *encoder, scratch), &pipelines.color_match_rows, &sums, [1, height.div_ceil(LINE_WORKGROUP)], (LINE_WORKGROUP, row_work));
+            dispatch_in_rows(
+                (device, &mut *encoder, scratch),
+                &pipelines.color_match_rows,
+                &sums,
+                [1, height.div_ceil(LINE_WORKGROUP)],
+                (LINE_WORKGROUP, row_work),
+            );
             NeighbourhoodGpu::run(&pipelines.color_match_total, device, encoder, scratch, &params([original, rows, mean, 0]), [1, 1]);
             NeighbourhoodGpu::run(&gpu.apply, device, encoder, scratch, &params([original, mean, output, 0]), texel_groups);
         }
@@ -623,6 +623,9 @@ mod tests {
     /// A stack of (filter, effect opacity, effect blend).
     type Stack = Vec<(Filter, f32, BlendMode)>;
 
+    /// A content stack of (filter, effect opacity, effect blend, the one channel it is on for).
+    type ChannelStack = Vec<(Filter, f32, BlendMode, Option<Channel>)>;
+
     /// The oracle's layer: paint in the middle or across the set's edges, and the set's side.
     type Fixture = (bool, u32);
 
@@ -682,7 +685,15 @@ mod tests {
             library,
             ColorMatch { custom_variation: false, target_color: [0.2, 0.5, 0.7], ..library },
             ColorMatch { source_mode: SourceColorMode::Parameter, source_color: [0.6, 0.3, 0.2], target_color: blue, custom_variation: false, ..library },
-            ColorMatch { source_mode: SourceColorMode::Parameter, source_color: [0.6, 0.3, 0.2], target_color: blue, hue: 20.0, chroma: 0.05, luma: 0.1, ..library },
+            ColorMatch {
+                source_mode: SourceColorMode::Parameter,
+                source_color: [0.6, 0.3, 0.2],
+                target_color: blue,
+                hue: 20.0,
+                chroma: 0.05,
+                luma: 0.1,
+                ..library
+            },
             ColorMatch { source_mode: SourceColorMode::Input, target_color: blue, ..library },
             ColorMatch { target_mode: TargetColorMode::ImageInput, ..library },
             ColorMatch { target_color: blue, hue: 0.0, chroma: 0.0, luma: 0.0, ..library },
@@ -894,7 +905,8 @@ mod tests {
     fn filter_cases(filters: impl IntoIterator<Item = Filter>, chained: &Filter) -> Vec<(String, Stack, BlendMode)> {
         let normal = BlendMode::Normal;
         let blur = Filter::Blur { radius: 24.0, wrap: false };
-        let mut cases: Vec<(String, Stack, BlendMode)> = filters.into_iter().map(|filter| (format!("{filter:?}"), vec![(filter, 1.0, normal)], normal)).collect();
+        let mut cases: Vec<(String, Stack, BlendMode)> =
+            filters.into_iter().map(|filter| (format!("{filter:?}"), vec![(filter, 1.0, normal)], normal)).collect();
         cases.extend([
             (format!("{chained:?} under Multiply"), vec![(chained.clone(), 0.7, normal)], BlendMode::Multiply),
             (format!("{chained:?} disabled"), vec![(chained.clone(), 1.0, BlendMode::Disable)], normal),
@@ -1081,7 +1093,7 @@ mod tests {
     /// A paint layer with Base Color, Normal and (`with_height`) Height painted in shapes and two
     /// alphas, and `stack` on its content, each effect switched on only for its channel (None:
     /// every channel), and after its mask's paint.
-    fn normal_project(stack: &[(Filter, f32, BlendMode, Option<Channel>)], with_height: bool) -> Option<(Project, PixelStore, LayerId)> {
+    fn normal_project(stack: &ChannelStack, with_height: bool) -> Option<(Project, PixelStore, LayerId)> {
         let channels: Vec<Channel> =
             [Channel::BaseColor, Channel::Normal, Channel::Height].into_iter().filter(|&channel| with_height || channel != Channel::Height).collect();
         let mut project = Project::new("Height To Normal", "builtin:plane");
@@ -1144,7 +1156,7 @@ mod tests {
         let library = Filter::HeightToNormal(HeightToNormal::LIBRARY);
         let laid_over = Filter::HeightToNormal(HeightToNormal { overwrite: false, ..HeightToNormal::LIBRARY });
         let blur = Filter::Blur { radius: 24.0, wrap: false };
-        let mut cases: Vec<(String, Vec<(Filter, f32, BlendMode, Option<Channel>)>, bool)> = height_to_normals()
+        let mut cases: Vec<(String, ChannelStack, bool)> = height_to_normals()
             .into_iter()
             .map(|to_normal| (format!("{to_normal:?}"), vec![(Filter::HeightToNormal(to_normal), 1.0, normal, None)], true))
             .collect();
