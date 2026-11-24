@@ -105,7 +105,8 @@ pub(super) fn lower(filter: &Filter, _effect: &Effect, op: &mut Operation, input
             Some((ENVIRONMENT_OPCODE, [0.0; 3]))
         }
         Filter::PbrValidate(validate) => {
-            op.ids[2] = u32::from(validate.mode.checks_albedo()) * CHECKS_ALBEDO | u32::from(validate.mode.checks_metal()) * CHECKS_METAL;
+            let flag = |on: bool, bit: u32| if on { bit } else { 0 };
+            op.ids[2] = flag(validate.mode.checks_albedo(), CHECKS_ALBEDO) | flag(validate.mode.checks_metal(), CHECKS_METAL);
             let [red, green, blue] = PbrValidate::INVALID;
             op.high = [red, green, blue, METAL_THRESHOLD];
             read_material(op, Channel::Metallic);
@@ -226,7 +227,9 @@ mod tests {
         use std::sync::Arc;
 
         use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
-        use texturecraft_core::{BlendMode, Channel, Effect, Layer, LayerKind, Mask, MaskBackground, PbrValidate, Project, Projection, Sampling, Source, TextureSet, ValidationMode};
+        use texturecraft_core::{
+            BlendMode, Channel, Effect, Layer, LayerKind, Mask, MaskBackground, PbrValidate, Project, Projection, Sampling, Source, TextureSet, ValidationMode,
+        };
         use texturecraft_geom::primitives;
         use texturecraft_texel::{TILE, to_u16};
 
@@ -237,7 +240,8 @@ mod tests {
         // sRGB grays away from 30, 50 and 240 of 255 and from 60 and 70 percent, inverted too
         const GRAYS_SRGB: [f32; 5] = [0.05, 0.15, 0.3, 0.65, 0.99];
         let validate = Filter::PbrValidate(PbrValidate::LIBRARY);
-        let (material, mask) = compile_effects(Some(effect(EffectKind::Filter(validate.clone()))), Some(effect(EffectKind::Filter(validate.clone()))), ContentsOffset::NONE);
+        let (material, mask) =
+            compile_effects(Some(effect(EffectKind::Filter(validate.clone()))), Some(effect(EffectKind::Filter(validate.clone()))), ContentsOffset::NONE);
         assert!(material.is_ok() && mask.is_ok(), "{material:?} {mask:?}");
 
         let Some(mut gpu) = headless() else { return };
@@ -333,8 +337,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         use texturecraft_core::{
-            Channel, ChannelFormat, Effect, Fill, Layer, LayerKind, Mask, MaskBackground, Project, Projection, Sampling, Source, StylizedLighting,
-            TextureSet,
+            Channel, ChannelFormat, Effect, Fill, Layer, LayerKind, Mask, MaskBackground, Project, Projection, Sampling, Source, StylizedLighting, TextureSet,
         };
 
         let mut project = Project::new("Lighting", "builtin:sphere");
@@ -350,7 +353,9 @@ mod tests {
             (Channel::Specular, Source::Uniform([0.3, 0.5, 0.2])),
         ]);
         let below_id = project.alloc_id();
-        project.insert_layer(0, Layer::new(below_id, "Material", LayerKind::Fill(Fill { sources: below, ..Default::default() }), &channels), None, false).unwrap();
+        let material =
+            project.insert_layer(0, Layer::new(below_id, "Material", LayerKind::Fill(Fill { sources: below, ..Default::default() }), &channels), None, false);
+        assert!(material.is_ok(), "{material:?}");
         let lit = BTreeMap::from([
             (Channel::BaseColor, Source::Uniform([0.62, 0.45, 0.3])),
             (Channel::Metallic, Source::Uniform([0.2; 3])),
@@ -369,19 +374,28 @@ mod tests {
             layer.content_effects.push(added);
         }
         let mut mask = Mask::new(MaskBackground::White);
-        let fill = texturecraft_core::EffectKind::Fill { source: Source::Uniform([0.7; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE };
+        let fill =
+            texturecraft_core::EffectKind::Fill { source: Source::Uniform([0.7; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE };
         mask.effects.push(Effect::new(project.alloc_id(), fill));
         let skipped = stylized_lighting(StylizedLighting::library());
         mask.effects.push(Effect::new(project.alloc_id(), texturecraft_core::EffectKind::Filter(skipped)));
         layer.mask = Some(mask);
-        project.insert_layer(0, layer, None, false).unwrap();
+        let lit_layer = project.insert_layer(0, layer, None, false);
+        assert!(lit_layer.is_ok(), "{lit_layer:?}");
         edit(&mut project);
         (project, owner)
     }
 
     /// Baked Lighting Stylized with a sun from the side and some occlusion
     fn stylized_lighting(settings: texturecraft_core::StylizedLighting) -> texturecraft_core::Filter {
-        texturecraft_core::Filter::BakedLighting { azimuth: 30.0, elevation: 50.0, light: 1.0, ambient: 1.0, occlusion: 0.4, stylized: Some(Box::new(settings)) }
+        texturecraft_core::Filter::BakedLighting {
+            azimuth: 30.0,
+            elevation: 50.0,
+            light: 1.0,
+            ambient: 1.0,
+            occlusion: 0.4,
+            stylized: Some(Box::new(settings)),
+        }
     }
 
     /// Smooth AO, a curvature ramp that never lands on flat, and, when asked, a wavy Height and a
@@ -493,7 +507,9 @@ mod tests {
         }
 
         let lit = (filter, 1.0, BlendMode::Normal, true);
-        for (label, baked) in [("no Height", lit_bakes(false, true)), ("no World Normal", lit_bakes(true, false)), ("no bakes", texturecraft_compose::BakedMaps::default())] {
+        for (label, baked) in
+            [("no Height", lit_bakes(false, true)), ("no World Normal", lit_bakes(true, false)), ("no bakes", texturecraft_compose::BakedMaps::default())]
+        {
             assert_lit_matches(&mut gpu, &lit_project(std::slice::from_ref(&lit), |_| {}), &baked, false, label);
         }
 
@@ -536,14 +552,19 @@ mod tests {
         let night = lit_project(&[on_base(&changed)], |project| project.display.environment = "Night".into());
         assert_lit_matches(&mut gpu, &night, &baked, false, "another environment");
 
-        for (label, lit) in [("opacity and Multiply", (changed.clone(), 0.77, BlendMode::Multiply, true)), ("disabled", (changed.clone(), 0.77, BlendMode::Disable, true))] {
+        for (label, lit) in
+            [("opacity and Multiply", (changed.clone(), 0.77, BlendMode::Multiply, true)), ("disabled", (changed.clone(), 0.77, BlendMode::Disable, true))]
+        {
             assert_lit_matches(&mut gpu, &lit_project(&[lit], |_| {}), &baked, false, label);
         }
-        for (label, baked) in [("no Height", lit_bakes(false, true)), ("no World Normal", lit_bakes(true, false)), ("no bakes", texturecraft_compose::BakedMaps::default())] {
+        for (label, baked) in
+            [("no Height", lit_bakes(false, true)), ("no World Normal", lit_bakes(true, false)), ("no bakes", texturecraft_compose::BakedMaps::default())]
+        {
             assert_lit_matches(&mut gpu, &lit_project(&[on_base(&changed)], |_| {}), &baked, false, label);
         }
 
-        let chain = [(Filter::Invert, 1.0, BlendMode::Normal, false), on_base(&changed), (Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal, true)];
+        let chain =
+            [(Filter::Invert, 1.0, BlendMode::Normal, false), on_base(&changed), (Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal, true)];
         assert_lit_matches(&mut gpu, &lit_project(&chain, |_| {}), &baked, true, "after Invert and before a Blur");
     }
 }

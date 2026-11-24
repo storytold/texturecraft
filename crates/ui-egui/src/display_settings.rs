@@ -366,7 +366,8 @@ mod tests {
         app.run("layer.add.fill", json!({})).unwrap();
         app.run("effect.add.filter", json!({"target": "content", "filter": "bakedLightingEnvironment"})).unwrap();
         harness.run_steps(4);
-        let revisions = |harness: &Harness<'static, TextureCraftApp>| harness.state().session.caches.iter().map(|cache| cache.material_revision).collect::<Vec<_>>();
+        let revisions =
+            |harness: &Harness<'static, TextureCraftApp>| harness.state().session.caches.iter().map(|cache| cache.material_revision).collect::<Vec<_>>();
         let (rotation, before) = (harness.state().session.doc.project.display.env_rotation, revisions(&harness));
 
         let label = harness.get_by_label("Environment Rotation").rect();
