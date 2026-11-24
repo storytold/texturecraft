@@ -823,8 +823,8 @@ fn p1_footprints(op: Operation, samples: P1Samples, uv: vec2<f32>, neighbours: P
     let source = vec2<f32>(params.source.xy);
     let kind = param_word(op, P1_KIND);
     if kind == P1_KIND_UV || kind == P1_KIND_UV_TILE {
-        // The current tile's affine mapping, even where a neighbour wraps or is uncovered (P8: in
-        // a UV tile atlas, the mesh UV step of the texel's own tile)
+        // The current tile's affine mapping, even where a neighbour wraps or is uncovered
+        // P8: in a UV tile atlas, the mesh UV step of the texel's own tile
         let uv_step = udim_mesh_uv_step(vec2<u32>(uv * source));
         var span = max(uv_step.x * size.x, uv_step.y * size.y);
         if kind == P1_KIND_UV {

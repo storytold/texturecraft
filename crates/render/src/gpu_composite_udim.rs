@@ -23,7 +23,7 @@
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_core::{ChannelKind, Filter, Procedural, TextureSet};
 
-use super::{BakedInputs, CompositeProgram, FilterPlan, ProceduralInputs};
+use super::{BakedInputs, CompositeProgram, FilterPlan, FilterStage, ProceduralInputs};
 use crate::gpu_neighbourhood::{NeighbourhoodFilter, gather};
 
 #[path = "gpu_composite_udim_layout.rs"]
@@ -85,22 +85,22 @@ pub(super) fn prepare(layout: Option<&UdimLayout>, inputs: &mut ProceduralInputs
 
 /// `filter`'s stage at each further UV tile scale (`ProceduralInputs::levels`), as the CPU's
 /// `filter_region` runs it there: built at the tile's resolution, its radius at most the base
-/// stage's, whole-tile reads within the base block. None where the filter changes nothing at
-/// that scale: the stage then passes its field on.
+/// stage's, whole-tile reads within the base block. Where the filter moves nothing at that scale
+/// the base stage runs there without moving, as the CPU keeps the base filter.
 pub(super) fn level_filters(
     filter: &Filter,
     base: NeighbourhoodFilter,
     (opacity, channel): (f32, Option<ChannelKind>),
     inputs: &ProceduralInputs,
-) -> Vec<Option<NeighbourhoodFilter>> {
+) -> Vec<NeighbourhoodFilter> {
     inputs
         .levels
         .iter()
         .map(|&resolution| {
-            let mut level = NeighbourhoodFilter::new(filter, resolution, inputs.longest_side, opacity, channel)?;
+            let mut level = NeighbourhoodFilter::new(filter, resolution, inputs.longest_side, opacity, channel).unwrap_or_else(|| gather::without_move(base));
             level.radius = level.radius.min(base.radius);
             gather::set_block(&mut level, inputs.block);
-            Some(level)
+            level
         })
         .collect()
 }
@@ -120,6 +120,42 @@ pub(super) fn pattern_levels(pattern: &Procedural, inputs: &mut ProceduralInputs
         return Some(0);
     }
     inputs.pack_words(&pixels)
+}
+
+/// Whether a stage of `level` (`FilterStage::level`) runs over a field at `field_rect` (origin
+/// as i32 bits) of a set `size` texels across: a level stage only where a block of its tile scale
+/// lies, as the CPU's `filter_region` runs only the scales of its region. A field past the set's
+/// edges (a wrapping program's periodic copies) reaches every block.
+pub(super) fn runs_over(layout: Option<&UdimLayout>, level: u32, field_rect: [u32; 4], (size, wraps): ((u32, u32), bool)) -> bool {
+    let Some(layout) = layout.filter(|_| level != 0) else { return true };
+
+    let block = layout.block.max(1);
+    let span = |origin: u32, length: u32, side: u32| {
+        let low = i64::from(origin as i32);
+        let high = low + i64::from(length);
+        let outside = low < 0 || high > i64::from(side);
+        (outside, (low.clamp(0, i64::from(side)) as u32, high.clamp(0, i64::from(side)) as u32))
+    };
+    let (outside_x, (x0, x1)) = span(field_rect[0], field_rect[2], size.0);
+    let (outside_y, (y0, y1)) = span(field_rect[1], field_rect[3], size.1);
+    if wraps && (outside_x || outside_y) {
+        return true;
+    }
+    if x0 >= x1 || y0 >= y1 {
+        return false;
+    }
+
+    let levels = layout.block_levels();
+    let columns = x0 / block..=(x1 - 1) / block;
+    (y0 / block..=(y1 - 1) / block)
+        .any(|by| columns.clone().any(|bx| bx < layout.grid.cols && levels.get((by * layout.grid.cols + bx) as usize) == Some(&level)))
+}
+
+/// Whether level stage `output` filters the field its base stage prepared, unchanged since: no
+/// stage of its group before it averaged that field into cells.
+pub(super) fn reuses_base_field(stages: &[FilterStage], output: usize) -> bool {
+    let level = stages.get(output).map_or(0, |stage| stage.level as usize);
+    level != 0 && output >= level && stages[output - level..output].iter().all(|stage| stage.cell <= 1 || stage.filter.is_none())
 }
 
 /// Pack a UV tile atlas's record into the side table and return its offset (`udim_record` in
@@ -161,11 +197,13 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use texturecraft_compose::{BakedMaps, Composite, DisplayKind, ImageRes, ImageStore, Inputs, MaskGray, PaintTarget, PixelStore, StrokePreview, composite_tiles, tile_bytes};
+    use texturecraft_compose::{
+        BakedMaps, Composite, DisplayKind, ImageRes, ImageStore, Inputs, MaskGray, PaintTarget, PixelStore, StrokePreview, composite_tiles, tile_bytes,
+    };
     use texturecraft_core::{
-        BakedMap, Bevel, BlendMode, Channel, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, GradientInput, Layer, LayerId, LayerKind, Mask,
-        MaskBackground, Mirror, Procedural, ProceduralKind, Project, Projection, Sampling, Source, SourceWarp, StylizedLighting, TextureSet, TileTransform,
-        WarpSource, WarpSourceMode,
+        BakedMap, Bevel, BlendMode, Channel, ColorSelection, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, GradientInput, HeightToNormal, Layer,
+        LayerId, LayerKind, Mask, MaskBackground, Mirror, Procedural, ProceduralKind, Project, Projection, Sampling, Source, SourceWarp, StylizedLighting,
+        TextureSet, TileTransform, WarpSource, WarpSourceMode,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::{Mesh, UvGBuffer, primitives};
@@ -177,31 +215,39 @@ mod tests {
     use crate::headless::Headless;
     use crate::readback::Readback;
 
+    /// A stack of (filter, effect opacity, effect blend).
+    type Stack = Vec<(Filter, f32, BlendMode)>;
+
     /// Texels per side of an atlas block: tiles 1001 and 1011 fill theirs.
     const BLOCK: u32 = 64;
     /// Texels per side of the atlas, two blocks across and down.
     const SIDE: u32 = 2 * BLOCK;
-    /// The atlas's UV tiles: UDIM, own resolution when scaled, and the mesh UV of its corner.
-    const TILES: [(u32, u32, [f32; 2]); 4] = [(1001, BLOCK, [0.0, 0.0]), (1002, BLOCK / 2, [1.0, 0.0]), (1011, BLOCK, [0.0, -1.0]), (1012, BLOCK / 4, [1.0, -1.0])];
+    /// The atlas's UV tiles: UDIM and the mesh UV of its corner.
+    const TILES: [(u32, [f32; 2]); 4] = [(1001, [0.0, 0.0]), (1002, [1.0, 0.0]), (1011, [0.0, -1.0]), (1012, [1.0, -1.0])];
     /// A region on the corner of all four blocks, so a halo crosses tiles of every scale.
     const BLOCK_CORNER: CompositeRegion = CompositeRegion { min: [56, 54], max: [74, 70] };
     /// Hard decisions (edge searches, cell centres): at most 0.1 % of the texels may flip.
     const DECISIONS: Tolerance = Tolerance::TRANSCENDENTAL.with_flips((SIDE * SIDE / 1000) as usize);
 
-    /// A set of the four tiles in a 2 × 2 atlas, each with a resolution of its own when `scaled`
-    /// (1002 half its block, 1012 a quarter), and a mesh of four planes, one per tile, its UVs
-    /// laid in the atlas as an imported UV tile mesh's are.
-    fn atlas(scaled: bool, channels: &[Channel]) -> (Project, Arc<Mesh>) {
-        let mut set = TextureSet::new("Tiles", 0, BLOCK);
+    /// The tile resolutions of the uniform atlas and of the scaled one (1002 half its block, 1012
+    /// a quarter): three tile scales.
+    const UNIFORM: [u32; 4] = [BLOCK; 4];
+    const SCALED: [u32; 4] = [BLOCK, BLOCK / 2, BLOCK, BLOCK / 4];
+
+    /// A set of the four tiles of [`TILES`] in a 2 × 2 atlas of `block` texels per block, each
+    /// tile at its resolution in `resolutions` (its block's when equal), and a mesh of four planes,
+    /// one per tile, its UVs laid in the atlas as an imported UV tile mesh's are.
+    #[allow(clippy::unwrap_used)] // A test helper: a fixture that does not build fails the test
+    fn atlas_of(block: u32, resolutions: [u32; 4], channels: &[Channel]) -> (Project, Arc<Mesh>) {
+        let mut set = TextureSet::new("Tiles", 0, block);
         set.uv_tiles = TILES.map(|(udim, ..)| udim).to_vec();
         set.channels.retain(|(channel, _)| channels.contains(channel));
-        if scaled {
-            set.tile_resolutions.extend(TILES.iter().filter(|(_, resolution, _)| *resolution != BLOCK).map(|&(udim, resolution, _)| (udim, resolution)));
-        }
+        set.tile_resolutions
+            .extend(TILES.iter().zip(resolutions).filter(|&(_, resolution)| resolution != block).map(|(&(udim, ..), resolution)| (udim, resolution)));
         let grid = set.tile_grid().unwrap();
 
         let mut mesh = Mesh::default();
-        for (index, &(_, _, corner)) in TILES.iter().enumerate() {
+        for (index, &(_, corner)) in TILES.iter().enumerate() {
             let mut part = primitives::plane(1.0, 4);
             for position in &mut part.positions {
                 position.x += 1.5 * index as f32;
@@ -219,14 +265,23 @@ mod tests {
         (project, Arc::new(mesh))
     }
 
-    /// A paint layer with Base Color, Roughness and Height painted in stripes of four tones and
-    /// two alphas over the whole atlas, a painted mask over a black background, and `stack` after
-    /// the content and after the mask's paint, on [`atlas`]'s set.
-    fn painted(scaled: bool, stack: &[(Filter, f32, BlendMode)]) -> (Project, Arc<Mesh>, PixelStore, LayerId, LayerId) {
-        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height];
-        let (mut project, mesh) = atlas(scaled, &channels);
+    /// [`atlas_of`] at [`BLOCK`] texels per block, uniform or `scaled`.
+    fn atlas(scaled: bool, channels: &[Channel]) -> (Project, Arc<Mesh>) {
+        atlas_of(BLOCK, if scaled { SCALED } else { UNIFORM }, channels)
+    }
+
+    /// A paint layer of `channels` painted in stripes of four tones and two alphas over the whole
+    /// atlas (Normal flat), a painted mask over a black background, and `stack` after the content
+    /// and after the mask's paint, on [`atlas_of`]'s set.
+    #[allow(clippy::unwrap_used)] // A test helper: a fixture that does not build fails the test
+    fn painted_of(
+        (block, resolutions): (u32, [u32; 4]),
+        channels: &[Channel],
+        stack: &[(Filter, f32, BlendMode)],
+    ) -> (Project, Arc<Mesh>, PixelStore, LayerId, LayerId) {
+        let (mut project, mesh) = atlas_of(block, resolutions, channels);
         let owner = project.alloc_id();
-        let mut layer = Layer::new(owner, "Paint", LayerKind::Paint, &channels);
+        let mut layer = Layer::new(owner, "Paint", LayerKind::Paint, channels);
         let mut mask = Mask::new(MaskBackground::Black);
         let mask_paint = project.alloc_id();
         mask.effects.push(Effect::new(mask_paint, EffectKind::Paint));
@@ -242,17 +297,24 @@ mod tests {
         project.insert_layer(0, layer, None, false).unwrap();
 
         // Slanted stripes cross every block border, tones away from gray
-        let size = (SIDE, SIDE);
+        let side = 2 * block;
+        let size = (side, side);
         let mut pixels = PixelStore::default();
-        let mut mask_pixels = TileImage::new(SIDE, SIDE, 2);
-        for y in 0..SIDE {
-            for x in 0..SIDE {
+        let mut mask_pixels = TileImage::new(side, side, 2);
+        for y in 0..side {
+            for x in 0..side {
                 let tone = 0.15 + 0.2 * ((x / 6 + y / 9) % 4) as f32;
                 let alpha = if (x + 2 * y) % 23 < 5 { 0.6 } else { 1.0 };
                 let premultiplied = |value: f32| to_u16(value * alpha);
-                pixels.layer_mut(owner, Channel::BaseColor, size).set(x, y, &[premultiplied(tone), premultiplied(0.9 - tone), premultiplied(0.5 * tone + 0.2), to_u16(alpha)]);
-                pixels.layer_mut(owner, Channel::Roughness, size).set(x, y, &[premultiplied(tone), to_u16(alpha)]);
-                pixels.layer_mut(owner, Channel::Height, size).set(x, y, &[to_u16_signed((tone - 0.45) * alpha), to_u16(alpha)]);
+                for &channel in channels {
+                    let texel = match channel {
+                        Channel::BaseColor => vec![premultiplied(tone), premultiplied(0.9 - tone), premultiplied(0.5 * tone + 0.2), to_u16(alpha)],
+                        Channel::Height => vec![to_u16_signed((tone - 0.45) * alpha), to_u16(alpha)],
+                        Channel::Normal => vec![premultiplied(0.5), premultiplied(0.5), premultiplied(1.0), to_u16(alpha)],
+                        _ => vec![premultiplied(tone), to_u16(alpha)],
+                    };
+                    pixels.layer_mut(owner, channel, size).set(x, y, &texel);
+                }
                 mask_pixels.set(x, y, &[to_u16(1.0 - tone), u16::MAX]);
             }
         }
@@ -260,9 +322,14 @@ mod tests {
         (project, mesh, pixels, owner, mask_paint)
     }
 
+    /// [`painted_of`] with Base Color, Roughness and Height on the uniform or the `scaled` atlas.
+    fn painted(scaled: bool, stack: &[(Filter, f32, BlendMode)]) -> (Project, Arc<Mesh>, PixelStore, LayerId, LayerId) {
+        painted_of((BLOCK, if scaled { SCALED } else { UNIFORM }), &[Channel::BaseColor, Channel::Roughness, Channel::Height], stack)
+    }
+
     /// Composites each labelled stack of [`painted`] on the CPU and the GPU, on the uniform and the
     /// scaled atlas: every map, the mask preview and a partial update across the block corner.
-    fn check_stacks(gpu: &mut Headless, cases: &[(&str, Vec<(Filter, f32, BlendMode)>)], tolerance: Tolerance) {
+    fn check_stacks(gpu: &mut Headless, cases: &[(&str, Stack)], tolerance: Tolerance) {
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
         for scaled in [false, true] {
             for (label, stack) in cases {
@@ -341,10 +408,15 @@ mod tests {
             layer.content_effects.push(shown);
             let mut mask = Mask::new(MaskBackground::Black);
             let checker_mask = Source::Procedural { pattern: checker.clone(), low: [0.2; 3], high: [0.9; 3], ramp: Vec::new() };
-            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: checker_mask, projection: Projection::default(), sampling: Sampling::default() }));
+            mask.effects.push(Effect::new(
+                project.alloc_id(),
+                EffectKind::Fill { source: checker_mask, projection: Projection::default(), sampling: Sampling::default() },
+            ));
             let mut masked = Effect::new(project.alloc_id(), EffectKind::Filter(debug.clone()));
             masked.opacity = 0.6;
             mask.effects.push(masked);
+            // A stage, so the GPU leaves the texels the mesh does not cover as the CPU does
+            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false })));
             layer.mask = Some(mask);
             project.insert_layer(0, layer, None, false).unwrap();
             let pixels = PixelStore::default();
@@ -446,8 +518,14 @@ mod tests {
     fn lighting_reads_each_tiles_height_slopes_and_bakes() {
         let Some(mut gpu) = headless() else { return };
         let channels = [Channel::BaseColor, Channel::Metallic, Channel::Roughness];
-        let lighting =
-            Filter::BakedLighting { azimuth: 30.0, elevation: 50.0, light: 1.0, ambient: 1.0, occlusion: 0.4, stylized: Some(Box::new(StylizedLighting::library())) };
+        let lighting = Filter::BakedLighting {
+            azimuth: 30.0,
+            elevation: 50.0,
+            light: 1.0,
+            ambient: 1.0,
+            occlusion: 0.4,
+            stylized: Some(Box::new(StylizedLighting::library())),
+        };
         let (baked, images) = (atlas_bakes(), ImageStore::default());
 
         for scaled in [false, true] {
@@ -479,11 +557,13 @@ mod tests {
         let ramp = |side: usize, height: usize, value: fn(f32, f32) -> f32| -> Arc<Vec<f32>> {
             Arc::new((0..side * height).map(|index| value((index % side) as f32 / side as f32, (index / side) as f32 / height as f32)).collect())
         };
-        let mut baked = BakedMaps { resolution: 64, ..Default::default() };
-        baked.maps.insert(BakedMap::AmbientOcclusion, ramp(64, 64, |u, v| 0.3 + 0.6 * u * v));
-        baked.maps.insert(BakedMap::Curvature, ramp(64, 32, |u, _| 0.2 + 0.6 * u));
-        baked.maps.insert(BakedMap::Thickness, ramp(64, 16, |_, v| 0.25 + 0.5 * v));
-        let normals: Vec<f32> = (0..64 * 8).flat_map(|index| [0.5 + 0.3 * (index % 64) as f32 / 64.0, 0.55, 0.85]).collect();
+        // A width and heights whose texels the working texels never meet at an edge
+        let mut baked = BakedMaps { resolution: 48, ..Default::default() };
+        baked.maps.insert(BakedMap::AmbientOcclusion, ramp(48, 47, |u, v| 0.3 + 0.6 * u * v));
+        baked.maps.insert(BakedMap::Curvature, ramp(48, 23, |u, _| 0.2 + 0.6 * u));
+        baked.maps.insert(BakedMap::Thickness, ramp(48, 13, |_, v| 0.25 + 0.5 * v));
+        // Steps of the GPU's 10-bit baked normal (1 / 1022), so both sides read the same normal
+        let normals: Vec<f32> = (0..48 * 7).flat_map(|index| [(511 + 2 * (index % 48)) as f32 / 1022.0, 562.0 / 1022.0, 1.0]).collect();
         baked.maps.insert(BakedMap::Normal, Arc::new(normals));
         let images = ImageStore::default();
 
@@ -519,8 +599,135 @@ mod tests {
         let Some(mut gpu) = headless() else { return };
         let stack = [(Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal)];
         let (project, mesh, pixels, _, mask_paint) = painted(true, &stack);
+        let target = (PaintTarget::Mask(mask_paint), LiveBrushTarget::Mask { effect: mask_paint, value: 0.8, image: None });
+
+        let (actual, expected) = stroke(&mut gpu, (&project, &mesh, &pixels), target, BTreeMap::new());
+
+        let off = actual.iter().zip(&expected).filter(|(on_gpu, on_cpu)| on_gpu.abs_diff(**on_cpu) > Tolerance::NEIGHBOURHOOD.lsb).count();
+        assert_eq!(off, 0, "the GPU's live stroke differs from the CPU's preview in {off} components");
+    }
+
+    /// Curvature detail sizes are padded, blurred and coarsened per UV tile block of the bake, a
+    /// block of 256 bake texels across, its radius from the block's width: the Curvature and Edge
+    /// Wear generators with their default detail, on the uniform and the scaled atlas.
+    #[test]
+    fn curvature_detail_sizes_work_per_uv_tile_block() {
+        let Some(mut gpu) = headless() else { return };
+        const BAKE_SIDE: u32 = 512;
+        let curvature: Vec<f32> = (0..BAKE_SIDE * BAKE_SIDE)
+            .map(|index| {
+                let (x, y) = (index % BAKE_SIDE, index / BAKE_SIDE);
+                let block = (x / 256 + 2 * (y / 256)) as f32;
+                0.5 + 0.04 * ((x as f32 * (0.05 + 0.02 * block)) + y as f32 * 0.031).sin() + 0.02 * (block - 1.5)
+            })
+            .collect();
+        let baked = BakedMaps { resolution: BAKE_SIDE, maps: BTreeMap::from([(BakedMap::Curvature, Arc::new(curvature))]) };
+        let (pixels, images) = (PixelStore::default(), ImageStore::default());
+
+        for scaled in [false, true] {
+            for kind in [GeneratorKind::Curvature, GeneratorKind::EdgeWear] {
+                let (mut project, mesh) = atlas(scaled, &[Channel::BaseColor]);
+                let owner = project.alloc_id();
+                let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.7, 0.4, 0.2]))]), ..Fill::default() };
+                let mut layer = Layer::new(owner, "Curvature", LayerKind::Fill(fill), &[Channel::BaseColor]);
+                let mut mask = Mask::new(MaskBackground::Black);
+                mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(Generator::new(kind))));
+                layer.mask = Some(mask);
+                project.insert_layer(0, layer, None, false).unwrap();
+                let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+                case.mask_owner = Some(owner);
+
+                assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("{kind:?} detail, scaled {scaled}"));
+            }
+        }
+    }
+
+    /// A Color Selection reading the baked ID selects nothing where a smaller tile leaves its
+    /// block without a bake, as the CPU's missing ID, also under a Blur.
+    #[test]
+    fn a_colour_selection_reads_each_tiles_share_of_the_id_bake() {
+        let Some(mut gpu) = headless() else { return };
+        const ID_SIDE: usize = 48;
+        let palette = [[0.8, 0.1, 0.2], [0.1, 0.7, 0.3], [0.2, 0.3, 0.9]];
+        let ids: Vec<f32> = (0..ID_SIDE * ID_SIDE).flat_map(|index| palette[(index % ID_SIDE / 5 + index / ID_SIDE / 7) % 3]).collect();
+        let baked = BakedMaps { resolution: ID_SIDE as u32, maps: BTreeMap::from([(BakedMap::Id, Arc::new(ids))]) };
+        let images = ImageStore::default();
+        let mut soft = ColorSelection::new(vec![palette[0], palette[2]], 1.0 / 64.0);
+        soft.hardness = 0.5;
+        soft.output = 0.8;
+
+        for blurred in [false, true] {
+            let (mut project, mesh, pixels, owner, _) = painted(true, &[]);
+            let mask = project.layers.get_mut(&owner).and_then(|layer| layer.mask.as_mut()).unwrap();
+            mask.effects.push(Effect::new(LayerId(900), EffectKind::ColorSelection(soft.clone())));
+            if blurred {
+                mask.effects.push(Effect::new(LayerId(901), EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false })));
+            }
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+
+            // Each texel reads one bake texel; a bake edge may land a working texel either side
+            assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD.with_flips(16), &format!("ID selection, blurred {blurred}"));
+        }
+    }
+
+    /// Whole-set stages take one pre-pass entry per filter whatever the tile scales: a Mirror
+    /// and a Transform on the three-scale atlas and a Mirror on a four-scale one both run in the
+    /// pre-pass, at a block of 512 texels.
+    #[test]
+    fn whole_set_filters_keep_the_pre_pass_on_atlases_of_many_scales() {
+        let Some(mut gpu) = headless() else { return };
+        const LARGE: u32 = 512;
+        let normal = BlendMode::Normal;
+        let mirror = Filter::Mirror(Mirror { offset: [0.4, 0.5], ..Mirror::LIBRARY });
+        let transform = Filter::Transform(TileTransform { rotation: 30.0, offset: [0.1, -0.2], ..TileTransform::LIBRARY });
+        let three = [LARGE, LARGE / 2, LARGE, LARGE / 4];
+        let four = [LARGE, LARGE / 2, LARGE / 4, LARGE / 8];
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let cases = [
+            ("Mirror and Transform, three scales", three, vec![(mirror.clone(), 1.0, normal), (transform, 0.8, normal)]),
+            ("Mirror, four scales", four, vec![(mirror, 1.0, normal)]),
+        ];
+
+        for (label, resolutions, stack) in cases {
+            let (project, mesh, pixels, owner, _) = painted_of((LARGE, resolutions), &[Channel::BaseColor], &stack);
+            let program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+            case.region = Some(CompositeRegion { min: [LARGE - 40, LARGE - 24], max: [LARGE + 24, LARGE + 40] });
+
+            assert!(!program.whole_set_passes().is_empty(), "{label}: the whole-set filters run in the pre-pass");
+            assert_matches_cpu(&mut gpu, &case, DECISIONS, label);
+        }
+    }
+
+    /// A live stroke on a paint layer of the scaled atlas, under a Blur that runs at each tile's
+    /// scale, matches the CPU's preview of the same stroke.
+    #[test]
+    fn a_live_layer_stroke_on_uv_tiles_matches_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let stack = [(Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal)];
+        let (project, mesh, pixels, owner, _) = painted(true, &stack);
+        let values = BTreeMap::from([(Channel::BaseColor, [0.2, 0.6, 0.35]), (Channel::Height, [0.3; 3])]);
+        let target = (PaintTarget::Layer(owner), LiveBrushTarget::Layer { layer: owner, values: values.clone() });
+
+        let (actual, expected) = stroke(&mut gpu, (&project, &mesh, &pixels), target, values);
+
+        let off = actual.iter().zip(&expected).filter(|(on_gpu, on_cpu)| on_gpu.abs_diff(**on_cpu) > Tolerance::NEIGHBOURHOOD.lsb).count();
+        assert_eq!(off, 0, "the GPU's live stroke differs from the CPU's preview in {off} components");
+    }
+
+    /// Base Color as the GPU and the CPU show `project` with a live stroke on `targets`, painting
+    /// `values`: (GPU, CPU) bytes over the whole atlas.
+    #[allow(clippy::unwrap_used)] // A test helper: a fixture that does not build fails the test
+    fn stroke(
+        gpu: &mut Headless,
+        (project, mesh, pixels): (&Project, &Arc<Mesh>, &PixelStore),
+        (target, live_target): (PaintTarget, LiveBrushTarget),
+        values: BTreeMap<Channel, [f32; 3]>,
+    ) -> (Vec<u8>, Vec<u8>) {
         let size = (SIDE, SIDE);
-        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIDE, SIDE));
+        let gbuf = Arc::new(UvGBuffer::new(mesh, 0, SIDE, SIDE));
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
         let mut stroke_alpha = TileImage::new(SIDE, SIDE, 1);
         let mut dense_alpha = vec![0u16; (SIDE * SIDE) as usize];
@@ -534,11 +741,11 @@ mod tests {
         let alpha = super::super::input_texture(&gpu.device, "test UV tile stroke", size, 1, wgpu::TextureFormat::R16Uint);
         super::super::write_input(&gpu.queue, &alpha, size, (0, 0), &dense_alpha);
         let preview = StrokePreview {
-            target: PaintTarget::Mask(mask_paint),
+            target,
             alpha: stroke_alpha,
             opacity: 0.85,
             erase: false,
-            values: BTreeMap::new(),
+            values,
             mask_gray: MaskGray::Value(0.8),
             stencil: None,
             carried: BTreeMap::new(),
@@ -546,11 +753,11 @@ mod tests {
         };
         let set = &project.texture_sets[0];
         let inputs = Inputs {
-            project: &project,
+            project,
             ts: 0,
-            mesh: &mesh,
+            mesh,
             gbuf: &gbuf,
-            pixels: &pixels,
+            pixels,
             baked: &baked,
             block_scales: set.block_scales(),
             preview: Some(&preview),
@@ -561,17 +768,11 @@ mod tests {
         let tiles: Vec<(u32, u32)> = (0..SIDE / TILE).flat_map(|ty| (0..SIDE / TILE).map(move |tx| (tx, ty))).collect();
         let mut cpu = Composite { block_scales: set.block_scales(), ..Composite::new(&channels, SIDE) };
         composite_tiles(&inputs, &mut cpu, &tiles);
-        let live = LiveBrush {
-            target: LiveBrushTarget::Mask { effect: mask_paint, value: 0.8, image: None },
-            opacity: 0.85,
-            erase: false,
-            alpha: alpha.create_view(&Default::default()),
-            stencil: None,
-        };
+        let live = LiveBrush { target: live_target, opacity: 0.85, erase: false, alpha: alpha.create_view(&Default::default()), stencil: None };
 
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[(size, 0)], 1);
-        let mut program = CompositeProgram::try_compile_with_brush(&project, &pixels, 0, None, Some(live)).unwrap();
-        program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+        let mut program = CompositeProgram::try_compile_with_brush(project, pixels, 0, None, Some(live)).unwrap();
+        program.set_surface_inputs(mesh, &gbuf, None).unwrap();
         program.set_tile_images(&images);
         gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
         let texture = gpu.renderer.display_textures()[0][DisplayKind::BaseColor as usize];
@@ -580,12 +781,108 @@ mod tests {
         let mut expected = vec![0; actual.len()];
         for &(tx, ty) in &tiles {
             let tile = tile_bytes(&cpu, &baked, DisplayKind::BaseColor, tx, ty);
-            for (y, row) in tile.chunks_exact(TILE as usize * 4).enumerate() {
+            for (y, row) in tile.as_chunks::<{ TILE as usize * 4 }>().0.iter().enumerate() {
                 let start = ((ty * TILE + y as u32) * SIDE + tx * TILE) as usize * 4;
                 expected[start..start + row.len()].copy_from_slice(row);
             }
         }
-        let off = actual.iter().zip(&expected).filter(|(on_gpu, on_cpu)| on_gpu.abs_diff(**on_cpu) > Tolerance::NEIGHBOURHOOD.lsb).count();
-        assert_eq!(off, 0, "the GPU's live stroke differs from the CPU's preview in {off} components");
+        (actual, expected)
+    }
+
+    /// Height To Normal reads each tile's height at its own scale, on the scaled atlas.
+    #[test]
+    fn height_to_normal_runs_per_tile_scale() {
+        let Some(mut gpu) = headless() else { return };
+        let channels = [Channel::BaseColor, Channel::Height, Channel::Normal];
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let stack = [(Filter::HeightToNormal(HeightToNormal::LIBRARY), 1.0, BlendMode::Normal)];
+        let (project, mesh, pixels, owner, _) = painted_of((BLOCK, SCALED), &channels, &stack);
+        let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+        case.mask_owner = Some(owner);
+        case.region = Some(BLOCK_CORNER);
+
+        assert_matches_cpu(&mut gpu, &case, Tolerance::TRANSCENDENTAL, "Height To Normal on the scaled atlas");
+    }
+
+    /// Triplanar and planar fills (world space, Bilinear HQ footprints from the next texels) on
+    /// the scaled atlas.
+    #[test]
+    fn world_space_fills_match_the_cpu_on_uv_tiles() {
+        let Some(mut gpu) = headless() else { return };
+        let channels = [Channel::BaseColor, Channel::Roughness];
+        let stripes: Vec<[f32; 4]> =
+            (0..64 * 64).map(|texel| [0.2 + 0.6 * f32::from((texel % 64) % 6 >= 3), 0.4, 0.3 + 0.4 * f32::from((texel / 64) % 10 >= 5), 1.0]).collect();
+        let images = ImageStore::from([("stripes".to_owned(), Arc::new(ImageRes::new(64, 64, stripes, false)))]);
+        let baked = BakedMaps::default();
+        let triplanar =
+            Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43], uv: Default::default(), projector: Default::default() };
+        let planar = Projection::Planar { scale: 0.8, axis: 1, offset: [0.03, 0.0, 0.34], uv: Default::default(), projector: Default::default(), placed: None };
+        let clouds = Procedural { scale: 3.0, seed: 7, ..Procedural::new(ProceduralKind::Clouds) };
+
+        for (label, projection) in [("triplanar", triplanar), ("planar", planar)] {
+            let (mut project, mesh) = atlas(true, &channels);
+            let owner = project.alloc_id();
+            let sources = BTreeMap::from([
+                (Channel::BaseColor, Source::image("stripes")),
+                (Channel::Roughness, Source::Procedural { pattern: clouds.clone(), low: [0.2; 3], high: [0.9; 3], ramp: Vec::new() }),
+            ]);
+            let mut layer = Layer::new(owner, "World", LayerKind::Fill(Fill { sources, projection, ..Fill::default() }), &channels);
+            let mut mask = Mask::new(MaskBackground::White);
+            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false })));
+            layer.mask = Some(mask);
+            project.insert_layer(0, layer, None, false).unwrap();
+            let pixels = PixelStore::default();
+            let case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+
+            assert_matches_cpu(&mut gpu, &case, Tolerance::BILINEAR, &format!("{label} fill on UV tiles"));
+        }
+    }
+
+    /// A Blur stack on a live paint region and in full, on a 2K three-scale atlas and on a classic
+    /// 2K set. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_uv_tile_blur_stack() {
+        let Some(mut gpu) = headless() else { return };
+        const BENCH_BLOCK: u32 = 1024;
+        const RUNS: u32 = 5;
+        let normal = BlendMode::Normal;
+        let stack = [
+            (Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal),
+            (Filter::Invert, 1.0, normal),
+            (Filter::Blur { radius: 8.0, wrap: false }, 0.8, normal),
+        ];
+        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height];
+        let baked = BakedMaps::default();
+
+        for (label, resolutions) in [("classic", None), ("three scales", Some([BENCH_BLOCK, BENCH_BLOCK / 2, BENCH_BLOCK, BENCH_BLOCK / 4]))] {
+            let (mut project, mesh, pixels, ..) = painted_of((BENCH_BLOCK, resolutions.unwrap_or([BENCH_BLOCK; 4])), &channels, &stack);
+            if resolutions.is_none() {
+                let set = &mut project.texture_sets[0];
+                set.uv_tiles.clear();
+                set.tile_resolutions.clear();
+                set.resolution = 2 * BENCH_BLOCK;
+            }
+            let side = 2 * BENCH_BLOCK;
+            let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, side, side));
+            gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((side, side), 0)], 1);
+            let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+            program.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
+            program.set_tile_images(&ImageStore::default());
+            for (part, region) in [
+                ("full", None),
+                ("paint region", Some(CompositeRegion { min: [BENCH_BLOCK - 64, BENCH_BLOCK - 64], max: [BENCH_BLOCK + 64, BENCH_BLOCK + 64] })),
+            ] {
+                program.region = region;
+                gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+                gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+                let start = std::time::Instant::now();
+                for _ in 0..RUNS {
+                    gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+                    gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+                }
+                println!("{label}, {part}: {:.1} ms", start.elapsed().as_secs_f64() * 1000.0 / f64::from(RUNS));
+            }
+        }
     }
 }

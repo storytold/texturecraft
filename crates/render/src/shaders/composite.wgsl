@@ -181,11 +181,11 @@ fn bake_has(maps: u32) -> bool {
 // Row block `block` at the texel: 0 the built-in maps (baked_at), 1 the baked Height in x and the
 // stored World Normal in yzw (f32 bits; zeros where bake_has says a map is missing).
 fn baked_block_at(pixel: vec2<u32>, block: u32) -> vec4<u32> {
-    // P8: no bake where a smaller UV tile leaves its block empty, and maps of different heights
-    // in rows of their own (params.packages[7].y)
+    // P8: no bake where a smaller UV tile leaves its block empty
     if !udim_bake_valid(pixel) {
         return udim_absent_bake(block);
     }
+    // P8: maps of different heights in rows of their own (params.packages[7].y)
     if params.packages[7].y != 0u {
         return udim_separate_bake(pixel, block);
     }
@@ -663,7 +663,8 @@ struct LayerTexel {
 }
 
 fn color_selection(effect: Operation, pixel: vec2<u32>) -> f32 {
-    if params.id_bake.x == 0u || effect.procedural.z == 0u { return 0.0; }
+    // P8: no baked ID where a smaller UV tile leaves its block empty
+    if params.id_bake.x == 0u || effect.procedural.z == 0u || !udim_bake_valid(pixel) { return 0.0; }
     let color = id_color_at(pixel);
     for (var i = 0u; i < effect.procedural.z; i++) {
         let at = effect.procedural.y + i * 3u;

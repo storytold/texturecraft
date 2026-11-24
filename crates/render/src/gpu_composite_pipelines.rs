@@ -491,6 +491,12 @@ mod tests {
             occlusion: 0.4,
             stylized: Some(Box::new(StylizedLighting::library())),
         };
+        let uv_tiles = |mut project: Project| {
+            let set = &mut project.texture_sets[0];
+            set.uv_tiles = vec![1001, 1002, 1011, 1012];
+            set.tile_resolutions.extend([(1002, 128), (1012, 64)]);
+            project
+        };
         let compare = |left| EffectKind::Compare {
             op: CompareOp::GreaterThan,
             value: 0.4,
@@ -504,12 +510,29 @@ mod tests {
             (
                 "material: Blur, Levels, lighting, generator mask",
                 project(
-                    vec![EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false }), EffectKind::Levels(Levels::default()), EffectKind::Filter(lighting)],
+                    vec![
+                        EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false }),
+                        EffectKind::Levels(Levels::default()),
+                        EffectKind::Filter(lighting.clone()),
+                    ],
                     vec![EffectKind::Generator(Generator::new(GeneratorKind::Dirt))],
                 ),
             ),
             ("mask comparing Layers Below and This Layer", project(Vec::new(), vec![compare(CompareSource::LayersBelow), compare(CompareSource::ThisLayer)])),
             ("plain fill", project(Vec::new(), Vec::new())),
+            // P8: the same material on a UV tile atlas with three tile scales
+            (
+                "UV tile atlas: Blur, Levels, lighting, generator mask",
+                uv_tiles(project(
+                    vec![
+                        EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false }),
+                        EffectKind::Levels(Levels::default()),
+                        EffectKind::Filter(lighting.clone()),
+                    ],
+                    vec![EffectKind::Generator(Generator::new(GeneratorKind::Dirt))],
+                )),
+            ),
+            ("UV tile atlas: plain fill", uv_tiles(project(Vec::new(), Vec::new()))),
         ];
         let compositor = GpuCompositor::new(&gpu.device);
         let (curvature, id) = {

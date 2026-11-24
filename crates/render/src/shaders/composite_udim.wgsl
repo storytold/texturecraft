@@ -157,7 +157,7 @@ fn udim_tile_frame(pixel: vec2<u32>) -> vec4<u32> {
     if record == 0u {
         return vec4(0u, 0u, params.source.xy);
     }
-    let block = max(params.source.x / max(srgb[record + UDIM_COLS], 1u), 1u);
+    let block = max(srgb[record + UDIM_BLOCK], 1u);
     let tile = max(u32(udim_round(f32(block) * udim_scale_at(pixel))), 1u);
     return vec4(pixel / block * block, tile, tile);
 }

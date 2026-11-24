@@ -390,6 +390,17 @@ pub(crate) fn set_block(filter: &mut NeighbourhoodFilter, block: u32) {
     filter.radius = filter.radius.max(block);
 }
 
+/// A stage at a UV tile scale where `base`'s filter moves nothing (P8): the CPU's `filter_region`
+/// then runs the base filter at that scale, so a Warp or Blur Slope keeps its settings and moves
+/// no texel.
+pub(crate) fn without_move(base: NeighbourhoodFilter) -> NeighbourhoodFilter {
+    let mut filter = base;
+    if matches!(filter.kind, SOURCE_WARP | SOURCE_SLOPE_BLUR) {
+        filter.amount = 0.0;
+    }
+    filter
+}
+
 /// A Warp stage: the move in `amount`, the directions (Warp mode: the slope's measuring span) in
 /// `extra`, the source as [`source_settings`] lays it out.
 fn source_warp(stage: StageInputs, warp: &SourceWarp) -> NeighbourhoodFilter {
