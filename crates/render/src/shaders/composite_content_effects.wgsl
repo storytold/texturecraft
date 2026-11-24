@@ -42,6 +42,7 @@ fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
         }
     }
     var i = skip;
+    var fetched = false;
     loop {
         if !base && i >= count {
             break;
@@ -50,8 +51,19 @@ fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
         if !base {
             effect = layers[start + i];
         }
-        if base || is_fill_opcode(effect.ids.y) {
-            let source = base_content(effect, texel);
+        // A package effect's image input through the same base_content call, before the effect
+        let fetch = !base && !fetched && is_extended_effect(effect.ids.y) && effect.effects.w != 0u;
+        if base || fetch || is_fill_opcode(effect.ids.y) {
+            var read = effect;
+            if fetch {
+                read = layers[effect.effects.w - 1u];
+            }
+            let source = base_content(read, texel);
+            if fetch {
+                effect_input_cache = source;
+                fetched = true;
+                continue;
+            }
             if base {
                 base = false;
                 content = source;
@@ -67,6 +79,7 @@ fn layer_content(layer: Operation, texel: LayerTexel, count: u32) -> vec4<f32> {
             let filtered = effect_color(effect, content.rgb, layer.ids.x, texel.surface, texel.baked.x);
             content = vec4(content.rgb + (filtered - content.rgb) * effect.low.w, content.a);
         }
+        fetched = false;
         i++;
     }
     return vec4(content.rgb, min(content.a, 1.0));

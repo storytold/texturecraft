@@ -28,16 +28,33 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
             mask = clamp(filter_value(field, texel.pixel).x, 0.0, 1.0);
         }
     }
-    for (var i = skip; i < count; i++) {
+    var i = skip;
+    var fetched = false;
+    loop {
+        if i >= count {
+            break;
+        }
         let e = layers[start + i];
+        // A package effect's image input through the same base_content call, before the effect
+        let fetch = !fetched && is_extended_effect(e.ids.y) && e.effects.w != 0u;
+        var stay = false;
         if e.ids.y == 16u {
             continue;
         }
         var weight = e.low.w;
         var result: f32;
-        if is_fill_opcode(e.ids.y) {
+        if fetch || is_fill_opcode(e.ids.y) {
             // Paint and fills through one base_content call: the driver inlines each call site
-            let sampled = base_content(e, texel);
+            var read = e;
+            if fetch {
+                read = layers[e.effects.w - 1u];
+            }
+            let sampled = base_content(read, texel);
+            if fetch {
+                effect_input_cache = sampled;
+                stay = true;
+                continue;
+            }
             result = blend_scalar(u32(e.balance.z), mask, sampled.x);
             weight *= sampled.a;
         } else if enable_generators && e.ids.y >= 40u && e.ids.y < 48u {
@@ -77,6 +94,13 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
             result = scalar_filter(e, mask);
         }
         mask = lerp(mask, result, weight);
+
+        continuing {
+            fetched = stay;
+            if !stay {
+                i++;
+            }
+        }
     }
     return clamp(mask, 0.0, 1.0);
 }

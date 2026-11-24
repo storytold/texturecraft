@@ -68,11 +68,13 @@ fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f
 
     let p = surface.position * layer.projection.w + layer.projection.xyz;
     if mode == 1u {
+        // The three planes through one material_image_at call (the driver inlines each call site)
         let w = triplanar_weights(surface.normal, layer.balance.w);
+        let points = array<vec2<f32>, 3>(vec2(p.z, -p.y), p.xz, vec2(p.x, -p.y));
         var sampled = vec4(0.0);
-        if w.x > 0.0 { sampled += w.x * material_image_at(image, vec2(p.z, -p.y)); }
-        if w.y > 0.0 { sampled += w.y * material_image_at(image, p.xz); }
-        if w.z > 0.0 { sampled += w.z * material_image_at(image, vec2(p.x, -p.y)); }
+        for (var plane = 0u; plane < 3u; plane++) {
+            if w[plane] > 0.0 { sampled += w[plane] * material_image_at(image, points[plane]); }
+        }
         return sampled;
     }
     var point = uv;

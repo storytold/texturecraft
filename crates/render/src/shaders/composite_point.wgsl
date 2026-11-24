@@ -177,7 +177,7 @@ fn point_conversion_channel(op: Operation, c: vec3<f32>, channel: u32, alpha: f3
 
 // Grayscale Conversion's Custom Input at the texel: its source operation (effects.w, register_input) as a colour
 fn point_custom_input(op: Operation, texel: LayerTexel) -> vec3<f32> {
-    return base_content(layers[op.effects.w - 1u], texel).rgb;
+    return effect_input_color(op, texel);
 }
 
 // Grayscale Conversion of a Custom Input onto a channel (GrayscaleConversion::channel_value with an input)

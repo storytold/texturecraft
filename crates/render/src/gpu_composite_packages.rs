@@ -251,10 +251,17 @@ impl ShaderFlags {
 
 /// The packages' WGSL for the composite shader: this hub's dispatcher, then each package file
 /// or its stub.
-pub(super) fn shader_sources(flags: ShaderFlags) -> [&'static str; 7] {
+pub(super) fn shader_sources(flags: ShaderFlags) -> [&'static str; 8] {
     let pick = |full: bool, source: &'static str, stub: &'static str| if full { source } else { stub };
+    // The hooks' test probes only in the tests: the driver compiles every function the shader holds
+    let probes = if cfg!(test) {
+        include_str!("shaders/composite_probes.wgsl")
+    } else {
+        "const PROBE_OPCODES_START: u32 = 188u;\nfn probe_mask_effect(effect: Operation, texel: LayerTexel) -> f32 { return 0.0; }"
+    };
     [
         include_str!("shaders/composite_packages.wgsl"),
+        probes,
         pick(flags.projection, fill_projection::WGSL, fill_projection::WGSL_STUB),
         pick(flags.point, point::WGSL, point::WGSL_STUB),
         pick(flags.stack, stack::WGSL, stack::WGSL_STUB),

@@ -275,17 +275,20 @@ fn p1_image_at(image: u32, uv: vec2<f32>, layer: Operation) -> vec4<f32> {
         return full;
     }
 
-    // Blend the two levels round the footprint's level of detail
+    // Blend the two levels round the footprint's level of detail, both through one
+    // p1_level_sample call (the driver inlines each call site)
     let detail = min(log2(footprint), f32(p1_level_count(image)));
     let finer = u32(floor(detail));
     let toward_coarser = detail - f32(finer);
-    let finer_sample = p1_level_sample(image, finer, uv, clamps, full);
-    if toward_coarser <= 0.0 {
-        return finer_sample;
+    let levels = select(2u, 1u, toward_coarser <= 0.0);
+    var samples = array<vec4<f32>, 2>(full, full);
+    for (var k = 0u; k < levels; k++) {
+        samples[k] = p1_level_sample(image, finer + k, uv, clamps, full);
     }
-
-    let coarser = p1_level_sample(image, finer + 1u, uv, clamps, full);
-    return finer_sample + (coarser - finer_sample) * toward_coarser;
+    if levels == 1u {
+        return samples[0];
+    }
+    return samples[0] + (samples[1] - samples[0]) * toward_coarser;
 }
 
 // `point` turned by the sine and cosine in `turn`, scaled by `tiling` and moved by `offset` (compose placement)
@@ -459,11 +462,16 @@ fn p1_read_image(op: Operation, image: u32, point: vec2<f32>, surface: Surface, 
     read.ids.w = kind;
     read.procedural.w = P1_POINT_PROJECTION;
     read.projection = vec4(footprint, select(0.0, 1.0, linear), 0.0, 0.0);
-    // The image path of `value` alone: its patterns would be inlined at every read
-    if !enable_authored_images {
+    // `authored_image_value` at a projected point alone: the other projections and the patterns
+    // would be inlined at every read
+    if image == MISSING_IMAGE {
         return vec3(0.5);
     }
-    return authored_image_value(read, point, surface);
+    let sampled = p1_image_at(image, point, read);
+    if kind == P1_ALPHA_KIND {
+        return vec3(sampled.a);
+    }
+    return decode_image_sample(read, sampled.rgb);
 }
 
 // An image source's value from its samples (compose Texel::source): read as stored, weighed, then decoded for the channel
