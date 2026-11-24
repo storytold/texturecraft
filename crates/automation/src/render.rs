@@ -213,6 +213,13 @@ mod tests {
     use serde_json::json;
     use texturecraft_engine::execute;
 
+    /// One GPU test at a time: the NVIDIA driver (620.70) can deadlock when one test's device is
+    /// destroyed while another test records commands on its own device.
+    fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+        static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A 64×32 Radiance `.hdr` (flat RGBE scanlines): a hot orange sky over a dim blue ground.
     fn sky_hdr() -> Vec<u8> {
         let rgbe = |c: [f32; 3]| {
@@ -234,6 +241,7 @@ mod tests {
         let mut s = Session::new_project("t", mesh, "builtin:material_ball", None, 256).unwrap();
         let name = s.import_resource_bytes("sky.hdr", sky_hdr()).unwrap();
         assert!(s.images[&name].rgba[0][0] > 10.0, "the decoder keeps HDR values");
+        let _gpu = gpu_lock();
         let Ok(mut gpu) = Gpu::new() else {
             eprintln!("skipping: no GPU adapter");
             return;
@@ -252,6 +260,7 @@ mod tests {
         let mut session = Session::new_project("Test", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
         session.doc.project.display.taa = false;
         let name = session.import_resource_bytes("sky.hdr", sky_hdr()).unwrap();
+        let _gpu = gpu_lock();
         let Ok(mut gpu) = Gpu::new() else {
             eprintln!("skipping: no GPU adapter");
             return;
@@ -283,6 +292,7 @@ mod tests {
         execute(&mut session, "viewport.view", &json!({"mode": "image", "image": "red"})).unwrap();
         let camera = session.camera;
         let uv = |ts| ViewKind::Uv { ts, zoom: 1.0, pan: [0.0, 0.0], rotation: 0.0 };
+        let _gpu = gpu_lock();
         let Ok(mut gpu) = Gpu::new() else {
             eprintln!("skipping: no GPU adapter");
             return;
@@ -306,6 +316,7 @@ mod tests {
         let mesh = texturecraft_engine::geom::primitives::material_ball();
         let mut s = Session::new_project("t", mesh, "builtin:material_ball", None, 256).unwrap();
         execute(&mut s, "layer.add.fill", &json!({"color": [0.75, 0.42, 0.23], "roughness": 0.3, "metallic": 0.4})).unwrap();
+        let _gpu = gpu_lock();
         let Ok(mut gpu) = Gpu::new() else {
             eprintln!("skipping: no GPU adapter");
             return;
@@ -339,6 +350,7 @@ mod tests {
 
         // Atlas UV 0.75 is the middle of tile 1002
         execute(&mut s, "tool.strokeUv", &json!({"points": [[0.75, 0.5]]})).unwrap();
+        let _gpu = gpu_lock();
         let Ok(mut gpu) = Gpu::new() else {
             eprintln!("skipping: no GPU adapter");
             return;
