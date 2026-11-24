@@ -850,9 +850,14 @@ mod tests {
         });
         encoder.copy_buffer_to_buffer(scratch, 0, &staging, 0, Some(scratch.size()));
         gpu.queue.submit([encoder.finish()]);
-        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        // The callback may run on another test's poll of the shared device: wait for it
+        let (sender, receiver) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |result| drop(sender.send(result)));
         let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
         // A failed mapping reads no texels, which the tests' comparisons then report
+        if !matches!(receiver.recv(), Ok(Ok(()))) {
+            return Vec::new();
+        }
         let Ok(bytes) = staging.slice(..).get_mapped_range() else { return Vec::new() };
         bytemuck::cast_slice::<u8, u32>(&bytes).as_chunks::<5>().0.to_vec()
     }

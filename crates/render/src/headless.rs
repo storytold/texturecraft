@@ -13,17 +13,22 @@ impl Headless {
     /// Create a device on the default adapter with every limit it reports. Errors when no GPU
     /// (or software) adapter exists.
     pub fn new() -> Result<Headless, String> {
-        // The render crate's tests share one device (and its compiled pipelines,
-        // `gpu_composite`): llvmpipe keeps what it compiled until the process ends
+        // The render crate's tests on GL share one device (and its compiled pipelines,
+        // `gpu_composite`): llvmpipe keeps what it compiled until the process ends. Other backends
+        // get a device per test, which the test's end destroys
         #[cfg(all(test, not(target_arch = "wasm32")))]
         {
-            static SHARED: std::sync::OnceLock<Result<(wgpu::Device, wgpu::Queue, String), String>> = std::sync::OnceLock::new();
-            let (device, queue, adapter_name) =
-                SHARED.get_or_init(|| Self::with_limits(crate::device_limits).map(|gpu| (gpu.device, gpu.queue, gpu.adapter_name))).clone()?;
-            let renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
-            return Ok(Headless { device, queue, renderer, adapter_name });
+            type Shared = Option<(wgpu::Device, wgpu::Queue, String)>;
+            static SHARED: std::sync::OnceLock<Result<Shared, String>> = std::sync::OnceLock::new();
+            let shared = SHARED.get_or_init(|| {
+                let gpu = Self::with_limits(crate::device_limits)?;
+                Ok((gpu.device.adapter_info().backend == wgpu::Backend::Gl).then_some((gpu.device, gpu.queue, gpu.adapter_name)))
+            });
+            if let Some((device, queue, adapter_name)) = shared.clone()? {
+                let renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+                return Ok(Headless { device, queue, renderer, adapter_name });
+            }
         }
-        #[allow(unreachable_code)]
         Self::with_limits(crate::device_limits)
     }
 

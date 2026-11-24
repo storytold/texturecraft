@@ -866,8 +866,10 @@ mod tests {
         let mut encoder = headless.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, bytes);
         headless.queue.submit([encoder.finish()]);
-        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let (sender, receiver) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |result| drop(sender.send(result)));
         headless.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        receiver.recv().unwrap().unwrap();
 
         bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec()
     }

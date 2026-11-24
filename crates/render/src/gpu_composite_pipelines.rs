@@ -211,12 +211,14 @@ pub(super) struct CompositePipelines {
     variants: BTreeMap<Features, Variants>,
 }
 
-/// The pipelines a compositor uses: its own, or in the render crate's tests one set per device
-/// for every compositor (llvmpipe keeps what it compiled until the process ends, so each test
-/// compiling the same variants again would add up).
+/// The pipelines a compositor uses: its own, or in the render crate's tests on GL one set per
+/// device for every compositor (llvmpipe keeps what it compiled until the process ends, so each
+/// test compiling the same variants again would add up). Other backends keep their own: a device
+/// kept here lives until the process ends, and the NVIDIA driver can crash at exit while one
+/// still compiles in the background.
 pub(super) fn shared(device: &wgpu::Device, supports_curvature: bool, supports_id: bool) -> Arc<Mutex<CompositePipelines>> {
     #[cfg(all(test, not(target_arch = "wasm32")))]
-    {
+    if device.adapter_info().backend == wgpu::Backend::Gl {
         static SHARED: Mutex<Vec<(wgpu::Device, Arc<Mutex<CompositePipelines>>)>> = Mutex::new(Vec::new());
         let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((_, pipelines)) = shared.iter().find(|(owner, _)| owner == device) {

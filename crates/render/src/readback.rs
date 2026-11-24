@@ -91,10 +91,18 @@ impl Readback {
     pub fn blocking_level(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, level: u32) -> Option<(u32, u32, Vec<u8>)> {
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_read") });
         let r = Readback::new_level(device, &mut enc, texture, level)?;
-        queue.submit([enc.finish()]);
+        let submitted = queue.submit([enc.finish()]);
         r.map();
-        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-        r.take().flatten()
+        // Another thread polling the same device may run the map callback: wait until it ran
+        loop {
+            if device.poll(wgpu::PollType::Wait { submission_index: Some(submitted.clone()), timeout: None }).is_err() {
+                return None;
+            }
+            if let Some(pixels) = r.take() {
+                return pixels;
+            }
+            std::thread::yield_now();
+        }
     }
 }
 
