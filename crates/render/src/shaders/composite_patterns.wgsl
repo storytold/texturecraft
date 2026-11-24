@@ -147,7 +147,7 @@ fn procedural_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f
                 let position = surface.position + layer.projection.xyz;
                 var d = vec3(0.0, 1.0, 0.0);
                 if dot(position, position) > 0.0 { d = normalize(position); }
-                points[0] = vec2(azimuth(d.z, d.x) * 4.0, acos(clamp(d.y, -1.0, 1.0)) * (2.0 / 3.141592654)) * layer.projection.w;
+                points[0] = vec2(azimuth(d.z, d.x) * 4.0, polar_angle(d.y) * (2.0 / 3.141592654)) * layer.projection.w;
             }
             case 6u, 7u, 8u: {
                 let pos = surface.position + layer.projection.xyz;

@@ -334,7 +334,7 @@ fn p1_local(op: Operation, coords: P1Coords) -> P1Coords {
 // 0..1 round a spherical projection's pole axis and down from its top (compose spherical_uv)
 fn p1_sphere(op: Operation, pos: vec3<f32>) -> vec2<f32> {
     let direction = p1_normalized(pos + p1_vec3(op, P1_OFFSET), vec3(0.0, 1.0, 0.0));
-    return vec2(azimuth(direction.z, direction.x), acos(clamp(direction.y, -1.0, 1.0)) / 3.141592654);
+    return vec2(azimuth(direction.z, direction.x), polar_angle(direction.y) / 3.141592654);
 }
 
 // 0..1 round a cylindrical projection's axis over its angle, and the height along it (compose cylinder_coords)

@@ -845,6 +845,37 @@ mod tests {
         }
     }
 
+    /// A spherical projection reads a tall image's nearest row from the polar angle, so the
+    /// angle must agree with the CPU's acos within about one ulp: a backend's own acos (llvmpipe's
+    /// is off by about 1e-5) moves rows across texel edges, 732 of these texels there. Rows
+    /// alternate black and white, so a row read one off shows as a flipped texel. A hardware
+    /// driver's rounding of the direction itself flips a few dozen (47 on one).
+    #[test]
+    fn spherical_nearest_reads_the_cpus_rows_of_a_tall_image() {
+        const ROWS: u32 = 4096;
+        const DIRECTION_ROUNDING_FLIPS: usize = (SIZE * SIZE / 100) as usize;
+        let Some(mut gpu) = headless() else { return };
+        let rows = (0..2 * ROWS)
+            .map(|index| {
+                let value = ((index / 2) % 2) as f32;
+                [value, value, value, 1.0]
+            })
+            .collect();
+        let images = ImageStore::from([("rows".to_owned(), Arc::new(ImageRes::new(2, ROWS, rows, false)))]);
+        let mut project = Project::new("Polar rows", "builtin:sphere");
+        project.texture_sets.push(TextureSet::new("Set", 0, SIZE));
+        let sampling = Sampling { filtering: Filtering::Nearest, ..Sampling::SAVED_BEFORE };
+        let projection = Projection::Spherical { scale: 1.0, uv: UvTransform::default(), offset: [0.0; 3], projector: Projector::default() };
+        let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::image("rows"))]), projection, sampling, ..Fill::default() };
+        let layer = Layer::new(project.alloc_id(), "Rows", LayerKind::Fill(fill), &[Channel::BaseColor]);
+        assert!(project.insert_layer(0, layer, None, false).is_ok());
+        let (pixels, baked, mesh) = (PixelStore::default(), BakedMaps::default(), sphere());
+
+        let case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+
+        assert_matches_cpu(&mut gpu, &case, Tolerance::POINT.with_flips(DIRECTION_ROUNDING_FLIPS), "spherical nearest rows");
+    }
+
     /// Every wrap stops the fill at its tile's edges on the axes that do not repeat, and stops
     /// image reads at the edge texel there; tri-planar never leaves its tile but clamps its reads
     #[test]
