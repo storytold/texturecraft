@@ -348,10 +348,11 @@ impl Session {
         if image_mask && gpu_tool && self.brush_device.is_some() {
             self.log.performance("Brush: CPU (mask image)");
         }
-        // Symmetry copies reach the device with the stamps: a 3D copy carries its source stamp for visibility
+        // Symmetry copies reach the device with the stamps (a 3D copy carries its source for visibility); particle strokes stay on the CPU
         let device = if gpu_tool
             && !image_mask
             && canvas.pickup.is_none()
+            && !settings.particles.enabled
             && settings.alpha_image.is_none()
             && settings.alpha_library.is_none()
             && let Some(backend) = &self.brush_device

@@ -2781,6 +2781,30 @@ pub(crate) mod tests {
         }
     }
 
+    /// A stroke with particles never reaches the GPU brush, the Eraser included
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_particle_eraser_stroke_stays_off_the_gpu_brush() {
+        let Ok(gpu) = Headless::new() else { return };
+        let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
+        let mut s = Session::new_project("Particle eraser", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [0.9, 0.3, 0.1]})).unwrap();
+        s.stroke_uv_points(&[Vec2::splat(0.5)]).unwrap();
+        let mut link = link();
+        link.gpu_composite_enabled = true;
+        link.brush_device = Some(brush.clone());
+        link.sync(&mut s, None, None, 0, 0.0);
+        execute(&mut s, "tool.eraser", &json!({})).unwrap();
+        execute(&mut s, "tool.brush", &json!({"particles": {"enabled": true}})).unwrap();
+
+        s.brush_device = link.brush_device(&s);
+        assert!(s.brush_device.is_some(), "the material composites on the GPU");
+        s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+
+        assert!(s.device_stroke().is_none(), "a particle stroke rasterises on the CPU");
+        s.end_stroke().unwrap();
+    }
+
     /// A stroke with symmetry runs on the GPU brush in the 2D and the 3D view: its mirrored copy
     /// shows live where the release commits it
     #[cfg(not(target_arch = "wasm32"))]
