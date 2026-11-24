@@ -364,3 +364,17 @@ fn interpolate_cells(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     write_at(params.buffers.z, id.xy, Texel(vec4(value, original.value.yzw), original.coverage));
 }
+
+// Copy a stage output out of a pre-pass field into the whole-set result (the composite's
+// `whole_slots`): `mode.y` × `mode.z` texels from field texel `rect.xy` of the field at
+// `buffers.x` (`rect.z` texels wide) to row `mode.w` of the result at `buffers.z` (`mode.x`
+// texels wide), `field_layout.x` words each.
+@compute @workgroup_size(8, 8)
+fn copy_field(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= params.mode.y || id.y >= params.mode.z { return; }
+    let source_word = word_at(params.buffers.x, params.rect.xy + id.xy);
+    let target_word = params.buffers.z + ((params.mode.w + id.y) * params.mode.x + id.x) * params.field_layout.x;
+    for (var word = 0u; word < params.field_layout.x; word++) {
+        fields[target_word + word] = fields[source_word + word];
+    }
+}

@@ -45,8 +45,11 @@ use crate::gpu_neighbourhood::{box_family, gather};
 pub(super) const FIELD_LAYOUT: usize = 44;
 /// First word of the package vec4s (`Params.packages`): P1 at 48, P2 at 52, … P8 at 76.
 const PACKAGE_SLOTS: usize = 48;
+/// First word of the whole-set pre-pass table (`Params.whole_slots`, `whole_bases`,
+/// `whole_rect`), after the package vec4s.
+pub(super) const WHOLE_SET: usize = PACKAGE_SLOTS + 8 * 4;
 /// Words of the band uniform.
-pub(super) const UNIFORM_WORDS: usize = PACKAGE_SLOTS + 8 * 4;
+pub(super) const UNIFORM_WORDS: usize = WHOLE_SET + 3 * 4;
 
 /// Opcodes of the packages' effects (`is_extended_effect` in WGSL).
 pub(super) const EXTENDED_EFFECTS: Range<u32> = 128..192;
@@ -491,6 +494,229 @@ mod tests {
         for (index, (&expected, pixel)) in expected.iter().zip(actual.as_chunks::<4>().0).enumerate() {
             assert!(pixel[0].abs_diff(expected) <= 2, "mask texel {index}: {} instead of {expected}", pixel[0]);
         }
+    }
+
+    /// The whole-set pre-pass (P0f): a stage marked whole-set (test seam: built-in stages
+    /// reaching 30 texels or more) runs once per update with the lower stages of its stack, and
+    /// the bands read its result instead of their own field. Paint content [Blur 24, Blur 160,
+    /// Blur 24] and a painted mask with Blur 160, against the CPU: full, a partial update of a
+    /// corner region, and with the Blur 160 stages wrapping (staged as in the P0e test).
+    #[test]
+    fn whole_set_stages_match_the_cpu_through_the_pre_pass() {
+        use std::sync::Arc;
+
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
+        use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, tile_bytes};
+        use texturecraft_core::Effect;
+        use texturecraft_geom::{UvGBuffer, primitives};
+        use texturecraft_texel::{TILE, TileImage, to_u16};
+
+        use crate::gpu_composite::CompositeRegion;
+        use crate::gpu_composite::oracle::headless;
+        use crate::gpu_neighbourhood::WHOLE_SET_TEST_REACH;
+        use crate::readback::Readback;
+
+        let Some(mut gpu) = headless() else { return };
+        const SIZE: u32 = 128;
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let build = |wrap: bool| {
+            let mut project = Project::new("Whole-set stage", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+            let owner = project.alloc_id();
+            let mut layer = Layer::new(owner, "Paint", LayerKind::Paint, &[Channel::BaseColor]);
+            for filter in [Filter::Blur { radius: 24.0, wrap: false }, Filter::Blur { radius: 160.0, wrap }, Filter::Blur { radius: 24.0, wrap: false }] {
+                layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(filter)));
+            }
+            let mut mask = Mask::new(MaskBackground::Black);
+            let mask_paint = project.alloc_id();
+            mask.effects.push(Effect::new(mask_paint, EffectKind::Paint));
+            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 160.0, wrap })));
+            layer.mask = Some(mask);
+            project.insert_layer(0, layer, None, false).unwrap();
+            (project, owner, mask_paint)
+        };
+        let wide = crate::gpu_neighbourhood::NeighbourhoodFilter::new(&Filter::Blur { radius: 160.0, wrap: false }, SIZE, SIZE, 1.0, None).unwrap();
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        let tiles: Vec<_> = (0..SIZE / TILE).flat_map(|y| (0..SIZE / TILE).map(move |x| (x, y))).collect();
+        for wrap in [false, true] {
+            let (cpu_project, owner, mask_paint) = build(wrap);
+            let (gpu_project, _, _) = build(false);
+            let mut pixels = PixelStore::default();
+            let paint = pixels.layer_mut(owner, Channel::BaseColor, (SIZE, SIZE));
+            let mut mask_pixels = TileImage::new(SIZE, SIZE, 2);
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    if (x < 9 && (20..70).contains(&y))
+                        || (y < 7 && (30..90).contains(&x))
+                        || ((50..60).contains(&x) && (60..75).contains(&y))
+                        || (x > 116 && y > 112)
+                    {
+                        paint.set(x, y, &[to_u16(0.8), to_u16(0.25), to_u16(0.4), u16::MAX]);
+                        mask_pixels.set(x, y, &[to_u16(0.9), u16::MAX]);
+                    }
+                }
+            }
+            pixels.masks.insert(mask_paint, mask_pixels);
+            let inputs = Inputs {
+                project: &cpu_project,
+                ts: 0,
+                mesh: &mesh,
+                gbuf: &gbuf,
+                pixels: &pixels,
+                baked: &baked,
+                block_scales: cpu_project.texture_sets[0].block_scales(),
+                preview: None,
+                images: &images,
+                bounds: mesh.bounds(),
+            };
+            let compile = |region: Option<CompositeRegion>, mask: bool| {
+                WHOLE_SET_TEST_REACH.set(Some(wide.reach()));
+                let program = if mask {
+                    CompositeProgram::try_compile_mask_preview(&gpu_project, &pixels, 0, owner, region, None)
+                } else {
+                    CompositeProgram::try_compile_region(&gpu_project, &pixels, 0, region)
+                };
+                WHOLE_SET_TEST_REACH.set(None);
+                let mut program = program.unwrap();
+                for stage in &mut program.filters.stages {
+                    stage.wrap = wrap && stage.filter.is_some_and(|filter| filter.radius == wide.radius);
+                }
+                let whole = program.filters.whole_set().expect("the Blur 160 stages run in the pre-pass");
+                assert!(whole.outputs.iter().all(|&output| program.filters.stages[output].filter.is_some_and(|filter| filter.radius == wide.radius)));
+                assert!(program.filters.band_reach() < program.filters.reach, "the bands no longer carry the pre-pass's reach");
+                program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+                program
+            };
+            let read = |gpu: &crate::headless::Headless| {
+                let texture = gpu.renderer.display_textures()[0][DisplayKind::BaseColor as usize];
+                Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap().2
+            };
+
+            let mut oracle = Composite::new(&[Channel::BaseColor], SIZE);
+            composite_tiles(&inputs, &mut oracle, &tiles);
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &compile(None, false)).unwrap();
+            let full = read(&gpu);
+            for &(tx, ty) in &tiles {
+                let expected = tile_bytes(&oracle, &baked, DisplayKind::BaseColor, tx, ty);
+                for (y, row) in expected.as_chunks::<{ TILE as usize * 4 }>().0.iter().enumerate() {
+                    let start = ((ty * TILE + y as u32) * SIZE + tx * TILE) as usize * 4;
+                    for (x, (gpu, cpu)) in full[start..start + row.len()].as_chunks::<4>().0.iter().zip(row.as_chunks::<4>().0).enumerate() {
+                        let largest = gpu.iter().zip(cpu).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+                        assert!(largest <= 2, "wrap {wrap} material ({}, {}): GPU {gpu:?}, CPU {cpu:?}", tx * TILE + x as u32, ty * TILE + y as u32);
+                    }
+                }
+            }
+            // A partial update: the pre-pass covers only what the corner region's bands read
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &compile(Some(CompositeRegion { min: [0, 0], max: [16, 16] }), false)).unwrap();
+            assert!(read(&gpu).iter().zip(&full).all(|(a, b)| a.abs_diff(*b) <= 1), "wrap {wrap}: the corner region changed the result");
+
+            let expected = mask_image(&inputs, owner, SIZE).unwrap();
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &compile(None, true)).unwrap();
+            let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.aux_texture(0).unwrap()).unwrap();
+            for (index, (&expected, pixel)) in expected.iter().zip(actual.as_chunks::<4>().0).enumerate() {
+                assert!(pixel[0].abs_diff(expected) <= 2, "wrap {wrap} mask texel {index}: {} instead of {expected}", pixel[0]);
+            }
+        }
+    }
+
+    /// Timing and working memory of a large-reach stage at 2K and 4K, in the bands and in the
+    /// whole-set pre-pass (test seam). `cargo test … -- --ignored --nocapture bench_whole_set`.
+    #[test]
+    #[ignore = "GPU benchmark"]
+    fn bench_whole_set_stage() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        use texturecraft_core::Effect;
+        use texturecraft_geom::{UvGBuffer, primitives};
+        use texturecraft_texel::to_u16;
+
+        use crate::gpu_composite::oracle::headless;
+        use crate::gpu_neighbourhood::{NeighbourhoodFilter, WHOLE_SET_TEST_REACH};
+
+        let Some(mut gpu) = headless() else { return };
+        let limits = gpu.device.limits();
+        println!(
+            "BENCH adapter {}: storage binding {} MiB, buffer {} MiB",
+            gpu.adapter_name,
+            limits.max_storage_buffer_binding_size >> 20,
+            limits.max_buffer_size >> 20
+        );
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        for size in [2048u32, 4096] {
+            let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, size, size));
+            let mut project = Project::new("Whole-set bench", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Plane", 0, size));
+            let owner = project.alloc_id();
+            let mut layer = Layer::new(owner, "Paint", LayerKind::Paint, &[Channel::BaseColor]);
+            // A Bevel-like reach: about 411 texels at 4K
+            let blur = Filter::Blur { radius: 68.5, wrap: false };
+            layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(blur.clone())));
+            project.insert_layer(0, layer, None, false).unwrap();
+            let mut pixels = PixelStore::default();
+            let paint = pixels.layer_mut(owner, Channel::BaseColor, (size, size));
+            for y in (0..size).step_by(7) {
+                for x in (0..size).step_by(5) {
+                    paint.set(x, y, &[to_u16(0.8), to_u16(0.25), to_u16(0.4), u16::MAX]);
+                }
+            }
+            let reach = NeighbourhoodFilter::new(&blur, size, size, 1.0, Some(texturecraft_core::ChannelKind::Color)).unwrap().reach();
+            gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((size, size), 0)], 1);
+            for whole in [false, true] {
+                WHOLE_SET_TEST_REACH.set(whole.then_some(reach));
+                let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+                WHOLE_SET_TEST_REACH.set(None);
+                program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+                let mut times = Vec::new();
+                for _ in 0..4 {
+                    let started = Instant::now();
+                    gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+                    gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+                    times.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                let result_mb = if whole { (u64::from(size) * u64::from(size) * 5 * 4) >> 20 } else { 0 };
+                println!(
+                    "BENCH {size}² reach {reach} whole-set {whole}: first {:.0} ms, warm {:.0} ms (result {result_mb} MiB)",
+                    times[0],
+                    times[1..].iter().copied().fold(f64::MAX, f64::min)
+                );
+            }
+        }
+    }
+
+    /// A stack whose reach is half a 4K set (a Drop Shadow's) composites in bands on an adapter
+    /// whose full limits allow it, without the pre-pass. `-- --ignored large_halo`.
+    #[test]
+    #[ignore = "4K GPU memory"]
+    fn a_large_halo_stack_composites_at_4k_with_the_adapter_limits() {
+        use std::sync::Arc;
+
+        use texturecraft_core::Effect;
+        use texturecraft_geom::{UvGBuffer, primitives};
+        use texturecraft_texel::to_u16;
+
+        use crate::gpu_composite::oracle::headless;
+
+        let Some(mut gpu) = headless() else { return };
+        const SIZE: u32 = 4096;
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        let mut project = Project::new("Large halo", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let owner = project.alloc_id();
+        let mut layer = Layer::new(owner, "Paint", LayerKind::Paint, &[Channel::BaseColor]);
+        // Three box passes of 683 texels: a reach of 2049, half the set
+        layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 341.5, wrap: false })));
+        project.insert_layer(0, layer, None, false).unwrap();
+        let mut pixels = PixelStore::default();
+        pixels.layer_mut(owner, Channel::BaseColor, (SIZE, SIZE)).set(2000, 2000, &[to_u16(0.8), to_u16(0.25), to_u16(0.4), u16::MAX]);
+        let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+        assert!(program.filters.whole_set().is_none() && program.filters.reach >= SIZE / 2, "{}", program.filters.reach);
+        program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
     }
 
     #[test]
