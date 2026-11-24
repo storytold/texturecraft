@@ -653,7 +653,9 @@ impl FilterPlan {
             let preceding = preceding as u32 | if mask { MASK_STAGE } else { 0 };
             // An image input the effect registered (`ProceduralInputs::register_input`)
             let input = effect.effects[3];
-            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input, wrap: false, whole });
+            // P4: Blur and Bevel with Wrap read the set periodically past its edges
+            let wrap = gpu_neighbourhood::box_family::wraps(filter);
+            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input, wrap, whole });
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);
