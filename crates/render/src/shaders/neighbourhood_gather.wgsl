@@ -5,6 +5,8 @@
 
 // The P5 kinds (gpu_neighbourhood_gather.rs)
 const GATHER_FXAA: u32 = 32u;
+const GATHER_SOURCE_WARP: u32 = 34u;
+const GATHER_SOURCE_SLOPE_BLUR: u32 = 35u;
 const GATHER_MIRROR: u32 = 36u;
 const GATHER_TRANSFORM: u32 = 37u;
 
@@ -24,6 +26,39 @@ const GATHER_MIRROR_Y: u32 = 2u;
 const GATHER_MIRROR_KEEP_RIGHT: u32 = 4u;
 const GATHER_MIRROR_KEEP_BOTTOM: u32 = 8u;
 const GATHER_MIRROR_DEBUG: u32 = 16u;
+
+// Bit fields of a Warp's or Blur Slope's words[0]: the warp mode, the blending, the directions,
+// the source's mode, whether the source repeats within the UV tile, and the read count
+const GATHER_WARP_MODE_SHIFT: u32 = 0u;
+const GATHER_BLENDING_SHIFT: u32 = 2u;
+const GATHER_DIRECTION_COUNT_SHIFT: u32 = 4u;
+const GATHER_SOURCE_MODE_SHIFT: u32 = 8u;
+const GATHER_SOURCE_TILED: u32 = 1024u;
+const GATHER_READ_COUNT_SHIFT: u32 = 16u;
+const GATHER_WARP_MODE_WARP: u32 = 0u;
+const GATHER_WARP_MODE_MULTI_DIRECTIONAL: u32 = 2u;
+const GATHER_WARP_BLENDING_MAX: u32 = 1u;
+const GATHER_WARP_BLENDING_MIN: u32 = 2u;
+const GATHER_WARP_BLENDING_CHAIN: u32 = 3u;
+const GATHER_SLOPE_BLENDING_BLUR: u32 = 0u;
+const GATHER_SLOPE_BLENDING_MAX: u32 = 2u;
+const GATHER_SOURCE_DEFAULT_NOISE: u32 = 0u;
+const GATHER_SOURCE_CUSTOM_NOISE: u32 = 2u;
+// Mid gray, the source value that moves nothing, and how far noise is stretched from it
+// (WarpSource in core)
+const GATHER_MID_GRAY: f32 = 0.5;
+const GATHER_NOISE_STRETCH: f32 = 1.5;
+// Octaves of a warp's default noise (texel_noise in eval.rs)
+const GATHER_NOISE_OCTAVES: u32 = 3u;
+// The source's slope (rise per UV tile) that moves a texel the whole way (SourceWarp::FULL_SLOPE)
+const GATHER_FULL_SLOPE: f32 = 4.0;
+// A source rising less than this across a texel is flat (slope_texel.rs)
+const GATHER_FLAT_STEEPNESS: f32 = 1e-6;
+// A content read covering less alpha than this has no colour (MIN_ALPHA in eval.rs)
+const GATHER_MIN_ALPHA: f32 = 1e-5;
+// The gray an image input reads until one is linked (ImageInput's default): linked inputs still
+// composite on the CPU (effect_needs_cpu)
+const GATHER_INPUT_DEFAULT: f32 = 0.5;
 
 const GATHER_LARGEST_FINITE: f32 = 3.402823466e38;
 
@@ -82,11 +117,11 @@ fn gather_keep_coverage(acc: Texel, own: f32) -> Texel {
 
 // The luma at home position `home`; off the UV island the texel's own, so seams are not edges
 fn gather_fxaa_luma(home: vec2<f32>, own: f32) -> f32 {
-    let read = gather_read(home);
-    if read.coverage <= MIN_WEIGHT {
+    let found = gather_read(home);
+    if found.coverage <= MIN_WEIGHT {
         return own;
     }
-    return gather_luma(read.value / read.coverage);
+    return gather_luma(found.value / found.coverage);
 }
 
 // Walk the edge's midline one way until its luma leaves the edge's: (steps, last difference)
@@ -158,6 +193,220 @@ fn gather_fxaa(home: vec2<f32>, center: vec4<f32>) -> Texel {
         return gather_read(home + perp * blend);
     }
     return EMPTY;
+}
+
+// finite_unit in core: clamped to 0..1, 0 when not finite
+fn gather_finite_unit(value: f32) -> f32 {
+    return select(0.0, clamp(value, 0.0, 1.0), gather_finite(value));
+}
+
+// An image input's gray at home position `home` (the input closure of gather in eval.rs):
+// bilinear over the covered texels, (gray, 1), or (0, 0) where it covers nothing. Until one is
+// linked an input reads its default everywhere it covers
+fn gather_input(home: vec2<f32>) -> vec2<f32> {
+    if gather_read(home).coverage > MIN_WEIGHT {
+        return vec2(GATHER_INPUT_DEFAULT, 1.0);
+    }
+    return vec2(0.0);
+}
+
+// The direction of a warp's `index`-th move, laid out in pairs in `extra`
+fn gather_direction(index: u32) -> vec2<f32> {
+    let pair = params.extra[index / 2u];
+    return select(pair.xy, pair.zw, index % 2u == 1u);
+}
+
+// A warp's or slope blur's source at `position` before it is shaped (WarpSourceSample::raw):
+// (value, 1), or (0, 0) where the values it reads cover nothing. `texel` is the home position of
+// the texel being written, whose UV tile a repeating source stays in
+fn gather_source_raw(texel: vec2<f32>, position: vec2<f32>) -> vec2<f32> {
+    let flags = params.field_layout.z;
+    let mode = (flags >> GATHER_SOURCE_MODE_SHIFT) & 3u;
+    if mode == GATHER_SOURCE_DEFAULT_NOISE {
+        let height = fbm(vec3(position * params.weights.z, 0.0), GATHER_NOISE_OCTAVES, params.mode.z, true);
+        if !gather_finite(height) {
+            return vec2(GATHER_MID_GRAY, 1.0);
+        }
+        return vec2(clamp(GATHER_MID_GRAY + (height - GATHER_MID_GRAY) * GATHER_NOISE_STRETCH, 0.0, 1.0), 1.0);
+    }
+
+    // Keep the bilinear taps in this UV tile at the ends of each repeat
+    var at = position;
+    if (flags & GATHER_SOURCE_TILED) != 0u {
+        let side = vec2<f32>(params.bounds.zw - params.bounds.xy);
+        let origin = floor(texel / side) * side;
+        let repeated = (position - origin + 0.5) * params.weights.z;
+        let wrapped = vec2(gather_rem_euclid(repeated.x, side.x), gather_rem_euclid(repeated.y, side.y)) - 0.5;
+        at = origin + clamp(wrapped, vec2(0.0), side - 1.0);
+    }
+    if mode == GATHER_SOURCE_CUSTOM_NOISE {
+        return gather_input(at);
+    }
+
+    // The filtered values' luminance; content stays premultiplied by its own coverage
+    let found = gather_read(at);
+    if gather_is_content() {
+        if found.value.w > GATHER_MIN_ALPHA {
+            let color = found.value.xyz / found.value.w;
+            return vec2(0.3 * color.x + 0.59 * color.y + 0.11 * color.z, 1.0);
+        }
+        return vec2(0.0);
+    }
+    if found.coverage > MIN_WEIGHT {
+        return vec2(found.value.x / found.coverage, 1.0);
+    }
+    return vec2(0.0);
+}
+
+// The source at `position` after its blur, Balance and Contrast (WarpSourceSample::at)
+fn gather_source_at(texel: vec2<f32>, position: vec2<f32>) -> f32 {
+    let half = params.direction.y;
+    var value = GATHER_MID_GRAY;
+    if half > 0.0 {
+        var sum = 0.0;
+        var count = 0.0;
+        for (var corner = 0u; corner < 4u; corner++) {
+            let offset = select(vec2(-half), vec2(half), vec2(corner & 1u, corner >> 1u) != vec2(0u));
+            let raw = gather_source_raw(texel, position + offset);
+            if raw.y > 0.0 {
+                sum += raw.x;
+                count += 1.0;
+            }
+        }
+        if count > 0.0 {
+            value = sum / count;
+        }
+    } else {
+        let raw = gather_source_raw(texel, position);
+        if raw.y > 0.0 {
+            value = raw.x;
+        }
+    }
+
+    // Balance and Contrast (shape_gray in core's gradient_input.rs); a steepness of 0 is a step
+    let balanced = gather_finite_unit(value) + params.weights.w - GATHER_MID_GRAY;
+    let steepness = bitcast<f32>(params.field_layout.w);
+    if steepness == 0.0 {
+        return select(0.0, 1.0, balanced >= GATHER_MID_GRAY);
+    }
+    return gather_finite_unit((balanced - GATHER_MID_GRAY) / steepness + GATHER_MID_GRAY);
+}
+
+// How far (-1..1 of the move) a source value moves a texel along a direction (SourceWarp::amount)
+fn gather_warp_amount(value: f32) -> f32 {
+    return select(0.0, clamp(2.0 * value - 1.0, -1.0, 1.0), gather_finite(value));
+}
+
+// The largest (or smallest) of reads, component by component (keep_extreme_read in
+// warp_texel.rs): reads that cover nothing are skipped
+struct GatherExtreme {
+    picked: vec4<f32>,
+    found: bool,
+}
+
+fn gather_extreme_add(extreme: GatherExtreme, home: vec2<f32>, larger: bool) -> GatherExtreme {
+    let found = gather_read(home);
+    if found.coverage <= MIN_WEIGHT {
+        return extreme;
+    }
+
+    let value = found.value / found.coverage;
+    if !extreme.found {
+        return GatherExtreme(value, true);
+    }
+    return GatherExtreme(select(min(extreme.picked, value), max(extreme.picked, value), larger), true);
+}
+
+fn gather_extreme_texel(extreme: GatherExtreme) -> Texel {
+    if !extreme.found {
+        return EMPTY;
+    }
+    return Texel(extreme.picked, 1.0);
+}
+
+// Warp at home position `home` (warp_texel.rs): where its source sends the texel, or those reads blended
+fn gather_source_warp(home: vec2<f32>) -> Texel {
+    let flags = params.field_layout.z;
+    let mode = (flags >> GATHER_WARP_MODE_SHIFT) & 3u;
+    let blending = (flags >> GATHER_BLENDING_SHIFT) & 3u;
+    let count = (flags >> GATHER_DIRECTION_COUNT_SHIFT) & 7u;
+    let reach = params.weights.y;
+    if mode == GATHER_WARP_MODE_WARP {
+        let probe = params.direction.x;
+        let rise = vec2(
+            gather_source_at(home, home + vec2(probe, 0.0)) - gather_source_at(home, home - vec2(probe, 0.0)),
+            gather_source_at(home, home + vec2(0.0, probe)) - gather_source_at(home, home - vec2(0.0, probe)),
+        );
+
+        // The slope per UV tile against the one that moves the whole way, at most the whole move
+        let across = params.extra[0].x;
+        let slope = vec2(
+            select(0.0, rise.x / across / GATHER_FULL_SLOPE, gather_finite(rise.x)),
+            select(0.0, rise.y / across / GATHER_FULL_SLOPE, gather_finite(rise.y)),
+        );
+        let slope_length = sqrt(slope.x * slope.x + slope.y * slope.y);
+        let fit = select(1.0, 1.0 / slope_length, slope_length > 1.0);
+        return gather_read(home + vec2(slope.x * fit * reach, slope.y * fit * reach));
+    }
+
+    // One move after the other, each from where the last one landed
+    let multi = mode == GATHER_WARP_MODE_MULTI_DIRECTIONAL;
+    if multi && blending == GATHER_WARP_BLENDING_CHAIN {
+        var at = home;
+        for (var index = 0u; index < count; index++) {
+            let moved = gather_warp_amount(gather_source_at(home, at)) * reach;
+            at = at + gather_direction(index) * moved;
+        }
+        return gather_read(at);
+    }
+
+    // Independent directions share the source at the original texel
+    let moved = gather_warp_amount(gather_source_at(home, home)) * reach;
+    if multi && (blending == GATHER_WARP_BLENDING_MAX || blending == GATHER_WARP_BLENDING_MIN) {
+        var extreme = GatherExtreme(vec4(0.0), false);
+        for (var index = 0u; index < count; index++) {
+            extreme = gather_extreme_add(extreme, home + gather_direction(index) * moved, blending == GATHER_WARP_BLENDING_MAX);
+        }
+        return gather_extreme_texel(extreme);
+    }
+    var acc = EMPTY;
+    for (var index = 0u; index < count; index++) {
+        acc = gather_sample(acc, home + gather_direction(index) * moved);
+    }
+    return acc;
+}
+
+// Blur Slope at home position `home` (slope_texel.rs): the reads downhill of its source, blended
+fn gather_source_slope_blur(home: vec2<f32>) -> Texel {
+    let flags = params.field_layout.z;
+    let probe = params.direction.x;
+    let downhill = vec2(
+        gather_source_at(home, home - vec2(probe, 0.0)) - gather_source_at(home, home + vec2(probe, 0.0)),
+        gather_source_at(home, home - vec2(0.0, probe)) - gather_source_at(home, home + vec2(0.0, probe)),
+    );
+    let steepness = sqrt(downhill.x * downhill.x + downhill.y * downhill.y);
+
+    // A flat spot keeps its value
+    if !(steepness > GATHER_FLAT_STEEPNESS) {
+        return gather_read(home);
+    }
+
+    let along = downhill / steepness;
+    let reads = flags >> GATHER_READ_COUNT_SHIFT;
+    let spacing = params.weights.y / f32(reads);
+    let blending = (flags >> GATHER_BLENDING_SHIFT) & 3u;
+    if blending == GATHER_SLOPE_BLENDING_BLUR {
+        var acc = EMPTY;
+        for (var taken = 0u; taken <= reads; taken++) {
+            acc = gather_sample(acc, home + along * (f32(taken) * spacing));
+        }
+        return acc;
+    }
+    var extreme = GatherExtreme(vec4(0.0), false);
+    for (var taken = 0u; taken <= reads; taken++) {
+        extreme = gather_extreme_add(extreme, home + along * (f32(taken) * spacing), blending == GATHER_SLOPE_BLENDING_MAX);
+    }
+    return gather_extreme_texel(extreme);
 }
 
 // value.rem_euclid(modulus) as Rust computes it for a positive modulus: the truncated remainder,
@@ -296,6 +545,10 @@ fn gather_family_gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
         if (flags & GATHER_FXAA_ALPHA) == 0u {
             acc = gather_keep_coverage(acc, original.w);
         }
+    } else if kind == GATHER_SOURCE_WARP {
+        acc = gather_source_warp(home);
+    } else if kind == GATHER_SOURCE_SLOPE_BLUR {
+        acc = gather_source_slope_blur(home);
     } else if kind == GATHER_MIRROR {
         acc = gather_mirror(home, original);
     } else if kind == GATHER_TRANSFORM {

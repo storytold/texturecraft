@@ -30,17 +30,24 @@
 //! oracle test (`crate::gpu_composite::oracle`, `Tolerance::TRANSCENDENTAL`, normals by dot
 //! product) on paint and in a mask, chained, and with a partial region.
 
-use texturecraft_core::{Filter, Mirror, MirrorMode, RepeatMode, TileTransform};
+use texturecraft_core::{
+    Filter, Mirror, MirrorMode, RepeatMode, SlopeBlending, SourceSlopeBlur, SourceWarp, TileTransform, WarpBlending, WarpMode, WarpSource, WarpSourceMode,
+    finite_unit,
+};
 
 use super::{GATHER_KINDS, Kind, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, StageInputs};
 
 /// Library filter ids P5 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["warp", "blurSlope", "anisotropicKuwahara", "colorMatch", "heightToNormal"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["anisotropicKuwahara", "colorMatch", "heightToNormal"];
 
 pub(super) const WGSL: &str = include_str!("shaders/neighbourhood_gather.wgsl");
 
 /// FXAA: the luma edge search of `fxaa_texel` in eval.rs.
 const FXAA: Kind = Kind(GATHER_KINDS.start);
+/// Warp (`SourceWarp`): where its source sends a texel (`warp_texel.rs`).
+const SOURCE_WARP: Kind = Kind(GATHER_KINDS.start + 2);
+/// Blur Slope (`SourceSlopeBlur`): the reads downhill of its source (`slope_texel.rs`).
+const SOURCE_SLOPE_BLUR: Kind = Kind(GATHER_KINDS.start + 3);
 /// Mirror: the texel its UV tile's kept side gives (`mirror_texel` in eval.rs), whole-set.
 const MIRROR: Kind = Kind(GATHER_KINDS.start + 4);
 /// Transform: the bilinear read its affine gives in its UV tile (`transform_texel`), whole-set.
@@ -60,6 +67,22 @@ const MIRROR_KEEP_RIGHT: u32 = 4;
 const MIRROR_KEEP_BOTTOM: u32 = 8;
 const MIRROR_DEBUG: u32 = 16;
 
+/// Bit fields of a Warp's or Blur Slope's `words[0]` (the same constants in the WGSL file): the
+/// warp mode, the blending, the directions, the source's mode, whether the source repeats within
+/// the UV tile, and Blur Slope's read count.
+const WARP_MODE_SHIFT: u32 = 0;
+const BLENDING_SHIFT: u32 = 2;
+const DIRECTION_COUNT_SHIFT: u32 = 4;
+const SOURCE_MODE_SHIFT: u32 = 8;
+const SOURCE_TILED: u32 = 1 << 10;
+const READ_COUNT_SHIFT: u32 = 16;
+
+/// Samples along a slope blur at most (`LINE_SAMPLES` in eval.rs).
+const LINE_SAMPLES: u32 = 24;
+
+/// The least steepness a source contrast below 1 keeps (`MIN_STEEPNESS` in core's gradient_input.rs).
+const MIN_SOURCE_STEEPNESS: f32 = 1e-3;
+
 /// Filter sizes are texels at this many texels per side, as the CPU scales them.
 const FILTER_SIZE_RESOLUTION: f32 = 2048.0;
 /// The smallest radius a filter runs at, in texels.
@@ -70,6 +93,9 @@ const SAMPLE_WORK: u64 = 4;
 
 /// Reads of an FXAA texel at most: the 3 × 3 lumas, both edge walks and the blended read.
 const FXAA_READS: u64 = 9 + 2 * FXAA_SEARCH as u64 + 1;
+
+/// Source reads of a warp or slope blur texel at most: four slope probes, each at its blur's corners.
+const SOURCE_READS: u64 = 4 * 4;
 
 /// P5's own compute pipelines, created from the neighbourhood module.
 pub(super) struct Pipelines;
@@ -86,7 +112,7 @@ fn flag(on: bool, bit: u32) -> u32 {
 
 /// Whether a P5 stage evaluates `filter` as the CPU does.
 pub(super) fn supports(filter: &Filter) -> bool {
-    matches!(filter, Filter::Fxaa { .. } | Filter::Mirror(_) | Filter::Transform(_))
+    matches!(filter, Filter::Fxaa { .. } | Filter::SourceWarp(_) | Filter::SourceSlopeBlur(_) | Filter::Mirror(_) | Filter::Transform(_))
 }
 
 /// The P5 stage for `filter`, None when its size reaches nothing.
@@ -98,11 +124,103 @@ pub(super) fn new(filter: &Filter, stage: StageInputs) -> Option<NeighbourhoodFi
             fxaa.words[0] = flag(*alpha, FXAA_ALPHA);
             Some(fxaa)
         }
+        Filter::SourceWarp(warp) if warp.move_texels(stage.resolution) > 0.0 => Some(source_warp(stage, warp)),
+        Filter::SourceSlopeBlur(slope) if slope.move_texels(stage.resolution) > 0.0 => Some(source_slope_blur(stage, slope)),
         // A mirror or transform reads anywhere in its UV tile; one that changes nothing is skipped
         Filter::Mirror(mirror) => Some(mirror_stage(stage, mirror)),
         Filter::Transform(transform) if !transform.is_identity() => Some(transform_stage(stage, transform)),
         _ => None,
     }
+}
+
+/// Unit texel-space vector of `angle` degrees, as `direction` in eval.rs.
+fn direction(angle: f32) -> [f32; 2] {
+    let (sine, cosine) = angle.to_radians().sin_cos();
+    [cosine, -sine]
+}
+
+/// Whether a warp's source repeats within the UV tile: it then reads anywhere in it.
+fn tiled_source(source: &WarpSource) -> bool {
+    source.mode != WarpSourceMode::DefaultNoise && source.tiling_factor() != 1.0
+}
+
+/// The texels a warp or slope blur reads around a texel (`reach` its own), the whole set where
+/// its source repeats within the UV tile (`filter_reach` in eval.rs).
+fn source_texels(reach: f32, source: &WarpSource, stage: StageInputs) -> f32 {
+    let texels = reach.max(MIN_FILTER_RADIUS);
+    if tiled_source(source) { texels.max(stage.longest_side as f32) } else { texels }
+}
+
+/// The source of a warp or slope blur: its mode bits, and its reads in `frequency` (the noise's
+/// scale per texel, or the Tiling), `middle` (the Balance), `direction` (the slope probe and half
+/// the blur) and `words[1]` (the Contrast's steepness as f32 bits, 0 for a step).
+fn source_settings(out: &mut NeighbourhoodFilter, source: &WarpSource, resolution: u32) -> u32 {
+    let mode = match source.mode {
+        WarpSourceMode::DefaultNoise => 0,
+        WarpSourceMode::PreviousInput => 1,
+        WarpSourceMode::CustomNoise => 2,
+    };
+    let noise_scale = source.noise_scale();
+    let noise_scale = if noise_scale.is_finite() { noise_scale.clamp(Filter::NOISE_SCALE_MIN, Filter::NOISE_SCALE_MAX) } else { 1.0 };
+    let contrast = finite_unit(source.contrast);
+
+    out.frequency = if source.mode == WarpSourceMode::DefaultNoise { noise_scale / resolution.max(1) as f32 } else { source.tiling_factor() };
+    out.middle = finite_unit(source.balance);
+    out.direction = [SourceWarp::probe_texels(resolution), source.blur_texels(resolution) / 2.0];
+    out.words[1] = if contrast == 1.0 { 0 } else { (1.0 - contrast).max(MIN_SOURCE_STEEPNESS).to_bits() };
+    (mode << SOURCE_MODE_SHIFT) | flag(tiled_source(source), SOURCE_TILED)
+}
+
+/// A Warp stage: the move in `amount`, the directions (Warp mode: the slope's measuring span) in
+/// `extra`, the source as [`source_settings`] lays it out.
+fn source_warp(stage: StageInputs, warp: &SourceWarp) -> NeighbourhoodFilter {
+    let resolution = stage.resolution;
+    let mode = match warp.mode {
+        WarpMode::Warp => 0,
+        WarpMode::Directional => 1,
+        WarpMode::MultiDirectional => 2,
+    };
+    let blending = match warp.blending {
+        WarpBlending::Average => 0,
+        WarpBlending::Max => 1,
+        WarpBlending::Min => 2,
+        WarpBlending::Chain => 3,
+    };
+    let directions: Vec<[f32; 2]> = warp.angles().map(direction).collect();
+
+    let mut out = stage.filter(SOURCE_WARP, source_texels(warp.reach(resolution), &warp.source, stage));
+    if warp.mode == WarpMode::Warp {
+        // The texels the slope is measured across, in UV tiles (slope_move in core's source_warp.rs)
+        out.extra[0] = 2.0 * SourceWarp::probe_texels(resolution) / resolution.max(1) as f32;
+    }
+    for (slot, along) in out.extra.chunks_exact_mut(2).zip(&directions) {
+        slot.copy_from_slice(along);
+    }
+    out.amount = warp.move_texels(resolution);
+    out.seed = warp.seed;
+    let source = source_settings(&mut out, &warp.source, resolution);
+    out.words[0] = (mode << WARP_MODE_SHIFT) | (blending << BLENDING_SHIFT) | ((directions.len() as u32) << DIRECTION_COUNT_SHIFT) | source;
+    out
+}
+
+/// A Blur Slope stage: the reach downhill in `amount`, the blending and the read count in
+/// `words[0]`, the source as [`source_settings`] lays it out.
+fn source_slope_blur(stage: StageInputs, slope: &SourceSlopeBlur) -> NeighbourhoodFilter {
+    let resolution = stage.resolution;
+    let reach = slope.move_texels(resolution);
+    let reads = slope.samples((reach.ceil() as u32).clamp(1, LINE_SAMPLES));
+    let blending = match slope.blending {
+        SlopeBlending::Blur => 0,
+        SlopeBlending::Min => 1,
+        SlopeBlending::Max => 2,
+    };
+
+    let mut out = stage.filter(SOURCE_SLOPE_BLUR, source_texels(slope.reach(resolution), &slope.source, stage));
+    out.amount = reach;
+    out.seed = slope.seed;
+    let source = source_settings(&mut out, &slope.source, resolution);
+    out.words[0] = (blending << BLENDING_SHIFT) | (reads << READ_COUNT_SHIFT) | source;
+    out
 }
 
 /// A Mirror stage: the axes, the debug line's half width (a share of the tile) and the tile's
@@ -153,6 +271,9 @@ pub(super) fn reach(filter: NeighbourhoodFilter) -> u32 {
 pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
     match filter.kind {
         FXAA => SAMPLE_WORK * FXAA_READS,
+        // The source read at the four corners of its blur round the texel and its slope probes
+        SOURCE_WARP => SAMPLE_WORK * (SOURCE_READS + u64::from(SourceWarp::DIRECTIONS[2])),
+        SOURCE_SLOPE_BLUR => SAMPLE_WORK * (SOURCE_READS + u64::from(filter.words[0] >> READ_COUNT_SHIFT) + 1),
         MIRROR => SAMPLE_WORK,
         // The four texels round the read, one at a time
         TRANSFORM => 4 * SAMPLE_WORK,
@@ -163,8 +284,13 @@ pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
 /// Whether a stage runs in the whole-set pre-pass instead of in every band (see
 /// `NeighbourhoodFilter::whole_set`): large reaches and whole-set reads.
 pub(super) fn whole_set(filter: NeighbourhoodFilter, _resolution: u32) -> bool {
-    // A mirror or transform reads anywhere in its UV tile
-    matches!(filter.kind, MIRROR | TRANSFORM)
+    match filter.kind {
+        // A mirror or transform reads anywhere in its UV tile
+        MIRROR | TRANSFORM => true,
+        // So does a warp whose source repeats within the tile
+        SOURCE_WARP | SOURCE_SLOPE_BLUR => filter.words[0] & SOURCE_TILED != 0,
+        _ => false,
+    }
 }
 
 /// Encodes a P5 stage with passes of its own; false lets the apply pass run.
@@ -186,7 +312,8 @@ mod tests {
     use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
     use texturecraft_core::{
         BlendMode, Channel, ContentsOffset, Effect, EffectKind, Filter, FlipMode, HeightToNormal, Layer, LayerId, LayerKind, Mask, MaskBackground, Mirror,
-        MirrorCorner, MirrorMode, Project, RepeatMode, TextureSet, TileTransform,
+        MirrorCorner, MirrorMode, Project, RepeatMode, SlopeBlending, SourceSlopeBlur, SourceWarp, TextureSet, TileTransform, WarpBlending, WarpMode,
+        WarpSource, WarpSourceMode,
     };
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TileImage, to_u16, to_u16_signed};
@@ -239,9 +366,58 @@ mod tests {
     /// Every filter and setting P5 ported, as content and in the mask.
     fn ported() -> Vec<Filter> {
         let mut filters = vec![Filter::Fxaa { alpha: false }, Filter::Fxaa { alpha: true }];
+        filters.extend(warps().into_iter().map(Filter::SourceWarp));
+        filters.extend(slope_blurs().into_iter().map(Filter::SourceSlopeBlur));
         filters.extend(mirrors().into_iter().map(Filter::Mirror));
         filters.extend(transforms().into_iter().map(Filter::Transform));
         filters
+    }
+
+    /// A warp moving 6.4 texels at 128 texels across, from its default noise.
+    const WIDE_WARP: SourceWarp = SourceWarp { intensity: 0.5, ..SourceWarp::LIBRARY };
+
+    /// Each source mode, shaped (blurred, balanced, contrasted, a hard step) and repeating.
+    fn sources() -> Vec<WarpSource> {
+        let library = WarpSource::LIBRARY;
+        let previous = WarpSource { mode: WarpSourceMode::PreviousInput, ..library };
+        vec![
+            library,
+            WarpSource { blur: 0.4, tiling: 3.0, ..library },
+            previous,
+            WarpSource { blur: 0.5, balance: 0.6, contrast: 0.3, ..previous },
+            WarpSource { contrast: 1.0, ..previous },
+            WarpSource { tiling: 2.0, ..previous },
+            WarpSource { mode: WarpSourceMode::CustomNoise, ..library },
+        ]
+    }
+
+    /// The library's Warp, every source in Warp mode, and every mode and blending.
+    fn warps() -> Vec<SourceWarp> {
+        let mut warps = vec![SourceWarp::LIBRARY];
+        warps.extend(sources().into_iter().map(|source| SourceWarp { source, ..WIDE_WARP }));
+        let multi = SourceWarp { mode: WarpMode::MultiDirectional, angle: 30.0, ..WIDE_WARP };
+        warps.extend([
+            SourceWarp { mode: WarpMode::Directional, angle: 30.0, ..WIDE_WARP },
+            SourceWarp { mode: WarpMode::Directional, source: WarpSource { mode: WarpSourceMode::PreviousInput, ..WarpSource::LIBRARY }, ..WIDE_WARP },
+            multi,
+            SourceWarp { blending: WarpBlending::Max, ..multi },
+            SourceWarp { blending: WarpBlending::Min, directions: 2, ..multi },
+            SourceWarp { blending: WarpBlending::Chain, ..multi },
+            SourceWarp { directions: 3, ..multi },
+        ]);
+        warps
+    }
+
+    /// The library's Blur Slope, every source, every blending and fewer reads.
+    fn slope_blurs() -> Vec<SourceSlopeBlur> {
+        let library = SourceSlopeBlur::LIBRARY;
+        let mut slopes: Vec<SourceSlopeBlur> = sources().into_iter().map(|source| SourceSlopeBlur { source, ..library }).collect();
+        slopes.extend([
+            SourceSlopeBlur { blending: SlopeBlending::Min, ..library },
+            SourceSlopeBlur { blending: SlopeBlending::Max, source: WarpSource { mode: WarpSourceMode::PreviousInput, ..WarpSource::LIBRARY }, ..library },
+            SourceSlopeBlur { quality: 0.4, intensity: 0.5, ..library },
+        ]);
+        slopes
     }
 
     /// The library's Mirror and one of every mode, side, corner and the debug axes.
@@ -377,6 +553,71 @@ mod tests {
         ];
 
         assert!(check_cases(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, GATHER_DECISIONS).is_some());
+    }
+
+    /// Labelled single-filter cases, plus opacity below 1 under Multiply, Disable and chains for
+    /// `chained`: each filter alone at full opacity, as content and in the mask.
+    fn filter_cases(filters: impl IntoIterator<Item = Filter>, chained: &Filter) -> Vec<(String, Stack, BlendMode)> {
+        let normal = BlendMode::Normal;
+        let blur = Filter::Blur { radius: 24.0, wrap: false };
+        let mut cases: Vec<(String, Stack, BlendMode)> = filters.into_iter().map(|filter| (format!("{filter:?}"), vec![(filter, 1.0, normal)], normal)).collect();
+        cases.extend([
+            (format!("{chained:?} under Multiply"), vec![(chained.clone(), 0.7, normal)], BlendMode::Multiply),
+            (format!("{chained:?} disabled"), vec![(chained.clone(), 1.0, BlendMode::Disable)], normal),
+            (format!("{chained:?} after a blur"), vec![(blur.clone(), 1.0, normal), (chained.clone(), 0.85, normal), (Filter::Invert, 1.0, normal)], normal),
+            (format!("{chained:?} before a blur"), vec![(Filter::Invert, 1.0, normal), (chained.clone(), 0.85, normal), (blur, 1.0, normal)], normal),
+        ]);
+        cases
+    }
+
+    /// Composites `cases` as [`check_cases`] does, with owned labels.
+    fn check_labelled(gpu: &mut Headless, cases: &[(String, Stack, BlendMode)], fixture: Fixture, region: CompositeRegion, tolerance: Tolerance) -> Option<()> {
+        let cases: Vec<(&str, Stack, BlendMode)> = cases.iter().map(|(label, stack, blend)| (label.as_str(), stack.clone(), *blend)).collect();
+        check_cases(gpu, &cases, fixture, region, tolerance)
+    }
+
+    /// Warp matches the CPU from every source (default noise, the values it filters and an
+    /// unlinked Custom Noise; blurred, balanced, contrasted, stepped and repeating in the tile,
+    /// whose stages run in the whole-set pre-pass) in Warp mode, and in every mode and blending:
+    /// below full opacity under Multiply, disabled, between filters and in a partial update. A
+    /// stepped source is a hard decision.
+    #[test]
+    fn warp_matches_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let cases = filter_cases(warps().into_iter().map(Filter::SourceWarp), &Filter::SourceWarp(WIDE_WARP));
+
+        assert!(check_labelled(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, GATHER_DECISIONS).is_some());
+    }
+
+    /// Blur Slope matches the CPU from every source, in every blending and with fewer reads: below
+    /// full opacity under Multiply, disabled, between filters and in a partial update.
+    #[test]
+    fn blur_slope_matches_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let cases = filter_cases(slope_blurs().into_iter().map(Filter::SourceSlopeBlur), &Filter::SourceSlopeBlur(SourceSlopeBlur::LIBRARY));
+
+        assert!(check_labelled(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, GATHER_DECISIONS).is_some());
+    }
+
+    /// Warp and Blur Slope under a wrapping Blur, on paint across the set's edges: their noise and
+    /// repeating sources follow each texel's home position, as the CPU's wrapped lower stages do.
+    #[test]
+    fn warp_and_blur_slope_under_a_wrapping_blur_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let normal = BlendMode::Normal;
+        let wrapped = Filter::Blur { radius: 160.0, wrap: true };
+        let repeating = WarpSource { mode: WarpSourceMode::PreviousInput, tiling: 2.0, ..WarpSource::LIBRARY };
+        let cases = [
+            ("Warp under a wrapping Blur", vec![(Filter::SourceWarp(WIDE_WARP), 1.0, normal), (wrapped.clone(), 1.0, normal)], normal),
+            (
+                "repeating Warp under a wrapping Blur",
+                vec![(Filter::SourceWarp(SourceWarp { source: repeating, ..WIDE_WARP }), 1.0, normal), (wrapped.clone(), 1.0, normal)],
+                normal,
+            ),
+            ("Blur Slope under a wrapping Blur", vec![(Filter::SourceSlopeBlur(SourceSlopeBlur::LIBRARY), 1.0, normal), (wrapped, 1.0, normal)], normal),
+        ];
+
+        assert!(check_cases(&mut gpu, &cases, EDGE_PAINT, CORNER, GATHER_DECISIONS).is_some());
     }
 
     /// Mirror matches the CPU in every mode, side, corner and with its debug axes, through the
