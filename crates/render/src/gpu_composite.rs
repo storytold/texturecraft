@@ -469,6 +469,10 @@ struct FilterStage {
     input: u32,
     /// How the prepare pass reads `input` ([`INPUT_LAYER`], [`INPUT_COLOR`]; 0: an input source's gray)
     input_kind: u32,
+    /// A second input source (operation index plus one, 0: none), read as colour into words
+    /// 8..11 (`input2_color_at` in neighbourhood.wgsl): an effect's `effects[2]` on a
+    /// neighbourhood operation (P5: Color Match's Input and Image Input both linked).
+    input2: u32,
     /// The prepare pass reads the set periodically outside it (P4: Blur and Bevel `wrap`), and
     /// the fields of the program may start below zero ([`FilterPlan::wraps`]).
     wrap: bool,
@@ -552,6 +556,9 @@ const INPUT_COLOR: u32 = 4;
 /// The prepare pass's `field_layout.w` bit of a stage of the lit Base Color's own view
 /// (`FilterStage::own_view`), whose first slot goes in `params.anchor.y`
 const OWN_VIEW: u32 = 8;
+/// The prepare pass's `field_layout.w` bit of a stage with a second input (`FilterStage::input2`),
+/// whose operation plus one goes in `params.anchor.z`
+const INPUT2: u32 = 16;
 
 /// Whole-set stages the band uniform can address (`whole_slots` in composite.wgsl)
 const MAX_WHOLE_SET_STAGES: usize = 4;
@@ -785,6 +792,7 @@ impl FilterPlan {
                         anchor: Some((channel, u32::MAX, 0)),
                         input: 0,
                         input_kind: 0,
+                        input2: 0,
                         wrap: false,
                         whole: false,
                         own_view: None,
@@ -853,6 +861,7 @@ impl FilterPlan {
                         anchor: None,
                         input: 0,
                         input_kind: 0,
+                        input2: 0,
                         wrap: false,
                         whole: false,
                         own_view,
@@ -906,6 +915,7 @@ impl FilterPlan {
                 anchor: material.map(|(first, cut)| (channel, first, cut)),
                 input: 0,
                 input_kind: 0,
+                input2: 0,
                 wrap: false,
                 whole: false,
                 own_view: None,
@@ -954,6 +964,7 @@ impl FilterPlan {
                     anchor: None,
                     input: 0,
                     input_kind: 0,
+                    input2: 0,
                     wrap: false,
                     whole: false,
                     own_view: None,
@@ -984,7 +995,20 @@ impl FilterPlan {
             let whole = whole && input_kind != INPUT_LAYER;
             // P4: Blur and Bevel with Wrap read the set periodically past its edges
             let wrap = gpu_neighbourhood::box_family::wraps(filter);
-            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input, input_kind, wrap, whole, own_view: None });
+            let input2 = effect.effects[2];
+            self.stages.push(FilterStage {
+                layer,
+                preceding,
+                filter: Some(filter),
+                cell: 1,
+                anchor: None,
+                input,
+                input_kind,
+                input2,
+                wrap,
+                whole,
+                own_view: None,
+            });
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);
@@ -1009,7 +1033,9 @@ impl FilterPlan {
     /// input as colour. One stride for every field of the program; the shaders read it from the
     /// uniform, never from a literal.
     fn field_words(&self) -> u32 {
-        if self.stages.iter().any(|stage| stage.input_kind == INPUT_COLOR) {
+        if self.stages.iter().any(|stage| stage.input2 != 0) {
+            FIELD_WORDS + 6
+        } else if self.stages.iter().any(|stage| stage.input_kind == INPUT_COLOR) {
             FIELD_WORDS + 3
         } else if self.stages.iter().any(|stage| stage.input != 0) {
             FIELD_WORDS + 1
@@ -1019,10 +1045,11 @@ impl FilterPlan {
     }
 
     /// The kernels' `NeighbourhoodRegion::input` bits for `stage`: the fields carry input words
-    /// (1), the stage has an input of its own (2), the fields carry colour words 5..8 (4).
+    /// (1), the stage has an input of its own (2), the fields carry colour words 5..8 (4), the
+    /// stage has a second input in words 8..11 (8).
     fn input_bits(&self, stage: &FilterStage) -> u32 {
         let words = self.field_words();
-        u32::from(words > FIELD_WORDS) | (u32::from(stage.input != 0) << 1) | (u32::from(words >= FIELD_WORDS + 3) << 2)
+        u32::from(words > FIELD_WORDS) | (u32::from(stage.input != 0) << 1) | (u32::from(words >= FIELD_WORDS + 3) << 2) | (u32::from(stage.input2 != 0) << 3)
     }
 }
 
@@ -1087,6 +1114,10 @@ fn bind_input_sources(operations: &mut Vec<Operation>, layer_count: u32, sources
     for op in operations.iter_mut().skip(layer_count as usize).filter(|op| !(FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1])) {
         if op.effects[3] != 0 {
             op.effects[3] += offset;
+        }
+        // A neighbourhood stage's second input (`FilterStage::input2`)
+        if op.ids[1] == NEIGHBOURHOOD_OPCODE && op.effects[2] != 0 {
+            op.effects[2] += offset;
         }
     }
     operations.extend_from_slice(sources);
@@ -3339,10 +3370,13 @@ impl GpuCompositor {
                             let mut source = values(paint_params);
                             source[25..28].copy_from_slice(&[slot, stage.layer, stage.preceding]);
                             source[packages::FIELD_LAYOUT + 2] = stage.input;
-                            source[packages::FIELD_LAYOUT + 3] = u32::from(wraps) | stage.input_kind | stage.own_view.map_or(0, |_| OWN_VIEW);
+                            source[packages::FIELD_LAYOUT + 3] =
+                                u32::from(wraps) | stage.input_kind | stage.own_view.map_or(0, |_| OWN_VIEW) | if stage.input2 != 0 { INPUT2 } else { 0 };
                             if let Some(first) = stage.own_view {
                                 source[37] = first;
                             }
+                            // A second input source (operation plus one)
+                            source[38] = stage.input2;
                             source
                         };
                         let mut chunks: Vec<[u32; 4]> = (0..field_rect[3])
@@ -3503,10 +3537,13 @@ impl GpuCompositor {
                         source[packages::FIELD_LAYOUT + 2] = stage.input;
                         // In a wrapping program every stage's field is a periodic copy of the set
                         // past its edges; the stages keep apart what lies across a seam (`bounds`)
-                        source[packages::FIELD_LAYOUT + 3] = u32::from(wraps) | stage.input_kind | stage.own_view.map_or(0, |_| OWN_VIEW);
+                        source[packages::FIELD_LAYOUT + 3] =
+                            u32::from(wraps) | stage.input_kind | stage.own_view.map_or(0, |_| OWN_VIEW) | if stage.input2 != 0 { INPUT2 } else { 0 };
                         if let Some(first) = stage.own_view {
                             source[37] = first;
                         }
+                        // A second input source (operation plus one)
+                        source[38] = stage.input2;
                         if let Some((channel, first, cut)) = stage.anchor {
                             source[36..39].copy_from_slice(&[channel_slot(channel), first, cut]);
                             source[40..43].copy_from_slice(&channel.default_value().map(f32::to_bits));

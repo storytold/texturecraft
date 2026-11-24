@@ -824,7 +824,7 @@ mod tests {
 
     /// A Height To Normal stage on a Normal operation reads its layer's own Height content (times
     /// its coverage) as its input, prepared after the Height's own stages; without a Height
-    /// operation it keeps its effect's input. A colour input reaches the kernel as colour.
+    /// operation it keeps its effect's input. Colour inputs, a second one too, reach the kernel as colour.
     #[test]
     fn stage_inputs_reach_the_kernels() {
         use texturecraft_compose::DisplayKind;
@@ -859,12 +859,12 @@ mod tests {
         super::INPUT_PROBE.set(false);
         assert_eq!(program.input_of_last_stage(), (0, 0));
 
-        // A colour input
-        let source_color = [0.2, 0.5, 0.7];
-        let (probed, _) =
-            fill_layer(&[(Channel::BaseColor, [0.9; 3])], &[(Channel::BaseColor, Filter::ColorMatch(ColorMatch { source_color, ..ColorMatch::LIBRARY }))]);
-        let (reference, _) = fill_layer(&[(Channel::BaseColor, source_color)], &[]);
-        compare(&mut gpu, &probed, &reference, DisplayKind::BaseColor, "colour input");
+        // Two colour inputs, summed by the probe
+        let (source_color, target_color) = ([0.2, 0.3, 0.1], [0.1, 0.2, 0.4]);
+        let matching = ColorMatch { source_color, target_color, ..ColorMatch::LIBRARY };
+        let (probed, _) = fill_layer(&[(Channel::BaseColor, [0.9; 3])], &[(Channel::BaseColor, Filter::ColorMatch(matching))]);
+        let (reference, _) = fill_layer(&[(Channel::BaseColor, [0.3, 0.5, 0.5])], &[]);
+        compare(&mut gpu, &probed, &reference, DisplayKind::BaseColor, "two colour inputs");
     }
 
     /// A paint layer of Base Color and Roughness in stripes and steps that run across the set's

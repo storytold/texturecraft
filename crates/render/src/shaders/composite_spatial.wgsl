@@ -104,6 +104,7 @@ fn previous_field(start: u32, count: u32) -> u32 {
 const INPUT_LAYER: u32 = 2u;
 const INPUT_COLOR: u32 = 4u;
 const OWN_VIEW: u32 = 8u;
+const INPUT2: u32 = 16u;
 
 @compute @workgroup_size(8, 8)
 fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -125,6 +126,7 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
     var prepared = vec4(0.0);
     var geometric_weight = 0.0;
     var stage_input = vec3(0.0);
+    var stage_input2 = vec3(0.0);
     if covered && params.coverage.x != 0u {
         covered = uv_texel_covered(pixel);
     }
@@ -249,10 +251,17 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
         if capture {
             prepared = vec4(result, 1.0);
         }
-        if params.field_layout.z != 0u && !input_layer {
-            // An input source's colour, or its gray (P3's stage_input_value is its base content's x)
-            let source = base_content(layers[params.field_layout.z - 1u], texel);
-            stage_input = select(vec3(source.x), source.rgb, (params.field_layout.w & INPUT_COLOR) != 0u);
+        // The input sources: the first (unless a layer operation), and a second one (INPUT2,
+        // its colour); one base_content call (P3's stage_input_value is its base content's x)
+        let second = (params.field_layout.w & INPUT2) != 0u;
+        let sources = select(1u, 2u, second);
+        for (var k = select(0u, 1u, params.field_layout.z == 0u || input_layer); k < sources; k++) {
+            let source = base_content(layers[select(params.field_layout.z, params.anchor.z, k == 1u) - 1u], texel);
+            if k == 1u {
+                stage_input2 = source.rgb;
+            } else {
+                stage_input = select(vec3(source.x), source.rgb, (params.field_layout.w & INPUT_COLOR) != 0u);
+            }
         }
         geometric_weight = 1.0;
     }
@@ -268,6 +277,11 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
         if params.field_layout.x >= 8u {
             output[start + 6u] = bitcast<u32>(stage_input.y);
             output[start + 7u] = bitcast<u32>(stage_input.z);
+        }
+        if params.field_layout.x >= 11u {
+            output[start + 8u] = bitcast<u32>(stage_input2.x);
+            output[start + 9u] = bitcast<u32>(stage_input2.y);
+            output[start + 10u] = bitcast<u32>(stage_input2.z);
         }
     }
 }
