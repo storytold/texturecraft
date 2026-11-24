@@ -97,6 +97,15 @@ fn stack_at(effect: Operation, pixel: vec2<u32>) -> vec3<f32> {
     return filter_value(effect.spatial.w - 1u, pixel).rgb;
 }
 
+// The material of the second channel a package effect asked for (Operation.spatial.z,
+// FilterPlan::bind_stack_reads): P6's Metallic and Roughness, or Glossiness and Specular.
+fn stack_at_second(effect: Operation, pixel: vec2<u32>) -> vec3<f32> {
+    if effect.spatial.z == 0u {
+        return vec3(0.0);
+    }
+    return filter_value(effect.spatial.z - 1u, pixel).rgb;
+}
+
 // The effect's layer's own content of the read channel (Operation.effects.x), with its coverage
 // in alpha: Compare's This Layer mixes it over stack_at. Call it from mask effects only:
 // layer_content reaches the content hooks, and WGSL rejects recursion.
@@ -128,6 +137,25 @@ fn image_texel_nearest(image: u32, uv: vec2<f32>) -> vec4<f32> {
     return material_image_texel(image, pixel, size);
 }
 
+// An image's stored texels under `uv` blended bilinearly without wrapping: past an edge it keeps
+// the edge texels, as ImageRes::sample_filtered with BilinearSharp and UvWrap::None reads it
+// (P7: the brush mask image, MaskGray::at). `image` as for image_texel_nearest.
+fn image_texel_bilinear_clamped(image: u32, uv: vec2<f32>) -> vec4<f32> {
+    if image == 0xffffffffu {
+        return vec4(0.0);
+    }
+    let size = vec2<i32>(i32(srgb[image]), i32(srgb[image + 1u]));
+    let at = uv * vec2<f32>(size) - 0.5;
+    let corner = floor(at);
+    let t = at - corner;
+    let last = size - 1;
+    let low = clamp(vec2<i32>(corner), vec2(0), last);
+    let high = clamp(vec2<i32>(corner) + 1, vec2(0), last);
+    let top = mix(material_image_texel(image, low, size), material_image_texel(image, vec2(high.x, low.y), size), t.x);
+    let bottom = mix(material_image_texel(image, vec2(low.x, high.y), size), material_image_texel(image, high, size), t.x);
+    return mix(top, bottom, t.y);
+}
+
 // Test probes of the hooks above (opcodes 188..192, emitted only by the render crate's tests).
 const PROBE_OPCODES_START: u32 = 188u;
 fn probe_mask_effect(effect: Operation, texel: LayerTexel) -> f32 {
@@ -135,7 +163,34 @@ fn probe_mask_effect(effect: Operation, texel: LayerTexel) -> f32 {
         case 188u: { return this_layer_content(effect, texel).x; }
         case 189u: { return stack_at(effect, texel.pixel).x; }
         case 190u: { return image_texel_nearest(param_word(effect, 0u), texel.uv).x; }
-        default: { return effect_input(effect, texel); }
+        default: {
+            if effect.ext.x != 0u {
+                return probe_late_hooks(effect, texel);
+            }
+            return effect_input(effect, texel);
+        }
+    }
+}
+
+// Opcode 191 with a selector in its first side-table word probes the P0h hooks: 1..4 the surface
+// tangent's x, y, z and sign as 0.5 + 0.5 v, 5 the second stack read, 6 environment word
+// param_word(effect, 2u) of the block at param_word(effect, 1u), 7 the baked Height of the bake
+// rows (0.25 without one), 8 the baked ambient occlusion where baked_at reads it, 9 the image
+// "probe" read bilinearly without wrapping.
+fn probe_late_hooks(effect: Operation, texel: LayerTexel) -> f32 {
+    let selector = param_word(effect, 0u);
+    switch selector {
+        case 1u, 2u, 3u, 4u: { return 0.5 + 0.5 * texel.surface.tangent[selector - 1u]; }
+        case 5u: { return stack_at_second(effect, texel.pixel).x; }
+        case 6u: { return bitcast<f32>(srgb[param_word(effect, 1u) + param_word(effect, 2u)]); }
+        case 8u: { return bitcast<f32>(baked_at(texel.pixel).x); }
+        case 9u: { return image_texel_bilinear_clamped(param_word(effect, 1u), texel.uv).x; }
+        default: {
+            if !bake_has(BAKED_HEIGHT) {
+                return 0.25;
+            }
+            return bitcast<f32>(baked_block_at(texel.pixel, 1u).x);
+        }
     }
 }
 

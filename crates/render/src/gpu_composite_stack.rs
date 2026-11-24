@@ -125,6 +125,13 @@ pub(super) fn uses_shader(program: &CompositeProgram) -> bool {
         || program.operations.iter().any(|op| STACK_OPCODES.contains(&op.ids[1]) || op.ext[2] & STACK_OP_BITS != 0)
 }
 
+/// Whether a mask operation reads its own layer's content (`this_layer_content`): the hub then
+/// prepares the layer's content stacks before its mask stack (`FilterPlan::compile`). None yet;
+/// P3b's This Layer comparison replaces this.
+pub(super) fn reads_own_layer(_op: &Operation) -> bool {
+    false
+}
+
 /// P3's vec4 of the band uniform (`params.packages[2]`).
 pub(super) fn band_uniform(_program: &CompositeProgram) -> [u32; 4] {
     [0; 4]
