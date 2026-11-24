@@ -817,7 +817,10 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             app.session.camera.zoom(-delta.y * DRAG_ZOOM_PER_POINT * app.ui.prefs.drag_zoom_scale());
         } else if shift {
             let display = &mut app.session.doc.project.display;
-            display.env_rotation = (display.env_rotation + delta.x * LIGHT_DEGREES_PER_POINT).rem_euclid(360.0);
+            let rotation_before = display.env_rotation;
+            display.env_rotation = (rotation_before + delta.x * LIGHT_DEGREES_PER_POINT).rem_euclid(360.0);
+            let environment = display.environment.clone();
+            texturecraft_engine::view_cmds::relight_environment(&mut app.session, &environment, rotation_before);
         } else {
             orbit(app, delta);
         }
