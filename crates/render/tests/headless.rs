@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use texturecraft_compose::{DisplayKind, ImageRes};
 use texturecraft_geom::glam::Vec3;
 use texturecraft_geom::{OrbitCamera, primitives};
@@ -46,13 +49,29 @@ impl Img {
 /// The id `setup` uploads the material ball under
 const MESH_ID: u64 = 1;
 
-/// A headless renderer with the material ball framed in a 480×360 view (None without a GPU).
-fn setup() -> Option<(Headless, Frame)> {
-    setup_with(Headless::new())
+/// Holds this test thread's turn until the thread ends, after the test dropped its device: the
+/// NVIDIA driver can deadlock when one test destroys its device while another records commands
+/// on its own. A thread that runs several tests (one test thread) keeps its turn.
+fn take_turn() {
+    static TURN: Mutex<()> = Mutex::new(());
+    thread_local! {
+        static HELD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
+    }
+    HELD.with(|held| {
+        if held.borrow().is_none() {
+            *held.borrow_mut() = Some(TURN.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+    });
 }
 
-fn setup_with(headless: Result<Headless, String>) -> Option<(Headless, Frame)> {
-    let Ok(mut h) = headless else {
+/// A headless renderer with the material ball framed in a 480×360 view (None without a GPU).
+fn setup() -> Option<(Headless, Frame)> {
+    setup_with(Headless::new)
+}
+
+fn setup_with(headless: impl FnOnce() -> Result<Headless, String>) -> Option<(Headless, Frame)> {
+    take_turn();
+    let Ok(mut h) = headless() else {
         eprintln!("skipping: no GPU adapter");
         return None;
     };
@@ -600,7 +619,7 @@ fn bake_visualization_draws_the_high_poly_and_the_cage() {
 #[test]
 fn oversized_bake_high_poly_leaves_the_view_renderable() {
     // The WebGPU default buffer limit (256 MiB) keeps the oversized mesh small enough to build
-    let Some((mut headless, frame)) = setup_with(Headless::with_limits(|_| texturecraft_render::wgpu::Limits::default())) else { return };
+    let Some((mut headless, frame)) = setup_with(|| Headless::with_limits(|_| texturecraft_render::wgpu::Limits::default())) else { return };
 
     let high = primitives::sphere(0.5, 16, 8);
     headless.renderer.set_bake_high(&headless.device, &headless.queue, Some(&high), 1).unwrap();
