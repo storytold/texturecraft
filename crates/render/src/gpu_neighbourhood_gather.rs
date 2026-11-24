@@ -166,6 +166,12 @@ fn flag(on: bool, bit: u32) -> u32 {
 
 /// Whether a P5 stage evaluates `filter` as the CPU does.
 pub(super) fn supports(filter: &Filter) -> bool {
+    // The hub's input probe lowers these itself (`INPUT_PROBE`)
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    if super::INPUT_PROBE.get() && matches!(filter, Filter::HeightToNormal(_) | Filter::ColorMatch(_)) {
+        return false;
+    }
+
     matches!(
         filter,
         Filter::Fxaa { .. }
@@ -1174,5 +1180,131 @@ mod tests {
         let stack = vec![(Filter::Fxaa { alpha: true }, 1.0, normal), (Filter::Blur { radius: 160.0, wrap: true }, 1.0, normal)];
 
         assert!(check_cases(&mut gpu, &[("FXAA under a wrapping Blur", stack, normal)], EDGE_PAINT, CORNER, GATHER_DECISIONS).is_some());
+    }
+
+    /// Timing of the heavy gathers at 2K and 4K on the GPU (warm, best of three) and the CPU,
+    /// then the 4K Mirror on a painted layer's Base Color, Roughness, Height and mask over a
+    /// six-channel material with the pre-pass's working memory. `-- --ignored --nocapture bench_gather`.
+    #[test]
+    #[ignore = "GPU and CPU benchmark"]
+    fn bench_gather_filters() {
+        use std::time::Instant;
+
+        use texturecraft_compose::eval::{Composite, Inputs, composite_tiles};
+        use texturecraft_core::{ChannelFormat, Fill};
+        use texturecraft_geom::UvGBuffer;
+        use texturecraft_texel::TILE;
+
+        use crate::gpu_composite::CompositeProgram;
+
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let filters = [
+            ("Kuwahara", Filter::AnisotropicKuwahara(AnisotropicKuwahara { radius: AnisotropicKuwahara::MAX_RADIUS, ..AnisotropicKuwahara::LIBRARY })),
+            ("Color Match", Filter::ColorMatch(ColorMatch::LIBRARY)),
+            ("Mirror", Filter::Mirror(Mirror::LIBRARY)),
+            ("Warp", Filter::SourceWarp(SourceWarp::LIBRARY)),
+        ];
+        let paint = |pixels: &mut PixelStore, owner: LayerId, channels: &[Channel], side: u32| {
+            for &channel in channels {
+                let image = pixels.layer_mut(owner, channel, (side, side));
+                for y in 0..side {
+                    for x in 0..side {
+                        let tone = ((x / 37 + y / 23) % 5) as f32 / 5.0 * 0.8 + 0.1;
+                        let texel = [to_u16(tone), to_u16(0.9 * tone + 0.05), to_u16(0.6 * tone), u16::MAX];
+                        let comps = channel.components();
+                        image.set(x, y, &[&texel[..comps], &[u16::MAX]].concat());
+                    }
+                }
+            }
+        };
+        let gpu_time = |gpu: &mut Headless, program: &CompositeProgram, side: u32| {
+            gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((side, side), 0)], 1);
+            let mut times = Vec::new();
+            for _ in 0..4 {
+                let started = Instant::now();
+                gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, program).unwrap();
+                gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            times[1..].iter().copied().fold(f64::MAX, f64::min)
+        };
+        for side in [2048u32, 4096] {
+            let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, side, side));
+            for (label, filter) in &filters {
+                let mut project = Project::new("Gather bench", "builtin:plane");
+                project.texture_sets.push(TextureSet::new("Plane", 0, side));
+                let owner = project.alloc_id();
+                let mut layer = Layer::new(owner, "Paint", LayerKind::Paint, &[Channel::BaseColor]);
+                layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(filter.clone())));
+                project.insert_layer(0, layer, None, false).unwrap();
+                let mut pixels = PixelStore::default();
+                paint(&mut pixels, owner, &[Channel::BaseColor], side);
+
+                let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+                program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+                let gpu_ms = gpu_time(&mut gpu, &program, side);
+                let inputs = Inputs {
+                    project: &project,
+                    ts: 0,
+                    mesh: &mesh,
+                    gbuf: &gbuf,
+                    pixels: &pixels,
+                    baked: &baked,
+                    block_scales: project.texture_sets[0].block_scales(),
+                    preview: None,
+                    images: &images,
+                    bounds: mesh.bounds(),
+                };
+                let tiles: Vec<_> = (0..side / TILE).flat_map(|y| (0..side / TILE).map(move |x| (x, y))).collect();
+                let mut oracle = Composite::new(&[Channel::BaseColor], side);
+                let started = Instant::now();
+                composite_tiles(&inputs, &mut oracle, &tiles);
+                let cpu_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let [working, _] = gpu.renderer.composite_update_bytes();
+                println!("BENCH {side} {label}: GPU {gpu_ms:.0} ms, CPU {cpu_ms:.0} ms, working {} MiB", working >> 20);
+            }
+        }
+
+        // 4K: Mirror on a painted layer's three channels and mask over a six-channel material
+        let side = 4096;
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, side, side));
+        let channels = [Channel::BaseColor, Channel::Metallic, Channel::Roughness, Channel::Normal, Channel::Height, Channel::AmbientOcclusion];
+        let mut project = Project::new("Mirror bench", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, side));
+        project.texture_sets[0].channels = channels.iter().map(|&channel| (channel, ChannelFormat::default_for(channel))).collect();
+        let base = project.alloc_id();
+        project.insert_layer(0, Layer::new(base, "Material", LayerKind::Fill(Fill::default()), &channels), None, false).unwrap();
+        let painted = [Channel::BaseColor, Channel::Roughness, Channel::Height];
+        let owner = project.alloc_id();
+        let mut layer = Layer::new(owner, "Paint", LayerKind::Paint, &painted);
+        let mut mask = Mask::new(MaskBackground::Black);
+        let mask_paint = project.alloc_id();
+        mask.effects.push(Effect::new(mask_paint, EffectKind::Paint));
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Mirror(Mirror::LIBRARY))));
+        layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Mirror(Mirror::LIBRARY))));
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let mut pixels = PixelStore::default();
+        paint(&mut pixels, owner, &painted, side);
+        let mut mask_pixels = TileImage::new(side, side, 2);
+        for y in 0..side {
+            for x in 0..side {
+                mask_pixels.set(x, y, &[to_u16(((x + y) % 13) as f32 / 13.0), u16::MAX]);
+            }
+        }
+        pixels.masks.insert(mask_paint, mask_pixels);
+        let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+        program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+        let gpu_ms = gpu_time(&mut gpu, &program, side);
+        let [working, paint_bytes] = gpu.renderer.composite_update_bytes();
+        let limits = gpu.device.limits();
+        println!(
+            "BENCH 4096 Mirror, 3 channels and mask over 6: GPU {gpu_ms:.0} ms, working {} MiB, paint {} MiB, binding limit {} MiB",
+            working >> 20,
+            paint_bytes >> 20,
+            limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) >> 20
+        );
     }
 }
