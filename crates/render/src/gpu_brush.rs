@@ -895,13 +895,19 @@ mod tests {
         assert_coverage_matches(&cpu, &actual, "mirrored plane");
         assert!(actual.get(96, 77)[0] > 0, "the copy paints across the plane");
 
+        // A copy whose source faces away from the camera paints nothing, though its own texels face it
+        let mirror_y = StampSource { origin: Vec3::ZERO, to_source: Mat3::from_diagonal(Vec3::new(1.0, -1.0, 1.0)) };
+        let away = Stamp { center: Vec3::new(0.25, 0.0, 0.1), source: Some(mirror_y), ..stroke };
+        let (cpu, actual) = world_brush_coverage(&mut gpu, primitives::plane(1.0, 4), settings.clone(), Some(camera), &[stroke, away]);
+        assert_coverage_matches(&cpu, &actual, "copy of a back face");
+        assert_eq!(actual.get(96, 77)[0], 0, "the copy sees the texel from its back-facing source");
+
         // A copy whose source point lies under another surface, inside the stamp depth
         let corners = [Vec3::new(-1.0, 0.03, -1.0), Vec3::new(1.0, 0.03, -1.0), Vec3::new(1.0, 0.03, 1.0), Vec3::new(-1.0, 0.03, 1.0)];
         let source_corners = corners.map(|point| Vec3::new(point.x, -0.02, point.z));
         let uvs = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y].into_iter().chain([Vec2::ZERO; 4]).collect();
         let indices = [0, 2, 1, 0, 3, 2, 4, 6, 5, 4, 7, 6].to_vec();
         let mesh = Mesh::from_parts(corners.into_iter().chain(source_corners).collect(), None, uvs, indices, "Asymmetric mirror").unwrap();
-        let mirror_y = StampSource { origin: Vec3::ZERO, to_source: Mat3::from_diagonal(Vec3::new(1.0, -1.0, 1.0)) };
         let copy = Stamp { center: Vec3::new(0.0, 0.03, 0.0), radius: 0.3, flow: 1.0, hardness: 0.9, source: Some(mirror_y), ..stroke };
         let looking_down = OrbitCamera { pitch: 1.45, ..OrbitCamera::default() };
         let settings = BrushSettings { backface_culling: false, ..settings };
