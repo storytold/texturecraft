@@ -52,6 +52,7 @@ pub struct RunParams {
     pub id: String,
     /// Command parameters (see the command's `params` doc). Omitted = defaults; never a dialog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("type" = ["object", "null"]))]
     pub params: Option<Value>,
 }
 
@@ -560,6 +561,20 @@ impl ServerHandler for TexturecraftMcp {}
 mod tests {
     use super::*;
     use crate::headless::Filesystem;
+
+    #[test]
+    fn command_params_are_nullable_objects() {
+        let tools = TexturecraftMcp::tool_router().list_all();
+        let schema = |name: &str| Value::Object((*tools.iter().find(|t| t.name == name).unwrap().input_schema).clone());
+        let run = schema("command_run");
+        let batch = schema("command_batch");
+        let step_ref = batch["properties"]["steps"]["items"]["$ref"].as_str().unwrap();
+        let step = batch.pointer(step_ref.strip_prefix('#').unwrap()).unwrap();
+        for command in [&run, step] {
+            assert_eq!(command["properties"]["params"]["type"], json!(["object", "null"]), "{command}");
+            assert!(!command["required"].as_array().unwrap().iter().any(|name| name == "params"));
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_panic_does_not_wedge_the_session() {
