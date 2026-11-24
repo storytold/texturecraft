@@ -1002,13 +1002,13 @@ mod tests {
 
     /// Composites each (label, stack, inputs) as [`check_cases`] does, with the stack's effects
     /// reading `inputs` (image input id, source).
-    fn check_linked(gpu: &mut Headless, cases: &[(&str, Stack, Vec<(&str, Source)>)], fixture: Fixture, region: CompositeRegion, tolerance: Tolerance) {
+    fn check_linked(gpu: &mut Headless, cases: &[LinkedCase], fixture: Fixture, region: CompositeRegion, tolerance: Tolerance) -> Option<()> {
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
         for (label, stack, linked) in cases {
-            let (mut project, pixels, owner) = painted_project(stack, BlendMode::Normal, fixture).unwrap();
-            let layer = project.layers.get_mut(&owner).unwrap();
-            let mask = layer.mask.as_mut().unwrap();
+            let (mut project, pixels, owner) = painted_project(stack, BlendMode::Normal, fixture)?;
+            let layer = project.layers.get_mut(&owner)?;
+            let mask = layer.mask.as_mut()?;
             for effect in layer.content_effects.iter_mut().chain(mask.effects.iter_mut()).filter(|effect| matches!(effect.kind, EffectKind::Filter(_))) {
                 for (id, source) in linked {
                     effect.inputs.insert((*id).into(), source.clone());
@@ -1020,7 +1020,11 @@ mod tests {
 
             assert_matches_cpu(gpu, &case, tolerance, label);
         }
+        Some(())
     }
+
+    /// A labelled stack whose effects read (image input id, source).
+    type LinkedCase<'a> = (&'a str, Stack, Vec<(&'a str, Source)>);
 
     /// A procedural source between two colours, for linked image inputs.
     fn procedural(kind: ProceduralKind, low: [f32; 3], high: [f32; 3]) -> Source {
@@ -1041,7 +1045,11 @@ mod tests {
         let (source_input, target_input) = (ImageInput::SOURCE_INPUT.id, ImageInput::TARGET_INPUT.id);
         let both = ColorMatch { source_mode: SourceColorMode::Input, target_mode: TargetColorMode::ImageInput, ..ColorMatch::LIBRARY };
         let cases = [
-            ("Warp from a linked noise", vec![(Filter::SourceWarp(SourceWarp { source: custom_noise, ..WIDE_WARP }), 1.0, normal)], vec![(noise, gray.clone())]),
+            (
+                "Warp from a linked noise",
+                vec![(Filter::SourceWarp(SourceWarp { source: custom_noise, ..WIDE_WARP }), 1.0, normal)],
+                vec![(noise, gray.clone())],
+            ),
             (
                 "Directional Warp from a uniform noise",
                 vec![(Filter::SourceWarp(SourceWarp { mode: WarpMode::Directional, angle: 40.0, source: custom_noise, ..WIDE_WARP }), 0.8, normal)],
@@ -1054,12 +1062,20 @@ mod tests {
             ),
             (
                 "Color Match from a linked Input",
-                vec![(Filter::ColorMatch(ColorMatch { source_mode: SourceColorMode::Input, target_color: [0.1, 0.4, 0.6], ..ColorMatch::LIBRARY }), 1.0, normal)],
+                vec![(
+                    Filter::ColorMatch(ColorMatch { source_mode: SourceColorMode::Input, target_color: [0.1, 0.4, 0.6], ..ColorMatch::LIBRARY }),
+                    1.0,
+                    normal,
+                )],
                 vec![(source_input, colours.clone())],
             ),
             (
                 "Color Match to a linked Image Input",
-                vec![(Filter::ColorMatch(ColorMatch { target_mode: TargetColorMode::ImageInput, custom_variation: false, ..ColorMatch::LIBRARY }), 0.9, normal)],
+                vec![(
+                    Filter::ColorMatch(ColorMatch { target_mode: TargetColorMode::ImageInput, custom_variation: false, ..ColorMatch::LIBRARY }),
+                    0.9,
+                    normal,
+                )],
                 vec![(target_input, colours.clone())],
             ),
             (
@@ -1068,11 +1084,12 @@ mod tests {
                 vec![(source_input, Source::Uniform([0.6, 0.3, 0.2])), (target_input, colours.clone())],
             ),
         ];
-        check_linked(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, GATHER_DECISIONS);
+        assert!(check_linked(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, GATHER_DECISIONS).is_some());
 
         let kuwahara = AnisotropicKuwahara { radius: AnisotropicKuwahara::MAX_RADIUS, custom_input: true, ..AnisotropicKuwahara::LIBRARY };
-        let cases = [("Kuwahara from a linked Custom Input", vec![(Filter::AnisotropicKuwahara(kuwahara), 1.0, normal)], vec![(ImageInput::CUSTOM_INPUT.id, gray)])];
-        check_linked(&mut gpu, &cases, (false, KUWAHARA_SIZE), KUWAHARA_MIDDLE, KUWAHARA_DECISIONS);
+        let cases =
+            [("Kuwahara from a linked Custom Input", vec![(Filter::AnisotropicKuwahara(kuwahara), 1.0, normal)], vec![(ImageInput::CUSTOM_INPUT.id, gray)])];
+        assert!(check_linked(&mut gpu, &cases, (false, KUWAHARA_SIZE), KUWAHARA_MIDDLE, KUWAHARA_DECISIONS).is_some());
 
         // Both Color Match inputs read at the texels: one stage carries one input
         let mut two = effect(EffectKind::Filter(Filter::ColorMatch(both)));
