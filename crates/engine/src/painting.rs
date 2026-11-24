@@ -740,11 +740,15 @@ impl Session {
     }
 
     /// Whether texture set `ts` shows the active stroke live: the set it paints, or another set of
-    /// the same size drawing the painted layer (an instance), whose texels are the same pixels
+    /// the same size drawing the painted layer (an instance), whose texels are the same pixels. A
+    /// stencil is sampled at the painted set's surface, which another set's texels do not share.
     fn stroke_feeds(&self, ts: usize) -> bool {
         let Some(stroke) = self.stroke.as_ref() else { return false };
         if stroke.ts == ts {
             return true;
+        }
+        if stroke.stencil.is_some() {
+            return false;
         }
 
         let size = |set: usize| self.caches.get(set).map(|cache| cache.size);
