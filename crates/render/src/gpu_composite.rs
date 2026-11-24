@@ -8,8 +8,10 @@ use std::{
 
 use bytemuck::{Pod, Zeroable};
 use rayon::prelude::*;
+use texturecraft_compose::environment_sh::EnvironmentSh;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
+use texturecraft_core::project::DisplaySettings;
 use texturecraft_core::{
     BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, CompareSource, ContentsOffset, CurvatureDetail, CurvatureMode, Effect, EffectKind,
     Filter, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Sampling, Source,
@@ -82,6 +84,12 @@ const MAX_TILE_WORK_PER_UPDATE: u64 = 8 << 30;
 const MAX_TILE_WORK_PER_BAND: u64 = 64 << 20;
 const MAX_TILE_WORK_PER_SUBMISSION: u64 = 256 << 20;
 const BAKE_MAPS: [BakedMap; 4] = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Thickness];
+/// The maps of the second bake row block, for programs that ask (`ProceduralInputs::read_bake_rows`):
+/// its texel holds the height in x and the stored world normal in yzw (f32 bits). Bit `i` of the
+/// presence word (`bake_has` in WGSL) is set when map `i` is baked.
+const BAKE_ROW_MAPS: [BakedMap; 2] = [BakedMap::Height, BakedMap::WorldNormal];
+/// Side-table words of the environment's diffuse light (`ProceduralInputs::reserve_environment`)
+const ENVIRONMENT_WORDS: usize = 28;
 const MAX_ID_BAKE_BYTES: u64 = 1 << 30;
 const MAX_ID_UPLOAD_BYTES: usize = 64 << 20;
 
@@ -90,17 +98,35 @@ struct BakedInputs {
     width: u32,
     height: u32,
     maps: [Option<Arc<Vec<f32>>>; BAKE_MAPS.len()],
+    /// The second row block's maps ([`BAKE_ROW_MAPS`]), only in programs that read them
+    rows: [Option<Arc<Vec<f32>>>; BAKE_ROW_MAPS.len()],
 }
 
 impl BakedInputs {
-    fn new(baked: &BakedMaps) -> Result<Option<Self>, &'static str> {
-        let maps = BAKE_MAPS.map(|map| baked.maps.get(&map).filter(|data| !data.is_empty()).cloned());
-        let Some(index) = maps.iter().position(Option::is_some) else { return Ok(None) };
-        let height = baked.height(BAKE_MAPS[index]);
-        if height == 0 || baked.resolution == 0 || BAKE_MAPS.iter().zip(&maps).any(|(&map, data)| data.is_some() && baked.height(map) != height) {
+    /// The bakes a program reads: the built-in maps, and with `rows` the second row block's
+    fn new(baked: &BakedMaps, rows: bool) -> Result<Option<Self>, &'static str> {
+        let present = |map: &BakedMap| baked.maps.get(map).filter(|data| !data.is_empty()).cloned();
+        let maps = BAKE_MAPS.map(|map| present(&map));
+        let rows = BAKE_ROW_MAPS.map(|map| present(&map).filter(|_| rows));
+        let all = BAKE_MAPS.iter().zip(&maps).chain(BAKE_ROW_MAPS.iter().zip(&rows));
+        let Some(first) = all.clone().find_map(|(&map, data)| data.as_ref().map(|_| map)) else { return Ok(None) };
+        let height = baked.height(first);
+        if height == 0 || baked.resolution == 0 || all.into_iter().any(|(&map, data)| data.is_some() && baked.height(map) != height) {
             return Err("The baked maps have different layouts and use CPU compositing.");
         }
-        Ok(Some(Self { width: baked.resolution, height, maps }))
+        Ok(Some(Self { width: baked.resolution, height, maps, rows }))
+    }
+
+    /// Row blocks of the bake texture: the built-in maps', and the second block's when a map of it is baked
+    fn blocks(&self) -> u32 {
+        if self.rows.iter().any(Option::is_some) { 2 } else { 1 }
+    }
+
+    /// The band uniform's bake words (`params.id_bake.zw`): rows per block (0: one block, the
+    /// whole texture) and the second block's presence bits
+    fn uniform_words(&self) -> [u32; 2] {
+        let present = self.rows.iter().enumerate().filter(|(_, data)| data.is_some()).fold(0, |bits, (index, _)| bits | 1 << index);
+        [if self.blocks() > 1 { self.height } else { 0 }, present]
     }
 }
 
@@ -246,6 +272,11 @@ struct ProceduralInputs {
     /// Side-table words that hold an image's record offset once the atlas is laid out
     /// (`pack_image`): (word index in the side table, image index).
     image_words: Vec<(u32, u32)>,
+    /// The side-table word where the environment's diffuse light starts, filled at upload
+    /// (`reserve_environment`).
+    environment_word: Option<u32>,
+    /// A lowering reads the Height and World Normal bake rows (`read_bake_rows`).
+    bake_rows: bool,
 }
 
 #[derive(Default)]
@@ -291,7 +322,37 @@ impl ProceduralInputs {
             preceding_stage: None,
             input_sources: Vec::new(),
             image_words: Vec::new(),
+            environment_word: None,
+            bake_rows: false,
         }
+    }
+
+    /// Reserve the [`ENVIRONMENT_WORDS`] side-table words that hold the viewport environment's
+    /// diffuse light (`EnvironmentSh`): its nine RGB coefficients as f32 bits in `sh_basis` order
+    /// (coefficient `i`, component `k` at word `3 i + k`), then the environment rotation in
+    /// radians. The program keeps the project's display settings from compile and fills the words
+    /// when it learns the images (`CompositeProgram::set_tile_images`), so a turned or changed
+    /// environment needs no other lowering. Returns their absolute offset (like `pack_words`); a
+    /// second reservation returns the same words. P6: Baked Lighting Environment.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn reserve_environment(&mut self) -> Option<u32> {
+        if let Some(word) = self.environment_word {
+            return LOOKUP_WORDS.checked_add(word);
+        }
+        let word = u32::try_from(self.ramp_words.len()).ok()?;
+        let offset = self.pack_words(&[0; ENVIRONMENT_WORDS])?;
+        self.environment_word = Some(word);
+        Some(offset)
+    }
+
+    /// Ask for the bake rows after the built-in maps: the baked Height and World Normal at
+    /// `baked_block_at(pixel, 1u)` in WGSL (x the height, yzw the stored world normal, f32 bits),
+    /// present when `bake_has(BAKED_HEIGHT)` / `bake_has(BAKED_WORLD_NORMAL)`. The rows exist only
+    /// in programs that ask and only for the maps that are baked. P6: lighting's height slope and
+    /// detail normal.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn read_bake_rows(&mut self) {
+        self.bake_rows = true;
     }
 
     /// Register `source` (a `source_operation`) as an effect's image input: the returned
@@ -439,8 +500,7 @@ struct FilterPlan {
 
 impl FilterPlan {
     fn compile(operations: &mut [Operation], layer_count: u32, inputs: &ProceduralInputs) -> Self {
-        let reads_stack =
-            operations.iter().skip(layer_count as usize).any(|op| op.spatial[3] != 0 && !(FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]));
+        let reads_stack = operations.iter().skip(layer_count as usize).any(|op| stack_reads(op) != [0; 2]);
         if inputs.filters.is_empty() && inputs.generator_stages.is_empty() && inputs.anchors.reads.is_empty() && !reads_stack {
             return Self::default();
         }
@@ -450,6 +510,7 @@ impl FilterPlan {
         plan.anchor_slots.resize(inputs.anchors.reads.len(), 0);
         let mut stack_reads = BTreeMap::new();
         let mut read_effects = BTreeSet::new();
+        let mut prepared = BTreeSet::new();
         for index in 0..layers.len() {
             if layers[index].ids[1] != ANCHOR_PUBLISH_LAYER {
                 plan.bind_stack_reads(layers, effects, index, (&mut stack_reads, &mut read_effects));
@@ -459,16 +520,29 @@ impl FilterPlan {
                 plan.add_anchor(layer.ids[2], index as u32, MATERIAL_ANCHOR_STAGE, &inputs.anchors, Some((layer.effects[0], layer.effects[1])));
                 continue;
             }
-            let [mask, mask_count, content, content_count] = layer.effects;
+            let [mask, mask_count, _, _] = layer.effects;
+            // A mask reading its own layer's content: that layer's content stacks first, so the
+            // mask's prepare pass resumes from prepared content fields
+            if mask_count > 0 && !masks.contains_key(&mask) && effects.iter().skip(mask as usize).take(mask_count as usize).any(packages::mask_reads_own_layer)
+            {
+                let same_layer = |op: &Operation| op.effects[..2] == layers[index].effects[..2] && !groups::is_group(op) && op.ids[1] != ANCHOR_PUBLISH_LAYER;
+                let end = (index..layers.len()).take_while(|&later| same_layer(&layers[later])).last().map_or(index + 1, |last| last + 1);
+                for own in index..end {
+                    plan.bind_stack_reads(layers, effects, own, (&mut stack_reads, &mut read_effects));
+                    plan.add_content_stack(layers, effects, own, inputs);
+                    prepared.insert(own);
+                }
+            }
             let mask_has_fields = mask_count > 0
                 && *masks.entry(mask).or_insert_with(|| {
                     let before = plan.stages.len();
                     plan.add_stack(effects, mask, mask_count, index as u32, None, inputs);
                     plan.stages.len() != before
                 });
-            let first = plan.stages.len();
-            plan.add_stack(effects, content, content_count, index as u32, Some(slot_kind(layer.ids[0])), inputs);
-            layer.spatial[..3].copy_from_slice(&[first as u32, u32::from(first != plan.stages.len()), u32::from(mask_has_fields)]);
+            if !prepared.contains(&index) {
+                plan.add_content_stack(layers, effects, index, inputs);
+            }
+            layers[index].spatial[2] = u32::from(mask_has_fields);
         }
         // An anchor can carry a filter's footprint into the next layer. Independent
         // channels within a layer share a footprint instead of adding to one another.
@@ -540,6 +614,12 @@ impl FilterPlan {
     /// stage's slot plus one (`stack_at` in WGSL), and `effects[0]` the layer's own operation of
     /// that channel plus one (0: none; `this_layer_content` in WGSL). P3: Compare reading This
     /// Layer and Layers Below; P6: lighting's material.
+    ///
+    /// A package effect (`packages::EXTENDED_EFFECTS`) may ask for a second channel in
+    /// `spatial[2]` the same way, read with `stack_at_second` (P6: Stylized lighting's Metallic
+    /// and Roughness, or Glossiness and Specular). It is bound like the first, up to the same
+    /// operation, and shares a stage with any read of the same channel there; it gets no
+    /// `this_layer_content`.
     fn bind_stack_reads(
         &mut self,
         layers: &[Operation],
@@ -551,7 +631,7 @@ impl FilterPlan {
         let [mask, mask_count, content, content_count] = layer.effects.map(|word| word as usize);
         let reads: Vec<usize> = (mask..mask + mask_count)
             .chain(content..content + content_count)
-            .filter(|&effect| effects.get(effect).is_some_and(|op| op.spatial[3] != 0) && !done.contains(&effect))
+            .filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2]) && !done.contains(&effect))
             .collect();
         if reads.is_empty() {
             return;
@@ -563,29 +643,46 @@ impl FilterPlan {
         for effect in reads {
             done.insert(effect);
             let op = &mut effects[effect];
-            let slot = op.spatial[3] - 1;
-            let Some(channel) = Channel::ALL.into_iter().find(|&channel| channel_slot(channel) == slot) else {
-                op.spatial[3] = 0;
-                continue;
-            };
             let until =
                 if op.effects[1] == 1 { (first..end).find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor)).unwrap_or(end) } else { first };
-            let stage = *stages.entry((until as u32, channel)).or_insert_with(|| {
-                self.stages.push(FilterStage {
-                    layer: until as u32,
-                    preceding: MATERIAL_ANCHOR_STAGE,
-                    filter: None,
-                    cell: 1,
-                    anchor: Some((channel, u32::MAX, 0)),
-                    input: 0,
-                    wrap: false,
-                    whole: false,
+            let [first_read, second_read] = stack_reads(op);
+            let mut bind = |read: u32| {
+                let slot = read.checked_sub(1)?;
+                let channel = Channel::ALL.into_iter().find(|&channel| channel_slot(channel) == slot)?;
+                let stage = *stages.entry((until as u32, channel)).or_insert_with(|| {
+                    self.stages.push(FilterStage {
+                        layer: until as u32,
+                        preceding: MATERIAL_ANCHOR_STAGE,
+                        filter: None,
+                        cell: 1,
+                        anchor: Some((channel, u32::MAX, 0)),
+                        input: 0,
+                        wrap: false,
+                        whole: false,
+                    });
+                    self.stages.len() as u32
                 });
-                self.stages.len() as u32
-            });
-            op.spatial[3] = stage;
-            op.effects[0] = (first..end).find(|&own| layers[own].ids[0] == slot).map_or(0, |own| own as u32 + 1);
+                Some((slot, stage))
+            };
+            let first_stage = bind(first_read);
+            let second_stage = bind(second_read);
+            op.spatial[3] = first_stage.map_or(0, |(_, stage)| stage);
+            if packages::EXTENDED_EFFECTS.contains(&op.ids[1]) {
+                op.spatial[2] = second_stage.map_or(0, |(_, stage)| stage);
+            }
+            if let Some((slot, _)) = first_stage {
+                op.effects[0] = (first..end).find(|&own| layers[own].ids[0] == slot).map_or(0, |own| own as u32 + 1);
+            }
         }
+    }
+
+    /// The content stack of layer operation `index`: its first stage and whether it has any in
+    /// the layer's `spatial[0..2]`.
+    fn add_content_stack(&mut self, layers: &mut [Operation], effects: &mut [Operation], index: usize, inputs: &ProceduralInputs) {
+        let [_, _, content, content_count] = layers[index].effects;
+        let first = self.stages.len();
+        self.add_stack(effects, content, content_count, index as u32, Some(slot_kind(layers[index].ids[0])), inputs);
+        layers[index].spatial[..2].copy_from_slice(&[first as u32, u32::from(first != self.stages.len())]);
     }
 
     fn add_anchor(&mut self, publication: u32, layer: u32, preceding: u32, inputs: &AnchorInputs, material: Option<(u32, u32)>) {
@@ -681,6 +778,16 @@ impl FilterPlan {
     fn field_words(&self) -> u32 {
         if self.stages.iter().any(|stage| stage.input != 0) { FIELD_WORDS + 1 } else { FIELD_WORDS }
     }
+}
+
+/// The channel slots plus one an effect operation asks the stack for (`FilterPlan::bind_stack_reads`):
+/// `spatial[3]`, and `spatial[2]` for a package effect; 0 for none. Generators use those words for
+/// their own stages.
+fn stack_reads(op: &Operation) -> [u32; 2] {
+    if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]) {
+        return [0; 2];
+    }
+    [op.spatial[3], if packages::EXTENDED_EFFECTS.contains(&op.ids[1]) { op.spatial[2] } else { 0 }]
 }
 
 /// Append the effects' image input sources and rebind each effect's `effects[3]` reference to
@@ -817,6 +924,34 @@ pub struct CompositeProgram {
     mask_layers: BTreeMap<LayerId, u32>,
     /// Side-table words to fill with image record offsets at upload (`ProceduralInputs::pack_image`)
     image_words: Vec<(u32, u32)>,
+    /// The environment's diffuse light the program reads (`ProceduralInputs::reserve_environment`)
+    environment: Option<LateEnvironment>,
+    /// Upload the second bake row block (`ProceduralInputs::read_bake_rows`)
+    bake_rows: bool,
+}
+
+/// A program's late-bound environment words: where they start in the side table, the display
+/// settings of the compiled project (environment and rotation) and, once the images are known,
+/// the words.
+#[derive(Debug)]
+struct LateEnvironment {
+    word: u32,
+    display: DisplaySettings,
+    words: Option<[u32; ENVIRONMENT_WORDS]>,
+}
+
+impl LateEnvironment {
+    fn new(word: Option<u32>, display: &DisplaySettings) -> Option<Self> {
+        word.map(|word| Self { word, display: display.clone(), words: None })
+    }
+
+    fn set(&mut self, environment: &EnvironmentSh) {
+        let mut words = [0; ENVIRONMENT_WORDS];
+        for (word, value) in words.iter_mut().zip(environment.coefficients().iter().flatten().chain([environment.rotation()].iter())) {
+            *word = value.to_bits();
+        }
+        self.words = Some(words);
+    }
 }
 
 fn display_bit(kind: DisplayKind) -> u32 {
@@ -893,10 +1028,29 @@ impl CompositeProgram {
         self.coverage = Some((coverage, if self.mask_preview { 0 } else { radius.min(15) }));
     }
 
-    /// Resolve named images used by authored fills, decals and Tile Generators.
+    /// Resolve named images used by authored fills, decals and Tile Generators, and the
+    /// environment's diffuse light (an imported environment is an image).
     pub fn set_tile_images(&mut self, images: &ImageStore) {
         self.tile_patterns.set_images(images);
         self.material_images.set_images(images);
+        if let Some(environment) = &mut self.environment {
+            environment.set(&EnvironmentSh::of(&environment.display, images));
+        }
+    }
+
+    /// The environment and rotation (degrees) the program lights with, from the compiled
+    /// project's display settings; None when nothing reads the environment. A viewport compiles
+    /// again when either changes (or the imported environment image does).
+    pub fn environment(&self) -> Option<(&str, f32)> {
+        self.environment.as_ref().map(|environment| (environment.display.environment.as_str(), environment.display.env_rotation))
+    }
+
+    /// Replace the environment's diffuse light (tests: a stub reader instead of `EnvironmentSh::of`).
+    #[cfg(test)]
+    fn set_environment(&mut self, environment: &EnvironmentSh) {
+        if let Some(late) = &mut self.environment {
+            late.set(environment);
+        }
     }
 
     /// Mesh-space projections and generators share the viewport's surface and bake inputs.
@@ -910,7 +1064,7 @@ impl CompositeProgram {
         if self.mask_preview || ((!self.filters.stages.is_empty() || !self.geometry.parts.is_empty()) && self.coverage.is_none()) {
             self.set_coverage(gbuf.clone(), 0);
         }
-        self.baked = baked.map(BakedInputs::new).transpose()?.flatten();
+        self.baked = baked.map(|baked| BakedInputs::new(baked, self.bake_rows)).transpose()?.flatten();
         self.id_bake = baked.filter(|_| self.operations.iter().any(|op| op.ids[1] == COLOR_SELECTION_OPCODE && op.procedural[2] != 0)).and_then(IdBake::new);
         if !self.mask_preview && self.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some()) {
             self.display_outputs |= display_bit(DisplayKind::Normal);
@@ -1285,6 +1439,8 @@ impl CompositeProgram {
             mask_layer: 0,
             mask_layers,
             image_words: procedural.image_words,
+            environment: LateEnvironment::new(procedural.environment_word, &project.display),
+            bake_rows: procedural.bake_rows,
         })
     }
 
@@ -1360,6 +1516,8 @@ impl CompositeProgram {
             mask_layer: 0,
             mask_layers: BTreeMap::new(),
             image_words: procedural.image_words,
+            environment: LateEnvironment::new(procedural.environment_word, &project.display),
+            bake_rows: procedural.bake_rows,
         })
     }
 }
@@ -1606,8 +1764,9 @@ fn compile_mask(
                 stack::soften_compare(&mut operation, *hardness);
                 operation
             }
-            // Lighting reads the base color, which a mask does not have
-            EffectKind::Filter(Filter::BakedLighting { .. } | Filter::EnvironmentLighting { .. }) => continue,
+            // Lighting and PBR Validate read the base color, which a mask does not have: the CPU
+            // leaves the mask as it is (`Filter::point` is None), so they lower to nothing here
+            EffectKind::Filter(Filter::BakedLighting { .. } | Filter::EnvironmentLighting { .. } | Filter::PbrValidate(_)) => continue,
             _ => point_effect(effect, procedural).ok_or("A mask effect uses CPU compositing.")?,
         };
         if !effect.opacity.is_finite() {
@@ -1959,7 +2118,8 @@ struct SurfaceCache {
 
 struct BakeCache {
     size: (u32, u32),
-    maps: [Option<Weak<Vec<f32>>>; BAKE_MAPS.len()],
+    /// The built-in maps, then the second row block's
+    maps: Vec<Option<Weak<Vec<f32>>>>,
     view: wgpu::TextureView,
 }
 
@@ -2152,7 +2312,8 @@ impl GpuCompositor {
             return Ok((view.clone(), vertices.clone()));
         }
         let limits = device.limits();
-        let vertex_bytes = mesh.indices.len() as u64 * 32;
+        // Two vec4 per vertex, then the tangents two per 32-byte element (`surface_tangent` in WGSL)
+        let vertex_bytes = (mesh.indices.len() as u64 + (mesh.indices.len() as u64).div_ceil(2)) * 32;
         if gbuf.width.max(gbuf.height) > limits.max_texture_dimension_2d || vertex_bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
             return Err("UV surface data exceeds the GPU limits".into());
         }
@@ -2160,7 +2321,7 @@ impl GpuCompositor {
         let (lo, hi) = mesh.bounds();
         let center = (lo + hi) * 0.5;
         let radius = ((hi - lo).length() * 0.5).max(1e-4);
-        let vertex_data: Vec<[[f32; 4]; 2]> = mesh
+        let mut vertex_data: Vec<[[f32; 4]; 2]> = mesh
             .indices
             .iter()
             .map(|&index| {
@@ -2171,6 +2332,10 @@ impl GpuCompositor {
                 [pos.extend(uv.x).to_array(), normal.extend(uv.y).to_array()]
             })
             .collect();
+        // The MikkTSpace tangents after the vertices, two per element: the brush and the stencil
+        // read the vertices at the same stride
+        let tangent = |index: Option<&u32>| index.and_then(|&index| mesh.tangents.get(index as usize)).copied().unwrap_or_default().to_array();
+        vertex_data.extend(mesh.indices.chunks(2).map(|pair| [tangent(pair.first()), tangent(pair.get(1))]));
         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tc_composite_surface_vertices"),
             contents: bytemuck::cast_slice(&vertex_data),
@@ -2292,9 +2457,10 @@ impl GpuCompositor {
             return Ok(self.default_baked.clone());
         };
         let size = (baked.width, baked.height);
-        let refs = baked.maps.each_ref().map(|map| map.as_ref().map(Arc::downgrade));
+        let refs: Vec<_> = baked.maps.iter().chain(&baked.rows).map(|map| map.as_ref().map(Arc::downgrade)).collect();
         if let Some(cache) = self.baked.get(&ts).filter(|cache| {
             size == cache.size
+                && refs.len() == cache.maps.len()
                 && refs.iter().zip(&cache.maps).all(|(a, b)| match (a, b) {
                     (Some(a), Some(b)) => a.ptr_eq(b),
                     (None, None) => true,
@@ -2303,13 +2469,15 @@ impl GpuCompositor {
         }) {
             return Ok(cache.view.clone());
         }
-        if size.0.max(size.1) > device.limits().max_texture_dimension_2d {
+        // The second row block (Height and World Normal) sits below the built-in maps
+        let rows = size.1.checked_mul(baked.blocks()).ok_or("Baked maps exceed the GPU texture dimensions")?;
+        if size.0.max(rows) > device.limits().max_texture_dimension_2d {
             return Err("Baked maps exceed the GPU texture dimensions".into());
         }
         self.baked.remove(&ts);
         // Keep all three scalar inputs at f32 precision for narrow generator ramps. The
         // normal uses the remaining word, keeping the atlas at 16 bytes per texel.
-        let texture = input_texture(device, "tc_composite_bakes", size, 1, wgpu::TextureFormat::Rgba32Uint);
+        let texture = input_texture(device, "tc_composite_bakes", (size.0, rows), 1, wgpu::TextureFormat::Rgba32Uint);
         let value = |map: usize, i: usize, fallback: f32| baked.maps[map].as_ref().and_then(|data| data.get(i).copied()).unwrap_or(fallback);
         for top in (0..size.1).step_by(ROWS as usize) {
             let end = (top + ROWS).min(size.1);
@@ -2326,6 +2494,19 @@ impl GpuCompositor {
                 })
                 .collect();
             write_input(queue, &texture, (size.0, end - top), (top, 0), &texels);
+        }
+        if baked.blocks() > 1 {
+            // Height in x, the stored world normal in yzw; zeros where a map is not baked
+            let row = |map: usize, i: usize, component: usize| {
+                let components = BAKE_ROW_MAPS[map].components();
+                baked.rows[map].as_ref().and_then(|data| data.get(i * components + component).copied()).unwrap_or(0.0).to_bits()
+            };
+            for top in (0..size.1).step_by(ROWS as usize) {
+                let end = (top + ROWS).min(size.1);
+                let indices = top as usize * size.0 as usize..end as usize * size.0 as usize;
+                let texels: Vec<[u32; 4]> = indices.into_par_iter().map(|i| [row(0, i, 0), row(1, i, 0), row(1, i, 1), row(1, i, 2)]).collect();
+                write_input(queue, &texture, (size.0, end - top), (size.1 + top, 0), &texels);
+            }
         }
         let view = texture.create_view(&Default::default());
         self.baked.insert(ts, BakeCache { size, maps: refs, view: view.clone() });
@@ -2485,6 +2666,7 @@ impl GpuCompositor {
         let curvature = self.curvature_inputs(device, queue, ts, program, &baked)?;
         let id_bake = self.id_bake_input(device, queue, ts, program.id_bake.as_ref())?;
         let [id_width, id_height] = program.id_bake.as_ref().map_or([0; 2], |id| id.size);
+        let bake_words = program.baked.as_ref().map_or([0; 2], BakedInputs::uniform_words);
         let mut words_per_pixel = 0;
         let copies = DisplayKind::ALL.map(|kind| {
             if !program.writes_display(kind) {
@@ -2563,6 +2745,11 @@ impl GpuCompositor {
                 for &(word, image) in &program.image_words {
                     let at = LOOKUP_WORDS as usize + word as usize;
                     words[at] = images.get(image as usize).copied().unwrap_or(u32::MAX);
+                }
+                // The environment's diffuse light, late-bound (`reserve_environment`)
+                if let Some(LateEnvironment { word, words: Some(light), .. }) = &program.environment {
+                    let at = LOOKUP_WORDS as usize + *word as usize;
+                    words[at..at + ENVIRONMENT_WORDS].copy_from_slice(light);
                 }
                 let limits = device.limits();
                 // The operation stores the offset as an exactly represented float.
@@ -2654,8 +2841,8 @@ impl GpuCompositor {
                     field_rect[3],
                     id_width,
                     id_height,
-                    0,
-                    0,
+                    bake_words[0],
+                    bake_words[1],
                     0,
                     0,
                     0,
@@ -4846,6 +5033,8 @@ mod paint_window_tests {
             mask_layer: 0,
             mask_layers: BTreeMap::new(),
             image_words: Vec::new(),
+            environment: None,
+            bake_rows: false,
         };
         let region = CompositeRegion { min: [0, 0], max: [128, 128] };
         let limit = 6 * 64 * 64 * 2 + 32;
