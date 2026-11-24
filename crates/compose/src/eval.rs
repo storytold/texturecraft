@@ -4128,12 +4128,6 @@ fn composite_evaluation_tiles(inp: &EvaluationInputs, out: &mut Composite, tiles
     }
 }
 
-/// Whether texture set `texture_set_index` lights a visible layer with the viewport environment
-/// (Baked Lighting Environment): its material changes when the environment turns or changes.
-pub fn lit_by_environment(project: &Project, texture_set_index: usize) -> bool {
-    project.texture_set(texture_set_index).is_ok_and(|set| uses_environment(project, &set.stack, 0))
-}
-
 /// Whether a visible layer in this draw needs the diffuse environment before parallel tile planning.
 fn uses_environment(project: &Project, stack: &[LayerId], depth: usize) -> bool {
     if depth > texturecraft_core::project::MAX_DEPTH {
@@ -4995,6 +4989,12 @@ pub fn flatten_layer(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Opti
         .collect();
 
     Some(out.into_iter().flatten().collect())
+}
+
+/// Whether texture set `texture_set_index` lights a visible layer with the viewport environment
+/// (Baked Lighting Environment): its material changes when the environment turns or changes.
+pub fn lit_by_environment(project: &Project, texture_set_index: usize) -> bool {
+    project.texture_set(texture_set_index).is_ok_and(|set| uses_environment(project, &set.stack, 0))
 }
 
 #[cfg(test)]

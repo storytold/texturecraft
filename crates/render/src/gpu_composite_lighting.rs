@@ -553,8 +553,7 @@ mod tests {
         }
     }
 
-    /// The lit layer laying Base Color alone under a blurred mask: its Base Color operation is
-    /// the layer's first, and the material's capture must still follow the mask's stack
+    /// The lit layer laying Base Color alone under a blurred mask: its material is the stack below
     fn base_color_alone_under_a_blurred_mask(project: &mut texturecraft_core::Project) {
         use texturecraft_core::{Channel, Effect, EffectKind, Filter};
 
@@ -815,20 +814,45 @@ mod tests {
             ambient_occlusion: 0.4,
             specular_occlusion: 0.8,
         };
-        // Unlit first: the pipelines of each later kind compile on its first frame
-        let filters = [
-            ("unlit", None),
-            ("PBR Validate", Some(Filter::PbrValidate(texturecraft_core::PbrValidate::LIBRARY))),
-            ("environment", Some(environment)),
-            ("stylized", Some(stylized_lighting(StylizedLighting::library()))),
+        // Each variant's pipelines compile on its first frame: unlit, a content Blur (the prepare
+        // pass), an anchor read (a capture without lighting) with and without a content filter,
+        // each lighting kind, and all three
+        let validate = Filter::PbrValidate(texturecraft_core::PbrValidate::LIBRARY);
+        let stylized = stylized_lighting(StylizedLighting::library());
+        let filters: [(&str, Vec<Filter>); 8] = [
+            ("unlit", Vec::new()),
+            ("Blur", vec![Filter::Blur { radius: 4.0, wrap: false }]),
+            ("anchor read", Vec::new()),
+            ("anchor read and Invert", vec![Filter::Invert]),
+            ("PBR Validate", vec![validate.clone()]),
+            ("environment", vec![environment.clone()]),
+            ("stylized", vec![stylized.clone()]),
+            ("all three", vec![validate, environment, stylized]),
         ];
+        // The material layer publishes an anchor whose Roughness the lit layer's fill reads
+        let anchor_read = |project: &mut texturecraft_core::Project| {
+            use texturecraft_core::{Channel, Effect, EffectKind, LayerKind, Source};
+
+            let anchor = project.alloc_id();
+            if let Some(material) = project.layers.values_mut().find(|layer| layer.name == "Material") {
+                material.content_effects.push(Effect::new(anchor, EffectKind::Anchor));
+            }
+            if let Some(LayerKind::Fill(fill)) = lit_layer(project).map(|layer| &mut layer.kind) {
+                fill.sources.insert(Channel::Roughness, Source::Anchor { anchor, channel: Channel::Roughness, ramp: Vec::new() });
+            }
+        };
         let (pixels, images) = (PixelStore::default(), ImageStore::default());
         for size in [2048u32, 4096] {
             let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, size, size));
             gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((size, size), 0)], 1);
-            for (name, filter) in &filters {
-                let effects: Vec<LitEffect> = filter.iter().map(|filter| (filter.clone(), 1.0, BlendMode::Normal, true)).collect();
-                let (project, _) = lit_project(&effects, |project| project.texture_sets[0].resolution = size);
+            for (name, filters) in &filters {
+                let effects: Vec<LitEffect> = filters.iter().map(|filter| (filter.clone(), 1.0, BlendMode::Normal, true)).collect();
+                let (project, _) = lit_project(&effects, |project| {
+                    project.texture_sets[0].resolution = size;
+                    if name.starts_with("anchor read") {
+                        anchor_read(project);
+                    }
+                });
                 let set = &project.texture_sets[0];
                 let inputs = Inputs {
                     project: &project,
