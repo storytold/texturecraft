@@ -3834,8 +3834,11 @@ impl<'a, 'b> Texel<'a, 'b> {
             && sa > 0.0
         {
             if p.erase {
-                val = val.map(|v| v * (1.0 - sa));
-                cov *= 1.0 - sa;
+                // As the commit erases: every painted channel, or the listed ones when any are
+                if p.values.is_empty() || Channel::ALL.get(c.ch).is_some_and(|ch| p.values.contains_key(ch)) {
+                    val = val.map(|v| v * (1.0 - sa));
+                    cov *= 1.0 - sa;
+                }
             } else if let Some(ch) = Channel::ALL.get(c.ch)
                 && let Some(pval) = p.values.get(ch)
             {
@@ -5342,6 +5345,38 @@ mod tests {
         f.project.layer_mut(id).unwrap().mask = Some(Mask::new(MaskBackground::Black));
         let out = run(&f, None);
         assert!(close(out.value(Channel::BaseColor, 3, 3), [0.5; 3]));
+    }
+
+    /// A live erase previews the channels its commit erases: the listed ones, or every painted one
+    #[test]
+    fn a_live_erase_previews_only_the_channels_it_erases() {
+        let mut f = fixture();
+        let id = f.project.alloc_id();
+        f.project.insert_layer(0, Layer::new(id, "Paint", LayerKind::Paint, &[Channel::BaseColor, Channel::Height]), None, false).unwrap();
+        f.pixels.layer_mut(id, Channel::BaseColor, (64, 64)).set(4, 3, &[to_u16(0.8), 0, 0, to_u16(1.0)]);
+        f.pixels.layer_mut(id, Channel::Height, (64, 64)).set(4, 3, &[to_u16_signed(0.6), to_u16(1.0)]);
+        let mut alpha = TileImage::new(64, 64, 1);
+        alpha.set(4, 3, &[to_u16(1.0)]);
+        let erase = |values: BTreeMap<Channel, [f32; 3]>| StrokePreview {
+            target: PaintTarget::Layer(id),
+            alpha: alpha.clone(),
+            opacity: 1.0,
+            erase: true,
+            values,
+            mask_gray: MaskGray::Value(1.0),
+            stencil: None,
+            carried: BTreeMap::new(),
+            carried_mask: None,
+        };
+        let before = run(&f, None);
+
+        let height_only = run(&f, Some(&erase(BTreeMap::from([(Channel::Height, [0.0; 3])]))));
+        let every_channel = run(&f, Some(&erase(BTreeMap::new())));
+
+        let (color, height) = (before.value(Channel::BaseColor, 4, 3), before.value(Channel::Height, 4, 3));
+        assert!(close(height_only.value(Channel::BaseColor, 4, 3), color), "an unlisted channel keeps its paint");
+        assert!(!close(height_only.value(Channel::Height, 4, 3), height), "a listed channel is erased");
+        assert!(!close(every_channel.value(Channel::BaseColor, 4, 3), color), "with none listed every painted channel is erased");
     }
 
     #[test]
