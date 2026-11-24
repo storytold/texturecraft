@@ -252,6 +252,10 @@ fn gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
     let n = i32(clamp(params.mode.x, 1u, 24u));
     let step = radius / f32(n);
     let seed = params.mode.z;
+    // The texel's home in the set: in a wrapping program a periodic copy past the set's edges
+    // takes its noise and cells there, as the CPU's wrapped read of the lower stage does
+    let shift = vec2<f32>(copy_of(vec2<i32>(point) - field_origin()) * (params.bounds.zw - params.bounds.xy));
+    let home = point - shift;
     var acc = EMPTY;
     switch params.mode.y {
         case 5u: {
@@ -260,11 +264,11 @@ fn gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
             }
         }
         case 6u: {
-            let offset = vec2(warp_offset(point, seed, radius), warp_offset(point, seed ^ 0x5bd1e995u, radius));
+            let offset = vec2(warp_offset(home, seed, radius), warp_offset(home, seed ^ 0x5bd1e995u, radius));
             acc = sample_field(acc, point + offset);
         }
         case 7u: {
-            acc = sample_field(acc, point + params.direction.xy * warp_offset(point, seed, radius));
+            acc = sample_field(acc, point + params.direction.xy * warp_offset(home, seed, radius));
         }
         case 8u: {
             let left = normalized_or(sample_field(EMPTY, point - vec2(radius, 0.0)), original);
@@ -278,8 +282,8 @@ fn gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
         }
         case 9u: {
             let d = vec2(
-                height_noise(point, vec2(-0.01, 0.0), seed) - height_noise(point, vec2(0.01, 0.0), seed),
-                height_noise(point, vec2(0.0, -0.01), seed) - height_noise(point, vec2(0.0, 0.01), seed),
+                height_noise(home, vec2(-0.01, 0.0), seed) - height_noise(home, vec2(0.01, 0.0), seed),
+                height_noise(home, vec2(0.0, -0.01), seed) - height_noise(home, vec2(0.0, 0.01), seed),
             );
             let direction = d / max(length(d), 1e-20);
             for (var i = 0; i <= n; i++) {
@@ -287,7 +291,7 @@ fn gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
             }
         }
         case 10u: {
-            let center = (floor(point / radius) + 0.5) * radius - 0.5;
+            let center = (floor(home / radius) + 0.5) * radius - 0.5 + shift;
             acc = sample_field(acc, center);
         }
         default: {

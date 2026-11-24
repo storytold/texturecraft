@@ -517,3 +517,76 @@ impl NeighbourhoodGpu {
         run(&self.apply, [region.original, source, region.output, 0], false, [width.div_ceil(APPLY_WORKGROUP), height.div_ceil(APPLY_WORKGROUP)]);
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use std::sync::Arc;
+
+    use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
+    use texturecraft_core::{Channel, Effect, EffectKind, Filter, Layer, LayerKind, Mask, MaskBackground, Project, TextureSet};
+    use texturecraft_geom::primitives;
+    use texturecraft_texel::{TileImage, to_u16};
+
+    use crate::gpu_composite::CompositeRegion;
+    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, headless};
+
+    const SIDE: u32 = 128;
+
+    /// A paint layer of Base Color and Roughness in stripes and steps that run across the set's
+    /// edges, its mask painted alike, and `stack` after both.
+    fn striped(stack: &[Filter]) -> (Project, PixelStore, texturecraft_core::LayerId) {
+        let channels = [Channel::BaseColor, Channel::Roughness];
+        let mut project = Project::new("Wrapping", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIDE));
+        let owner = project.alloc_id();
+        let mut layer = Layer::new(owner, "Paint", LayerKind::Paint, &channels);
+        let mut mask = Mask::new(MaskBackground::Black);
+        let mask_paint = project.alloc_id();
+        mask.effects.push(Effect::new(mask_paint, EffectKind::Paint));
+        for effects in [&mut layer.content_effects, &mut mask.effects] {
+            for filter in stack {
+                effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(filter.clone())));
+            }
+        }
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let size = (SIDE, SIDE);
+        let mut pixels = PixelStore::default();
+        let mut mask_pixels = TileImage::new(SIDE, SIDE, 2);
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let tone = if (x / 9 + y / 13) % 2 == 0 { 0.85 } else { 0.2 } * if x < 5 || x >= SIDE - 7 { 0.5 } else { 1.0 };
+                let other = (x as f32 / SIDE as f32 + 0.3 * (y % 17) as f32 / 17.0).fract();
+                pixels.layer_mut(owner, Channel::BaseColor, size).set(x, y, &[to_u16(tone), to_u16(other), to_u16(0.5 * tone), u16::MAX]);
+                pixels.layer_mut(owner, Channel::Roughness, size).set(x, y, &[to_u16(other), u16::MAX]);
+                mask_pixels.set(x, y, &[to_u16(tone), u16::MAX]);
+            }
+        }
+        pixels.masks.insert(mask_paint, mask_pixels);
+        (project, pixels, owner)
+    }
+
+    /// Warp, Directional Warp, Slope Blur and Pixelate (built-in kinds 6, 7, 9 and 10) below a
+    /// Blur with Wrap match the CPU, whose wrapped Blur reads the lower stage at the texel's home
+    /// in the set: the noise and the cells follow the home position in every periodic copy.
+    #[test]
+    fn built_in_gathers_below_a_wrapping_blur_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let wrap = Filter::Blur { radius: 2.0, wrap: true };
+        let cases = [
+            ("Warp", Filter::Warp { intensity: 6.0, scale: 3.0, seed: 7, divider: 1 }),
+            ("Directional Warp", Filter::DirectionalWarp { intensity: 6.0, angle: 30.0, scale: 3.0, seed: 3, divider: 1 }),
+            ("Slope Blur", Filter::SlopeBlur { radius: 5.0, scale: 3.0, seed: 11, divider: 1 }),
+            ("Pixelate", Filter::Mosaic { size: 24.0, alpha: true }),
+        ];
+        for (label, filter) in cases {
+            let (project, pixels, owner) = striped(&[filter, wrap.clone()]);
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+            case.region = Some(CompositeRegion { min: [0, 0], max: [16, 16] });
+            assert_matches_cpu(&mut gpu, &case, Tolerance::TRANSCENDENTAL, &format!("{label} below a wrapping Blur"));
+        }
+    }
+}
