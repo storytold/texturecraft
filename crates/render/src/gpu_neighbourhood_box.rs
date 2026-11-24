@@ -1194,7 +1194,13 @@ mod tests {
         let Some(mut gpu) = headless() else { return };
         let mesh = oracle_mesh(false);
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
-        let filters = [("Glow", LIBRARY_GLOW), ("Drop Shadow", LIBRARY_DROP_SHADOW), ("Bevel", Filter::DistanceBevel(Bevel::LIBRARY))];
+        let filters = [
+            ("Glow", LIBRARY_GLOW),
+            ("Drop Shadow", LIBRARY_DROP_SHADOW),
+            ("Bevel", Filter::DistanceBevel(Bevel::LIBRARY)),
+            ("Bevel Smooth", Filter::BevelSmooth(BevelSmooth::LIBRARY)),
+            ("Directional Distance", Filter::DirectionalDistance(DirectionalDistance::LIBRARY)),
+        ];
         for side in [2048, 4096] {
             gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((side, side), 0)], 1);
             let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, side, side));
