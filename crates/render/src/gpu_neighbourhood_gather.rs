@@ -592,6 +592,7 @@ mod tests {
         Mask, MaskBackground, Mirror, MirrorCorner, MirrorMode, Project, RepeatMode, SlopeBlending, SourceColorMode, SourceSlopeBlur, SourceWarp,
         TargetColorMode, TextureSet, TileTransform, WarpBlending, WarpMode, WarpSource, WarpSourceMode,
     };
+    use texturecraft_core::{ImageInput, Procedural, ProceduralKind, Source};
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TileImage, to_u16, to_u16_signed};
 
@@ -979,6 +980,87 @@ mod tests {
         PRE_PASS_TEST_BUDGET.set(None);
 
         assert!(checked.is_some());
+    }
+
+    /// Composites each (label, stack, inputs) as [`check_cases`] does, with the stack's effects
+    /// reading `inputs` (image input id, source).
+    fn check_linked(gpu: &mut Headless, cases: &[(&str, Stack, Vec<(&str, Source)>)], fixture: Fixture, region: CompositeRegion, tolerance: Tolerance) {
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        for (label, stack, linked) in cases {
+            let (mut project, pixels, owner) = painted_project(stack, BlendMode::Normal, fixture).unwrap();
+            let layer = project.layers.get_mut(&owner).unwrap();
+            let mask = layer.mask.as_mut().unwrap();
+            for effect in layer.content_effects.iter_mut().chain(mask.effects.iter_mut()).filter(|effect| matches!(effect.kind, EffectKind::Filter(_))) {
+                for (id, source) in linked {
+                    effect.inputs.insert((*id).into(), source.clone());
+                }
+            }
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+            case.region = Some(region);
+
+            assert_matches_cpu(gpu, &case, tolerance, label);
+        }
+    }
+
+    /// A procedural source between two colours, for linked image inputs.
+    fn procedural(kind: ProceduralKind, low: [f32; 3], high: [f32; 3]) -> Source {
+        Source::Procedural { pattern: Procedural { scale: 6.0, seed: 11, ..Procedural::new(kind) }, low, high, ramp: Vec::new() }
+    }
+
+    /// Linked image inputs match the CPU: Warp's and Blur Slope's Custom Noise (procedural and
+    /// uniform), Kuwahara's Custom Input, and Color Match's Input and Image Input in colour, one
+    /// uniform beside one read at the texels too. Two inputs read at the texels stay on the CPU.
+    #[test]
+    fn linked_inputs_match_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let normal = BlendMode::Normal;
+        let custom_noise = WarpSource { mode: WarpSourceMode::CustomNoise, ..WarpSource::LIBRARY };
+        let gray = procedural(ProceduralKind::Perlin, [0.0; 3], [1.0; 3]);
+        let colours = procedural(ProceduralKind::Clouds, [0.7, 0.2, 0.1], [0.1, 0.3, 0.8]);
+        let noise = ImageInput::CUSTOM_NOISE.id;
+        let (source_input, target_input) = (ImageInput::SOURCE_INPUT.id, ImageInput::TARGET_INPUT.id);
+        let both = ColorMatch { source_mode: SourceColorMode::Input, target_mode: TargetColorMode::ImageInput, ..ColorMatch::LIBRARY };
+        let cases = [
+            ("Warp from a linked noise", vec![(Filter::SourceWarp(SourceWarp { source: custom_noise, ..WIDE_WARP }), 1.0, normal)], vec![(noise, gray.clone())]),
+            (
+                "Directional Warp from a uniform noise",
+                vec![(Filter::SourceWarp(SourceWarp { mode: WarpMode::Directional, angle: 40.0, source: custom_noise, ..WIDE_WARP }), 0.8, normal)],
+                vec![(noise, Source::Uniform([0.85; 3]))],
+            ),
+            (
+                "Blur Slope from a linked noise",
+                vec![(Filter::SourceSlopeBlur(SourceSlopeBlur { source: WarpSource { blur: 0.3, ..custom_noise }, ..SourceSlopeBlur::LIBRARY }), 1.0, normal)],
+                vec![(noise, gray.clone())],
+            ),
+            (
+                "Color Match from a linked Input",
+                vec![(Filter::ColorMatch(ColorMatch { source_mode: SourceColorMode::Input, target_color: [0.1, 0.4, 0.6], ..ColorMatch::LIBRARY }), 1.0, normal)],
+                vec![(source_input, colours.clone())],
+            ),
+            (
+                "Color Match to a linked Image Input",
+                vec![(Filter::ColorMatch(ColorMatch { target_mode: TargetColorMode::ImageInput, custom_variation: false, ..ColorMatch::LIBRARY }), 0.9, normal)],
+                vec![(target_input, colours.clone())],
+            ),
+            (
+                "Color Match from a uniform Input to a linked Image Input",
+                vec![(Filter::ColorMatch(both), 1.0, normal)],
+                vec![(source_input, Source::Uniform([0.6, 0.3, 0.2])), (target_input, colours.clone())],
+            ),
+        ];
+        check_linked(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, GATHER_DECISIONS);
+
+        let kuwahara = AnisotropicKuwahara { radius: AnisotropicKuwahara::MAX_RADIUS, custom_input: true, ..AnisotropicKuwahara::LIBRARY };
+        let cases = [("Kuwahara from a linked Custom Input", vec![(Filter::AnisotropicKuwahara(kuwahara), 1.0, normal)], vec![(ImageInput::CUSTOM_INPUT.id, gray)])];
+        check_linked(&mut gpu, &cases, (false, KUWAHARA_SIZE), KUWAHARA_MIDDLE, KUWAHARA_DECISIONS);
+
+        // Both Color Match inputs read at the texels: one stage carries one input
+        let mut two = effect(EffectKind::Filter(Filter::ColorMatch(both)));
+        two.inputs.insert(source_input.into(), colours.clone());
+        two.inputs.insert(target_input.into(), colours);
+        assert!(compile_effects(Some(two), None, ContentsOffset::NONE).0.is_err());
     }
 
     /// Anisotropic Kuwahara matches the CPU through its structure tensor pass, at the library's
