@@ -1649,7 +1649,8 @@ impl Renderer {
     /// Start compiling `program`'s pipelines on worker threads (the current project's variants
     /// at load), so its first composite does not wait for them.
     pub fn prewarm_composite(&mut self, device: &wgpu::Device, program: &CompositeProgram) {
-        if cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
+        // Only with asynchronous compiles (the viewport): tests and wasm compile in place
+        if !self.asynchronous_compile || cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
             return;
         }
         let asynchronous = self.asynchronous_compile;

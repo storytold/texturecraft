@@ -547,7 +547,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
     }));
     let mut renderer = Renderer::new(&rs.device, &rs.queue, rs.target_format);
     // New composite pipelines compile on worker threads; the viewport keeps its last result
-    renderer.set_asynchronous_compile(true);
+    renderer.set_asynchronous_compile(!cfg!(test));
     rs.renderer.write().callback_resources.insert(GpuState { renderer, recreated: recreated.clone(), reports: reports.clone(), ctx: ctx.clone() });
     let info = rs.adapter.get_info();
     GpuLink {
