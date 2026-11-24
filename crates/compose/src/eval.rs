@@ -2324,7 +2324,7 @@ fn fields_of(inp: &EvaluationInputs, channels: &[Channel], (list, around): (&[La
         }
 
         if !layer.is_group() && neighbourhood(&layer.content_effects, working_width).is_some() {
-            for channel in channels.iter().filter(|channel| layer.channels.contains_key(channel)) {
+            for channel in field_channel_order(layer, channels).iter().filter(|channel| layer.channels.contains_key(channel)) {
                 let mut key = FieldKey::content(id, *channel, place.offset);
                 if place.instance != 0 {
                     let reads_anchor = matches!(&layer.kind, LayerKind::Fill(fill) if fill.sources.get(channel).is_some_and(|source| source.reads_anchor(None)))
@@ -2351,6 +2351,21 @@ fn fields_of(inp: &EvaluationInputs, channels: &[Channel], (list, around): (&[La
     }
 
     out
+}
+
+/// The order a layer's content fields are built in: the set's channels, with Height before Normal
+/// when a Height To Normal reads the layer's Height (its Normal stage reads the Height's field)
+fn field_channel_order(layer: &Layer, channels: &[Channel]) -> Vec<Channel> {
+    let mut ordered = channels.to_vec();
+    let reads_height = layer.content_effects.iter().any(|effect| effect.visible && matches!(effect.kind, EffectKind::Filter(Filter::HeightToNormal(_))));
+    if let (true, Some(normal), Some(height)) =
+        (reads_height, ordered.iter().position(|&channel| channel == Channel::Normal), ordered.iter().position(|&channel| channel == Channel::Height))
+        && height > normal
+    {
+        let moved = ordered.remove(height);
+        ordered.insert(normal, moved);
+    }
+    ordered
 }
 
 /// Store a filtered mask once per transform, or per draw when it reads the stack.
@@ -5305,6 +5320,47 @@ mod tests {
         f.project.layer_mut(top).unwrap().channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Multiply, opacity: 1.0 });
         let out = run(&f, None);
         assert!(close(out.value(Channel::BaseColor, 5, 5), [0.0, 0.0, 0.0]));
+    }
+
+    /// Height To Normal reads its layer's Height after the Height's own neighbourhood stages,
+    /// whatever order the set lists Normal and Height in.
+    #[test]
+    fn height_to_normal_reads_the_blurred_height_in_any_channel_order() {
+        let normals = |height_first: bool, blurred: bool| {
+            let mut f = fixture();
+            if height_first {
+                let channels = &mut f.project.texture_sets[0].channels;
+                let height = channels.iter().position(|(channel, _)| *channel == Channel::Height).unwrap();
+                let entry = channels.remove(height);
+                channels.insert(0, entry);
+            }
+            let id = f.project.alloc_id();
+            let channels = [Channel::Normal, Channel::Height];
+            let mut layer = Layer::new(id, "Paint", LayerKind::Paint, &channels);
+            if blurred {
+                let mut blur = Effect::new(f.project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 160.0, wrap: false }));
+                blur.off_channels.insert(Channel::Normal);
+                layer.content_effects.push(blur);
+            }
+            layer.content_effects.push(Effect::new(f.project.alloc_id(), EffectKind::Filter(Filter::HeightToNormal(HeightToNormal::LIBRARY))));
+            f.project.insert_layer(0, layer, None, false).unwrap();
+
+            // A step in the height: only the blurred step slopes away from the edge
+            for y in 0..64 {
+                for x in 0..64 {
+                    f.pixels.layer_mut(id, Channel::Normal, (64, 64)).set(x, y, &[to_u16(0.5), to_u16(0.5), u16::MAX, u16::MAX]);
+                    let height = if x >= 32 { 0.4 } else { 0.0 };
+                    f.pixels.layer_mut(id, Channel::Height, (64, 64)).set(x, y, &[to_u16_signed(height), u16::MAX]);
+                }
+            }
+            let out = run(&f, None);
+            (24..40).map(|x| out.value(Channel::Normal, x, 20)).collect::<Vec<_>>()
+        };
+
+        let (default_order, height_first) = (normals(false, true), normals(true, true));
+
+        assert_eq!(default_order, height_first, "the Normal stage reads the blurred Height in the default order too");
+        assert_ne!(height_first, normals(true, false), "the blur changes the normal");
     }
 
     #[test]
