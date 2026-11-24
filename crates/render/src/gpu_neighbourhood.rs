@@ -321,7 +321,10 @@ impl NeighbourhoodFilter {
     /// distance passes, P5's frames and reductions; P5 declares fewer at its merge), none for a
     /// built-in gather. The whole-set pre-pass gives a stage only these.
     pub(crate) fn blur_fields(self) -> u32 {
-        if self.kind.box_family() || self.kind.gather() || self.uses_box() { 2 } else { 0 }
+        if self.kind.box_family() {
+            return box_family::blur_fields(self);
+        }
+        if self.kind.gather() || self.uses_box() { 2 } else { 0 }
     }
 
     pub(crate) fn uses_box(self) -> bool {

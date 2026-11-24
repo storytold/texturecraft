@@ -374,7 +374,8 @@ fn box_bevel_texel(original: Texel, slope: f32) -> vec4<f32> {
 // The apply pass of the kinds with passes of their own: the original at buffers.x, the filtered field at buffers.y, the result to buffers.z
 @compute @workgroup_size(8, 8)
 fn box_family_apply(@builtin(global_invocation_id) id: vec3<u32>) {
-    let point = id.xy;
+    // A dispatch split by rows under a work budget starts at row stage.z
+    let point = vec2(id.x, id.y + params.stage.z);
     if any(point >= params.rect.zw) {
         return;
     }
@@ -424,7 +425,8 @@ fn box_family_apply(@builtin(global_invocation_id) id: vec3<u32>) {
 // What the box passes of a kind with passes of its own blur, from the original at buffers.x into buffers.z
 @compute @workgroup_size(8, 8)
 fn box_family_prepare(@builtin(global_invocation_id) id: vec3<u32>) {
-    let point = id.xy;
+    // A dispatch split by rows under a work budget starts at row stage.z
+    let point = vec2(id.x, id.y + params.stage.z);
     if any(point >= params.rect.zw) {
         return;
     }
@@ -499,7 +501,8 @@ fn box_set_field_word(offset: u32, position: vec2<u32>, word: u32, value: u32) {
 // A stage that does not wrap measures each copy of the set apart, as the CPU's region stops at the set's edges
 @compute @workgroup_size(64)
 fn distance_rows(@builtin(global_invocation_id) id: vec3<u32>) {
-    let y = id.x;
+    // A dispatch split by lines under a work budget starts at line stage.z
+    let y = id.x + params.stage.z;
     if y >= params.rect.w {
         return;
     }
@@ -654,7 +657,8 @@ fn box_column_envelope(x: u32, side: u32, angular: bool, first: i32, end: i32) {
 // One invocation per column: both sides' envelopes over the row distances in buffers.z, each copy of the set apart unless the stage wraps
 @compute @workgroup_size(64)
 fn distance_columns(@builtin(global_invocation_id) id: vec3<u32>) {
-    let x = id.x;
+    // A dispatch split by lines under a work budget starts at line stage.z
+    let x = id.x + params.stage.z;
     if x >= params.rect.z {
         return;
     }
@@ -755,7 +759,8 @@ fn box_distance_map(point: vec2<u32>) -> f32 {
 // Coverage 1 everywhere, so the smoothing blurs every texel alike as the CPU's blur does; the reach in extra 1
 @compute @workgroup_size(8, 8)
 fn distance_edges(@builtin(global_invocation_id) id: vec3<u32>) {
-    let point = id.xy;
+    // A dispatch split by rows under a work budget starts at row stage.z
+    let point = vec2(id.x, id.y + params.stage.z);
     if any(point >= params.rect.zw) {
         return;
     }
@@ -830,7 +835,8 @@ fn box_exact_product(first: f32, second: f32) -> f32 {
 // The trail into word 0 of buffers.z, the step that found a shape (-1: none) into word 1; reach in extra 1, step length 2, 1 - contrast 3
 @compute @workgroup_size(8, 8)
 fn directional_trail(@builtin(global_invocation_id) id: vec3<u32>) {
-    let point = id.xy;
+    // A dispatch split by rows under a work budget starts at row stage.z
+    let point = vec2(id.x, id.y + params.stage.z);
     if any(point >= params.rect.zw) {
         return;
     }

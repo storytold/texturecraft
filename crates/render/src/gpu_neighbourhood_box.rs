@@ -107,6 +107,10 @@ const BILINEAR_SAMPLE_WORK: u64 = 5;
 const BOX_FILTER_WORK: u64 = 8;
 /// Work per texel of a pass of P4's own (prepare, apply, a distance line or the edges).
 const OWN_PASS_WORK: u64 = 2;
+/// Work per texel of the distance row pass (two sweeps along the line).
+const ROW_PASS_WORK: u64 = 4;
+/// Work per texel of the distance column pass (two envelopes, built and read back).
+const COLUMN_PASS_WORK: u64 = 8;
 
 /// P4's own compute pipelines, created from the neighbourhood module.
 pub(super) struct Pipelines {
@@ -384,7 +388,7 @@ pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
 /// The three horizontal and three vertical box passes over the field at `first` (read on the
 /// first pass as the original is), radius `radius`; the offset of the blurred field.
 fn box_passes(
-    run: &mut impl FnMut(&wgpu::ComputePipeline, [u32; 4], u32, bool, [u32; 2]),
+    run: &mut impl FnMut(&wgpu::ComputePipeline, [u32; 4], u32, bool, [u32; 2], (u32, u64)),
     box_blur: &wgpu::ComputePipeline,
     region: NeighbourhoodRegion,
     first: u32,
@@ -396,10 +400,22 @@ fn box_passes(
         let vertical = step >= BOX_PASSES;
         let line_count = if vertical { width } else { height };
         let target = region.blur[step % 2];
-        run(box_blur, [first, source, target, u32::from(vertical)], radius, step == 0, [line_count.div_ceil(LINE_WORKGROUP), 1]);
+        // The built-in box kernel reads no first line, so it runs whole
+        run(box_blur, [first, source, target, u32::from(vertical)], radius, step == 0, [line_count.div_ceil(LINE_WORKGROUP), 1], (LINE_WORKGROUP, 0));
         source = target;
     }
     source
+}
+
+/// The working fields a P4 stage uses besides the original and the output
+/// (`NeighbourhoodFilter::blur_fields`): none for Pixelate's gather, one for Directional
+/// Distance's inside flags, two for the box passes and the distance envelopes.
+pub(super) fn blur_fields(filter: NeighbourhoodFilter) -> u32 {
+    match filter.kind {
+        PIXELATE_KEEPING_ALPHA => 0,
+        DIRECTIONAL_DISTANCE => 1,
+        _ => 2,
+    }
 }
 
 /// Whether a stage runs in the whole-set pre-pass instead of in every band (see
@@ -419,8 +435,12 @@ pub(super) fn encode(
 ) -> bool {
     let [_, _, width, height] = region.rect;
     let texel_groups = [width.div_ceil(APPLY_WORKGROUP), height.div_ceil(APPLY_WORKGROUP)];
-    let mut run = |pipeline: &wgpu::ComputePipeline, buffers: [u32; 4], radius: u32, first_box: bool, groups: [u32; 2]| {
-        let params = Params {
+    let line_groups = |lines: u32| [lines.div_ceil(LINE_WORKGROUP), 1];
+
+    // Under the work budget of the whole-set pre-pass a pass is split, each chunk submitted on its own
+    let budget = super::BUDGET.with_borrow(|budget| budget.as_ref().map(|budget| (budget.queue.clone(), budget.limit)));
+    let mut run = |pipeline: &wgpu::ComputePipeline, buffers: [u32; 4], radius: u32, first_box: bool, groups: [u32; 2], (unit, group_work): (u32, u64)| {
+        let mut params = Params {
             rect: region.rect,
             buffers,
             mode: [radius, filter.kind.0, filter.seed, u32::from(first_box)],
@@ -431,35 +451,60 @@ pub(super) fn encode(
             stage: [filter.context, u32::from(region.wrap), 0, 0],
             bounds: region.bounds,
         };
-        NeighbourhoodGpu::run(pipeline, device, encoder, scratch, &params, groups);
+
+        // Texel passes split by rows of workgroups, line passes by workgroups of lines (stage.z: the first row or line)
+        let axis = usize::from(unit == APPLY_WORKGROUP);
+        let chunk =
+            budget.as_ref().filter(|_| group_work > 0).map(|(queue, limit)| (queue, (limit / group_work).clamp(1, u64::from(groups[axis].max(1))) as u32));
+        let Some((queue, per_chunk)) = chunk.filter(|(_, per_chunk)| *per_chunk < groups[axis]) else {
+            NeighbourhoodGpu::run(pipeline, device, encoder, scratch, &params, groups);
+            return;
+        };
+
+        let mut first = 0;
+        while first < groups[axis] {
+            let mut chunk_groups = groups;
+            chunk_groups[axis] = per_chunk.min(groups[axis] - first);
+            params.stage[2] = first * unit;
+            NeighbourhoodGpu::run(pipeline, device, encoder, scratch, &params, chunk_groups);
+            first += chunk_groups[axis];
+            let finished = std::mem::replace(&mut *encoder, device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_box_family") }));
+            queue.submit([finished.finish()]);
+        }
     };
+
+    // The work of one workgroup row of a texel pass at `per_texel`, and of one workgroup of lines `length` long
+    let texel_pass = |per_texel: u64| (APPLY_WORKGROUP, u64::from(texel_groups[0]) * u64::from(APPLY_WORKGROUP * APPLY_WORKGROUP) * per_texel);
+    let line_pass = |length: u32, per_texel: u64| (LINE_WORKGROUP, u64::from(LINE_WORKGROUP) * u64::from(length) * per_texel);
+    let own = texel_pass(OWN_PASS_WORK);
     let (original, output) = (region.original, region.output);
     match filter.kind {
         // What the box passes blur goes to the output field first, which the apply pass overwrites
         HIGHPASS | HALO | OUTLINE => {
-            run(&pipelines.prepare, [original, 0, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.prepare, [original, 0, output, 0], filter.radius, false, texel_groups, own);
             let blurred = box_passes(&mut run, &gpu.box_blur, region, output, filter.radius);
-            run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups, own);
         }
         PRE_BLUR => {
             let blurred = box_passes(&mut run, &gpu.box_blur, region, original, filter.radius);
-            run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.apply, [original, blurred, output, 0], filter.radius, false, texel_groups, own);
         }
         // Row distances in the first blur field, the envelopes' stacks in the second, the ramp in the output, then its smoothing
         DISTANCE_BEVEL | BEVEL_SMOOTH => {
             let [rows, stacks] = region.blur;
-            run(&pipelines.distance_rows, [original, 0, rows, 0], filter.radius, false, [height.div_ceil(LINE_WORKGROUP), 1]);
-            run(&pipelines.distance_columns, [original, stacks, rows, 0], filter.radius, false, [width.div_ceil(LINE_WORKGROUP), 1]);
-            run(&pipelines.distance_edges, [original, rows, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.distance_rows, [original, 0, rows, 0], filter.radius, false, line_groups(height), line_pass(width, ROW_PASS_WORK));
+            run(&pipelines.distance_columns, [original, stacks, rows, 0], filter.radius, false, line_groups(width), line_pass(height, COLUMN_PASS_WORK));
+            run(&pipelines.distance_edges, [original, rows, output, 0], filter.radius, false, texel_groups, own);
             let smoothing = filter.words[1];
             let ramp = if smoothing > 0 { box_passes(&mut run, &gpu.box_blur, region, output, smoothing) } else { output };
-            run(&pipelines.apply, [original, ramp, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.apply, [original, ramp, output, 0], filter.radius, false, texel_groups, own);
         }
         DIRECTIONAL_DISTANCE => {
             let inside = region.blur[0];
-            run(&pipelines.prepare, [original, 0, inside, 0], filter.radius, false, texel_groups);
-            run(&pipelines.directional_trail, [original, inside, output, 0], filter.radius, false, texel_groups);
-            run(&pipelines.apply, [original, output, output, 0], filter.radius, false, texel_groups);
+            run(&pipelines.prepare, [original, 0, inside, 0], filter.radius, false, texel_groups, own);
+            let trail = texel_pass(u64::from(filter.words[0]).saturating_add(1));
+            run(&pipelines.directional_trail, [original, inside, output, 0], filter.radius, false, texel_groups, trail);
+            run(&pipelines.apply, [original, output, output, 0], filter.radius, false, texel_groups, own);
         }
         // Pixelate gathers and the wrapping filters run the built-in passes
         _ => return false,
