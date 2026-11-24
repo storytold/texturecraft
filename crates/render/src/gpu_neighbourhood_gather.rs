@@ -3,11 +3,11 @@
 //!
 //! What P5 implements: FXAA, Anisotropic Kuwahara (structure tensor pass, then a sector gather),
 //! Warp (`SourceWarp`) and Blur Slope (`SourceSlopeBlur`) with every mode, blending and source,
-//! Mirror and Transform (whole-UV-tile reach), and Color Match (the whole set's mean: two
-//! reduction passes, then a point map). Height To Normal still composites on the CPU: its Normal
-//! stage needs the layer's own Height content in the field's sixth word, which no prepare-pass
-//! hook evaluates yet. Image inputs read their unlinked default (mid gray); a linked input still
-//! composites on the CPU (`effect_needs_cpu`).
+//! Mirror and Transform (whole-UV-tile reach), Color Match (the whole set's mean: two reduction
+//! passes, then a point map) and Height To Normal (the layer's own Height in the field's sixth
+//! word, `INPUT_LAYER`). A linked image input reaches the kernels through the field's input
+//! words (`stage_linked`, `input_at`, `input_color_at`); [`bind_inputs`] says which input an
+//! effect registers. An unlinked input reads its default.
 //!
 //! P5 also owns the whole-tile and whole-set field path in `GpuCompositor::compose`
 //! (gpu_composite.rs: band planning and the prepare loop; no other package touches `compose`)
@@ -33,16 +33,16 @@
 //! product) on paint and in a mask, chained, and with a partial region.
 
 use texturecraft_core::{
-    AnisotropicKuwahara, ChannelKind, ColorMatch, Filter, ImageInput, Mirror, MirrorMode, RepeatMode, SlopeBlending, SourceColorMode, SourceSlopeBlur,
+    AnisotropicKuwahara, ChannelKind, ColorMatch, Effect, Filter, HeightToNormal, ImageInput, Mirror, MirrorMode, RepeatMode, SlopeBlending, SourceColorMode, SourceSlopeBlur,
     SourceWarp, TargetColorMode, TileTransform, WarpBlending, WarpMode, WarpSource, WarpSourceMode, finite_unit, oklab,
 };
 
 use super::{
-    APPLY_WORKGROUP, GATHER_KINDS, Kind, LINE_WORKGROUP, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs, WHOLE_SET_KINDS,
+    APPLY_WORKGROUP, BUDGET, GATHER_KINDS, Kind, LINE_WORKGROUP, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs, WHOLE_SET_KINDS,
 };
 
 /// Library filter ids P5 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["heightToNormal"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
 
 pub(super) const WGSL: &str = include_str!("shaders/neighbourhood_gather.wgsl");
 
@@ -59,6 +59,8 @@ const SOURCE_SLOPE_BLUR: Kind = Kind(GATHER_KINDS.start + 3);
 const MIRROR: Kind = Kind(GATHER_KINDS.start + 4);
 /// Transform: the bilinear read its affine gives in its UV tile (`transform_texel`), whole-set.
 const TRANSFORM: Kind = Kind(GATHER_KINDS.start + 5);
+/// Height To Normal: the Sobel normal of the layer's Height (`height_to_normal_texel` in eval.rs).
+const HEIGHT_TO_NORMAL: Kind = Kind(GATHER_KINDS.start + 6);
 /// Color Match: every colour moved from its source to its target in OKLab (`color_match` in
 /// eval.rs); Average reads the whole set's mean, summed by two reduction passes of its own.
 const COLOR_MATCH: Kind = Kind(WHOLE_SET_KINDS.start);
@@ -77,10 +79,20 @@ const MIRROR_KEEP_RIGHT: u32 = 4;
 const MIRROR_KEEP_BOTTOM: u32 = 8;
 const MIRROR_DEBUG: u32 = 16;
 
+/// Flag bit of a Height To Normal stage's `words[0]` (the same constant in the WGSL file):
+/// Overwrite Existing Normal.
+const HEIGHT_TO_NORMAL_OVERWRITE: u32 = 1;
+
+/// Height To Normal reads its 3 × 3 heights around a texel.
+const HEIGHT_TO_NORMAL_READS: u64 = 9;
+
 /// Flag bits of a Color Match stage's `words[0]` (the same constants in the WGSL file): the source
 /// is the set's mean, and Custom Color Variation.
 const COLOR_MATCH_AVERAGE: u32 = 1;
 const COLOR_MATCH_CUSTOM_VARIATION: u32 = 2;
+/// The source (Input) or the target (Image Input) a linked input gives at each texel.
+const COLOR_MATCH_SOURCE_INPUT: u32 = 4;
+const COLOR_MATCH_TARGET_INPUT: u32 = 8;
 
 /// Work per texel of Color Match: its OKLab round trip, and its share of the mean's sums.
 const COLOR_MATCH_WORK: u64 = 2 * SAMPLE_WORK;
@@ -163,6 +175,7 @@ pub(super) fn supports(filter: &Filter) -> bool {
             | Filter::Mirror(_)
             | Filter::Transform(_)
             | Filter::ColorMatch(_)
+            | Filter::HeightToNormal(_)
     )
 }
 
@@ -180,6 +193,8 @@ pub(super) fn new(filter: &Filter, stage: StageInputs) -> Option<NeighbourhoodFi
         Filter::SourceWarp(warp) if warp.move_texels(stage.resolution) > 0.0 => Some(source_warp(stage, warp)),
         Filter::SourceSlopeBlur(slope) if slope.move_texels(stage.resolution) > 0.0 => Some(source_slope_blur(stage, slope)),
         Filter::ColorMatch(matcher) => Some(color_match_stage(stage, matcher)),
+        // The slopes come from the heights right around a texel
+        Filter::HeightToNormal(to_normal) => Some(height_to_normal_stage(stage, to_normal)),
         // A mirror or transform reads anywhere in its UV tile; one that changes nothing is skipped
         Filter::Mirror(mirror) => Some(mirror_stage(stage, mirror)),
         Filter::Transform(transform) if !transform.is_identity() => Some(transform_stage(stage, transform)),
@@ -216,7 +231,8 @@ fn kuwahara_stage(stage: StageInputs, kuwahara: &AnisotropicKuwahara) -> Neighbo
 fn color_match_stage(stage: StageInputs, matcher: &ColorMatch) -> NeighbourhoodFilter {
     let average = matcher.source_mode == SourceColorMode::Average && stage.channel == Some(ChannelKind::Color);
 
-    // An image input not linked reads its default (filter_region in eval.rs)
+    // An image input not linked reads its default (filter_region in eval.rs); a linked one is
+    // read at the texel ([`bind_inputs`] laid the others in)
     let source = match matcher.source_mode {
         SourceColorMode::Input => [ImageInput::SOURCE_INPUT.default; 3],
         SourceColorMode::Average | SourceColorMode::Parameter => matcher.source_color,
@@ -247,8 +263,63 @@ fn color_match_stage(stage: StageInputs, matcher: &ColorMatch) -> NeighbourhoodF
         limit(matcher.chroma, ColorMatch::MAX_CHROMA),
     ];
     out.amount = limit(matcher.luma, ColorMatch::MAX_LUMA);
-    out.words[0] = flag(average, COLOR_MATCH_AVERAGE) | flag(matcher.custom_variation, COLOR_MATCH_CUSTOM_VARIATION);
+    out.words[0] = flag(average, COLOR_MATCH_AVERAGE)
+        | flag(matcher.custom_variation, COLOR_MATCH_CUSTOM_VARIATION)
+        | flag(matcher.source_mode == SourceColorMode::Input, COLOR_MATCH_SOURCE_INPUT)
+        | flag(matcher.target_mode == TargetColorMode::ImageInput, COLOR_MATCH_TARGET_INPUT);
     out
+}
+
+/// A Height To Normal stage: the slope's strength in `extra`, Overwrite in `words[0]`. It reads
+/// the layer's Height from its input word (`INPUT_LAYER`), else a flat height of 1 as the CPU
+/// does without one; only Normal content changes.
+fn height_to_normal_stage(stage: StageInputs, to_normal: &HeightToNormal) -> NeighbourhoodFilter {
+    let mut out = stage.filter(HEIGHT_TO_NORMAL, 1.0);
+    out.extra[0] = to_normal.strength(stage.resolution);
+    out.words[0] = flag(to_normal.overwrite, HEIGHT_TO_NORMAL_OVERWRITE);
+    out
+}
+
+/// `filter` with the inputs it does not read at its texels laid in (an unlinked input reads its
+/// default, a uniform one of Color Match is its colour), and the input it reads at its texels
+/// with the kind to read it as (Color Match's in colour). The caller registers that input
+/// (`register_input`, or `register_color_input` for colour) in the operation's `effects[3]` and
+/// stores the returned filter in place of the effect's. None when two inputs are read at the
+/// texels (Color Match's Input and Image Input both linked to non-uniform sources): one stage
+/// carries one input, so that effect stays on the CPU.
+#[allow(dead_code)] // Called by the stack plumbing once it registers the gather filters' inputs
+pub(crate) fn bind_inputs(effect: &Effect, filter: &Filter) -> Option<(Filter, Option<(ImageInput, ChannelKind)>)> {
+    let linked = |input: &ImageInput| effect.inputs.get(input.id);
+    match filter {
+        Filter::ColorMatch(matcher) => {
+            let mut matcher = *matcher;
+            let mut texel_inputs = Vec::new();
+            if matcher.source_mode == SourceColorMode::Input {
+                match linked(&ImageInput::SOURCE_INPUT) {
+                    None => (matcher.source_mode, matcher.source_color) = (SourceColorMode::Parameter, [ImageInput::SOURCE_INPUT.default; 3]),
+                    Some(texturecraft_core::Source::Uniform(color)) => (matcher.source_mode, matcher.source_color) = (SourceColorMode::Parameter, *color),
+                    Some(_) => texel_inputs.push(ImageInput::SOURCE_INPUT),
+                }
+            }
+            if matcher.target_mode == TargetColorMode::ImageInput {
+                match linked(&ImageInput::TARGET_INPUT) {
+                    None => (matcher.target_mode, matcher.target_color) = (TargetColorMode::Parameter, [ImageInput::TARGET_INPUT.default; 3]),
+                    Some(texturecraft_core::Source::Uniform(color)) => (matcher.target_mode, matcher.target_color) = (TargetColorMode::Parameter, *color),
+                    Some(_) => texel_inputs.push(ImageInput::TARGET_INPUT),
+                }
+            }
+            let input = match texel_inputs.as_slice() {
+                [] => None,
+                [input] => Some((*input, ChannelKind::Color)),
+                _ => return None,
+            };
+            Some((Filter::ColorMatch(matcher), input))
+        }
+        filter => {
+            let input = ImageInput::of(filter).into_iter().find(|input| linked(input).is_some());
+            Some((filter.clone(), input.map(|input| (input, ChannelKind::Scalar))))
+        }
+    }
 }
 
 /// Unit texel-space vector of `angle` degrees, as `direction` in eval.rs.
@@ -395,9 +466,20 @@ pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
         SOURCE_SLOPE_BLUR => SAMPLE_WORK * (SOURCE_READS + u64::from(filter.words[0] >> READ_COUNT_SHIFT) + 1),
         MIRROR => SAMPLE_WORK,
         COLOR_MATCH => COLOR_MATCH_WORK,
+        HEIGHT_TO_NORMAL => SAMPLE_WORK * HEIGHT_TO_NORMAL_READS,
         // The four texels round the read, one at a time
         TRANSFORM => 4 * SAMPLE_WORK,
         _ => SAMPLE_WORK,
+    }
+}
+
+/// The working fields a P5 stage's own passes use besides the original and the output
+/// (`NeighbourhoodFilter::blur_fields`): Kuwahara's ellipse frames, Color Match's row sums and mean.
+pub(super) fn blur_fields(filter: NeighbourhoodFilter) -> u32 {
+    match filter.kind {
+        KUWAHARA => 1,
+        COLOR_MATCH => 2,
+        _ => 0,
     }
 }
 
@@ -426,39 +508,72 @@ pub(super) fn encode(
 ) -> bool {
     let [_, _, width, height] = region.rect;
     let texel_groups = [width.div_ceil(APPLY_WORKGROUP), height.div_ceil(APPLY_WORKGROUP)];
-    let mut run = |pipeline: &wgpu::ComputePipeline, buffers: [u32; 4], groups: [u32; 2]| {
-        let params = Params {
-            rect: region.rect,
-            buffers,
-            mode: [filter.radius, filter.kind.0, filter.seed, 0],
-            weights: [filter.opacity, filter.amount, filter.frequency, filter.middle],
-            direction: [filter.direction[0], filter.direction[1], 0.0, 0.0],
-            field_layout: region.field_layout(filter.words),
-            extra: filter.extra,
-            stage: [filter.context, u32::from(region.wrap), 0, 0],
-            bounds: region.bounds,
-        };
-        NeighbourhoodGpu::run(pipeline, device, encoder, scratch, &params, groups);
+    let params = |buffers: [u32; 4]| Params {
+        rect: region.rect,
+        buffers,
+        mode: [filter.radius, filter.kind.0, filter.seed, 0],
+        weights: [filter.opacity, filter.amount, filter.frequency, filter.middle],
+        direction: [filter.direction[0], filter.direction[1], 0.0, 0.0],
+        field_layout: region.field_layout(filter.words),
+        extra: filter.extra,
+        stage: [filter.context, u32::from(region.wrap), 0, 0],
+        bounds: region.bounds,
     };
     let (original, output) = (region.original, region.output);
     match filter.kind {
         // Each texel's ellipse frame in the first blur field, which the apply pass reads
         KUWAHARA => {
             let frame = region.blur[0];
-            run(&pipelines.kuwahara_frame, [original, 0, frame, 0], texel_groups);
-            run(&gpu.apply, [original, frame, output, 0], texel_groups);
+            let row_work = u64::from(width) * u64::from(APPLY_WORKGROUP) * SAMPLE_WORK * KUWAHARA_TENSOR_READS;
+            let frames = params([original, 0, frame, 0]);
+            dispatch_in_rows((device, &mut *encoder, scratch), &pipelines.kuwahara_frame, &frames, texel_groups, (APPLY_WORKGROUP, row_work));
+            NeighbourhoodGpu::run(&gpu.apply, device, encoder, scratch, &params([original, frame, output, 0]), texel_groups);
         }
         // Each row's sums in the first blur field, their total's mean in the second
         COLOR_MATCH if filter.words[0] & COLOR_MATCH_AVERAGE != 0 => {
             let [rows, mean] = region.blur;
-            run(&pipelines.color_match_rows, [original, 0, rows, 0], [height.div_ceil(LINE_WORKGROUP), 1]);
-            run(&pipelines.color_match_total, [original, rows, mean, 0], [1, 1]);
-            run(&gpu.apply, [original, mean, output, 0], texel_groups);
+            let row_work = u64::from(width) * u64::from(LINE_WORKGROUP);
+            let sums = params([original, 0, rows, 0]);
+            dispatch_in_rows((device, &mut *encoder, scratch), &pipelines.color_match_rows, &sums, [1, height.div_ceil(LINE_WORKGROUP)], (LINE_WORKGROUP, row_work));
+            NeighbourhoodGpu::run(&pipelines.color_match_total, device, encoder, scratch, &params([original, rows, mean, 0]), [1, 1]);
+            NeighbourhoodGpu::run(&gpu.apply, device, encoder, scratch, &params([original, mean, output, 0]), texel_groups);
         }
         // The other kinds gather in the apply pass
         _ => return false,
     }
     true
+}
+
+/// Dispatches a P5 pass whose workgroup rows cover `group_rows` texel rows each (the kernel adds
+/// `params.stage.z`, the first row): whole, or under a work budget (`NeighbourhoodGpu::budget`,
+/// the whole-set pre-pass) in row chunks of at most the budget's work, each submitted on its own.
+/// `group_row_work` is the work of one workgroup row.
+fn dispatch_in_rows(
+    (device, encoder, scratch): (&wgpu::Device, &mut wgpu::CommandEncoder, &wgpu::Buffer),
+    pipeline: &wgpu::ComputePipeline,
+    params: &Params,
+    groups: [u32; 2],
+    (group_rows, group_row_work): (u32, u64),
+) {
+    let budget = BUDGET.with_borrow(|budget| budget.as_ref().map(|budget| (budget.queue.clone(), budget.limit)));
+    let Some((queue, limit)) = budget else {
+        NeighbourhoodGpu::dispatch(pipeline, device, encoder, scratch, params, groups);
+        return;
+    };
+
+    let rows = (limit / group_row_work.max(1)).clamp(1, u64::from(groups[1].max(1))) as u32;
+    let mut first = 0;
+    while first < groups[1] {
+        let count = rows.min(groups[1] - first);
+        let mut chunk = *params;
+        chunk.stage[2] = first * group_rows;
+        NeighbourhoodGpu::dispatch(pipeline, device, encoder, scratch, &chunk, [groups[0], count]);
+        first += count;
+        if rows < groups[1] {
+            let finished = std::mem::replace(encoder, device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_gather") }));
+            queue.submit([finished.finish()]);
+        }
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -514,7 +629,7 @@ mod tests {
     /// P5's filters that still composite on the CPU, in content and in masks. Port one: delete
     /// its row (this test fails while a ported row stays) and add its oracle test.
     fn still_on_cpu() -> Vec<Filter> {
-        vec![Filter::HeightToNormal(HeightToNormal::LIBRARY)]
+        Vec::new()
     }
 
     #[test]
@@ -537,7 +652,19 @@ mod tests {
         filters.extend(slope_blurs().into_iter().map(Filter::SourceSlopeBlur));
         filters.extend(mirrors().into_iter().map(Filter::Mirror));
         filters.extend(transforms().into_iter().map(Filter::Transform));
+        filters.extend(height_to_normals().into_iter().map(Filter::HeightToNormal));
         filters
+    }
+
+    /// The library's Height To Normal, laid over the Normal, by Normal Intensity and steeper.
+    fn height_to_normals() -> Vec<HeightToNormal> {
+        let library = HeightToNormal::LIBRARY;
+        vec![
+            library,
+            HeightToNormal { overwrite: false, ..library },
+            HeightToNormal { world_units: false, intensity: 20.0, overwrite: false, ..library },
+            HeightToNormal { height_depth: 60.0, surface_size: 120.0, ..library },
+        ]
     }
 
     /// The library's Color Match, each source and target mode (inputs unlinked), with and without
@@ -917,6 +1044,98 @@ mod tests {
         ];
 
         assert!(check_cases(&mut gpu, &cases, EDGE_PAINT, CORNER, Tolerance::NEIGHBOURHOOD).is_some());
+    }
+
+    /// A paint layer with Base Color, Normal and (`with_height`) Height painted in shapes and two
+    /// alphas, and `stack` on its content, each effect switched on only for its channel (None:
+    /// every channel), and after its mask's paint.
+    fn normal_project(stack: &[(Filter, f32, BlendMode, Option<Channel>)], with_height: bool) -> Option<(Project, PixelStore, LayerId)> {
+        let channels: Vec<Channel> =
+            [Channel::BaseColor, Channel::Normal, Channel::Height].into_iter().filter(|&channel| with_height || channel != Channel::Height).collect();
+        let mut project = Project::new("Height To Normal", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let owner = project.alloc_id();
+        let mut layer = Layer::new(owner, "Paint", LayerKind::Paint, &channels);
+        let mut mask = Mask::new(MaskBackground::Black);
+        let mask_paint = project.alloc_id();
+        mask.effects.push(Effect::new(mask_paint, EffectKind::Paint));
+        for (filter, opacity, blend, only) in stack {
+            let mut added = Effect::new(project.alloc_id(), EffectKind::Filter(filter.clone()));
+            added.opacity = *opacity;
+            added.blend = *blend;
+            if let Some(only) = only {
+                added.off_channels = channels.iter().copied().filter(|channel| channel != only).collect();
+            }
+            layer.content_effects.push(added.clone());
+            added.id = project.alloc_id();
+            mask.effects.push(added);
+        }
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, None, false).ok()?;
+
+        // Raised shapes with soft and hard edges over a tilted normal, two alphas
+        let size = (SIZE, SIZE);
+        let mut pixels = PixelStore::default();
+        let mut mask_pixels = TileImage::new(SIZE, SIZE, 2);
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                if !(20..108).contains(&x) || !(18..110).contains(&y) {
+                    continue;
+                }
+
+                let alpha = if x >= 64 { 1.0 } else { 0.7 };
+                let ring = ((x as f32 - 64.0).hypot(y as f32 - 60.0) / 9.0).sin() * 0.4;
+                let height = if (40..80).contains(&x) && (30..50).contains(&y) { 0.6 } else { ring };
+                let premultiplied = |value: f32| to_u16(value * alpha);
+                pixels.layer_mut(owner, Channel::BaseColor, size).set(x, y, &[premultiplied(0.7), premultiplied(0.4), premultiplied(0.2), to_u16(alpha)]);
+                pixels.layer_mut(owner, Channel::Normal, size).set(x, y, &[premultiplied(0.62), premultiplied(0.44), premultiplied(0.93), to_u16(alpha)]);
+                if with_height {
+                    pixels.layer_mut(owner, Channel::Height, size).set(x, y, &[to_u16_signed(height * alpha), to_u16(alpha)]);
+                }
+                mask_pixels.set(x, y, &[to_u16(0.5 + height * 0.5), u16::MAX]);
+            }
+        }
+        pixels.masks.insert(mask_paint, mask_pixels);
+        Some((project, pixels, owner))
+    }
+
+    /// Height To Normal matches the CPU on the Normal from the layer's own Height (other channels
+    /// and the mask pass): every setting, below full opacity under Multiply, disabled, after a
+    /// Blur of the Height alone (the Height's stage prepared first), between filters, without a
+    /// Height (a flat height) and in a partial update. Normals compare by direction.
+    #[test]
+    fn height_to_normal_matches_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+        let normal = BlendMode::Normal;
+        let library = Filter::HeightToNormal(HeightToNormal::LIBRARY);
+        let laid_over = Filter::HeightToNormal(HeightToNormal { overwrite: false, ..HeightToNormal::LIBRARY });
+        let blur = Filter::Blur { radius: 24.0, wrap: false };
+        let mut cases: Vec<(String, Vec<(Filter, f32, BlendMode, Option<Channel>)>, bool)> = height_to_normals()
+            .into_iter()
+            .map(|to_normal| (format!("{to_normal:?}"), vec![(Filter::HeightToNormal(to_normal), 1.0, normal, None)], true))
+            .collect();
+        cases.extend([
+            ("under Multiply".to_string(), vec![(laid_over.clone(), 0.7, BlendMode::Multiply, None)], true),
+            ("disabled".to_string(), vec![(library.clone(), 1.0, BlendMode::Disable, None)], true),
+            ("after a Blur of the Height".to_string(), vec![(blur.clone(), 1.0, normal, Some(Channel::Height)), (library.clone(), 1.0, normal, None)], true),
+            (
+                "between filters".to_string(),
+                vec![(blur.clone(), 1.0, normal, Some(Channel::Normal)), (laid_over.clone(), 0.85, normal, None), (blur, 1.0, normal, None)],
+                true,
+            ),
+            ("without a Height".to_string(), vec![(laid_over, 1.0, normal, None)], false),
+            ("without a Height, overwriting".to_string(), vec![(library, 1.0, normal, None)], false),
+        ]);
+        for (label, stack, with_height) in &cases {
+            let (project, pixels, owner) = normal_project(stack, *with_height).unwrap();
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+            case.region = Some(MIDDLE);
+
+            assert_matches_cpu(&mut gpu, &case, Tolerance::TRANSCENDENTAL, &format!("Height To Normal {label}"));
+        }
     }
 
     /// FXAA before a wrapping Blur, on paint across the set's edges: the wrapping program's field

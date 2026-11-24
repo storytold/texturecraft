@@ -10,6 +10,7 @@ const GATHER_SOURCE_WARP: u32 = 34u;
 const GATHER_SOURCE_SLOPE_BLUR: u32 = 35u;
 const GATHER_MIRROR: u32 = 36u;
 const GATHER_TRANSFORM: u32 = 37u;
+const GATHER_HEIGHT_TO_NORMAL: u32 = 38u;
 const GATHER_COLOR_MATCH: u32 = 48u;
 
 // FXAA (fxaa_texel in eval.rs): edge search, least contrast and most subpixel blend
@@ -30,6 +31,14 @@ const GATHER_MIRROR_DEBUG: u32 = 16u;
 // Flag bits of a Color Match stage's words[0]: the source is the set's mean, and Custom Color Variation
 const GATHER_COLOR_MATCH_AVERAGE: u32 = 1u;
 const GATHER_COLOR_MATCH_CUSTOM_VARIATION: u32 = 2u;
+// The source (Input) or the target (Image Input) read at the texel from a linked input
+const GATHER_COLOR_MATCH_SOURCE_INPUT: u32 = 4u;
+const GATHER_COLOR_MATCH_TARGET_INPUT: u32 = 8u;
+
+// Flag bit of a Height To Normal stage's words[0]: Overwrite Existing Normal
+const GATHER_HEIGHT_TO_NORMAL_OVERWRITE: u32 = 1u;
+// The height of a Height To Normal stage without the layer's Height (eval.rs filter_region)
+const GATHER_FLAT_HEIGHT: f32 = 1.0;
 
 // Anisotropic Kuwahara (kuwahara_texel in eval.rs): ellipse steps, sectors and weights
 const GATHER_KUWAHARA_STEPS: i32 = 6;
@@ -212,13 +221,108 @@ fn gather_finite_unit(value: f32) -> f32 {
     return select(0.0, clamp(value, 0.0, 1.0), gather_finite(value));
 }
 
-// An unlinked image input at `home`: (default, 1) where covered, else (0, 0)
+// The stage's input words at `home`, bilinear over the covered texels in the texel's copy, as
+// (value, 1), or (0, 0) where none is covered (the input closure of gather in eval.rs)
+fn gather_input_read(home: vec2<f32>, clamped: bool) -> vec2<f32> {
+    let point = home + gather_shift;
+    if !all(abs(point) <= vec2(GATHER_LARGEST_FINITE)) {
+        return vec2(0.0);
+    }
+
+    let base = vec2<i32>(floor(point)) - field_origin();
+    let t = fract(point);
+    var sum = 0.0;
+    var weight = 0.0;
+    for (var corner = 0u; corner < 4u; corner++) {
+        let offset = vec2(i32(corner & 1u), i32(corner >> 1u));
+        let weights = select(1.0 - t, t, offset > vec2(0));
+        let share = weights.x * weights.y;
+        let texel = base + offset;
+        if share <= 0.0 || any(texel < vec2(0)) || any(texel >= vec2<i32>(params.rect.zw)) {
+            continue;
+        }
+        if !stage_wraps() && any(copy_of(texel) != output_copy) {
+            continue;
+        }
+        if original_at(vec2<u32>(texel)).coverage <= 0.0 {
+            continue;
+        }
+
+        // An image input's gray is clamped per texel, the layer's height is not
+        let value = input_at(vec2<u32>(texel));
+        sum += select(value, clamp(value, 0.0, 1.0), clamped) * share;
+        weight += share;
+    }
+    if weight > MIN_WEIGHT {
+        return vec2(sum / weight, 1.0);
+    }
+    return vec2(0.0);
+}
+
+// An image input at `home` (gather_input_read); until one is linked, its default where covered
 fn gather_input(home: vec2<f32>) -> vec2<f32> {
+    if stage_linked() {
+        return gather_input_read(home, true);
+    }
     if gather_read(home).coverage > MIN_WEIGHT {
         return vec2(GATHER_INPUT_DEFAULT, 1.0);
     }
-
     return vec2(0.0);
+}
+
+// The layer's height at `home` for Height To Normal (its Height times coverage), else flat
+fn gather_height(home: vec2<f32>) -> vec2<f32> {
+    if stage_linked() {
+        return gather_input_read(home, false);
+    }
+    if gather_read(home).coverage > MIN_WEIGHT {
+        return vec2(GATHER_FLAT_HEIGHT, 1.0);
+    }
+    return vec2(0.0);
+}
+
+// Packed `detail` reoriented onto packed `base` (rnm in core's blend.rs)
+fn gather_reoriented(base: vec3<f32>, detail: vec3<f32>) -> vec3<f32> {
+    let t = base * 2.0 - 1.0 + vec3(0.0, 0.0, 1.0);
+    let u = (detail * 2.0 - 1.0) * vec3(-1.0, -1.0, 1.0);
+    let d = t.x * u.x + t.y * u.y + t.z * u.z;
+    let n = vec3(t.x * d - u.x * t.z, t.y * d - u.y * t.z, t.z * d - u.z * t.z);
+    let size = max(sqrt(n.x * n.x + n.y * n.y + n.z * n.z), 1e-6);
+    return n / size * 0.5 + 0.5;
+}
+
+// Height To Normal at `home` over premultiplied `center` (height_to_normal_texel in eval.rs)
+fn gather_height_to_normal(home: vec2<f32>, center: vec4<f32>) -> Texel {
+    let own = gather_height(home);
+    if stage_context() != STAGE_NORMAL_MAP || own.y <= 0.0 || center.w <= 0.0 {
+        return EMPTY;
+    }
+
+    // Sobel gradients over the kernel's weight sum; a height off the island reads the texel's own
+    var heights: array<f32, 9>;
+    for (var index = 0; index < 9; index++) {
+        let at = gather_height(home + vec2(f32(index % 3 - 1), f32(index / 3 - 1)));
+        heights[index] = select(own.x, at.x, at.y > 0.0);
+    }
+    let gx = (heights[2] + 2.0 * heights[5] + heights[8] - heights[0] - 2.0 * heights[3] - heights[6]) / 8.0;
+    let gy = (heights[6] + 2.0 * heights[7] + heights[8] - heights[0] - 2.0 * heights[1] - heights[2]) / 8.0;
+
+    // The unit normal of the slopes (HeightToNormal::normal), packed
+    let strength = params.extra[0].x;
+    let x = -gx * strength;
+    let y = gy * strength;
+    let size = sqrt(x * x + y * y + 1.0);
+    var made = vec3(0.0, 0.0, 1.0);
+    if gather_finite(size) {
+        made = vec3(x / size, y / size, 1.0 / size);
+    }
+    made = made * 0.5 + 0.5;
+
+    var packed = made;
+    if (params.field_layout.z & GATHER_HEIGHT_TO_NORMAL_OVERWRITE) == 0u {
+        packed = gather_reoriented(center.xyz / center.w, made);
+    }
+    return Texel(vec4(packed * center.w, center.w), 1.0);
 }
 
 // The direction of a warp's `index`-th move, laid out in pairs in `extra`
@@ -498,16 +602,18 @@ fn gather_kuwahara_ellipse(home: vec2<f32>) -> vec4<f32> {
 // Kuwahara's tensor pass: each covered texel's ellipse into buffers.z
 @compute @workgroup_size(8, 8)
 fn gather_kuwahara_frame(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= params.rect.z || id.y >= params.rect.w {
+    // A dispatch split by rows starts at row stage.z
+    let texel = vec2(id.x, id.y + params.stage.z);
+    if texel.x >= params.rect.z || texel.y >= params.rect.w {
         return;
     }
 
     var ellipse = vec4(0.0);
-    if original_at(id.xy).coverage > 0.0 {
-        output_copy = copy_of(vec2<i32>(id.xy));
-        ellipse = gather_kuwahara_ellipse(gather_begin(vec2<f32>(vec2<i32>(id.xy) + field_origin())));
+    if original_at(texel).coverage > 0.0 {
+        output_copy = copy_of(vec2<i32>(texel));
+        ellipse = gather_kuwahara_ellipse(gather_begin(vec2<f32>(vec2<i32>(texel) + field_origin())));
     }
-    write_at(params.buffers.z, id.xy, Texel(ellipse, 0.0));
+    write_at(params.buffers.z, texel, Texel(ellipse, 0.0));
 }
 
 // Anisotropic Kuwahara at `home`: its sectors' means weighed by their calm (kuwahara_texel in eval.rs)
@@ -629,9 +735,10 @@ fn gather_read_words(start: u32) -> vec4<f32> {
 }
 
 // Color Match's mean, pass 1: each row's premultiplied sums over the set, four words per row
-@compute @workgroup_size(64)
+@compute @workgroup_size(1, 64)
 fn gather_color_match_rows(@builtin(global_invocation_id) id: vec3<u32>) {
-    let row = id.x;
+    // A dispatch split by rows starts at row stage.z
+    let row = id.y + params.stage.z;
     if row >= params.rect.w {
         return;
     }
@@ -706,7 +813,7 @@ fn gather_color_reference(color: vec3<f32>, polar: bool) -> vec3<f32> {
 }
 
 // Color Match on colour content (color_match in eval.rs, ColorMatch::move_polar)
-fn gather_color_match(original: vec4<f32>) -> vec4<f32> {
+fn gather_color_match(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
     let alpha = original.w;
     if stage_context() != STAGE_COLOR || !(alpha > 0.0) || !gather_finite(alpha) {
         return original;
@@ -722,7 +829,17 @@ fn gather_color_match(original: vec4<f32>) -> vec4<f32> {
             source = gather_color_reference(mean.xyz, polar);
         }
     }
-    let goal = params.extra[1].xyz;
+    var goal = params.extra[1].xyz;
+
+    // A linked Input or Image Input gives the texel its own source or target
+    if stage_linked() {
+        let linked = gather_color_reference(input_color_at(vec2<u32>(vec2<i32>(point) - field_origin())), polar);
+        if (flags & GATHER_COLOR_MATCH_SOURCE_INPUT) != 0u {
+            source = linked;
+        } else if (flags & GATHER_COLOR_MATCH_TARGET_INPUT) != 0u {
+            goal = linked;
+        }
+    }
     let lab = gather_oklab(max(color, vec3(0.0)));
     var moved = goal + lab - source;
     if polar {
@@ -872,7 +989,7 @@ fn gather_family_filtered(original: vec4<f32>, blurred: vec4<f32>) -> vec4<f32> 
 fn gather_family_gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
     let kind = params.mode.y;
     if kind == GATHER_COLOR_MATCH {
-        return gather_color_match(original);
+        return gather_color_match(point, original);
     }
 
     let flags = params.field_layout.z;
@@ -894,6 +1011,8 @@ fn gather_family_gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
         acc = gather_mirror(home, original);
     } else if kind == GATHER_TRANSFORM {
         acc = gather_transform(home);
+    } else if kind == GATHER_HEIGHT_TO_NORMAL {
+        acc = gather_height_to_normal(home, original);
     } else {
         return original;
     }
