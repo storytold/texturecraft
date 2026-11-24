@@ -1,4 +1,4 @@
-//! F5 and F6 switch the projection, the Viewport menu goes to fixed views, and Alt+Shift+drag orbits
+//! F5 and F6 switch the projection, the Viewport menu goes to fixed views, Alt+right drag zooms both ways, and Alt+Shift+drag orbits
 //! in 90° steps.
 
 use std::f32::consts::FRAC_PI_2;
@@ -23,15 +23,20 @@ fn press(h: &mut Harness<'_, TextureCraftApp>, key: Key) {
 
 /// Drag with the left button and `modifiers` from `from` by `by` in a few moves.
 fn drag(h: &mut Harness<'_, TextureCraftApp>, from: Pos2, by: egui::Vec2, modifiers: Modifiers) {
+    drag_with(h, PointerButton::Primary, from, by, modifiers);
+}
+
+/// Drag with `button` and `modifiers` from `from` by `by` in a few moves.
+fn drag_with(h: &mut Harness<'_, TextureCraftApp>, button: PointerButton, from: Pos2, by: egui::Vec2, modifiers: Modifiers) {
     h.event(Event::ModifiersChanged(modifiers));
     h.hover_at(from);
-    h.event(Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: true, modifiers });
+    h.event(Event::PointerButton { pos: from, button, pressed: true, modifiers });
     h.run_steps(2);
     for k in 1..=4 {
         h.hover_at(from + by * (k as f32 / 4.0));
         h.run_steps(1);
     }
-    h.event(Event::PointerButton { pos: from + by, button: PointerButton::Primary, pressed: false, modifiers });
+    h.event(Event::PointerButton { pos: from + by, button, pressed: false, modifiers });
     h.event(Event::ModifiersChanged(Modifiers::NONE));
     h.run_steps(3);
 }
@@ -249,6 +254,20 @@ fn alt_drag_during_a_glide_is_not_overwritten_by_it() {
 
     // The glide ends at yaw 0 and pitch 0; the drag turned the camera away from the front by far more than a degree
     assert!(camera.yaw.abs() > 0.1, "the orbit stays: yaw {}", camera.yaw.to_degrees());
+}
+
+#[test]
+fn alt_right_drag_zooms_on_a_sideways_drag_too() {
+    let mut h = harness();
+    let center = h.state().viewport_rect.center();
+    let start = h.state().session.camera.distance;
+    drag_with(&mut h, PointerButton::Secondary, center, vec2(100.0, 0.0), Modifiers::ALT);
+    let closer = h.state().session.camera.distance;
+    assert!(closer < start, "dragging right moves closer: {start} -> {closer}");
+    drag_with(&mut h, PointerButton::Secondary, center, vec2(-200.0, 0.0), Modifiers::ALT);
+    assert!(h.state().session.camera.distance > start, "dragging left moves away");
+    drag_with(&mut h, PointerButton::Secondary, center, vec2(0.0, -300.0), Modifiers::ALT);
+    assert!(h.state().session.camera.distance < start, "dragging up still moves closer");
 }
 
 #[test]

@@ -666,7 +666,7 @@ fn axis_gizmo(ui: &Ui, rect: Rect, app: &TextureCraftApp, uv_rotation: Option<f3
 /// Camera turn per point of a drag (radians)
 pub(crate) const ORBIT_RADIANS_PER_POINT: f32 = 0.008;
 
-/// Camera zoom per point of an Alt+right drag
+/// Camera zoom per point of an Alt+right drag, right or up moving closer
 pub(crate) const DRAG_ZOOM_PER_POINT: f32 = 0.01;
 
 /// Camera zoom per point of mouse wheel
@@ -772,7 +772,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     } else if response.dragged_by(PointerButton::Secondary) {
         app.camera_glide = None;
         if alt {
-            app.session.camera.zoom(-delta.y * DRAG_ZOOM_PER_POINT * app.ui.prefs.drag_zoom_scale());
+            app.session.camera.zoom((delta.x - delta.y) * DRAG_ZOOM_PER_POINT * app.ui.prefs.drag_zoom_scale());
         } else if shift {
             let display = &mut app.session.doc.project.display;
             display.env_rotation = (display.env_rotation + delta.x * LIGHT_DEGREES_PER_POINT).rem_euclid(360.0);
