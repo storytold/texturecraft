@@ -10,6 +10,7 @@ const GATHER_SOURCE_WARP: u32 = 34u;
 const GATHER_SOURCE_SLOPE_BLUR: u32 = 35u;
 const GATHER_MIRROR: u32 = 36u;
 const GATHER_TRANSFORM: u32 = 37u;
+const GATHER_COLOR_MATCH: u32 = 48u;
 
 // FXAA (fxaa_texel in eval.rs): the edge search, the least contrast it smooths and the most a
 // lone texel blends in
@@ -27,6 +28,10 @@ const GATHER_MIRROR_Y: u32 = 2u;
 const GATHER_MIRROR_KEEP_RIGHT: u32 = 4u;
 const GATHER_MIRROR_KEEP_BOTTOM: u32 = 8u;
 const GATHER_MIRROR_DEBUG: u32 = 16u;
+
+// Flag bits of a Color Match stage's words[0]: the source is the set's mean, and Custom Color Variation
+const GATHER_COLOR_MATCH_AVERAGE: u32 = 1u;
+const GATHER_COLOR_MATCH_CUSTOM_VARIATION: u32 = 2u;
 
 // Anisotropic Kuwahara (kuwahara_texel in eval.rs): the ellipse's sample rows each side, its
 // sectors, the least tensor with a direction, the samples' falloff and the spread's 8-bit scale
@@ -604,6 +609,153 @@ fn gather_kuwahara(home: vec2<f32>, ellipse: vec4<f32>) -> Texel {
     return total;
 }
 
+// A compensated sum (Kahan): the CPU sums the mean in f64
+struct GatherSum {
+    sum: vec4<f32>,
+    correction: vec4<f32>,
+}
+
+fn gather_add(total: GatherSum, value: vec4<f32>) -> GatherSum {
+    let added = value - total.correction;
+    let sum = total.sum + added;
+    return GatherSum(sum, (sum - total.sum) - added);
+}
+
+fn gather_write_words(start: u32, value: vec4<f32>) {
+    let words = bitcast<vec4<u32>>(value);
+    fields[start] = words.x;
+    fields[start + 1u] = words.y;
+    fields[start + 2u] = words.z;
+    fields[start + 3u] = words.w;
+}
+
+fn gather_read_words(start: u32) -> vec4<f32> {
+    return bitcast<vec4<f32>>(vec4(fields[start], fields[start + 1u], fields[start + 2u], fields[start + 3u]));
+}
+
+// Color Match's mean, first pass: one row's premultiplied colour and alpha summed over the
+// texels of the set with alpha (mean_region_color in eval.rs), four words per row at buffers.z.
+// A wrapping program's periodic copies past the set's edges count once, in the set
+@compute @workgroup_size(64)
+fn gather_color_match_rows(@builtin(global_invocation_id) id: vec3<u32>) {
+    let row = id.x;
+    if row >= params.rect.w {
+        return;
+    }
+
+    var total = GatherSum(vec4(0.0), vec4(0.0));
+    let in_set = i32(row) >= params.bounds.y && i32(row) < params.bounds.w;
+    let first = u32(clamp(params.bounds.x, 0, i32(params.rect.z)));
+    let end = u32(clamp(params.bounds.z, 0, i32(params.rect.z)));
+    for (var column = first; in_set && column < end; column++) {
+        let texel = original_at(vec2(column, row));
+        if texel.value.w > 0.0 && gather_finite(texel.value.w) {
+            total = gather_add(total, texel.value);
+        }
+    }
+    gather_write_words(params.buffers.z + row * 4u, total.sum);
+}
+
+// Color Match's mean, second pass: the rows' sums at buffers.y totalled into the mean colour and
+// whether any texel had alpha, four words at buffers.z
+@compute @workgroup_size(1)
+fn gather_color_match_total(@builtin(global_invocation_id) id: vec3<u32>) {
+    var total = GatherSum(vec4(0.0), vec4(0.0));
+    for (var row = 0u; row < params.rect.w; row++) {
+        total = gather_add(total, gather_read_words(params.buffers.y + row * 4u));
+    }
+
+    var mean = vec4(0.0);
+    if total.sum.w > 0.0 {
+        mean = vec4(total.sum.xyz / total.sum.w, 1.0);
+    }
+    gather_write_words(params.buffers.z, mean);
+}
+
+// Linear sRGB to OKLab (from_linear in core's oklab.rs)
+fn gather_cube_root(value: f32) -> f32 {
+    return select(0.0, pow(value, 1.0 / 3.0), value > 0.0);
+}
+
+fn gather_oklab(color: vec3<f32>) -> vec3<f32> {
+    let l = gather_cube_root(0.41222146 * color.x + 0.53633255 * color.y + 0.051445995 * color.z);
+    let m = gather_cube_root(0.2119035 * color.x + 0.6806995 * color.y + 0.10739696 * color.z);
+    let s = gather_cube_root(0.08830246 * color.x + 0.28171885 * color.y + 0.6299787 * color.z);
+    return vec3(
+        0.21045426 * l + 0.7936178 * m - 0.004072047 * s,
+        1.9779985 * l - 2.4285922 * m + 0.4505937 * s,
+        0.025904037 * l + 0.78277177 * m - 0.80867577 * s,
+    );
+}
+
+// OKLab back to linear sRGB, unclamped (to_linear in core's oklab.rs)
+fn gather_linear(lab: vec3<f32>) -> vec3<f32> {
+    let l = lab.x + 0.39633778 * lab.y + 0.21580376 * lab.z;
+    let m = lab.x - 0.105561346 * lab.y - 0.06385417 * lab.z;
+    let s = lab.x - 0.08948418 * lab.y - 1.2914855 * lab.z;
+    let l3 = l * l * l;
+    let m3 = m * m * m;
+    let s3 = s * s * s;
+    return vec3(
+        4.0767417 * l3 - 3.3077116 * m3 + 0.23096994 * s3,
+        -1.268438 * l3 + 2.6097574 * m3 - 0.34131938 * s3,
+        -0.0041960863 * l3 - 0.7034186 * m3 + 1.7076147 * s3,
+    );
+}
+
+// A colour's reference for the match: its OKLab, polar (lightness, chroma, hue) with Custom
+// Color Variation (PreparedColorMatch in core)
+fn gather_color_reference(color: vec3<f32>, polar: bool) -> vec3<f32> {
+    let lab = gather_oklab(max(color, vec3(0.0)));
+    if !polar {
+        return lab;
+    }
+    return vec3(lab.x, sqrt(lab.y * lab.y + lab.z * lab.z), gather_atan2(lab.z, lab.y));
+}
+
+// Color Match on premultiplied `original` (color_match in eval.rs): its colour moved by the step
+// from the source to the target, keeping at most Hue, Chroma and Luma of its difference from the
+// source with Custom Color Variation (ColorMatch::move_polar). Colour content only
+fn gather_color_match(original: vec4<f32>) -> vec4<f32> {
+    let alpha = original.w;
+    if stage_context() != STAGE_COLOR || !(alpha > 0.0) || !gather_finite(alpha) {
+        return original;
+    }
+
+    let flags = params.field_layout.z;
+    let polar = (flags & GATHER_COLOR_MATCH_CUSTOM_VARIATION) != 0u;
+    let color = original.xyz / alpha;
+    var source = params.extra[0].xyz;
+    if (flags & GATHER_COLOR_MATCH_AVERAGE) != 0u {
+        let mean = gather_read_words(params.buffers.y);
+        if mean.w > 0.0 {
+            source = gather_color_reference(mean.xyz, polar);
+        }
+    }
+    let goal = params.extra[1].xyz;
+    let lab = gather_oklab(max(color, vec3(0.0)));
+    var moved = goal + lab - source;
+    if polar {
+        let texel = vec3(lab.x, sqrt(lab.y * lab.y + lab.z * lab.z), gather_atan2(lab.z, lab.y));
+        let hue_limit = params.extra[0].w;
+        let chroma_limit = params.extra[1].w;
+        let luma_limit = params.weights.y;
+        let turn = gather_rem_euclid(texel.z - source.z + GATHER_PI, GATHER_TAU) - GATHER_PI;
+        let lightness = goal.x + clamp(texel.x - source.x, -luma_limit, luma_limit);
+        let chroma = max(goal.y + clamp(texel.y - source.y, -chroma_limit, chroma_limit), 0.0);
+        let hue = goal.z + clamp(turn, -hue_limit, hue_limit);
+        moved = vec3(lightness, chroma * cos(hue), chroma * sin(hue));
+    }
+
+    // A move that leaves the colours gives the colour back
+    let linear = gather_linear(moved);
+    var result = color;
+    if gather_finite(linear.x) && gather_finite(linear.y) && gather_finite(linear.z) {
+        result = clamp(linear, vec3(0.0), vec3(1.0));
+    }
+    return vec4(result * alpha, alpha);
+}
+
 // value.rem_euclid(modulus) as Rust computes it for a positive modulus: the truncated remainder,
 // moved up by the modulus when below zero
 fn gather_rem_euclid(value: f32, modulus: f32) -> f32 {
@@ -732,6 +884,10 @@ fn gather_family_filtered(original: vec4<f32>, blurred: vec4<f32>) -> vec4<f32> 
 // field, input_at the sixth word.
 fn gather_family_gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
     let kind = params.mode.y;
+    if kind == GATHER_COLOR_MATCH {
+        return gather_color_match(original);
+    }
+
     let flags = params.field_layout.z;
     let home = gather_begin(point);
     var acc = EMPTY;

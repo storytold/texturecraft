@@ -31,14 +31,16 @@
 //! product) on paint and in a mask, chained, and with a partial region.
 
 use texturecraft_core::{
-    AnisotropicKuwahara, Filter, Mirror, MirrorMode, RepeatMode, SlopeBlending, SourceSlopeBlur, SourceWarp, TileTransform, WarpBlending, WarpMode, WarpSource, WarpSourceMode,
-    finite_unit,
+    AnisotropicKuwahara, ChannelKind, ColorMatch, Filter, ImageInput, Mirror, MirrorMode, RepeatMode, SlopeBlending, SourceColorMode, SourceSlopeBlur,
+    SourceWarp, TargetColorMode, TileTransform, WarpBlending, WarpMode, WarpSource, WarpSourceMode, finite_unit, oklab,
 };
 
-use super::{APPLY_WORKGROUP, GATHER_KINDS, Kind, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs};
+use super::{
+    APPLY_WORKGROUP, GATHER_KINDS, Kind, LINE_WORKGROUP, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs, WHOLE_SET_KINDS,
+};
 
 /// Library filter ids P5 still leaves on the CPU with their defaults (see `gpu_composite_packages.rs`).
-pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["colorMatch", "heightToNormal"];
+pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &["heightToNormal"];
 
 pub(super) const WGSL: &str = include_str!("shaders/neighbourhood_gather.wgsl");
 
@@ -69,6 +71,18 @@ const MIRROR_Y: u32 = 2;
 const MIRROR_KEEP_RIGHT: u32 = 4;
 const MIRROR_KEEP_BOTTOM: u32 = 8;
 const MIRROR_DEBUG: u32 = 16;
+
+/// Color Match: every colour moved from its source to its target in OKLab (`color_match` in
+/// eval.rs); Average reads the whole set's mean, summed by two reduction passes of its own.
+const COLOR_MATCH: Kind = Kind(WHOLE_SET_KINDS.start);
+
+/// Flag bits of a Color Match stage's `words[0]` (the same constants in the WGSL file): the source
+/// is the set's mean, and Custom Color Variation.
+const COLOR_MATCH_AVERAGE: u32 = 1;
+const COLOR_MATCH_CUSTOM_VARIATION: u32 = 2;
+
+/// Work per texel of Color Match: its OKLab round trip, and its share of the mean's sums.
+const COLOR_MATCH_WORK: u64 = 2 * SAMPLE_WORK;
 
 /// Flag bit of a Kuwahara stage's `words[0]` (the same constant in the WGSL file): Extract
 /// Direction Custom Input.
@@ -118,11 +132,18 @@ const KUWAHARA_SAMPLE_WORK: u64 = 3 * SAMPLE_WORK;
 pub(super) struct Pipelines {
     /// Anisotropic Kuwahara's structure tensor: each texel's ellipse frame.
     kuwahara_frame: wgpu::ComputePipeline,
+    /// Color Match's mean: each row's sums, then the rows' total.
+    color_match_rows: wgpu::ComputePipeline,
+    color_match_total: wgpu::ComputePipeline,
 }
 
 impl Pipelines {
     pub(super) fn new(pipeline: &dyn Fn(&'static str) -> wgpu::ComputePipeline) -> Self {
-        Self { kuwahara_frame: pipeline("gather_kuwahara_frame") }
+        Self {
+            kuwahara_frame: pipeline("gather_kuwahara_frame"),
+            color_match_rows: pipeline("gather_color_match_rows"),
+            color_match_total: pipeline("gather_color_match_total"),
+        }
     }
 }
 
@@ -132,7 +153,7 @@ fn flag(on: bool, bit: u32) -> u32 {
 
 /// Whether a P5 stage evaluates `filter` as the CPU does.
 pub(super) fn supports(filter: &Filter) -> bool {
-    matches!(filter, Filter::Fxaa { .. } | Filter::AnisotropicKuwahara(_) | Filter::SourceWarp(_) | Filter::SourceSlopeBlur(_) | Filter::Mirror(_) | Filter::Transform(_))
+    matches!(filter, Filter::Fxaa { .. } | Filter::AnisotropicKuwahara(_) | Filter::ColorMatch(_) | Filter::SourceWarp(_) | Filter::SourceSlopeBlur(_) | Filter::Mirror(_) | Filter::Transform(_))
 }
 
 /// The P5 stage for `filter`, None when its size reaches nothing.
@@ -148,6 +169,7 @@ pub(super) fn new(filter: &Filter, stage: StageInputs) -> Option<NeighbourhoodFi
         Filter::AnisotropicKuwahara(kuwahara) if kuwahara.radius > 0.0 => Some(kuwahara_stage(stage, kuwahara)),
         Filter::SourceWarp(warp) if warp.move_texels(stage.resolution) > 0.0 => Some(source_warp(stage, warp)),
         Filter::SourceSlopeBlur(slope) if slope.move_texels(stage.resolution) > 0.0 => Some(source_slope_blur(stage, slope)),
+        Filter::ColorMatch(matcher) => Some(color_match_stage(stage, matcher)),
         // A mirror or transform reads anywhere in its UV tile; one that changes nothing is skipped
         Filter::Mirror(mirror) => Some(mirror_stage(stage, mirror)),
         Filter::Transform(transform) if !transform.is_identity() => Some(transform_stage(stage, transform)),
@@ -173,6 +195,49 @@ fn kuwahara_stage(stage: StageInputs, kuwahara: &AnisotropicKuwahara) -> Neighbo
         kuwahara.angle.to_radians(),
     ]);
     out.words[0] = flag(kuwahara.custom_input, KUWAHARA_CUSTOM_INPUT);
+    out
+}
+
+/// A Color Match stage. It moves colours only: other channels and masks pass, without the mean.
+/// `extra` holds the source's and the target's OKLab references (polar with Custom Color
+/// Variation, as `PreparedColorMatch` prepares them) beside the Hue and Chroma limits, `amount` the
+/// Luma limit. Average sums the whole set's mean on the GPU; where nothing is covered the CPU falls
+/// back to the target, whose reference then stands in for the source's.
+fn color_match_stage(stage: StageInputs, matcher: &ColorMatch) -> NeighbourhoodFilter {
+    let average = matcher.source_mode == SourceColorMode::Average && stage.channel == Some(ChannelKind::Color);
+
+    // An image input not linked reads its default (filter_region in eval.rs)
+    let source = match matcher.source_mode {
+        SourceColorMode::Input => [ImageInput::SOURCE_INPUT.default; 3],
+        SourceColorMode::Average | SourceColorMode::Parameter => matcher.source_color,
+    };
+    let target = match matcher.target_mode {
+        TargetColorMode::Parameter => matcher.target_color,
+        TargetColorMode::ImageInput => [ImageInput::TARGET_INPUT.default; 3],
+    };
+    let reference = |color: [f32; 3]| {
+        let lab = oklab::from_linear(color.map(|component| component.max(0.0)));
+        if matcher.custom_variation { [lab[0], lab[1].hypot(lab[2]), lab[2].atan2(lab[1])] } else { lab }
+    };
+    let limit = |value: f32, most: f32| if value.is_finite() { value.clamp(0.0, most) } else { 0.0 };
+    let source = reference(if average { target } else { source });
+    let target = reference(target);
+
+    // Average reads the whole set; the other modes and channels the texel alone
+    let texels = if average { stage.longest_side as f32 } else { 1.0 };
+    let mut out = stage.filter(COLOR_MATCH, texels);
+    out.extra = [
+        source[0],
+        source[1],
+        source[2],
+        limit(matcher.hue, ColorMatch::MAX_HUE_DEGREES).to_radians(),
+        target[0],
+        target[1],
+        target[2],
+        limit(matcher.chroma, ColorMatch::MAX_CHROMA),
+    ];
+    out.amount = limit(matcher.luma, ColorMatch::MAX_LUMA);
+    out.words[0] = flag(average, COLOR_MATCH_AVERAGE) | flag(matcher.custom_variation, COLOR_MATCH_CUSTOM_VARIATION);
     out
 }
 
@@ -319,6 +384,7 @@ pub(super) fn work_per_texel(filter: NeighbourhoodFilter) -> u64 {
         SOURCE_WARP => SAMPLE_WORK * (SOURCE_READS + u64::from(SourceWarp::DIRECTIONS[2])),
         SOURCE_SLOPE_BLUR => SAMPLE_WORK * (SOURCE_READS + u64::from(filter.words[0] >> READ_COUNT_SHIFT) + 1),
         MIRROR => SAMPLE_WORK,
+        COLOR_MATCH => COLOR_MATCH_WORK,
         // The four texels round the read, one at a time
         TRANSFORM => 4 * SAMPLE_WORK,
         _ => 8,
@@ -333,6 +399,8 @@ pub(super) fn whole_set(filter: NeighbourhoodFilter, _resolution: u32) -> bool {
         MIRROR | TRANSFORM => true,
         // So does a warp whose source repeats within the tile
         SOURCE_WARP | SOURCE_SLOPE_BLUR => filter.words[0] & SOURCE_TILED != 0,
+        // Average moves every colour by the whole set's mean
+        COLOR_MATCH => filter.words[0] & COLOR_MATCH_AVERAGE != 0,
         _ => false,
     }
 }
@@ -370,6 +438,13 @@ pub(super) fn encode(
             run(&pipelines.kuwahara_frame, [original, 0, frame, 0], texel_groups);
             run(&gpu.apply, [original, frame, output, 0], texel_groups);
         }
+        // Each row's sums in the first blur field, their total's mean in the second
+        COLOR_MATCH if filter.words[0] & COLOR_MATCH_AVERAGE != 0 => {
+            let [rows, mean] = region.blur;
+            run(&pipelines.color_match_rows, [original, 0, rows, 0], [height.div_ceil(LINE_WORKGROUP), 1]);
+            run(&pipelines.color_match_total, [original, rows, mean, 0], [1, 1]);
+            run(&gpu.apply, [original, mean, output, 0], texel_groups);
+        }
         // The other kinds gather in the apply pass
         _ => return false,
     }
@@ -382,7 +457,7 @@ mod tests {
 
     use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
     use texturecraft_core::{
-        AnisotropicKuwahara, BlendMode, Channel, ContentsOffset, Effect, EffectKind, Filter, FlipMode, HeightToNormal, Layer, LayerId, LayerKind, Mask, MaskBackground, Mirror,
+        AnisotropicKuwahara, BlendMode, ColorMatch, SourceColorMode, TargetColorMode, Channel, ContentsOffset, Effect, EffectKind, Filter, FlipMode, HeightToNormal, Layer, LayerId, LayerKind, Mask, MaskBackground, Mirror,
         MirrorCorner, MirrorMode, Project, RepeatMode, SlopeBlending, SourceSlopeBlur, SourceWarp, TextureSet, TileTransform, WarpBlending, WarpMode,
         WarpSource, WarpSourceMode,
     };
@@ -447,11 +522,28 @@ mod tests {
     fn ported() -> Vec<Filter> {
         let mut filters = vec![Filter::Fxaa { alpha: false }, Filter::Fxaa { alpha: true }];
         filters.extend(kuwaharas().into_iter().map(Filter::AnisotropicKuwahara));
+        filters.extend(color_matches().into_iter().map(Filter::ColorMatch));
         filters.extend(warps().into_iter().map(Filter::SourceWarp));
         filters.extend(slope_blurs().into_iter().map(Filter::SourceSlopeBlur));
         filters.extend(mirrors().into_iter().map(Filter::Mirror));
         filters.extend(transforms().into_iter().map(Filter::Transform));
         filters
+    }
+
+    /// The library's Color Match, each source and target mode (inputs unlinked), with and without
+    /// Custom Color Variation, and with narrow limits.
+    fn color_matches() -> Vec<ColorMatch> {
+        let library = ColorMatch::LIBRARY;
+        let blue = [0.1, 0.4, 0.6];
+        vec![
+            library,
+            ColorMatch { custom_variation: false, target_color: [0.2, 0.5, 0.7], ..library },
+            ColorMatch { source_mode: SourceColorMode::Parameter, source_color: [0.6, 0.3, 0.2], target_color: blue, custom_variation: false, ..library },
+            ColorMatch { source_mode: SourceColorMode::Parameter, source_color: [0.6, 0.3, 0.2], target_color: blue, hue: 20.0, chroma: 0.05, luma: 0.1, ..library },
+            ColorMatch { source_mode: SourceColorMode::Input, target_color: blue, ..library },
+            ColorMatch { target_mode: TargetColorMode::ImageInput, ..library },
+            ColorMatch { target_color: blue, hue: 0.0, chroma: 0.0, luma: 0.0, ..library },
+        ]
     }
 
     /// The library's Anisotropic Kuwahara and each setting away from it.
@@ -670,6 +762,18 @@ mod tests {
     fn check_labelled(gpu: &mut Headless, cases: &[(String, Stack, BlendMode)], fixture: Fixture, region: CompositeRegion, tolerance: Tolerance) -> Option<()> {
         let cases: Vec<(&str, Stack, BlendMode)> = cases.iter().map(|(label, stack, blend)| (label.as_str(), stack.clone(), *blend)).collect();
         check_cases(gpu, &cases, fixture, region, tolerance)
+    }
+
+    /// Color Match matches the CPU in Base Color (other channels and the mask pass): Average from
+    /// the whole set's mean, summed by its reduction passes in the whole-set pre-pass, and the
+    /// other modes, with and without Custom Color Variation: below full opacity under Multiply,
+    /// disabled, between filters (the blur below runs in the pre-pass too) and in a partial update.
+    #[test]
+    fn color_match_matches_the_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let cases = filter_cases(color_matches().into_iter().map(Filter::ColorMatch), &Filter::ColorMatch(ColorMatch::LIBRARY));
+
+        assert!(check_labelled(&mut gpu, &cases, MIDDLE_PAINT, MIDDLE, Tolerance::TRANSCENDENTAL).is_some());
     }
 
     /// Anisotropic Kuwahara matches the CPU through its structure tensor pass, at the library's
