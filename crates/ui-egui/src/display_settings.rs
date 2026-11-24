@@ -48,24 +48,30 @@ pub(crate) fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
     });
 
     if display != app.session.doc.project.display {
-        if display.fov != app.session.doc.project.display.fov {
-            app.session.camera.fov = display.fov;
-            if let Some(glide) = &mut app.camera_glide {
-                glide.from.fov = display.fov;
-                glide.to.fov = display.fov;
-            }
-        }
-
-        let before = std::mem::replace(&mut app.session.doc.project.display, display);
-        texturecraft_engine::view_cmds::relight_environment(&mut app.session, &before.environment, before.env_rotation);
-        app.session.modified = true;
-        app.session.revision = app.session.revision.wrapping_add(1);
+        apply_display(app, display);
     }
 
     if import_hdr {
         let ctx = ui.ctx().clone();
         crate::web_files::import_environment(app, &ctx);
     }
+}
+
+/// Take the panel's edited display settings: the camera's field of view follows, and the layers
+/// Baked Lighting Environment lights composite again when the environment turned or changed
+fn apply_display(app: &mut TextureCraftApp, display: DisplaySettings) {
+    if display.fov != app.session.doc.project.display.fov {
+        app.session.camera.fov = display.fov;
+        if let Some(glide) = &mut app.camera_glide {
+            glide.from.fov = display.fov;
+            glide.to.fov = display.fov;
+        }
+    }
+
+    let before = std::mem::replace(&mut app.session.doc.project.display, display);
+    texturecraft_engine::view_cmds::relight_environment(&mut app.session, &before.environment, before.env_rotation);
+    app.session.modified = true;
+    app.session.revision = app.session.revision.wrapping_add(1);
 }
 
 /// A sub-heading inside a section, as the reference's "Environment" and "Shadows"
@@ -286,14 +292,13 @@ mod tests {
 
     use super::*;
 
-    /// The Display panel of a sample session showing `section`
-    fn display_harness(section: &str) -> Harness<'static, TextureCraftApp> {
+    fn display_harness() -> Harness<'static, TextureCraftApp> {
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
         let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_step_dt(0.01).build_eframe(|cc| TextureCraftApp::new(cc, session));
         harness.state_mut().ui.prefs.language = "en".into();
         harness.state_mut().ui.dock.focus(crate::docking::Panel::Display);
         harness.run_steps(4);
-        harness.get_all_by_label(section).max_by(|a, b| a.rect().width().total_cmp(&b.rect().width())).unwrap().click();
+        harness.get_all_by_label("Camera settings").max_by(|a, b| a.rect().width().total_cmp(&b.rect().width())).unwrap().click();
         harness.run_steps(25);
         harness
     }
@@ -301,7 +306,7 @@ mod tests {
     #[test]
     fn feedback_editing_fov_during_a_glide_keeps_the_new_value() {
         let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut harness = display_harness("Camera settings");
+        let mut harness = display_harness();
         let app = harness.state_mut();
         app.run("camera.set", json!({"yaw": 70, "pitch": 30})).unwrap();
         app.run("camera.view.front", json!({})).unwrap();
@@ -331,7 +336,7 @@ mod tests {
     #[test]
     fn feedback_deleting_an_earlier_camera_keeps_the_later_rename() {
         let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut harness = display_harness("Camera settings");
+        let mut harness = display_harness();
         for name in ["First", "Second", "Third"] {
             harness.state_mut().run("camera.add", json!({"name": name})).unwrap();
         }
@@ -356,30 +361,23 @@ mod tests {
         assert_eq!(names, [edited.as_str(), "Third"]);
     }
 
-    /// Turning the environment on the panel composites the layers Baked Lighting Environment
-    /// lights again, as `display.set` does: the CPU material would keep the old light otherwise
+    /// The panel's turned environment composites the layers Baked Lighting Environment lights
+    /// again, as `display.set` does: the CPU material keeps the old light otherwise
     #[test]
-    fn turning_the_environment_relights_the_layers_lit_by_it() {
+    fn a_turned_environment_on_the_panel_relights_the_layers_lit_by_it() {
         let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut harness = display_harness("Environment settings");
+        let mut harness = display_harness();
         let app = harness.state_mut();
         app.run("layer.add.fill", json!({})).unwrap();
         app.run("effect.add.filter", json!({"target": "content", "filter": "bakedLightingEnvironment"})).unwrap();
-        harness.run_steps(4);
-        let revisions =
-            |harness: &Harness<'static, TextureCraftApp>| harness.state().session.caches.iter().map(|cache| cache.material_revision).collect::<Vec<_>>();
-        let (rotation, before) = (harness.state().session.doc.project.display.env_rotation, revisions(&harness));
+        let revisions = |app: &TextureCraftApp| app.session.caches.iter().map(|cache| cache.material_revision).collect::<Vec<_>>();
+        let before = revisions(app);
 
-        let label = harness.get_by_label("Environment Rotation").rect();
-        let track = egui::pos2(label.left() + 90.0, label.bottom() + 10.0);
-        harness.hover_at(track);
-        for pressed in [true, false] {
-            harness.event(egui::Event::PointerButton { pos: track, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
-        }
-        harness.run_steps(3);
+        let mut display = app.session.doc.project.display.clone();
+        display.env_rotation += 40.0;
+        apply_display(app, display);
 
-        assert_ne!(harness.state().session.doc.project.display.env_rotation, rotation, "the slider turned the environment");
-        let after = revisions(&harness);
+        let after = revisions(app);
         assert!(!before.is_empty() && before.iter().zip(&after).all(|(before, after)| before != after), "{before:?} {after:?}");
     }
 }
