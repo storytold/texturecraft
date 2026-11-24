@@ -795,7 +795,7 @@ fn p1_projector_cover(op: Operation, coords: P1Coords) -> f32 {
 
 // The surfaces of the texels across and down from `uv`, for the footprints (invalid without Bilinear HQ)
 fn p1_neighbours(op: Operation, uv: vec2<f32>) -> P1Neighbours {
-    let invalid = Surface(vec3(0.0), vec3(0.0, 1.0, 0.0), false);
+    let invalid = NO_SURFACE;
     let kind = param_word(op, P1_KIND);
     if (op.ext.y & P1_HQ) == 0u || kind == P1_KIND_UV || kind == P1_KIND_UV_TILE {
         return P1Neighbours(invalid, invalid);
@@ -990,7 +990,8 @@ fn p1_copied(surface: Surface, copy: P1Copy) -> Surface {
         return surface;
     }
 
-    return Surface(copy.pivot + copy.turn * (surface.position - copy.pivot), copy.turn * surface.normal, true);
+    // The CPU's copy turns the point and the normals, not the tangent (Texel::surface)
+    return Surface(copy.pivot + copy.turn * (surface.position - copy.pivot), copy.turn * surface.normal, true, surface.tangent);
 }
 
 // The fill sampled once through `copy`: its value and its coverage (compose Texel::fill_texel)

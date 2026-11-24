@@ -549,8 +549,8 @@ fn put_symmetry(words: &mut [u32; SLOT_WORDS], symmetry: &FillSymmetry) -> Optio
 
 /// The work per output texel of operation `op`, whose own work (a Tile Generator's placements
 /// per plane and sample, 0 for other operations) is `own`: P1 adds its fills' cost here, so
-/// bands shrink and one submission stays short. It counts against the update budget too
-/// (`MAX_TILE_WORK_PER_UPDATE`).
+/// bands shrink and one submission stays short; a costly update runs in more bands and
+/// submissions (`MAX_TILE_WORK_PER_BAND`, `MAX_TILE_WORK_PER_SUBMISSION`).
 ///
 /// A unit is one sampled read: per copy an image reads each plane at one level (two with
 /// Bilinear HQ) plus the footprint's neighbours, a pattern or uniform once, and depth culling
@@ -1302,8 +1302,8 @@ mod tests {
     }
 
     /// 64 radial copies of a small cropped planar fill read with Bilinear HQ cost the bands so
-    /// much per texel that a 4K set composites in shorter bands than a plain fill, still within
-    /// the update budget; uncropped copies (the first covers every texel) cost one copy
+    /// much per texel that a 4K set composites in shorter bands than a plain fill, each texel
+    /// within a band; uncropped copies (the first covers every texel) cost one copy
     #[test]
     fn symmetry_copies_shrink_the_bands() {
         const WIDTH: u32 = 4096;
@@ -1325,7 +1325,7 @@ mod tests {
 
         let rows = |work| crate::gpu_composite::composite_band_size(WIDTH, work).1;
         assert!(rows(copied) < rows(plain), "{copied} against {plain}");
-        assert_eq!(crate::gpu_composite::check_tile_update_budget(WIDTH, WIDTH, copied), Ok(()));
+        assert_eq!(crate::gpu_composite::check_texel_work(copied), Ok(()));
         assert_eq!(covering, once, "copies past one that covers every texel are skipped");
     }
 
