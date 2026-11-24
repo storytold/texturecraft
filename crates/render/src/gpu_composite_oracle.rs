@@ -106,7 +106,8 @@ pub(crate) fn assert_matches_cpu(gpu: &mut Headless, case: &OracleCase, toleranc
         bounds: case.mesh.bounds(),
     };
     let tiles: Vec<(u32, u32)> = (0..height / TILE).flat_map(|ty| (0..width / TILE).map(move |tx| (tx, ty))).collect();
-    let mut oracle = Composite::new(&channels, width);
+    // A UV tile atlas's displays read the bakes and tile scales per block, as the session's do
+    let mut oracle = Composite { block_scales: set.block_scales(), ..Composite::new(&channels, width) };
     composite_tiles(&inputs, &mut oracle, &tiles);
 
     let sets: Vec<_> = case.project.texture_sets.iter().map(|set| (set.size(), set.material)).collect();
