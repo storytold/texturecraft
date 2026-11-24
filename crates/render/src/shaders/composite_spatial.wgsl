@@ -28,12 +28,33 @@ fn field_local(pixel: vec2<u32>) -> vec2<u32> {
     return vec2<u32>(local);
 }
 
-fn filter_value(slot: u32, pixel: vec2<u32>) -> vec4<f32> {
+// The first word of stage `slot` at source pixel `pixel`, or u32 max outside its field. A
+// whole-set stage (whole_slots) reads the pre-pass result at the pixel, also in a periodic
+// prepare pass; any other stage its band field.
+fn slot_word(slot: u32, pixel: vec2<u32>) -> u32 {
+    if params.whole_slots.x != 0u {
+        for (var k = 0u; k < 4u; k++) {
+            if params.whole_slots[k] == slot + 1u {
+                let local = vec2<i32>(pixel) - bitcast<vec2<i32>>(params.whole_rect.xy);
+                if any(local < vec2(0)) || any(local >= vec2<i32>(params.whole_rect.zw)) {
+                    return 0xffffffffu;
+                }
+                return params.whole_bases[k] + (u32(local.y) * params.whole_rect.z + u32(local.x)) * params.field_layout.x;
+            }
+        }
+    }
     let local = field_local(pixel);
     if local.x == 0xffffffffu {
+        return 0xffffffffu;
+    }
+    return field_word(slot, local);
+}
+
+fn filter_value(slot: u32, pixel: vec2<u32>) -> vec4<f32> {
+    let start = slot_word(slot, pixel);
+    if start == 0xffffffffu {
         return vec4(0.0);
     }
-    let start = field_word(slot, local);
     return bitcast<vec4<f32>>(vec4(output[start], output[start + 1u], output[start + 2u], output[start + 3u]));
 }
 
@@ -44,11 +65,14 @@ var<private> preceding_field: u32 = 0xffffffffu;
 // there, which no reader uses, so a stage can leave a second value in it (P4's pre-blur gray
 // for P2's gradient after `precede_with_stage`). Zero outside the field or without a stage.
 fn preceding_stage_word(pixel: vec2<u32>) -> f32 {
-    let local = field_local(pixel);
-    if preceding_field == 0xffffffffu || local.x == 0xffffffffu {
+    if preceding_field == 0xffffffffu {
         return 0.0;
     }
-    return bitcast<f32>(output[field_word(preceding_field, local) + 4u]);
+    let start = slot_word(preceding_field, pixel);
+    if start == 0xffffffffu {
+        return 0.0;
+    }
+    return bitcast<f32>(output[start + 4u]);
 }
 
 // The most recent prepared field already contains all the effects below it.

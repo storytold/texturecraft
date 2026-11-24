@@ -360,6 +360,37 @@ struct FilterStage {
     /// The prepare pass reads the set periodically outside it (P4: Blur and Bevel `wrap`), and
     /// the fields of the program may start below zero ([`FilterPlan::wraps`]).
     wrap: bool,
+    /// Evaluated once per update by the whole-set pre-pass ([`FilterPlan::whole_set`]) instead
+    /// of in every band: a stage with a large reach, or one that needs the whole set.
+    whole: bool,
+}
+
+/// The whole-set pre-pass of a program: the stages it evaluates (the whole-set stages and the
+/// lower stages of their stacks), the whole-set stages whose outputs the bands read, and the
+/// reach of the pre-pass fields.
+#[derive(Debug, PartialEq)]
+struct WholeSet {
+    stages: Vec<usize>,
+    outputs: Vec<usize>,
+    reach: u32,
+}
+
+/// Whole-set stages the band uniform can address (`whole_slots` in composite.wgsl)
+const MAX_WHOLE_SET_STAGES: usize = 4;
+
+impl FilterStage {
+    fn reach(&self) -> u32 {
+        self.filter.map_or(0, NeighbourhoodFilter::reach).saturating_add(if self.cell > 1 { self.cell * 2 } else { 0 })
+    }
+
+    /// The stack the stage belongs to: its layer operation and whether it filters the mask.
+    fn stack(&self) -> (u32, bool) {
+        (self.layer, self.preceding & MASK_STAGE != 0)
+    }
+
+    fn anchors(&self) -> bool {
+        self.anchor.is_some() || self.preceding & (MATERIAL_ANCHOR_STAGE | MASK_ANCHOR_STAGE) != 0
+    }
 }
 
 #[derive(Debug, Default)]
@@ -409,7 +440,46 @@ impl FilterPlan {
             });
             plan.reach = plan.reach.max(across_layers);
         }
+        // The pre-pass resumes no anchor reads, and the band uniform addresses a few outputs
+        let anchors = plan.stages.iter().any(FilterStage::anchors);
+        for (index, stage) in plan.stages.iter_mut().filter(|stage| stage.whole).enumerate() {
+            stage.whole = !anchors && index < MAX_WHOLE_SET_STAGES;
+        }
         plan
+    }
+
+    /// The whole-set pre-pass, None when no stage is whole-set (every program before the
+    /// packages mark one). Each whole-set stage takes the lower stages of its stack along.
+    fn whole_set(&self) -> Option<WholeSet> {
+        let outputs: Vec<usize> = self.stages.iter().enumerate().filter(|(_, stage)| stage.whole).map(|(index, _)| index).collect();
+        if outputs.is_empty() {
+            return None;
+        }
+        let mut stages = Vec::new();
+        let mut reach = 0u32;
+        for &output in &outputs {
+            let stack = self.stages[output].stack();
+            let lower: Vec<usize> = (0..=output).filter(|&index| self.stages[index].stack() == stack && !self.stages[index].anchors()).collect();
+            reach = reach.max(lower.iter().fold(0u32, |sum, &index| sum.saturating_add(self.stages[index].reach())));
+            stages.extend(lower);
+        }
+        stages.sort_unstable();
+        stages.dedup();
+        Some(WholeSet { stages, outputs, reach })
+    }
+
+    /// The halo of a band: every stack's reach, without the stages the whole-set pre-pass
+    /// evaluates (their reach is the pre-pass's). The plan's reach without a pre-pass.
+    fn band_reach(&self) -> u32 {
+        let Some(whole) = self.whole_set() else { return self.reach };
+        let mut stacks = BTreeMap::<(u32, bool), u32>::new();
+        for (index, stage) in self.stages.iter().enumerate() {
+            let reach = stacks.entry(stage.stack()).or_default();
+            if !whole.stages.contains(&index) {
+                *reach = reach.saturating_add(stage.reach());
+            }
+        }
+        stacks.into_values().max().unwrap_or(0)
     }
 
     fn add_anchor(&mut self, publication: u32, layer: u32, preceding: u32, inputs: &AnchorInputs, material: Option<(u32, u32)>) {
@@ -424,6 +494,7 @@ impl FilterPlan {
                 anchor: material.map(|(first, cut)| (channel, first, cut)),
                 input: 0,
                 wrap: false,
+                whole: false,
             });
         }
     }
@@ -461,6 +532,7 @@ impl FilterPlan {
                     anchor: None,
                     input: 0,
                     wrap: false,
+                    whole: false,
                 });
                 continue;
             }
@@ -470,11 +542,12 @@ impl FilterPlan {
             let (filter, opacity) = &inputs.filters[effect.ids[2] as usize];
             let Some(filter) = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.resolution, *opacity, channel) else { continue };
             let slot = self.stages.len();
+            let whole = filter.whole_set(inputs.resolution);
             effect.spatial[0] = if mask { slot } else { slot - first } as u32;
             let preceding = preceding as u32 | if mask { MASK_STAGE } else { 0 };
             // P4: Blur and Bevel with Wrap read the set periodically past its edges
             let wrap = gpu_neighbourhood::box_family::wraps(filter);
-            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input: 0, wrap });
+            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input: 0, wrap, whole });
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);
@@ -488,15 +561,15 @@ impl FilterPlan {
         if self.stages.is_empty() { 0 } else { (self.stages.len() as u64 + 3) * u64::from(self.field_words()) * area }
     }
 
-    /// Words per field texel: four premultiplied components and the UV coverage, plus a sixth
-    /// word when a stage carries an input ([`FilterStage::input`]). One stride for every field
-    /// of the program; the shaders read it from the uniform, never from a literal.
     /// Whether a stage wraps: the fields then extend by the halo past the set's edges, with an
     /// origin below zero, and the prepare pass fills the wrapping stages periodically there.
     fn wraps(&self) -> bool {
         self.stages.iter().any(|stage| stage.wrap)
     }
 
+    /// Words per field texel: four premultiplied components and the UV coverage, plus a sixth
+    /// word when a stage carries an input ([`FilterStage::input`]). One stride for every field
+    /// of the program; the shaders read it from the uniform, never from a literal.
     fn field_words(&self) -> u32 {
         if self.stages.iter().any(|stage| stage.input != 0) { FIELD_WORDS + 1 } else { FIELD_WORDS }
     }
@@ -2180,9 +2253,15 @@ impl GpuCompositor {
         let tile_work = pattern_work.saturating_add(program.groups.work_per_pixel()).saturating_add(selection_work);
         let grouped = program.groups.depth != 0;
         let radius = program.coverage.as_ref().map_or(0, |(_, radius)| *radius);
-        let halo = radius.saturating_add(program.filters.reach);
+        // A band's halo leaves out the stages the whole-set pre-pass evaluates
+        let halo = radius.saturating_add(program.filters.band_reach());
+        let whole = program.filters.whole_set();
         let limits = device.limits();
-        let scratch_limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
+        // The other buffers an update keeps alive: paint, operations and the parameter lookup
+        let live = self.paint_upload.as_ref().map_or(0, wgpu::Buffer::size)
+            + (program.operations.len() * size_of::<Operation>()) as u64
+            + (u64::from(LOOKUP_WORDS) + program.ramp_words.len() as u64 + program.geometry.words.len() as u64) * 4;
+        let scratch_limit = scratch_limit(&limits, live);
         let (mut band_width, mut band_rows) = composite_band_size(width, tile_work);
         let filtered = !program.filters.stages.is_empty();
         if filtered {
@@ -2226,6 +2305,16 @@ impl GpuCompositor {
         let required = |width, rows| (group_start(width, rows) + program.groups.words(band_area(width, rows))) * 4;
         let filter_work: u64 =
             program.filters.stages.iter().map(|stage| stage.filter.map_or(1, NeighbourhoodFilter::work_per_texel) + if stage.cell > 1 { 6 } else { 0 }).sum();
+        let texel_words = program.filters.field_words();
+        // The whole-set pre-pass: its result region (what the bands read around the update), its
+        // stripes and the scratch it needs besides the bands'
+        let whole = whole.map(|whole| WholeSetPass::plan(whole, (region, shift), source_size, halo, wraps, texel_words, program.filters.stages.len()));
+        let whole_bytes = whole.as_ref().map_or(0, WholeSetPass::result_bytes);
+        if whole_bytes >= scratch_limit {
+            return Err("The whole-set filter results exceed the adapter's working memory limit.".into());
+        }
+        let scratch_limit = scratch_limit - whole_bytes;
+        let whole = whole.map(|whole| whole.with_stripes(scratch_limit)).transpose()?;
         // A filtered band includes its source halo. Folder snapshots use only its output area.
         while required(band_width, band_rows) > scratch_limit {
             if band_width == 1 && band_rows == 1 {
@@ -2238,15 +2327,17 @@ impl GpuCompositor {
             }
         }
         let pitch = band_width.next_multiple_of(64);
-        let texel_words = program.filters.field_words();
         let submit_budget = if grouped || filtered || band_width < width || band_rows < ROWS { MAX_TILE_WORK_PER_SUBMISSION } else { u64::MAX };
         let area = pitch * band_rows;
         let stride = u64::from(area) * 4;
         let field_base = (display_words(band_width, band_rows)) as u32;
         let group_base = group_start(band_width, band_rows) as u32;
+        // The whole-set results follow the larger of the bands' and the pre-pass's working space
+        let working = whole.as_ref().map_or(0, WholeSetPass::stripe_bytes).max(required(band_width, band_rows));
+        let whole_base = u32::try_from(working / 4).map_err(|_| "The GPU working memory exceeds 32-bit word addressing.")?;
         let scratch = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tc_composite_scratch"),
-            size: required(band_width, band_rows),
+            size: working + whole_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -2311,61 +2402,9 @@ impl GpuCompositor {
         });
         let max_words = MAX_PAINT_WORDS.min((limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / 4) as usize);
         let windows = paint_windows(program, region, source_size, shift, halo, max_words)?;
-        let mut packed = Vec::new();
-        let mut pending_bytes = 0;
-        let mut last_submission = None;
-        let make_encoder = || device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_composite") });
-        let submit = |encoder: wgpu::CommandEncoder, bounds: CompositeRegion, submitted: &mut Option<CompositeRegion>| {
-            let submission = queue.submit([encoder.finish()]);
-            *submitted = Some(submitted.map_or(bounds, |region| region.union(bounds)));
-            submission
-        };
-        for (chunk, window, words) in windows {
-            let bytes = (words * 4) as u64;
-            window.pack(&program.paint, words, &mut packed);
-            let [paint_x, paint_y, paint_columns, paint_rows] = window.params();
-            if pending_bytes + bytes > (max_words * 4) as u64 {
-                device.poll(wgpu::PollType::Wait { submission_index: last_submission.take(), timeout: None }).map_err(|e| e.to_string())?;
-                pending_bytes = 0;
-            }
-            let upload_size = bytes.next_power_of_two().min((max_words * 4) as u64);
-            if self.paint_upload.as_ref().is_none_or(|buffer| buffer.size() < bytes) {
-                self.paint_upload = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("tc_composite_paint"),
-                    size: upload_size,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
-            }
-            let paint = self.paint_upload.as_ref().ok_or("paint upload buffer is missing")?;
-            queue.write_buffer(paint, 0, bytemuck::cast_slice(&packed));
-            let mut encoder = make_encoder();
-            let mut work = 0u64;
-            let mut bounds: Option<CompositeRegion> = None;
-            let bands = (chunk.min[1]..chunk.max[1])
-                .step_by(band_rows as usize)
-                .flat_map(|top| (chunk.min[0]..chunk.max[0]).step_by(band_width as usize).map(move |left| (left, top)));
-            for (left, top) in bands {
-                let width = band_width.min(chunk.max[0] - left);
-                let rows = band_rows.min(chunk.max[1] - top);
-                let source_work = u64::from(width).saturating_mul(u64::from(rows)).saturating_mul(tile_work);
-                let band_work = source_work.saturating_add(field_area(width, rows).saturating_mul(filter_work));
-                if let Some(written) = bounds.take_if(|_| work.saturating_add(band_work) > submit_budget) {
-                    let previous = std::mem::replace(&mut encoder, make_encoder());
-                    submit(previous, written, submitted);
-                    work = 0;
-                }
-                let field = CompositeRegion { min: [left << shift, top << shift], max: [(left + width) << shift, (top + rows) << shift] }.expanded(halo);
-                let mut field_rect =
-                    [field.min[0], field.min[1], field.max[0].min(source_size.0) - field.min[0], field.max[1].min(source_size.1) - field.min[1]];
-                if wraps {
-                    // The whole halo on every side; the origin can lie below zero (i32 bits)
-                    let start = |pixel: u32| (i64::from(pixel << shift) - i64::from(halo)) as i32 as u32;
-                    field_rect = [start(left), start(top), (width << shift).saturating_add(halo * 2), (rows << shift).saturating_add(halo * 2)];
-                }
-                // The set in field-local texels: a stage that does not wrap never reads across its
-                // edges (the CPU's region stops there), a wrapping one reads the periodic copy
-                let set_bounds = field_bounds(field_rect, source_size);
+        // The band uniform: the positional words, the field layout and the package vec4s
+        let band_values =
+            |(width, rows, top, left): (u32, u32, u32, u32), [paint_x, paint_y, paint_columns, paint_rows]: [u32; 4], field_rect: [u32; 4], field_base: u32| {
                 let mut values = [0; packages::UNIFORM_WORDS];
                 values[..packages::FIELD_LAYOUT].copy_from_slice(&[
                     width,
@@ -2420,47 +2459,201 @@ impl GpuCompositor {
                 // prepare pass adds its stage's input operation in the third word.
                 values[packages::FIELD_LAYOUT..packages::FIELD_LAYOUT + 2].copy_from_slice(&[texel_words, u32::from(texel_words > FIELD_WORDS)]);
                 packages::write_band_uniform(program, &mut values);
-                let bindings = |values: &[u32]| {
-                    let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("tc_composite_band"),
-                        contents: bytemuck::cast_slice(values),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
-                    let mut entries = [
-                        wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: ops.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: lookup.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: scratch.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 4, resource: paint.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 5, resource: coverage.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&surface) },
-                        wgpu::BindGroupEntry { binding: 7, resource: vertices.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&baked) },
-                        wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(brush_alpha) },
-                        wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(tile_images) },
-                        wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&brush_stencil.image) },
-                        wgpu::BindGroupEntry { binding: 12, resource: brush_stencil.uniforms.as_entire_binding() },
-                        wgpu::BindGroupEntry {
-                            binding: 13,
-                            resource: wgpu::BindingResource::TextureView(curvature.as_ref().map_or(&baked, |levels| &levels.image)),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 14,
-                            resource: curvature.as_ref().map_or_else(|| lookup.as_entire_binding(), |levels| levels.layout.as_entire_binding()),
-                        },
-                        wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(id_bake.as_ref().unwrap_or(&baked)) },
-                    ];
-                    let mut count = if curvature.is_some() { 15 } else { 13 };
-                    if id_bake.is_some() {
-                        entries.swap(count, 15);
-                        count += 1;
+                values
+            };
+        let make_bindings = |values: &[u32], paint: &wgpu::Buffer| {
+            let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tc_composite_band"),
+                contents: bytemuck::cast_slice(values),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let mut entries = [
+                wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: ops.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: lookup.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: scratch.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: paint.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: coverage.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&surface) },
+                wgpu::BindGroupEntry { binding: 7, resource: vertices.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&baked) },
+                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(brush_alpha) },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(tile_images) },
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&brush_stencil.image) },
+                wgpu::BindGroupEntry { binding: 12, resource: brush_stencil.uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(curvature.as_ref().map_or(&baked, |levels| &levels.image)) },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: curvature.as_ref().map_or_else(|| lookup.as_entire_binding(), |levels| levels.layout.as_entire_binding()),
+                },
+                wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(id_bake.as_ref().unwrap_or(&baked)) },
+            ];
+            let mut count = if curvature.is_some() { 15 } else { 13 };
+            if id_bake.is_some() {
+                entries.swap(count, 15);
+                count += 1;
+            }
+            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("tc_composite_band"), layout: &self.bindings, entries: &entries[..count] })
+        };
+        let mut packed = Vec::new();
+        let mut pending_bytes = 0;
+        let mut last_submission = None;
+        let make_encoder = || device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_composite") });
+        let submit = |encoder: wgpu::CommandEncoder, bounds: CompositeRegion, submitted: &mut Option<CompositeRegion>| {
+            let submission = queue.submit([encoder.finish()]);
+            *submitted = Some(submitted.map_or(bounds, |region| region.union(bounds)));
+            submission
+        };
+        // The whole-set pre-pass: its stages once over the region the bands read, in stripes,
+        // their outputs copied into the results the bands read through `filter_value`
+        if let (Some(whole), Some(prepare), Some(kernels)) = (&whole, &prepare, &self.filter_gpu) {
+            let [x0, y0, x1, y1] = whole.region;
+            let fields = program.filters.stages.len() as u32;
+            // Stripes from the top; one whose paint does not fit the upload budget splits in two
+            let mut stripes: Vec<(u32, u32)> = (y0..y1).step_by(whole.stripe_rows as usize).map(|top| (top, whole.stripe_rows.min(y1 - top))).rev().collect();
+            while let Some((top, rows)) = stripes.pop() {
+                let (low, high) = whole.paint_window(source_size, top, rows);
+                let window = CompositePaintWindow::covering(low, high, [source_size.0, source_size.1], &program.paint);
+                let Some(words) = window.words(&program.paint, max_words) else {
+                    if rows < 2 {
+                        return Err("Paint inputs of the whole-set filter exceed the adapter's upload budget.".into());
                     }
-                    device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("tc_composite_band"),
-                        layout: &self.bindings,
-                        entries: &entries[..count],
-                    })
+                    stripes.extend([(top + rows / 2, rows - rows / 2), (top, rows / 2)]);
+                    continue;
                 };
+                window.pack(&program.paint, words, &mut packed);
+                let bytes = (words * 4) as u64;
+                if self.paint_upload.as_ref().is_none_or(|buffer| buffer.size() < bytes) {
+                    self.paint_upload = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("tc_composite_paint"),
+                        size: bytes.next_power_of_two().min((max_words * 4) as u64),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }));
+                }
+                let paint = self.paint_upload.as_ref().ok_or("paint upload buffer is missing")?;
+                queue.write_buffer(paint, 0, bytemuck::cast_slice(&packed));
+                let field_rect = whole.field_rect(top, rows, source_size);
+                let set_bounds = field_bounds(field_rect, source_size);
+                let values = band_values((0, 0, 0, 0), window.params(), field_rect, 0);
+                let field_words = field_rect[2] * field_rect[3] * texel_words;
+                let offset = |slot: u32| slot * field_words;
+                let (source_width, source_rows) = if tile_work == 0 { (field_rect[2], field_rect[3]) } else { composite_band_size(field_rect[2], tile_work) };
+                let mut encoder = make_encoder();
+                let mut work = 0u64;
+                for &output in &whole.stages.stages {
+                    let stage = &program.filters.stages[output];
+                    let mut source = values;
+                    let direct = stage.filter.is_none() && stage.cell == 1;
+                    let slot = if direct { output as u32 } else { fields };
+                    source[25..28].copy_from_slice(&[slot, stage.layer, stage.preceding]);
+                    source[packages::FIELD_LAYOUT + 2] = stage.input;
+                    source[packages::FIELD_LAYOUT + 3] = u32::from(wraps);
+                    for y in (0..field_rect[3]).step_by(source_rows as usize) {
+                        for x in (0..field_rect[2]).step_by(source_width as usize) {
+                            let columns = source_width.min(field_rect[2] - x);
+                            let chunk_rows = source_rows.min(field_rect[3] - y);
+                            let work_here = u64::from(columns).saturating_mul(u64::from(chunk_rows)).saturating_mul(tile_work);
+                            if work > 0 && work.saturating_add(work_here) > MAX_TILE_WORK_PER_SUBMISSION {
+                                queue.submit([std::mem::replace(&mut encoder, make_encoder()).finish()]);
+                                work = 0;
+                            }
+                            source[28..32].copy_from_slice(&[x, y, columns, chunk_rows]);
+                            let source_bindings = make_bindings(&source, paint);
+                            let mut pass =
+                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tc_whole_set_source"), timestamp_writes: None });
+                            pass.set_pipeline(prepare);
+                            pass.set_bind_group(0, &source_bindings, &[]);
+                            pass.dispatch_workgroups(columns.div_ceil(WORKGROUP), chunk_rows.div_ceil(WORKGROUP), 1);
+                            work = work.saturating_add(work_here);
+                        }
+                    }
+                    let region = NeighbourhoodRegion {
+                        rect: field_rect,
+                        original: offset(fields),
+                        blur: [offset(fields + 1), offset(fields + 2)],
+                        output: offset(output as u32),
+                        field_words: texel_words,
+                        input: u32::from(texel_words > FIELD_WORDS),
+                        wrap: stage.wrap,
+                        bounds: set_bounds,
+                    };
+                    if stage.cell > 1 {
+                        let target = if stage.filter.is_some() { region.original } else { region.output };
+                        kernels.encode_cells(device, &mut encoder, &scratch, NeighbourhoodRegion { output: target, ..region }, stage.cell);
+                    }
+                    if let Some(filter) = stage.filter {
+                        kernels.encode(device, &mut encoder, &scratch, region, filter);
+                    }
+                }
+                // The stripe's rows of each output, from its field into the results
+                let from = [(x0 as i32 - field_rect[0] as i32) as u32, (top as i32 - field_rect[1] as i32) as u32];
+                for (index, &output) in whole.stages.outputs.iter().enumerate() {
+                    let result = whole.result_base(whole_base, index);
+                    kernels.encode_copy(
+                        device,
+                        &mut encoder,
+                        &scratch,
+                        (offset(output as u32), field_rect[2], from),
+                        (result, x1 - x0, top - y0),
+                        [x1 - x0, rows],
+                        texel_words,
+                    );
+                }
+                queue.submit([encoder.finish()]);
+            }
+        }
+        for (chunk, window, words) in windows {
+            let bytes = (words * 4) as u64;
+            window.pack(&program.paint, words, &mut packed);
+            let [paint_x, paint_y, paint_columns, paint_rows] = window.params();
+            if pending_bytes + bytes > (max_words * 4) as u64 {
+                device.poll(wgpu::PollType::Wait { submission_index: last_submission.take(), timeout: None }).map_err(|e| e.to_string())?;
+                pending_bytes = 0;
+            }
+            let upload_size = bytes.next_power_of_two().min((max_words * 4) as u64);
+            if self.paint_upload.as_ref().is_none_or(|buffer| buffer.size() < bytes) {
+                self.paint_upload = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("tc_composite_paint"),
+                    size: upload_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            let paint = self.paint_upload.as_ref().ok_or("paint upload buffer is missing")?;
+            queue.write_buffer(paint, 0, bytemuck::cast_slice(&packed));
+            let mut encoder = make_encoder();
+            let mut work = 0u64;
+            let mut bounds: Option<CompositeRegion> = None;
+            let bands = (chunk.min[1]..chunk.max[1])
+                .step_by(band_rows as usize)
+                .flat_map(|top| (chunk.min[0]..chunk.max[0]).step_by(band_width as usize).map(move |left| (left, top)));
+            for (left, top) in bands {
+                let width = band_width.min(chunk.max[0] - left);
+                let rows = band_rows.min(chunk.max[1] - top);
+                let source_work = u64::from(width).saturating_mul(u64::from(rows)).saturating_mul(tile_work);
+                let band_work = source_work.saturating_add(field_area(width, rows).saturating_mul(filter_work));
+                if let Some(written) = bounds.take_if(|_| work.saturating_add(band_work) > submit_budget) {
+                    let previous = std::mem::replace(&mut encoder, make_encoder());
+                    submit(previous, written, submitted);
+                    work = 0;
+                }
+                let field = CompositeRegion { min: [left << shift, top << shift], max: [(left + width) << shift, (top + rows) << shift] }.expanded(halo);
+                let mut field_rect =
+                    [field.min[0], field.min[1], field.max[0].min(source_size.0) - field.min[0], field.max[1].min(source_size.1) - field.min[1]];
+                if wraps {
+                    // The whole halo on every side; the origin can lie below zero (i32 bits)
+                    let start = |pixel: u32| (i64::from(pixel << shift) - i64::from(halo)) as i32 as u32;
+                    field_rect = [start(left), start(top), (width << shift).saturating_add(halo * 2), (rows << shift).saturating_add(halo * 2)];
+                }
+                // The set in field-local texels: a stage that does not wrap never reads across its
+                // edges (the CPU's region stops there), a wrapping one reads the periodic copy
+                let set_bounds = field_bounds(field_rect, source_size);
+                let mut values = band_values((width, rows, top, left), [paint_x, paint_y, paint_columns, paint_rows], field_rect, field_base);
+                if let Some(whole) = &whole {
+                    whole.write_uniform(&mut values, whole_base);
+                }
+                let bindings = |values: &[u32]| make_bindings(values, paint);
                 if let (Some(prepare), Some(kernels)) = (&prepare, &self.filter_gpu) {
                     let fields = program.filters.stages.len() as u32;
                     let field_words = field_rect[2] * field_rect[3] * texel_words;
@@ -2468,6 +2661,10 @@ impl GpuCompositor {
                     let (source_width, source_rows) =
                         if tile_work == 0 { (field_rect[2], field_rect[3]) } else { composite_band_size(field_rect[2], tile_work) };
                     for (output, stage) in program.filters.stages.iter().enumerate() {
+                        // The whole-set pre-pass evaluated this stage for the bands
+                        if whole.as_ref().is_some_and(|whole| whole.stages.stages.contains(&output)) {
+                            continue;
+                        }
                         let mut source = values;
                         let direct = stage.filter.is_none() && stage.cell == 1;
                         let slot = if direct { output as u32 } else { fields };
@@ -2550,6 +2747,120 @@ impl GpuCompositor {
             pending_bytes += bytes;
         }
         Ok(())
+    }
+}
+
+/// A later user-set limit on the GPU memory one update of the compositor may hold (bytes).
+/// None: the adapter's reported limits alone (the default).
+fn user_memory_limit() -> Option<u64> {
+    None
+}
+
+/// The bytes the working buffer of an update may take: the adapter's binding and buffer limits,
+/// the shaders' 32-bit word addressing (16 GiB), and a user-set memory limit less the `live`
+/// bytes of the update's other buffers.
+fn scratch_limit(limits: &wgpu::Limits, live: u64) -> u64 {
+    let addressable = (u64::from(u32::MAX) + 1) * 4;
+    let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size).min(addressable);
+    user_memory_limit().map_or(limit, |memory| limit.min(memory.saturating_sub(live)))
+}
+
+/// The whole-set pre-pass of one update ([`FilterPlan::whole_set`]): the region of results the
+/// bands read (source texels [x0, y0, x1, y1]: the update plus the bands' halo, a whole axis
+/// where a wrapping program crosses the set's edge) and the stripes it is evaluated in.
+struct WholeSetPass {
+    stages: WholeSet,
+    region: [u32; 4],
+    wraps: bool,
+    texel_words: u32,
+    /// Field slots of the program (stages plus the three working fields)
+    slots: u64,
+    stripe_rows: u32,
+}
+
+impl WholeSetPass {
+    fn plan(stages: WholeSet, (region, shift): (CompositeRegion, u32), size: (u32, u32), halo: u32, wraps: bool, texel_words: u32, stage_count: usize) -> Self {
+        let axis = |min: u32, max: u32, side: u32| {
+            let (low, high) = ((min << shift).saturating_sub(halo), (max << shift).saturating_add(halo));
+            if wraps && ((min << shift) < halo || high > side) { [0, side] } else { [low, high.min(side)] }
+        };
+        let [x0, x1] = axis(region.min[0], region.max[0], size.0);
+        let [y0, y1] = axis(region.min[1], region.max[1], size.1);
+        Self { region: [x0, y0, x1, y1], wraps, texel_words, slots: stage_count as u64 + 3, stripe_rows: (y1 - y0).max(1), stages }
+    }
+
+    fn result_words(&self) -> u64 {
+        let [x0, y0, x1, y1] = self.region;
+        u64::from(x1 - x0) * u64::from(y1 - y0) * u64::from(self.texel_words)
+    }
+
+    fn result_bytes(&self) -> u64 {
+        self.result_words() * self.stages.outputs.len() as u64 * 4
+    }
+
+    /// First word of output `index`'s results, after the working space ending at word `base`.
+    fn result_base(&self, base: u32, index: usize) -> u32 {
+        (u64::from(base) + self.result_words() * index as u64) as u32
+    }
+
+    /// The field of the stripe of `rows` from row `top`: the reach on every side, clamped to the
+    /// set unless the program wraps (origin as i32 bits).
+    fn field_rect(&self, top: u32, rows: u32, size: (u32, u32)) -> [u32; 4] {
+        let reach = i64::from(self.stages.reach);
+        let [x0, _, x1, _] = self.region;
+        let span = |low: u32, high: u32, side: u32| {
+            let (low, high) = (i64::from(low) - reach, i64::from(high) + reach);
+            if self.wraps { (low, high) } else { (low.max(0), high.min(i64::from(side))) }
+        };
+        let (left, right) = span(x0, x1, size.0);
+        let (upper, lower) = span(top, top + rows, size.1);
+        [left as i32 as u32, upper as i32 as u32, (right - left) as u32, (lower - upper) as u32]
+    }
+
+    /// Bytes of a stripe's fields: every slot of the program over the stripe plus its reach.
+    fn stripe_bytes(&self) -> u64 {
+        let reach = u64::from(self.stages.reach) * 2;
+        let [x0, _, x1, _] = self.region;
+        (u64::from(x1 - x0) + reach) * (u64::from(self.stripe_rows) + reach) * self.slots * u64::from(self.texel_words) * 4
+    }
+
+    /// The tallest stripes whose fields fit in `limit` bytes beside the results.
+    fn with_stripes(mut self, limit: u64) -> Result<Self, String> {
+        while self.stripe_bytes() > limit {
+            if self.stripe_rows <= 1 {
+                return Err("A whole-set filter's stripe exceeds the adapter's working memory limit.".into());
+            }
+            self.stripe_rows = self.stripe_rows.div_ceil(2);
+        }
+        Ok(self)
+    }
+
+    /// The paint the stripe of `rows` from `top` reads: the stripe plus the pre-pass reach, the
+    /// whole axis where a wrapping program crosses the set's edge.
+    fn paint_window(&self, size: (u32, u32), top: u32, rows: u32) -> ([u32; 2], [u32; 2]) {
+        let reach = self.stages.reach;
+        let [x0, _, x1, _] = self.region;
+        let (y0, y1) = (top, top + rows);
+        let axis = |low: u32, high: u32, side: u32| {
+            if self.wraps && (low < reach || high.saturating_add(reach) > side) {
+                (0, side)
+            } else {
+                (low.saturating_sub(reach), high.saturating_add(reach).min(side))
+            }
+        };
+        let ((left, right), (upper, lower)) = (axis(x0, x1, size.0), axis(y0, y1, size.1));
+        ([left, upper], [right, lower])
+    }
+
+    /// The band uniform's whole-set table: each output's slot plus one, its first word, the region.
+    fn write_uniform(&self, values: &mut [u32; packages::UNIFORM_WORDS], base: u32) {
+        let table = &mut values[packages::WHOLE_SET..packages::WHOLE_SET + 12];
+        for (index, &output) in self.stages.outputs.iter().enumerate() {
+            table[index] = output as u32 + 1;
+            table[4 + index] = self.result_base(base, index);
+        }
+        let [x0, y0, x1, y1] = self.region;
+        table[8..].copy_from_slice(&[x0, y0, x1 - x0, y1 - y0]);
     }
 }
 

@@ -402,6 +402,12 @@ fn box_passes(
     source
 }
 
+/// Whether a stage runs in the whole-set pre-pass instead of in every band (see
+/// `NeighbourhoodFilter::whole_set`): large reaches and whole-set reads.
+pub(super) fn whole_set(_filter: NeighbourhoodFilter, _resolution: u32) -> bool {
+    false
+}
+
 /// Encodes a P4 stage with passes of its own; false lets the box and apply passes run.
 pub(super) fn encode(
     (gpu, pipelines): (&NeighbourhoodGpu, &Pipelines),
