@@ -118,25 +118,38 @@ fn stack_at_second(effect: Operation, pixel: vec2<u32>) -> vec3<f32> {
 // (channel_default; their channel slots plus one in effects.z).
 var<private> reading_own_layer: bool = false;
 
+// Set by layer_mask while it evaluates the lit layer's first mask (params.mask_view)
+var<private> mask_view_active: bool = false;
+
 // The effect's layer's own content of the read channel, with its coverage in alpha: Compare's
 // This Layer mixes it over stack_at. It reads the field of its This Layer stage (slot plus one in
 // Operation.effects.z, FilterPlan::add_this_layer_reads), prepared from the whole content stack
 // before the mask: no content code inline in the mask's.
 fn this_layer_content(effect: Operation, texel: LayerTexel) -> vec4<f32> {
-    if effect.effects.z == 0u {
+    var slot = effect.effects.z;
+    // The lit layer's first mask reads its Base Color without fields or material (mask_view)
+    if mask_view_active && slot == params.mask_view.w {
+        slot = params.mask_view.z;
+    }
+    if slot == 0u {
         return vec4(0.0);
     }
-    let field = filter_value(effect.effects.z - 1u, texel.pixel);
+    let field = filter_value(slot - 1u, texel.pixel);
     let coverage = clamp(field.a, 0.0, 1.0);
     return vec4(select(vec3(0.0), field.rgb / coverage, coverage > 1e-5), coverage);
 }
 
-// The effect's image input at the texel (Operation.effects.w, ProceduralInputs::register_input).
+// A package effect's image input at the texel, read through layer_content's or layer_mask's one
+// base_content call right before the effect (the driver inlines each call site)
+var<private> effect_input_cache: vec4<f32> = vec4(0.0);
+
+// The effect's image input at the texel (Operation.effects.w, ProceduralInputs::register_input),
+// as P3's stage_input_value reads it: its base content's x.
 fn effect_input(effect: Operation, texel: LayerTexel) -> f32 {
     if effect.effects.w == 0u {
         return 0.0;
     }
-    return stage_input_value(layers[effect.effects.w - 1u], texel);
+    return effect_input_cache.x;
 }
 
 // The effect's image input as colour (ProceduralInputs::register_color_input).
@@ -144,7 +157,7 @@ fn effect_input_color(effect: Operation, texel: LayerTexel) -> vec3<f32> {
     if effect.effects.w == 0u {
         return vec3(0.0);
     }
-    return base_content(layers[effect.effects.w - 1u], texel).rgb;
+    return effect_input_cache.rgb;
 }
 
 // An image's stored texel under `uv`, wrapping, as ImageRes::sample_nearest reads it (an ID
@@ -178,43 +191,8 @@ fn image_texel_bilinear_clamped(image: u32, uv: vec2<f32>) -> vec4<f32> {
     return mix(top, bottom, t.y);
 }
 
-// Test probes of the hooks above (opcodes 188..192, emitted only by the render crate's tests).
-const PROBE_OPCODES_START: u32 = 188u;
-fn probe_mask_effect(effect: Operation, texel: LayerTexel) -> f32 {
-    switch effect.ids.y {
-        case 188u: { return this_layer_content(effect, texel).x; }
-        case 189u: { return stack_at(effect, texel.pixel).x; }
-        case 190u: { return image_texel_nearest(param_word(effect, 0u), texel.uv).x; }
-        default: {
-            if effect.ext.x != 0u {
-                return probe_late_hooks(effect, texel);
-            }
-            return effect_input(effect, texel);
-        }
-    }
-}
-
-// Opcode 191 with a selector in its first side-table word probes the P0h hooks: 1..4 the surface
-// tangent's x, y, z and sign as 0.5 + 0.5 v, 5 the second stack read, 6 environment word
-// param_word(effect, 2u) of the block at param_word(effect, 1u), 7 the baked Height of the bake
-// rows (0.25 without one), 8 the baked ambient occlusion where baked_at reads it, 9 the image
-// "probe" read bilinearly without wrapping.
-fn probe_late_hooks(effect: Operation, texel: LayerTexel) -> f32 {
-    let selector = param_word(effect, 0u);
-    switch selector {
-        case 1u, 2u, 3u, 4u: { return 0.5 + 0.5 * texel.surface.tangent[selector - 1u]; }
-        case 5u: { return stack_at_second(effect, texel.pixel).x; }
-        case 6u: { return bitcast<f32>(srgb[param_word(effect, 1u) + param_word(effect, 2u)]); }
-        case 8u: { return bitcast<f32>(baked_at(texel.pixel).x); }
-        case 9u: { return image_texel_bilinear_clamped(param_word(effect, 1u), texel.uv).x; }
-        default: {
-            if !bake_has(BAKED_HEIGHT) {
-                return 0.25;
-            }
-            return bitcast<f32>(baked_block_at(texel.pixel, 1u).x);
-        }
-    }
-}
+// Test probes of the hooks above: composite_probes.wgsl, compiled into the render crate's tests
+// only (a stub elsewhere, shader_sources in gpu_composite_packages.rs).
 
 // WGSL rejects recursion: a package function must not call anything that leads back to the hook
 // that called it (scalar_filter, effect_color, layer_content and layer_mask reach the hooks above,

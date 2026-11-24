@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::packages::{self, ShaderFlags};
 use super::{ANCHOR_PUBLISH_LAYER, ANCHOR_SOURCE, COLOR_SELECTION_OPCODE, CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, TILE_GENERATOR_OPCODE};
@@ -93,7 +94,7 @@ impl Features {
             include(
                 self.authored_images,
                 include_str!("shaders/material_image.wgsl"),
-                "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }\n                 fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> { return vec4(0.0); }",
+                "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }\n                 fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> { return vec4(0.0); }\n                 const MISSING_IMAGE: u32 = 0xffffffffu;\n                 fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> { return rgb; }",
             ),
             include_str!("shaders/stencil_projection.wgsl"),
             include(
@@ -169,10 +170,30 @@ impl Features {
     }
 }
 
+/// A pipeline compiled, or compiling on a worker thread (`CompositePipelines::asynchronous`)
+enum Slot {
+    Ready(wgpu::ComputePipeline),
+    Compiling(Arc<Mutex<Option<wgpu::ComputePipeline>>>),
+}
+
+impl Slot {
+    /// The pipeline once compiled
+    fn ready(&mut self) -> Option<wgpu::ComputePipeline> {
+        if let Slot::Compiling(compiled) = self {
+            let pipeline = compiled.lock().unwrap_or_else(PoisonError::into_inner).take()?;
+            *self = Slot::Ready(pipeline);
+        }
+        match self {
+            Slot::Ready(pipeline) => Some(pipeline.clone()),
+            Slot::Compiling(_) => None,
+        }
+    }
+}
+
 struct Variants {
     module: wgpu::ShaderModule,
-    render: [Option<wgpu::ComputePipeline>; 2],
-    prepare: [Option<wgpu::ComputePipeline>; 2],
+    render: [Option<Slot>; 2],
+    prepare: [Option<Slot>; 2],
 }
 
 pub(super) struct CompositePipelines {
@@ -181,17 +202,46 @@ pub(super) struct CompositePipelines {
     variants: BTreeMap<Features, Variants>,
 }
 
+/// The pipelines a compositor uses: its own, or in the render crate's tests one set per device
+/// for every compositor (llvmpipe keeps what it compiled until the process ends, so each test
+/// compiling the same variants again would add up).
+pub(super) fn shared(device: &wgpu::Device, supports_curvature: bool, supports_id: bool) -> Arc<Mutex<CompositePipelines>> {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    {
+        static SHARED: Mutex<Vec<(wgpu::Device, Arc<Mutex<CompositePipelines>>)>> = Mutex::new(Vec::new());
+        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, pipelines)) = shared.iter().find(|(owner, _)| owner == device) {
+            return pipelines.clone();
+        }
+        let pipelines = Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)));
+        shared.push((device.clone(), pipelines.clone()));
+        return pipelines;
+    }
+    #[cfg(not(all(test, not(target_arch = "wasm32"))))]
+    let _ = device;
+    #[allow(unreachable_code)]
+    Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)))
+}
+
 impl CompositePipelines {
     pub(super) fn new(supports_curvature: bool, supports_id: bool) -> Self {
         Self { supports_curvature, supports_id, variants: BTreeMap::new() }
     }
 
+    /// Start compiling `program`'s pipelines without waiting (`get` returns them once ready).
+    pub(super) fn prewarm(&mut self, device: &wgpu::Device, layout: &wgpu::PipelineLayout, program: &CompositeProgram) {
+        let _ = self.get(device, layout, program, !cfg!(target_arch = "wasm32"));
+    }
+
+    /// The program's compose and prepare pipelines; None while one still compiles (new ones
+    /// compile on worker threads when `asynchronous`: the viewport keeps its last result).
     pub(super) fn get(
         &mut self,
         device: &wgpu::Device,
         layout: &wgpu::PipelineLayout,
         program: &CompositeProgram,
-    ) -> (wgpu::ComputePipeline, Option<wgpu::ComputePipeline>) {
+        asynchronous: bool,
+    ) -> Option<(wgpu::ComputePipeline, Option<wgpu::ComputePipeline>)> {
         let features = Features::of(program);
         let supports_curvature = self.supports_curvature;
         let supports_id = self.supports_id;
@@ -203,30 +253,51 @@ impl CompositePipelines {
             render: [None, None],
             prepare: [None, None],
         });
-        let module = &variants.module;
-        let pipeline = |entry, label, grouped| {
+        let module = variants.module.clone();
+        let pipeline = |entry: &'static str, label: &'static str, grouped: bool| {
+            let compile = {
+                let (device, layout, module) = (device.clone(), layout.clone(), module.clone());
+                move || {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let started = std::time::Instant::now();
+                    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some(label),
+                        layout: Some(&layout),
+                        module: &module,
+                        entry_point: Some(entry),
+                        compilation_options: wgpu::PipelineCompilationOptions { constants: &features.constants(grouped), ..Default::default() },
+                        cache: None,
+                    });
+                    #[cfg(not(target_arch = "wasm32"))]
+                    log::debug!("GPU pipeline {label} compiled in {:.1} ms ({:?})", started.elapsed().as_secs_f64() * 1000.0, device.adapter_info().backend);
+                    pipeline
+                }
+            };
             #[cfg(not(target_arch = "wasm32"))]
-            let started = std::time::Instant::now();
-            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(label),
-                layout: Some(layout),
-                module,
-                entry_point: Some(entry),
-                compilation_options: wgpu::PipelineCompilationOptions { constants: &features.constants(grouped), ..Default::default() },
-                cache: None,
-            });
-            #[cfg(not(target_arch = "wasm32"))]
-            log::debug!("GPU pipeline {label} compiled in {:.1} ms ({:?})", started.elapsed().as_secs_f64() * 1000.0, device.adapter_info().backend);
-            pipeline
+            if asynchronous {
+                let compiled = Arc::new(Mutex::new(None));
+                let sink = compiled.clone();
+                std::thread::spawn(move || {
+                    let pipeline = compile();
+                    *sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(pipeline);
+                });
+                return Slot::Compiling(compiled);
+            }
+            Slot::Ready(compile())
         };
         let grouped = program.groups.depth != 0;
-        let render = variants.render[usize::from(grouped)].get_or_insert_with(|| pipeline("compose", "tc_gpu_composite", grouped)).clone();
+        let render = variants.render[usize::from(grouped)].get_or_insert_with(|| pipeline("compose", "tc_gpu_composite", grouped)).ready();
         // Only material anchor capture needs to walk the group structure while preparing a source.
         let grouped_capture = grouped && features.material_anchors;
-        let prepare = features.spatial.then(|| {
-            variants.prepare[usize::from(grouped_capture)].get_or_insert_with(|| pipeline("prepare_filter", "tc_spatial_source", grouped_capture)).clone()
-        });
-        (render, prepare)
+        let prepare = match features.spatial {
+            true => Some(
+                variants.prepare[usize::from(grouped_capture)]
+                    .get_or_insert_with(|| pipeline("prepare_filter", "tc_spatial_source", grouped_capture))
+                    .ready()?,
+            ),
+            false => None,
+        };
+        Some((render?, prepare))
     }
 }
 
@@ -315,6 +386,59 @@ mod tests {
         naga_check("neighbourhood", &NeighbourhoodGpu::source(), &NeighbourhoodGpu::ENTRY_POINTS, &[Vec::new()]);
     }
 
+    /// With asynchronous compiles a new program first answers GPU_PIPELINES_PENDING, leaving the
+    /// set's textures as they are, then composites once its pipelines are ready; a pre-warmed
+    /// program composites at once.
+    #[test]
+    #[allow(clippy::unwrap_used)] // A test: a program that does not build fails it
+    fn new_pipelines_compile_on_worker_threads() {
+        use std::collections::BTreeMap;
+
+        use texturecraft_compose::PixelStore;
+        use texturecraft_core::{Channel, Effect, EffectKind, Fill, Filter, Layer, LayerKind, Project, Source, TextureSet};
+
+        use crate::gpu_composite::{CompositeProgram, GPU_PIPELINES_PENDING};
+
+        // A device of its own: the tests share their pipelines per device
+        let Ok(mut gpu) = crate::headless::Headless::with_limits(crate::device_limits) else { return };
+        let project = |radius: f32| {
+            let mut project = Project::new("Asynchronous", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Plane", 0, 64));
+            let id = project.alloc_id();
+            let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.6, 0.3, 0.2]))]), ..Default::default() };
+            let mut layer = Layer::new(id, "Fill", LayerKind::Fill(fill), &[Channel::BaseColor]);
+            layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius, wrap: false })));
+            project.insert_layer(0, layer, None, false).unwrap();
+            project
+        };
+        let mesh = std::sync::Arc::new(texturecraft_geom::primitives::plane(1.0, 1));
+        let gbuf = std::sync::Arc::new(texturecraft_geom::UvGBuffer::new(&mesh, 0, 64, 64));
+        let program = |project: &Project| {
+            let mut program = CompositeProgram::compile(project, &PixelStore::default(), 0).unwrap();
+            program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+            program
+        };
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((64, 64), 0)], 1);
+        gpu.renderer.set_asynchronous_compile(true);
+        let first = program(&project(8.0));
+        assert_eq!(gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &first), Err(GPU_PIPELINES_PENDING.to_string()));
+        let started = std::time::Instant::now();
+        loop {
+            match gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &first) {
+                Err(error) if error == GPU_PIPELINES_PENDING => {
+                    assert!(started.elapsed() < std::time::Duration::from_secs(300), "the pipelines never finished");
+                    std::thread::yield_now();
+                }
+                result => {
+                    assert_eq!(result, Ok(()));
+                    break;
+                }
+            }
+        }
+        // The same features again: ready at once
+        assert_eq!(gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program(&project(16.0))), Ok(()));
+    }
+
     /// Cold compile times of realistic programs' pipelines (run with the driver's shader cache
     /// off, e.g. `__GL_SHADER_DISK_CACHE=0` on NVIDIA): a material of fills with Blur, Levels and
     /// lighting under a generator mask, a mask comparing the layers below and this layer, and the
@@ -388,7 +512,10 @@ mod tests {
             ("plain fill", project(Vec::new(), Vec::new())),
         ];
         let compositor = GpuCompositor::new(&gpu.device);
-        let (curvature, id) = (compositor.pipelines.supports_curvature, compositor.pipelines.supports_id);
+        let (curvature, id) = {
+            let pipelines = compositor.pipelines();
+            (pipelines.supports_curvature, pipelines.supports_id)
+        };
         let programs =
             cases.map(|(label, project)| (label, Features::of(&CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).unwrap())));
         let everything =
@@ -408,7 +535,9 @@ mod tests {
                     compilation_options: wgpu::PipelineCompilationOptions { constants: &features.constants(false), ..Default::default() },
                     cache: None,
                 });
-                eprintln!("COMPILE {label} {:?} preview {}, {entry}: {:?}", features.packages, features.mask_preview, started.elapsed());
+                let memory = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+                let peak = memory.lines().filter(|line| line.starts_with("VmHWM") || line.starts_with("VmRSS")).collect::<Vec<_>>().join(" ");
+                eprintln!("COMPILE {label} {:?} preview {}, {entry}: {:?} {peak}", features.packages, features.mask_preview, started.elapsed());
             }
         }
     }
@@ -419,7 +548,10 @@ mod tests {
     fn package_shaders_build_compute_pipelines_in_full_and_as_stubs() {
         let Some(gpu) = oracle::headless() else { return };
         let compositor = GpuCompositor::new(&gpu.device);
-        let (curvature, id) = (compositor.pipelines.supports_curvature, compositor.pipelines.supports_id);
+        let (curvature, id) = {
+            let pipelines = compositor.pipelines();
+            (pipelines.supports_curvature, pipelines.supports_id)
+        };
         // Every package variant; the program with every other feature too is left to the naga
         // check above: Mesa's GL compiler needs over 28 GB for it (llvmpipe, measured)
         // The program with every other feature too stays with the naga check above: Mesa's GL

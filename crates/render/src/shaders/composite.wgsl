@@ -55,6 +55,10 @@ struct Params {
     // In a pre-pass with compact slots (WholePass::compact in Rust): its first stage slot, its
     // stage count, the program's first working field, and 1 when active. Zero in the bands.
     whole_compact: vec4<u32>,
+    // While preparing a lit Base Color's material and its first mask (FilterPlan::
+    // add_lit_mask_views): the layer's mask base plus one, the first mask's base plus one, and
+    // the This Layer stages (plus one) of the first and of the layer's mask. Zero otherwise.
+    mask_view: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;

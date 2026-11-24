@@ -106,6 +106,7 @@ fn previous_field(start: u32, count: u32) -> u32 {
 const INPUT_LAYER: u32 = 2u;
 const INPUT_COLOR: u32 = 4u;
 const OWN_VIEW: u32 = 8u;
+const NO_FIELDS: u32 = 32u;
 const INPUT2: u32 = 16u;
 
 @compute @workgroup_size(8, 8)
@@ -225,11 +226,13 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
                 source_count = source.effects.w;
             } else if capture {
                 source_count = select(source.effects.w, min(source.effects.w, params.anchor.z), i >= params.anchor.y);
-            } else if (params.field_layout.w & OWN_VIEW) != 0u {
-                // The lit Base Color's own view for its mask: its own fields, the default material
-                source.spatial.x = params.anchor.y;
-                source.spatial.y = 1u;
-                reading_own_layer = true;
+            } else {
+                // A view of the layer for its mask (This Layer): its own material as the
+                // defaults (OWN_VIEW), its stages as identity (NO_FIELDS)
+                reading_own_layer = (params.field_layout.w & OWN_VIEW) != 0u;
+                if (params.field_layout.w & NO_FIELDS) != 0u {
+                    source.spatial.y = 0u;
+                }
             }
             let content = layer_content(source, texel, source_count);
             reading_own_layer = false;

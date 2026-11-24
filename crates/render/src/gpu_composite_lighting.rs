@@ -380,10 +380,8 @@ mod tests {
     /// Base Color last: its lighting's material lies under a mask M1 whose This Layer reads the
     /// Base Color with no fields (its stages as identity) and no lit material. Then it builds
     /// the mask field M2, whose This Layer resumes from the finished Base Color field. The final
-    /// composite uses M2. The GPU has one mask stack per layer (its effects hold absolute
-    /// slots), and it prepares that stack as M1 (`add_this_layer_reads`), so M2 differs.
+    /// composite uses M2. The GPU prepares both (`FilterPlan::add_lit_mask_views`).
     #[test]
-    #[ignore = "the CPU uses two masks here (M1 for the material, M2 for the composite); the GPU one"]
     fn a_mask_comparing_its_lit_base_color_matches_the_cpu() {
         use texturecraft_core::{BlendMode, Channel, CompareOp, CompareSource, Effect, EffectKind, StylizedLighting};
 
@@ -394,22 +392,29 @@ mod tests {
             (stylized_lighting(StylizedLighting::library()), 1.0, BlendMode::Normal, true),
             (Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal, false),
         ];
-        let project = lit_project(&effects, |project| {
-            let compare = EffectKind::Compare {
-                op: CompareOp::GreaterThan,
-                value: 0.45,
-                tolerance: 0.12,
-                left: CompareSource::ThisLayer,
-                right: CompareSource::Constant,
-                channel: Channel::BaseColor,
-                hardness: 0.6,
-            };
-            let ids = [project.alloc_id(), project.alloc_id()];
-            if let Some(mask) = lit_layer(project).and_then(|layer| layer.mask.as_mut()) {
-                mask.effects = vec![Effect::new(ids[0], compare), Effect::new(ids[1], EffectKind::Filter(Filter::Blur { radius: 16.0, wrap: false }))];
-            }
-        });
-        assert_lit_matches(&mut gpu, &project, &lit_bakes(true, true), (true, Tolerance::TRANSCENDENTAL), "a mask comparing its lit Base Color");
+        let project = |hardness: f32| {
+            lit_project(&effects, |project| {
+                let compare = EffectKind::Compare {
+                    op: CompareOp::GreaterThan,
+                    value: 0.45,
+                    tolerance: 0.12,
+                    left: CompareSource::ThisLayer,
+                    right: CompareSource::Constant,
+                    channel: Channel::BaseColor,
+                    hardness,
+                };
+                let ids = [project.alloc_id(), project.alloc_id()];
+                if let Some(mask) = lit_layer(project).and_then(|layer| layer.mask.as_mut()) {
+                    mask.effects = vec![Effect::new(ids[0], compare), Effect::new(ids[1], EffectKind::Filter(Filter::Blur { radius: 16.0, wrap: false }))];
+                }
+            })
+        };
+        let bakes = lit_bakes(true, true);
+        assert_lit_matches(&mut gpu, &project(0.1), &bakes, (true, Tolerance::TRANSCENDENTAL), "a mask comparing its lit Base Color");
+        // A steeper ramp turns float noise into a few steps (at most 0.1 % of the texels; at
+        // hardness 0.6 the sphere's pole holds 22 to 70 such texels, over 0.1 %)
+        let flips = (LIT_SIZE * LIT_SIZE / 1000) as usize;
+        assert_lit_matches(&mut gpu, &project(0.4), &bakes, (true, Tolerance::TRANSCENDENTAL.with_flips(flips)), "a steep mask comparing its lit Base Color");
     }
 
     /// One content effect of the lit layer: filter, opacity, blend, and whether it starts on Base
