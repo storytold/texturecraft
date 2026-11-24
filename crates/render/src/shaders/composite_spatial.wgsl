@@ -103,6 +103,7 @@ fn previous_field(start: u32, count: u32) -> u32 {
 // its input (FilterStage::input_kind in Rust)
 const INPUT_LAYER: u32 = 2u;
 const INPUT_COLOR: u32 = 4u;
+const OWN_VIEW: u32 = 8u;
 
 @compute @workgroup_size(8, 8)
 fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -141,36 +142,117 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
         let texel = LayerTexel(pixel, uv, surface, baked, projected);
         let layer = layers[params.filter_stage.z];
         let count = params.filter_stage.w & 0x0fffffffu;
-        if (params.filter_stage.w & 0x40000000u) != 0u {
-            let generator = layers[params.program.x + layer.effects.x + count];
-            prepared = vec4(generator_ramp(generator, texel), 0.0, 0.0, 1.0);
-        } else if enable_anchor_reads && (params.filter_stage.w & 0x30000000u) != 0u {
-            var triangle = 0xffffffffu;
-            if (params.coverage.w & GEOMETRY_MASKS) != 0u {
-                triangle = textureLoad(surface_uv, vec2<i32>(pixel), 0).x;
-            }
-            if (params.filter_stage.w & 0x20000000u) != 0u {
-                prepared = vec4(capture_material_anchor(texel, params.filter_stage.z, triangle), 1.0);
-            } else if geometry_allows(layer.constraints.x, triangle) {
-                prepared = vec4(vec3(layer_mask(layer, texel, count)), 1.0);
-            }
-        } else if (params.filter_stage.w & 0x80000000u) != 0u {
-            prepared = vec4(layer_mask(layer, texel, count), 0.0, 0.0, 1.0);
-        } else {
-            let content = layer_content(layer, texel, count);
-            prepared = vec4(content.rgb * content.a, content.a);
+        // Every mask and every content goes through one layer_mask and one layer_content call
+        // below, which the driver inlines once each (the call sites, not the paths, set the size)
+        let flags = params.filter_stage.w;
+        let capture = enable_anchor_reads && (flags & 0x20000000u) != 0u;
+        let anchor_mask = enable_anchor_reads && !capture && (flags & 0x10000000u) != 0u;
+        let generator = !capture && !anchor_mask && (flags & 0x40000000u) != 0u;
+        let mask = anchor_mask || (!capture && !generator && (flags & 0x80000000u) != 0u);
+        var triangle = 0xffffffffu;
+        if (capture || anchor_mask) && (params.coverage.w & GEOMETRY_MASKS) != 0u {
+            triangle = textureLoad(surface_uv, vec2<i32>(pixel), 0).x;
         }
-        if params.field_layout.z != 0u {
-            let source = layers[params.field_layout.z - 1u];
-            if (params.field_layout.w & INPUT_LAYER) != 0u {
-                // A layer operation's content times its coverage (Height To Normal's own Height)
-                let content = layer_content(source, texel, source.effects.w);
-                stage_input = vec3(content.x * content.a);
-            } else if (params.field_layout.w & INPUT_COLOR) != 0u {
-                stage_input = base_content(source, texel).rgb;
-            } else {
-                stage_input = vec3(stage_input_value(source, texel));
+        if generator {
+            let source = layers[params.program.x + layer.effects.x + count];
+            prepared = vec4(generator_ramp(source, texel), 0.0, 0.0, 1.0);
+        }
+        // One loop evaluates what the stage needs: a capture's layers below (their masks and
+        // contents blended as the anchor capture does), the stage's mask or its content, and a
+        // layer operation's content as its input (Height To Normal's own Height, INPUT_LAYER)
+        let input_layer = params.field_layout.z != 0u && (params.field_layout.w & INPUT_LAYER) != 0u;
+        var first = params.filter_stage.z;
+        var end = first + select(1u, 0u, generator);
+        if capture {
+            first = 0u;
+            end = params.filter_stage.z;
+        }
+        let input_step = end;
+        if input_layer {
+            end += 1u;
+        }
+        let channel = params.anchor.x;
+        let color_channel = channel == 0u || (channel >= 7u && channel <= 11u);
+        var result = params.anchor_default.rgb;
+        var parents: array<vec3<f32>, 17>;
+        var group_masks: array<f32, 17>;
+        var depth = 0u;
+        for (var i = first; i < end; i++) {
+            let input = i == input_step;
+            var source = layers[select(i, params.field_layout.z - 1u, input)];
+            if capture && !input {
+                if composite_groups && source.ids.y == END_GROUP {
+                    depth -= 1u;
+                    let weight = group_masks[depth] * bitcast<f32>(srgb[source.ids.z + channel]);
+                    result = mix(parents[depth], result, weight);
+                    continue;
+                }
+                if !(composite_groups && source.ids.y == BEGIN_GROUP) && source.ids.x != channel {
+                    continue;
+                }
             }
+            // The mask: a capture's folders and layers (with their height masks), or the stage's
+            var value = 1.0;
+            if !input && (capture || mask) {
+                value = 0.0;
+                if !(capture || anchor_mask) || geometry_allows(source.constraints.x, triangle) {
+                    value = layer_mask(source, texel, select(count, source.effects.y, capture));
+                    if capture {
+                        value = mask_with_height(source, texel, value);
+                    }
+                }
+                if mask {
+                    prepared = select(vec4(value, 0.0, 0.0, 1.0), vec4(vec3(value), 1.0), anchor_mask);
+                    continue;
+                }
+                if composite_groups && source.ids.y == BEGIN_GROUP {
+                    parents[depth] = result;
+                    group_masks[depth] = value;
+                    depth += 1u;
+                    continue;
+                }
+                if value <= 0.0 {
+                    continue;
+                }
+            }
+            // The content
+            var source_count = count;
+            if input {
+                source_count = source.effects.w;
+            } else if capture {
+                source_count = select(source.effects.w, min(source.effects.w, params.anchor.z), i >= params.anchor.y);
+            } else if (params.field_layout.w & OWN_VIEW) != 0u {
+                // The lit Base Color's own view for its mask: its own fields, the default material
+                source.spatial.x = params.anchor.y;
+                source.spatial.y = 1u;
+                reading_own_layer = true;
+            }
+            let content = layer_content(source, texel, source_count);
+            reading_own_layer = false;
+            if input {
+                // A layer operation's content times its coverage
+                stage_input = vec3(content.x * content.a);
+            } else if capture {
+                let mode = u32(source.balance.z);
+                let weight = source.low.w * value * select(content.a, 1.0, mode == 2u && content.a > 0.0);
+                if weight > 0.0 {
+                    if color_channel {
+                        result = mix(result, blend_rgb(mode, result, content.rgb), weight);
+                    } else {
+                        result = vec3(lerp(result.x, blend_scalar(mode, result.x, content.x), weight));
+                    }
+                }
+            } else {
+                prepared = vec4(content.rgb * content.a, content.a);
+            }
+        }
+        if capture {
+            prepared = vec4(result, 1.0);
+        }
+        if params.field_layout.z != 0u && !input_layer {
+            // An input source's colour, or its gray (P3's stage_input_value is its base content's x)
+            let source = base_content(layers[params.field_layout.z - 1u], texel);
+            stage_input = select(vec3(source.x), source.rgb, (params.field_layout.w & INPUT_COLOR) != 0u);
         }
         geometric_weight = 1.0;
     }

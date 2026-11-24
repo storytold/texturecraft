@@ -459,7 +459,11 @@ fn p1_read_image(op: Operation, image: u32, point: vec2<f32>, surface: Surface, 
     read.ids.w = kind;
     read.procedural.w = P1_POINT_PROJECTION;
     read.projection = vec4(footprint, select(0.0, 1.0, linear), 0.0, 0.0);
-    return value(read, point, surface);
+    // The image path of `value` alone: its patterns would be inlined at every read
+    if !enable_authored_images {
+        return vec3(0.5);
+    }
+    return authored_image_value(read, point, surface);
 }
 
 // An image source's value from its samples (compose Texel::source): read as stored, weighed, then decoded for the channel
@@ -497,14 +501,15 @@ fn p1_image_value(op: Operation, samples: P1Samples, surface: Surface, footprint
     }
 }
 
-// A procedural source's value from its pattern points: the pattern code weighs and shapes them
-fn p1_procedural_value(op: Operation, samples: P1Samples, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
+// A procedural source read at its pattern points: the pattern code weighs and shapes them
+// (`value` of the returned operation)
+fn p1_procedural_planes(op: Operation, samples: P1Samples) -> Operation {
     var planes = op;
     planes.procedural.w = P1_PLANES_PROJECTION;
     planes.projection = vec4(samples.points[0], samples.points[1]);
     planes.constraints = vec4(bitcast<vec2<u32>>(samples.points[2]), 0u, 0u);
     planes.balance = vec4(op.balance.x, samples.weights);
-    return procedural_value(planes, uv, surface);
+    return planes;
 }
 
 // A world point in the turned and stretched frame: across and up in frame sizes, out in world units; w 0 if not finite (compose frame_local)
@@ -1008,10 +1013,13 @@ fn p1_fill_once(op: Operation, uv: vec2<f32>, surface: Surface, neighbours: P1Ne
             footprints = p1_footprints(op, samples, uv, neighbours, copy, vec2<f32>(vec2(srgb[op.ids.z], srgb[op.ids.z + 1u])));
         }
         rgb = p1_image_value(op, samples, surface, footprints);
-    } else if kind != 0u && kind != P1_ANCHOR_SOURCE {
-        rgb = p1_procedural_value(op, p1_pattern_points(op, projected.coords), uv, surface);
     } else {
-        rgb = value(op, uv, surface);
+        // Patterns and plain sources through one `value` call (the driver inlines each call site)
+        var source = op;
+        if kind != 0u && kind != P1_ANCHOR_SOURCE {
+            source = p1_procedural_planes(op, p1_pattern_points(op, projected.coords));
+        }
+        rgb = value(source, uv, surface);
     }
     return vec4(rgb, p1_cover(op, coords, projected, uv, copied, neighbours, copy));
 }
@@ -1069,15 +1077,22 @@ fn p1_copy(op: Operation, index: u32, pivot: vec3<f32>) -> P1Copy {
 }
 
 // Every copy of a symmetric fill laid over the others, the texel's own copy on top (compose Texel::symmetric_copies, in mesh radii)
-fn p1_symmetric(op: Operation, uv: vec2<f32>, surface: Surface, neighbours: P1Neighbours) -> vec4<f32> {
-    let pivot = p1_vec3(op, P1_SYMMETRY_POSITION);
-    let axis = param_word(op, P1_SYMMETRY_AXIS);
-    let count = param_word(op, P1_SYMMETRY_COUNT);
+// `symmetric` false: the fill once, as it is (one p1_fill_once call site for both: the driver
+// inlines each call site)
+fn p1_symmetric(op: Operation, uv: vec2<f32>, surface: Surface, neighbours: P1Neighbours, symmetric: bool) -> vec4<f32> {
+    var pivot = vec3(0.0);
+    var axis = 0u;
+    var count = 1u;
+    if symmetric {
+        pivot = p1_vec3(op, P1_SYMMETRY_POSITION);
+        axis = param_word(op, P1_SYMMETRY_AXIS);
+        count = param_word(op, P1_SYMMETRY_COUNT);
+    }
     let from_pivot = surface.position - pivot;
 
     // The copy whose half (mirror) or wedge (radial) holds the texel comes first
-    var first = select(0u, 1u, from_pivot[axis] < 0.0);
-    if param_word(op, P1_SYMMETRY_KIND) != 0u {
+    var first = select(0u, 1u, symmetric && from_pivot[axis] < 0.0);
+    if symmetric && param_word(op, P1_SYMMETRY_KIND) != 0u {
         let turned = degrees(atan2(from_pivot[(axis + 2u) % 3u], from_pivot[(axis + 1u) % 3u]));
         first = p1_nearest_copy(select(turned, turned + P1_FULL_TURN_DEGREES, turned < 0.0), param(op, P1_SYMMETRY_STEP), count, param(op, P1_SYMMETRY_SPAN));
     }
@@ -1085,7 +1100,14 @@ fn p1_symmetric(op: Operation, uv: vec2<f32>, surface: Surface, neighbours: P1Ne
     var color = vec3(0.0);
     var cover = 0.0;
     for (var next = 0u; next < count; next++) {
-        let one = p1_fill_once(op, uv, surface, neighbours, p1_copy(op, (first + next) % count, pivot));
+        var copy = p1_identity_copy();
+        if symmetric {
+            copy = p1_copy(op, (first + next) % count, pivot);
+        }
+        let one = p1_fill_once(op, uv, surface, neighbours, copy);
+        if !symmetric {
+            return one;
+        }
         let weight = clamp(one.a, 0.0, 1.0) * (1.0 - cover);
         color += one.rgb * weight;
         cover += weight;
@@ -1105,9 +1127,5 @@ fn projection_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> v
     let neighbours = p1_neighbours(layer, uv);
 
     // An uncovered texel has no place to copy, so it samples the fill once
-    if (layer.ext.y & P1_SYMMETRY) != 0u && surface.valid {
-        return p1_symmetric(layer, uv, surface, neighbours);
-    }
-
-    return p1_fill_once(layer, uv, surface, neighbours, p1_identity_copy());
+    return p1_symmetric(layer, uv, surface, neighbours, (layer.ext.y & P1_SYMMETRY) != 0u && surface.valid);
 }

@@ -91,6 +91,9 @@ fn extended_mask_effect(effect: Operation, mask: f32, texel: LayerTexel) -> f32 
 // bound by FilterPlan::bind_stack_reads): every layer below the effect's layer, or also its
 // own operations before Base Color. Zero without a read.
 fn stack_at(effect: Operation, pixel: vec2<u32>) -> vec3<f32> {
+    if reading_own_layer && effect.effects.y == 1u {
+        return channel_default((effect.effects.z & 0xffffu) - 1u);
+    }
     if effect.spatial.w == 0u {
         return vec3(0.0);
     }
@@ -100,21 +103,32 @@ fn stack_at(effect: Operation, pixel: vec2<u32>) -> vec3<f32> {
 // The material of the second channel a package effect asked for (Operation.spatial.z,
 // FilterPlan::bind_stack_reads): P6's Metallic and Roughness, or Glossiness and Specular.
 fn stack_at_second(effect: Operation, pixel: vec2<u32>) -> vec3<f32> {
+    if reading_own_layer && effect.effects.y == 1u {
+        return channel_default((effect.effects.z >> 16u) - 1u);
+    }
     if effect.spatial.z == 0u {
         return vec3(0.0);
     }
     return filter_value(effect.spatial.z - 1u, pixel).rgb;
 }
 
-// The effect's layer's own content of the read channel (Operation.effects.x), with its coverage
-// in alpha: Compare's This Layer mixes it over stack_at. Call it from mask effects only:
-// layer_content reaches the content hooks, and WGSL rejects recursion.
+// Set while the prepare pass evaluates the lit Base Color as its mask reads it (OWN_VIEW): the
+// CPU evaluates a mask with no lit material (Texel::lit is None while node_mask runs), so the
+// layer's own-material reads (Operation.effects.y 1) give the channels' defaults there
+// (channel_default; their channel slots plus one in effects.z).
+var<private> reading_own_layer: bool = false;
+
+// The effect's layer's own content of the read channel, with its coverage in alpha: Compare's
+// This Layer mixes it over stack_at. It reads the field of its This Layer stage (slot plus one in
+// Operation.effects.z, FilterPlan::add_this_layer_reads), prepared from the whole content stack
+// before the mask: no content code inline in the mask's.
 fn this_layer_content(effect: Operation, texel: LayerTexel) -> vec4<f32> {
-    if effect.effects.x == 0u {
+    if effect.effects.z == 0u {
         return vec4(0.0);
     }
-    let layer = layers[effect.effects.x - 1u];
-    return layer_content(layer, texel, layer.effects.w);
+    let field = filter_value(effect.effects.z - 1u, texel.pixel);
+    let coverage = clamp(field.a, 0.0, 1.0);
+    return vec4(select(vec3(0.0), field.rgb / coverage, coverage > 1e-5), coverage);
 }
 
 // The effect's image input at the texel (Operation.effects.w, ProceduralInputs::register_input).

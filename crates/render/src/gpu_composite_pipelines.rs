@@ -122,11 +122,6 @@ impl Features {
                 "fn previous_field(start: u32, count: u32) -> u32 { return 0u; }\n                 fn filter_value(slot: u32, pixel: vec2<u32>) -> vec4<f32> { return vec4(0.0); }\n                 var<private> preceding_field: u32 = 0xffffffffu;\n                 fn preceding_stage_word(pixel: vec2<u32>) -> f32 { return 0.0; }",
             ),
             include(
-                self.material_anchors,
-                include_str!("shaders/composite_anchors.wgsl"),
-                "fn capture_material_anchor(texel: LayerTexel, end: u32, triangle: u32) -> vec3<f32> { return params.anchor_default.rgb; }",
-            ),
-            include(
                 self.color_selection && supports_id,
                 include_str!("shaders/id_sample.wgsl"),
                 "fn id_color_at(pixel: vec2<u32>) -> vec3<f32> { return vec3(0.0); }",
@@ -153,7 +148,9 @@ impl Features {
             include_str!("shaders/composite.wgsl"),
         ]
         .into_iter()
-        .chain(packages::shader_sources(self.packages))
+        .map(str::to_string)
+        .chain(packages::shader_sources(self.packages).into_iter().map(str::to_string))
+        .chain(std::iter::once(super::channel_defaults_wgsl()))
         .collect::<Vec<_>>()
         .join("\n")
     }
@@ -316,6 +313,104 @@ mod tests {
             }
         }
         naga_check("neighbourhood", &NeighbourhoodGpu::source(), &NeighbourhoodGpu::ENTRY_POINTS, &[Vec::new()]);
+    }
+
+    /// Cold compile times of realistic programs' pipelines (run with the driver's shader cache
+    /// off, e.g. `__GL_SHADER_DISK_CACHE=0` on NVIDIA): a material of fills with Blur, Levels and
+    /// lighting under a generator mask, a mask comparing the layers below and this layer, and the
+    /// test variant with every package and feature.
+    #[test]
+    #[ignore = "a measurement: cold pipeline compiles"]
+    #[allow(clippy::unwrap_used)] // A measurement: a program that does not build fails it
+    fn bench_cold_pipeline_compile() {
+        use std::collections::BTreeMap;
+
+        use texturecraft_compose::PixelStore;
+        use texturecraft_core::{
+            Channel, CompareOp, CompareSource, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, Layer, LayerKind, Levels, Mask, MaskBackground,
+            Project, Source, StylizedLighting, TextureSet,
+        };
+
+        use crate::gpu_composite::CompositeProgram;
+
+        let Some(gpu) = oracle::headless() else { return };
+        let channels = [Channel::BaseColor, Channel::Metallic, Channel::Roughness, Channel::Normal, Channel::Height];
+        let fill = |values: [f32; 3]| Fill {
+            sources: channels.iter().map(|&channel| (channel, Source::Uniform(values))).collect::<BTreeMap<_, _>>(),
+            ..Default::default()
+        };
+        let project = |content: Vec<EffectKind>, mask: Vec<EffectKind>| {
+            let mut project = Project::new("Compile", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Plane", 0, 256));
+            let below = project.alloc_id();
+            project.insert_layer(0, Layer::new(below, "Below", LayerKind::Fill(fill([0.3; 3])), &channels), None, false).unwrap();
+            let owner = project.alloc_id();
+            let mut layer = Layer::new(owner, "Layer", LayerKind::Fill(fill([0.6; 3])), &channels);
+            for kind in content {
+                layer.content_effects.push(Effect::new(project.alloc_id(), kind));
+            }
+            if !mask.is_empty() {
+                let mut layer_mask = Mask::new(MaskBackground::White);
+                for kind in mask {
+                    layer_mask.effects.push(Effect::new(project.alloc_id(), kind));
+                }
+                layer.mask = Some(layer_mask);
+            }
+            project.insert_layer(0, layer, None, false).unwrap();
+            project
+        };
+        let lighting = Filter::BakedLighting {
+            azimuth: 30.0,
+            elevation: 50.0,
+            light: 1.0,
+            ambient: 1.0,
+            occlusion: 0.4,
+            stylized: Some(Box::new(StylizedLighting::library())),
+        };
+        let compare = |left| EffectKind::Compare {
+            op: CompareOp::GreaterThan,
+            value: 0.4,
+            tolerance: 0.1,
+            left,
+            right: CompareSource::Constant,
+            channel: Channel::Roughness,
+            hardness: 0.5,
+        };
+        let cases = [
+            (
+                "material: Blur, Levels, lighting, generator mask",
+                project(
+                    vec![EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false }), EffectKind::Levels(Levels::default()), EffectKind::Filter(lighting)],
+                    vec![EffectKind::Generator(Generator::new(GeneratorKind::Dirt))],
+                ),
+            ),
+            ("mask comparing Layers Below and This Layer", project(Vec::new(), vec![compare(CompareSource::LayersBelow), compare(CompareSource::ThisLayer)])),
+            ("plain fill", project(Vec::new(), Vec::new())),
+        ];
+        let compositor = GpuCompositor::new(&gpu.device);
+        let (curvature, id) = (compositor.pipelines.supports_curvature, compositor.pipelines.supports_id);
+        let programs =
+            cases.map(|(label, project)| (label, Features::of(&CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).unwrap())));
+        let everything =
+            variants().into_iter().filter(|features| features.mask_preview || (features.spatial && !features.generators)).map(|features| ("variant", features));
+        for (label, features) in programs.into_iter().chain(everything) {
+            let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tc_bench"),
+                source: wgpu::ShaderSource::Wgsl(features.source(curvature, id).into()),
+            });
+            for entry in entry_points(features) {
+                let started = std::time::Instant::now();
+                let _pipeline = gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&compositor.pipeline_layout),
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: wgpu::PipelineCompilationOptions { constants: &features.constants(false), ..Default::default() },
+                    cache: None,
+                });
+                eprintln!("COMPILE {label} {:?} preview {}, {entry}: {:?}", features.packages, features.mask_preview, started.elapsed());
+            }
+        }
     }
 
     /// The same programs as compute pipelines on the adapter, as `CompositePipelines::get`

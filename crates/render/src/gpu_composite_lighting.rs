@@ -376,12 +376,10 @@ mod tests {
     }
 
     /// A lit layer with a stage after its lighting whose blurred mask compares the layer's own
-    /// lit Base Color (P3's This Layer). The CPU's mask reads that content with no lit material
-    /// (`Texel::lit` is None while the mask is evaluated), resuming from Base Color fields whose
-    /// lighting took the material, and that material is laid under the same mask: a cycle whose
-    /// CPU result depends on which fields exist when. Open until the CPU's meaning is settled.
+    /// lit Base Color (P3's This Layer): the CPU evaluates the mask with no lit material
+    /// (`Texel::lit` is None while `node_mask` runs), so the mask reads the Base Color lit with
+    /// the default material, on its own copy of the Base Color's stages (`add_own_view`).
     #[test]
-    #[ignore = "a mask comparing its lit Base Color reads it through a cycle on the CPU"]
     fn a_mask_comparing_its_lit_base_color_matches_the_cpu() {
         use texturecraft_core::{BlendMode, Channel, CompareOp, CompareSource, Effect, EffectKind, StylizedLighting};
 

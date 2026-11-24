@@ -194,7 +194,8 @@ fn box_segment(line: u32, vertical: bool, start: u32, end: u32) {
 fn box_blur(@builtin(global_invocation_id) id: vec3<u32>) {
     let vertical = params.buffers.w != 0u;
     let size = select(params.rect.zw, params.rect.wz, vertical);
-    let line = id.x;
+    // A dispatch split by lines (NeighbourhoodGpu::run under a work budget) starts at line stage.z
+    let line = id.x + params.stage.z;
     if line >= size.y { return; }
     if stage_wraps() {
         box_segment(line, vertical, 0u, size.x);

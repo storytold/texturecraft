@@ -21,12 +21,9 @@ fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 {
         }
         var weight = e.low.w;
         var result: f32;
-        if e.ids.y == 10u {
-            let sampled = painted(e, texel.pixel, texel.projected);
-            result = blend_scalar(u32(e.balance.z), mask, sampled.x);
-            weight *= sampled.w;
-        } else if is_fill_opcode(e.ids.y) {
-            let sampled = fill_value(e, texel.uv, texel.surface);
+        if is_fill_opcode(e.ids.y) {
+            // Paint and fills through one base_content call: the driver inlines each call site
+            let sampled = base_content(e, texel);
             result = blend_scalar(u32(e.balance.z), mask, sampled.x);
             weight *= sampled.a;
         } else if enable_generators && e.ids.y >= 40u && e.ids.y < 48u {

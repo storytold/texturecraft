@@ -28,7 +28,8 @@
 //!   `stack_mask_effect` (or directly in composite_mask_effects.wgsl);
 //!   flags go in `op.ext[2] & STACK_OP_BITS`, numbers in the side table (`pack_params`).
 //! - Inputs: set `FilterStage::input` to the source operation's index plus one; the prepare pass
-//!   then writes `stage_input_value(op, texel)` (this WGSL file) into the field's sixth word and
+//!   then writes the source's base content (`base_content(op, texel).x`, what `stage_input_value`
+//!   in this WGSL file gives point operations; one call site keeps the prepare pass small) into the field's sixth word and
 //!   every field of the program grows to six words (`FilterPlan::field_words`). Images go through
 //!   `MaterialImages::register_image(name, ImageUse::Material)`.
 //! - Folder offsets: call `ContentsOffset::apply` on the `Projection` before `source_operation`

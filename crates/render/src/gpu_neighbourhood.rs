@@ -151,8 +151,10 @@ impl StageInputs {
 /// A work budget the kernels run under (`NeighbourhoodGpu::budget`)
 struct Budget {
     queue: wgpu::Queue,
-    /// The apply pipeline's address: only its dispatch reads its first row from `stage.z`
+    /// The apply and box pipelines' addresses: only their dispatches read their first row or
+    /// line from `stage.z`
     apply: usize,
+    box_blur: usize,
     work_per_texel: u64,
     limit: u64,
 }
@@ -497,7 +499,13 @@ impl NeighbourhoodGpu {
     /// row chunks, each submitted on its own (the whole-set pre-pass, whose fields span the set).
     /// The packages' own passes run whole.
     pub(crate) fn budget(&self, queue: &wgpu::Queue, work_per_texel: u64, limit: u64) -> BudgetGuard {
-        BUDGET.set(Some(Budget { queue: queue.clone(), apply: std::ptr::from_ref(&self.apply) as usize, work_per_texel, limit }));
+        BUDGET.set(Some(Budget {
+            queue: queue.clone(),
+            apply: std::ptr::from_ref(&self.apply) as usize,
+            box_blur: std::ptr::from_ref(&self.box_blur) as usize,
+            work_per_texel,
+            limit,
+        }));
         BudgetGuard
     }
 
@@ -509,22 +517,32 @@ impl NeighbourhoodGpu {
         params: &Params,
         groups: [u32; 2],
     ) {
+        // The apply pass splits by rows of workgroups, the box passes by lines (`stage.z` holds
+        // the first row or line of a chunk)
+        let address = std::ptr::from_ref(pipeline) as usize;
         let budget = BUDGET.with_borrow(|budget| {
             budget
                 .as_ref()
-                .filter(|budget| budget.apply == std::ptr::from_ref(pipeline) as usize)
-                .map(|budget| (budget.queue.clone(), budget.work_per_texel, budget.limit))
+                .filter(|budget| budget.apply == address || budget.box_blur == address)
+                .map(|budget| (budget.queue.clone(), budget.work_per_texel, budget.limit, budget.box_blur == address))
         });
-        if let Some((queue, work_per_texel, limit)) = budget {
-            let row_work = u64::from(groups[0]) * u64::from(APPLY_WORKGROUP * APPLY_WORKGROUP) * work_per_texel.max(1);
-            let rows = (limit / row_work.max(1)).clamp(1, u64::from(groups[1].max(1))) as u32;
-            if rows < groups[1] {
+        if let Some((queue, work_per_texel, limit, lines)) = budget {
+            let (axis, step, group_work) = if lines {
+                let length = if params.buffers[3] != 0 { params.rect[3] } else { params.rect[2] };
+                (0, LINE_WORKGROUP, u64::from(LINE_WORKGROUP) * u64::from(length))
+            } else {
+                (1, APPLY_WORKGROUP, u64::from(groups[0]) * u64::from(APPLY_WORKGROUP * APPLY_WORKGROUP))
+            };
+            let per_chunk = (limit / (group_work * work_per_texel.max(1)).max(1)).clamp(1, u64::from(groups[axis].max(1))) as u32;
+            if per_chunk < groups[axis] {
                 let mut first = 0;
-                while first < groups[1] {
-                    let count = rows.min(groups[1] - first);
+                while first < groups[axis] {
+                    let count = per_chunk.min(groups[axis] - first);
                     let mut chunk = *params;
-                    chunk.stage[2] = first * APPLY_WORKGROUP;
-                    Self::dispatch(pipeline, device, encoder, scratch, &chunk, [groups[0], count]);
+                    chunk.stage[2] = first * step;
+                    let mut split = groups;
+                    split[axis] = count;
+                    Self::dispatch(pipeline, device, encoder, scratch, &chunk, split);
                     first += count;
                     let finished =
                         std::mem::replace(encoder, device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_neighbourhood") }));
@@ -688,6 +706,7 @@ mod tests {
             ("a stage below a wrapping stage below", vec![small.clone(), wrap.clone(), wide.clone()], reach(&wide), reach(&small) + reach(&wrap), None),
             ("a wrapping stage above", vec![wide.clone(), wrap.clone()], reach(&wide), 0, None),
             ("a gather in row chunks", vec![warp.clone(), wrap.clone()], reach(&warp), 0, Some(4096)),
+            ("box passes in line chunks", vec![wide.clone(), wrap.clone()], reach(&wide), 0, Some(4096)),
             ("paint in windows per chunk", vec![wrap.clone(), wide.clone()], reach(&wide), reach(&wrap), None),
         ];
         for (label, stack, whole_reach, past_edges, budget) in cases {

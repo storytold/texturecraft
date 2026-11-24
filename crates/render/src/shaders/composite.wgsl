@@ -792,13 +792,8 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let index = id.y * params.program.y + id.x;
     let texel = LayerTexel(pixel, uv, surface, mask_bakes, projected);
-    if composite_mask_preview {
-        var gray = 0u;
-        if covered {
-            let layer = layers[params.anchor.w];
-            gray = u32(layer_mask(layer, texel, layer.effects.y) * 255.0 + 0.5);
-        }
-        output[index] = (gray * 0x00010101u) | 0xff000000u;
+    if composite_mask_preview && !covered {
+        output[index] = 0xff000000u;
         return;
     }
     var base = vec3(0.5);
@@ -814,14 +809,45 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         triangle = textureLoad(surface_uv, vec2<i32>(pixel), 0).x;
     }
     var group_depth = 0u;
-    for (var i = 0u; covered && i < params.program.x; i++) {
+    // The mask preview runs the loop over its one layer, for its mask alone: every mask goes
+    // through the one layer_mask call below, which the driver inlines once
+    var first = 0u;
+    var end = params.program.x;
+    if composite_mask_preview {
+        first = params.anchor.w;
+        end = first + 1u;
+    }
+    for (var i = first; covered && i < end; i++) {
         let layer = layers[i];
-        if composite_groups {
-            if layer.ids.y == BEGIN_GROUP {
-                var mask = 0.0;
-                if geometry_allows(layer.constraints.x, triangle) {
-                    mask = mask_with_height(layer, texel, layer_mask(layer, texel, layer.effects.y));
+        let group = composite_groups && layer.ids.y == BEGIN_GROUP;
+        if composite_groups && layer.ids.y == END_GROUP {
+            group_depth -= 1u;
+            let mixed = mix_group_parent(group_depth, index, layer.ids.z, MaterialValues(base, normal, scalars, lobe_colors, lobe_values));
+            base = mixed.base;
+            normal = mixed.normal;
+            scalars = mixed.scalars;
+            lobe_colors = mixed.lobe_colors;
+            lobe_values = mixed.lobe_values;
+            continue;
+        }
+        if !group && (layer.ids.x == 0xffffffffu || !geometry_allows(layer.constraints.x, triangle)) && !composite_mask_preview { continue; }
+        // A folder's mask, or a layer's mask when its mask range changes
+        if composite_mask_preview || group || (layer.effects.y != 0u && last_mask != layer.effects.x) {
+            var mask = 0.0;
+            if composite_mask_preview || !group || geometry_allows(layer.constraints.x, triangle) {
+                mask = layer_mask(layer, texel, layer.effects.y);
+                if !composite_mask_preview {
+                    mask = mask_with_height(layer, texel, mask);
                 }
+            }
+            if composite_mask_preview {
+                output[index] = (u32(mask * 255.0 + 0.5) * 0x00010101u) | 0xff000000u;
+                return;
+            }
+            if !group {
+                last_mask = layer.effects.x;
+                mask_value = mask;
+            } else {
                 if mask <= 0.0 {
                     // The instruction stores the first operation after its END_GROUP.
                     i = layer.ids.w - 1u;
@@ -831,28 +857,12 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
                 group_depth += 1u;
                 continue;
             }
-            if layer.ids.y == END_GROUP {
-                group_depth -= 1u;
-                let mixed = mix_group_parent(group_depth, index, layer.ids.z, MaterialValues(base, normal, scalars, lobe_colors, lobe_values));
-                base = mixed.base;
-                normal = mixed.normal;
-                scalars = mixed.scalars;
-                lobe_colors = mixed.lobe_colors;
-                lobe_values = mixed.lobe_values;
-                continue;
-            }
         }
-        if layer.ids.x == 0xffffffffu { continue; }
-        if !geometry_allows(layer.constraints.x, triangle) { continue; }
         let mode = u32(layer.balance.z);
         var weight = layer.low.w;
         if layer.effects.y == 0u {
             weight *= layer.balance.y;
         } else {
-            if last_mask != layer.effects.x {
-                last_mask = layer.effects.x;
-                mask_value = mask_with_height(layer, texel, layer_mask(layer, texel, layer.effects.y));
-            }
             weight *= mask_value;
         }
         if weight <= 0.0 { continue; }
