@@ -47,6 +47,32 @@ template. `enabled: false` suppresses that file while reserving its name. When s
 sets produce the same name (ignoring case), programmatic and browser exports keep the first file
 and warn about later duplicates. The desktop export window reports the collision before writing.
 
+`file.exportTextures` with `usdAsset` also writes `<mesh>.usd` (binary USD, Crate) next to the textures: the whole mesh
+(every texture set, whatever `ts` selects) with one UsdPreviewSurface material per texture set. A
+material's inputs read the texture files the export planned for that set with its output template
+(`usdAsset: true`: the sets, options and `reservedNames` of this command; a list of export params such as
+`[{"ts": 0, "preset": "..."}, {"ts": 1}]`, not empty, every entry an object: each entry's sets, options and `reservedNames`, the way the export window,
+which runs one command per texture set, passes the params of all its commands with the last one).
+Bound inputs: `diffuseColor`, `roughness`, `metallic`, `normal`, `emissiveColor`, `opacity`,
+`clearcoat` and `clearcoatRoughness`, each reading the `rgb`, `r`, `g`, `b` or `a` output of the
+file that holds it; other maps (ambient occlusion, height, specular...) are not bound, a UDIM map that lost a tile to an earlier
+set's file name or to an entry's `reservedNames` is not bound, a mesh with no materials gets one implicit `default` material bound to the Default set, and a texture set outside the export has
+no textures. A file name is relative to the file (`./<file>`, with `<UDIM>` for UV tiles). A failure
+to build or write it is named in `warnings` and the command still succeeds. The file is in `files`.
+
+`file.exportTextures` with `materialX: true` also writes an OpenPBR `.mtlx` beside each texture
+set's maps. It reuses compatible maps with OpenPBR names and writes dedicated maps for remaining
+inputs with data. A named OpenPBR map explicitly disabled in `maps` stays disabled. Dedicated maps
+use the effective size, padding and color space. A dedicated replacement for a named map keeps
+its file settings where supported. PSD, JNG, PGM and WebP fall back to the OpenPBR template's PNG
+format and bit depth. MaterialX uses OpenGL normals.
+
+`reservedNames: [file names]` takes the basenames and `materialUdimPatterns` returned by earlier
+`file.exportTextures` calls in the same export. The desktop window passes both when exporting
+one set at a time. Comparisons ignore case. If a name is reserved, the command skips the file
+and names it in `warnings`. Materials omit any map with incomplete tiles or a UDIM pattern
+shared by different sets.
+
 `format` accepts the export window's names (`bmp`, `jpeg`, `jng`, `pgm`, `png`, `targa`, `tiff`,
 `hdr`, `exr`, `webp`, `psd`) and their extensions. `bitDepth: 32` selects floating point for
 TIFF, EXR and HDR. `dithering: true` dithers 8-bit integer output with an ordered pattern, and

@@ -514,7 +514,7 @@ fn normal_present(set: &TextureSet) -> bool {
 }
 
 /// A source with real data in this texture set (constants never count).
-fn source_present(set: &TextureSet, s: &SourceRef) -> bool {
+pub(crate) fn source_present(set: &TextureSet, s: &SourceRef) -> bool {
     match s {
         SourceRef::Channel { channel: Channel::Normal, .. } => normal_present(set),
         SourceRef::Channel { channel, .. } => set.has_channel(*channel),
@@ -864,6 +864,11 @@ impl Sampler<'_> {
 /// Render every file of `opts` for `input`'s texture set.
 pub fn render_maps(input: &ExportInput, options: &ExportOptions) -> Result<Vec<ExportedFile>> {
     let planned = list_outputs(input.project, input.ts, input.mesh_name, options)?;
+    render_planned_maps(input, options, planned)
+}
+
+/// Render the retained plans from `list_outputs` for this input and these options.
+pub fn render_planned_maps(input: &ExportInput, options: &ExportOptions, planned: Vec<PlannedFile>) -> Result<Vec<ExportedFile>> {
     let set = input.project.texture_set(input.ts)?;
     let (width, height) = (input.composite.resolution, input.composite.height);
     let grid = set.tile_grid();
@@ -901,6 +906,7 @@ pub fn render_maps(input: &ExportInput, options: &ExportOptions) -> Result<Vec<E
         normal_override: options.normal_format,
         project_normal: input.project.normal_format,
     };
+
     planned
         .into_iter()
         .map(|planned_file| {

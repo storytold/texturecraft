@@ -116,7 +116,8 @@ fn the_export_panel_leads_to_export_textures_and_the_mesh_options() {
         assert!(harness.query_by_label(label).is_some(), "{label}");
     }
     assert!(harness.query_by_label_contains("textures selected for export").is_some());
-    assert!(says_not_available(&mut harness, "Export USD asset"));
+    assert!(!says_not_available(&mut harness, "Export USD asset"));
+    assert!(says_not_available(&mut harness, "Export shader settings"));
 
     harness.get_by_label("Save settings").click();
     harness.run_steps(SETTLE_FRAMES);

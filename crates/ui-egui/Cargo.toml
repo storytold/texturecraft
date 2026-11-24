@@ -27,7 +27,6 @@ log = { workspace = true }
 base64 = "0.22"
 image = { workspace = true }
 craft-image-codecs = { workspace = true }
-zip = { workspace = true }
 
 # The OS UI language for the first run (MIT OR Apache-2.0; the browser asks `navigator.language`).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -62,14 +61,20 @@ skrifa = { version = "0.48", default-features = false, features = ["std"] }
 
 # Browser file I/O (web_files.rs): async pickers and Blob downloads.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+craft-zip = { workspace = true }
 rfd = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["Window", "Document", "HtmlElement", "HtmlAnchorElement", "Blob", "BlobPropertyBag", "Url", "CssStyleDeclaration", "Navigator"] }
 
+[dev-dependencies]
+craft-zip = { workspace = true }
+zip = { workspace = true }
+
 # winit needs a window system on Linux, so the crate's own tests build with X11.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+craft-usd.workspace = true
 eframe = { workspace = true, features = ["x11"] }
 # Offscreen pictures of the whole window (tests/ui_snapshots.rs).
 egui_kittest = { version = "0.37", features = ["wgpu", "eframe"] }
