@@ -744,10 +744,15 @@ impl Session {
     /// the same size drawing the painted layer (an instance), whose texels are the same pixels. A
     /// stencil is sampled at the painted set's surface, which another set's texels do not share.
     fn stroke_feeds(&self, ts: usize) -> bool {
-        let Some(stroke) = self.stroke.as_ref() else { return false };
+        self.stroke.as_ref().is_some_and(|stroke| self.feeds(stroke, ts))
+    }
+
+    /// Whether `stroke` shows live on texture set `ts` (see [`Session::stroke_feeds`]).
+    fn feeds(&self, stroke: &ActiveStroke, ts: usize) -> bool {
         if stroke.ts == ts {
             return true;
         }
+
         if stroke.stencil.is_some() {
             return false;
         }
@@ -801,7 +806,15 @@ impl Session {
     pub fn finished_display_stroke(&self, ts: usize, id: u64, previous_revision: u64) -> Option<&BTreeSet<(u32, u32)>> {
         let end = self.display_stroke_end.as_ref()?;
         let revision = self.caches.get(ts)?.material_revision;
-        (end.ts == ts && end.id == id && end.previous_revision == previous_revision && end.revision == revision).then_some(&end.tiles)
+        let own = end.ts == ts && end.previous_revision == previous_revision && end.revision == revision;
+        let fed = end.fed.contains(&(ts, previous_revision, revision));
+        (end.id == id && (own || fed)).then_some(&end.tiles)
+    }
+
+    /// The texture sets other than its own that `stroke` feeds, with their material revisions.
+    fn fed_revisions(&self, stroke: &ActiveStroke) -> Vec<(usize, u64)> {
+        let fed = |&(set, _): &(usize, &crate::session::SetCache)| set != stroke.ts && self.feeds(stroke, set);
+        self.caches.iter().enumerate().filter(fed).map(|(set, cache)| (set, cache.material_revision)).collect()
     }
 
     /// Commit the active stroke (one undo step).
@@ -862,8 +875,11 @@ impl Session {
         self.revision = self.revision.wrapping_add(1);
 
         let previous_revision = self.caches.get(stroke.ts).map_or(0, |cache| cache.material_revision);
+        let fed_before = self.fed_revisions(&stroke);
         // Recompute committed tiles at low priority because the live preview already shows them
         self.mark_settle(stroke.ts, stroke.target, stroke.canvas.dirty.iter().copied());
+        let revision_of = |set: usize| self.caches.get(set).map_or(0, |cache| cache.material_revision);
+        let fed = fed_before.into_iter().map(|(set, before)| (set, before, revision_of(set))).collect();
         if let Some(cache) = self.caches.get_mut(stroke.ts) {
             self.display_stroke_end = Some(DisplayStrokeEnd {
                 id: stroke.display_id,
@@ -871,6 +887,7 @@ impl Session {
                 previous_revision,
                 revision: cache.material_revision,
                 tiles: stroke.display_tiles,
+                fed,
             });
             cache.finished_dab = brush_tile
                 .filter(|tile| stroke.canvas.dirty.contains(tile) && (cache.dirty.contains(tile) || cache.upload.contains(tile) || cache.settle.contains(tile)))
@@ -882,6 +899,7 @@ impl Session {
     /// Abandon the active stroke (Esc).
     pub fn cancel_stroke(&mut self) {
         if let Some(st) = self.stroke.take() {
+            let fed = self.fed_revisions(&st).into_iter().map(|(set, revision)| (set, revision, revision)).collect();
             self.mark_painted(st.ts, st.target, st.canvas.dirty.iter().copied(), false);
             if st.target.is_none() {
                 self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
@@ -894,7 +912,7 @@ impl Session {
             if let Some(cache) = self.caches.get(st.ts) {
                 let revision = cache.material_revision;
                 self.display_stroke_end =
-                    Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision: revision, revision, tiles: st.canvas.dirty });
+                    Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision: revision, revision, tiles: st.canvas.dirty, fed });
             }
         }
     }

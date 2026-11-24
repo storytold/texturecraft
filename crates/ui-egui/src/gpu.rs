@@ -240,6 +240,7 @@ pub struct GpuReports {
 /// Most distinct uncaptured GPU errors kept until the UI shows them.
 const MAX_GPU_ERRORS: usize = 8;
 const GPU_COMPOSITE_ERROR: &str = n_("GPU compositing reported a device error. See the app log for details.");
+const NO_COVERED_TEXELS: &str = n_("The texture set has no covered UV texels.");
 
 #[derive(Default)]
 struct SetCompositor {
@@ -290,14 +291,19 @@ impl SetCompositor {
             return Err(GPU_COMPOSITE_ERROR);
         }
         let edits_view = !session.quick_mask.editing && mask.is_none_or(|id| session.stroke_mask_owner() == Some(session.doc.project.mask_owner(id)));
-        let stroke = session.pending_display_stroke(ts).filter(|_| edits_view);
+        let padding = mask.is_none().then(|| cache.dilation.mixed_coverage()).flatten();
+        let uncovered = mask.is_none() && !cache.dilation.fully_covered() && padding.is_none();
+
+        // A set fed by another set's stroke that is rejected for its material or coverage shows the stroke on release
+        let fed = session.stroke_texture_set() != Some(ts);
+        let fed_rejected = fed && (uncovered || self.rejected.is_some_and(|(rejected, _)| rejected == key));
+        let stroke = session.pending_display_stroke(ts).filter(|_| edits_view && !fed_rejected);
         if edits_view && session.stroke_texture_set() == Some(ts) && stroke.is_none() {
             return Err(n_("This painting tool uses CPU compositing."));
         }
 
-        let padding = mask.is_none().then(|| cache.dilation.mixed_coverage()).flatten();
-        if mask.is_none() && !cache.dilation.fully_covered() && padding.is_none() {
-            return Err(n_("The texture set has no covered UV texels."));
+        if uncovered {
+            return Err(NO_COVERED_TEXELS);
         }
         let stroke_id = stroke.map(|(id, _)| id);
         let current = self.current == Some(key);
@@ -655,8 +661,9 @@ impl GpuLink {
                     ""
                 }
                 Err(reason) => {
-                    // A set the device stroke feeds shows it on the CPU only from the stroke's alpha
-                    let feeds = session.stroke_texture_set() == Some(ts) || session.pending_display_stroke(ts).is_some();
+                    // A set the device stroke feeds shows it on the CPU only from the stroke's alpha, unless it is rejected for its material or coverage
+                    let structural = reason == NO_COVERED_TEXELS || state.rejected.is_some_and(|(_, rejected)| rejected == reason);
+                    let feeds = session.stroke_texture_set() == Some(ts) || (session.pending_display_stroke(ts).is_some() && !structural);
                     if feeds && !(gpu_quick_mask && session.quick_mask_stroke(ts).is_some()) {
                         session.materialize_device_stroke(Some(reason));
                     }
@@ -2935,7 +2942,9 @@ pub(crate) mod tests {
         s.begin_stroke_uv(Vec2::new(x as f32 + 0.5, y as f32 + 0.5) / SIZE as f32, 1.0).unwrap();
         assert!(s.device_stroke().is_some(), "an instance on a set of the same size keeps the stroke on the device");
         let live = display(&mut link, &mut s);
+        let (stroke_id, fed_revision) = (s.pending_display_stroke(1).unwrap().0, s.caches[1].material_revision);
         s.end_stroke().unwrap();
+        assert!(s.finished_display_stroke(1, stroke_id, fed_revision).is_some(), "the fed set recomposites the stroke's region on release");
         let committed = display(&mut link, &mut s);
 
         assert!(live.iter().zip(before).all(|(live, before)| *live != before), "both sets show the stroke live: {live:?}");
