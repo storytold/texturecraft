@@ -205,9 +205,9 @@ fn stroke_alpha(pixel: vec2<u32>, first: u32, count: u32, mask: u32) -> u32 {
     var point = vec3(0.0);
     var normal = vec3(0.0);
     var geometric = vec3(0.0);
+    var back_facing = false;
     var view = BrushView(vec3(0.0), vec3(0.0), 1.0);
     var has_normal = false;
-    var back_facing = false;
     if !uv_mode {
         let xy = unpack2x16unorm(hit.y);
         var weights = vec3(max(0.0, 1.0 - xy.x - xy.y), xy);
