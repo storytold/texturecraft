@@ -36,8 +36,7 @@ pub(crate) const LIBRARY_STILL_ON_CPU: &[&str] = &[];
 
 pub(super) const WGSL: &str = include_str!("shaders/composite_brush.wgsl");
 /// The same functions without P7's code, for programs that do not use it.
-pub(super) const WGSL_STUB: &str =
-    "fn live_brush_paint(layer: Operation, stored: vec4<f32>, m: f32, projected: ProjectedBrush) -> vec4<f32> { return stored; }";
+pub(super) const WGSL_STUB: &str = "fn live_brush_paint(layer: Operation, stored: vec4<f32>, m: f32, projected: ProjectedBrush, pixel: vec2<u32>, uv: vec2<f32>) -> vec4<f32> { return stored; }";
 
 /// Whether a program needs the full `composite_brush.wgsl`.
 pub(super) fn uses_shader(program: &CompositeProgram) -> bool {

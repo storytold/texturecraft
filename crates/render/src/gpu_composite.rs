@@ -8,8 +8,10 @@ use std::{
 
 use bytemuck::{Pod, Zeroable};
 use rayon::prelude::*;
+use texturecraft_compose::environment_sh::EnvironmentSh;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
+use texturecraft_core::project::DisplaySettings;
 use texturecraft_core::{
     BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, ContentsOffset, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter,
     Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Sampling, Source, ThresholdMode,
@@ -81,6 +83,12 @@ const MAX_TILE_WORK_PER_UPDATE: u64 = 8 << 30;
 const MAX_TILE_WORK_PER_BAND: u64 = 64 << 20;
 const MAX_TILE_WORK_PER_SUBMISSION: u64 = 256 << 20;
 const BAKE_MAPS: [BakedMap; 4] = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Thickness];
+/// The maps of the second bake row block, for programs that ask (`ProceduralInputs::read_bake_rows`):
+/// its texel holds the height in x and the stored world normal in yzw (f32 bits). Bit `i` of the
+/// presence word (`bake_has` in WGSL) is set when map `i` is baked.
+const BAKE_ROW_MAPS: [BakedMap; 2] = [BakedMap::Height, BakedMap::WorldNormal];
+/// Side-table words of the environment's diffuse light (`ProceduralInputs::reserve_environment`)
+const ENVIRONMENT_WORDS: usize = 28;
 const MAX_ID_BAKE_BYTES: u64 = 1 << 30;
 const MAX_ID_UPLOAD_BYTES: usize = 64 << 20;
 
@@ -89,17 +97,35 @@ struct BakedInputs {
     width: u32,
     height: u32,
     maps: [Option<Arc<Vec<f32>>>; BAKE_MAPS.len()],
+    /// The second row block's maps ([`BAKE_ROW_MAPS`]), only in programs that read them
+    rows: [Option<Arc<Vec<f32>>>; BAKE_ROW_MAPS.len()],
 }
 
 impl BakedInputs {
-    fn new(baked: &BakedMaps) -> Result<Option<Self>, &'static str> {
-        let maps = BAKE_MAPS.map(|map| baked.maps.get(&map).filter(|data| !data.is_empty()).cloned());
-        let Some(index) = maps.iter().position(Option::is_some) else { return Ok(None) };
-        let height = baked.height(BAKE_MAPS[index]);
-        if height == 0 || baked.resolution == 0 || BAKE_MAPS.iter().zip(&maps).any(|(&map, data)| data.is_some() && baked.height(map) != height) {
+    /// The bakes a program reads: the built-in maps, and with `rows` the second row block's
+    fn new(baked: &BakedMaps, rows: bool) -> Result<Option<Self>, &'static str> {
+        let present = |map: &BakedMap| baked.maps.get(map).filter(|data| !data.is_empty()).cloned();
+        let maps = BAKE_MAPS.map(|map| present(&map));
+        let rows = BAKE_ROW_MAPS.map(|map| present(&map).filter(|_| rows));
+        let all = BAKE_MAPS.iter().zip(&maps).chain(BAKE_ROW_MAPS.iter().zip(&rows));
+        let Some(first) = all.clone().find_map(|(&map, data)| data.as_ref().map(|_| map)) else { return Ok(None) };
+        let height = baked.height(first);
+        if height == 0 || baked.resolution == 0 || all.into_iter().any(|(&map, data)| data.is_some() && baked.height(map) != height) {
             return Err("The baked maps have different layouts and use CPU compositing.");
         }
-        Ok(Some(Self { width: baked.resolution, height, maps }))
+        Ok(Some(Self { width: baked.resolution, height, maps, rows }))
+    }
+
+    /// Row blocks of the bake texture: the built-in maps', and the second block's when a map of it is baked
+    fn blocks(&self) -> u32 {
+        if self.rows.iter().any(Option::is_some) { 2 } else { 1 }
+    }
+
+    /// The band uniform's bake words (`params.id_bake.zw`): rows per block (0: one block, the
+    /// whole texture) and the second block's presence bits
+    fn uniform_words(&self) -> [u32; 2] {
+        let present = self.rows.iter().enumerate().filter(|(_, data)| data.is_some()).fold(0, |bits, (index, _)| bits | 1 << index);
+        [if self.blocks() > 1 { self.height } else { 0 }, present]
     }
 }
 
@@ -245,6 +271,13 @@ struct ProceduralInputs {
     /// Side-table words that hold an image's record offset once the atlas is laid out
     /// (`pack_image`): (word index in the side table, image index).
     image_words: Vec<(u32, u32)>,
+    /// The side-table word where the environment's diffuse light starts, filled at upload
+    /// (`reserve_environment`).
+    environment_word: Option<u32>,
+    /// A lowering reads the Height and World Normal bake rows (`read_bake_rows`).
+    bake_rows: bool,
+    /// The image inputs (`register_input` references) read as colour (`register_color_input`).
+    color_inputs: BTreeSet<u32>,
 }
 
 #[derive(Default)]
@@ -290,7 +323,48 @@ impl ProceduralInputs {
             preceding_stage: None,
             input_sources: Vec::new(),
             image_words: Vec::new(),
+            environment_word: None,
+            bake_rows: false,
+            color_inputs: BTreeSet::new(),
         }
+    }
+
+    /// [`Self::register_input`] for an input read as colour: a neighbourhood stage's field then
+    /// carries its RGB in words 5..8 (`input_color_at` in neighbourhood.wgsl), and a point
+    /// operation reads it with `effect_input_color(effect, texel)`. P5: Color Match's inputs.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn register_color_input(&mut self, source: Operation) -> u32 {
+        let reference = self.register_input(source);
+        self.color_inputs.insert(reference);
+        reference
+    }
+
+    /// Reserve the [`ENVIRONMENT_WORDS`] side-table words that hold the viewport environment's
+    /// diffuse light (`EnvironmentSh`): its nine RGB coefficients as f32 bits in `sh_basis` order
+    /// (coefficient `i`, component `k` at word `3 i + k`), then the environment rotation in
+    /// radians. The program keeps the project's display settings from compile and fills the words
+    /// when it learns the images (`CompositeProgram::set_tile_images`), so a turned or changed
+    /// environment needs no other lowering. Returns their absolute offset (like `pack_words`); a
+    /// second reservation returns the same words. P6: Baked Lighting Environment.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn reserve_environment(&mut self) -> Option<u32> {
+        if let Some(word) = self.environment_word {
+            return LOOKUP_WORDS.checked_add(word);
+        }
+        let word = u32::try_from(self.ramp_words.len()).ok()?;
+        let offset = self.pack_words(&[0; ENVIRONMENT_WORDS])?;
+        self.environment_word = Some(word);
+        Some(offset)
+    }
+
+    /// Ask for the bake rows after the built-in maps: the baked Height and World Normal at
+    /// `baked_block_at(pixel, 1u)` in WGSL (x the height, yzw the stored world normal, f32 bits),
+    /// present when `bake_has(BAKED_HEIGHT)` / `bake_has(BAKED_WORLD_NORMAL)`. The rows exist only
+    /// in programs that ask and only for the maps that are baked. P6: lighting's height slope and
+    /// detail normal.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn read_bake_rows(&mut self) {
+        self.bake_rows = true;
     }
 
     /// Register `source` (a `source_operation`) as an effect's image input: the returned
@@ -393,6 +467,8 @@ struct FilterStage {
     /// The operation (index plus one, 0: none) the prepare pass evaluates into the field's sixth
     /// word: an image input's gray (P3) or the layer's own Height (P5, Height To Normal).
     input: u32,
+    /// How the prepare pass reads `input` ([`INPUT_LAYER`], [`INPUT_COLOR`]; 0: an input source's gray)
+    input_kind: u32,
     /// The prepare pass reads the set periodically outside it (P4: Blur and Bevel `wrap`), and
     /// the fields of the program may start below zero ([`FilterPlan::wraps`]).
     wrap: bool,
@@ -408,8 +484,68 @@ struct FilterStage {
 struct WholeSet {
     stages: Vec<usize>,
     outputs: Vec<usize>,
+    /// The largest pass's reach
     reach: u32,
+    /// One pass per stack, run one after another in the same working space
+    passes: Vec<WholePass>,
 }
+
+/// The whole-set pre-pass of one stack: its stages (a contiguous run of slots), the outputs of
+/// [`WholeSet::outputs`] among them, the reach of its fields, and how far past the set's edges
+/// its fields reach in a wrapping program (the stages at and below its topmost wrapping stage;
+/// a stage that does not wrap reads only the set, its own copy).
+#[derive(Debug, PartialEq)]
+struct WholePass {
+    stages: Vec<usize>,
+    outputs: Vec<usize>,
+    reach: u32,
+    past_edges: u32,
+    /// The working fields its kernels use besides the original ([`NeighbourhoodFilter::blur_fields`])
+    blur_fields: u32,
+}
+
+impl WholePass {
+    /// The compact slot table (`whole_compact` in composite.wgsl): the pass's stages take slots
+    /// 0.., the working fields the next three. Not active when its stages are not contiguous.
+    fn compact(&self, fields: u32) -> [u32; 4] {
+        let (Some(&first), Some(&last)) = (self.stages.first(), self.stages.last()) else { return [0; 4] };
+        if last + 1 - first != self.stages.len() {
+            return [0, 0, fields, 0];
+        }
+        [first as u32, self.stages.len() as u32, fields, 1]
+    }
+
+    /// The slot `slot` takes in the pass's working space ([`Self::compact`]).
+    fn slot(&self, slot: u32, fields: u32) -> u32 {
+        match self.compact(fields) {
+            [_, count, fields, 1] if slot >= fields => count + slot - fields,
+            [base, _, _, 1] => slot - base,
+            _ => slot,
+        }
+    }
+
+    /// Field slots of the pass's working space: its stages, the original and the working fields
+    /// its kernels use
+    fn slots(&self, fields: u32) -> u64 {
+        match self.compact(fields) {
+            [_, count, _, 1] => u64::from(count) + 1 + u64::from(self.blur_fields),
+            _ => u64::from(fields) + 3,
+        }
+    }
+
+    /// The kernels' working fields: the ones the pass has, else the original (never read then)
+    fn blur(&self, fields: u32, offset: impl Fn(u32) -> u32) -> [u32; 2] {
+        let compact = self.compact(fields)[3] == 1;
+        let field = |index: u32| if !compact || self.blur_fields > index { offset(fields + 1 + index) } else { offset(fields) };
+        [field(0), field(1)]
+    }
+}
+
+/// `FilterStage::input_kind`, also the bits of the prepare pass's `field_layout.w`: the input is a
+/// layer operation whose content times coverage the prepare pass evaluates (Height To Normal's
+/// own Height, `layer_content`), or an input source read as colour into words 5..8.
+const INPUT_LAYER: u32 = 2;
+const INPUT_COLOR: u32 = 4;
 
 /// Whole-set stages the band uniform can address (`whole_slots` in composite.wgsl)
 const MAX_WHOLE_SET_STAGES: usize = 4;
@@ -429,26 +565,32 @@ impl FilterStage {
     }
 }
 
+/// What `FilterPlan::compile` has done so far: the layer operations whose content is planned, the
+/// capture stages of the stack reads by (end operation, channel), and the effects bound to one.
+type ContentProgress<'a> = (&'a mut BTreeSet<usize>, &'a mut BTreeMap<(u32, Channel), u32>, &'a mut BTreeSet<usize>);
+
 #[derive(Debug, Default)]
 struct FilterPlan {
     stages: Vec<FilterStage>,
     reach: u32,
     anchor_slots: Vec<u32>,
+    /// The operation index of the first input source (`bind_input_sources`), while compiling
+    input_base: u32,
 }
 
 impl FilterPlan {
     fn compile(operations: &mut [Operation], layer_count: u32, inputs: &ProceduralInputs) -> Self {
-        let reads_stack =
-            operations.iter().skip(layer_count as usize).any(|op| op.spatial[3] != 0 && !(FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]));
+        let reads_stack = operations.iter().skip(layer_count as usize).any(|op| stack_reads(op) != [0; 2]);
         if inputs.filters.is_empty() && inputs.generator_stages.is_empty() && inputs.anchors.reads.is_empty() && !reads_stack {
             return Self::default();
         }
-        let mut plan = Self::default();
+        let mut plan = Self { input_base: (operations.len() - inputs.input_sources.len()) as u32, ..Self::default() };
         let (layers, effects) = operations.split_at_mut(layer_count as usize);
         let mut masks = BTreeMap::new();
         plan.anchor_slots.resize(inputs.anchors.reads.len(), 0);
         let mut stack_reads = BTreeMap::new();
         let mut read_effects = BTreeSet::new();
+        let mut prepared = BTreeSet::new();
         for index in 0..layers.len() {
             if layers[index].ids[1] != ANCHOR_PUBLISH_LAYER {
                 plan.bind_stack_reads(layers, effects, index, (&mut stack_reads, &mut read_effects));
@@ -458,16 +600,25 @@ impl FilterPlan {
                 plan.add_anchor(layer.ids[2], index as u32, MATERIAL_ANCHOR_STAGE, &inputs.anchors, Some((layer.effects[0], layer.effects[1])));
                 continue;
             }
-            let [mask, mask_count, content, content_count] = layer.effects;
+            let [mask, mask_count, _, _] = layer.effects;
+            // A mask reading its own layer's content: that layer's content stacks first, so the
+            // mask's prepare pass resumes from prepared content fields
+            if mask_count > 0 && !masks.contains_key(&mask) && effects.iter().skip(mask as usize).take(mask_count as usize).any(packages::mask_reads_own_layer)
+            {
+                let same_layer = |op: &Operation| op.effects[..2] == layers[index].effects[..2] && !groups::is_group(op) && op.ids[1] != ANCHOR_PUBLISH_LAYER;
+                let end = (index..layers.len()).take_while(|&later| same_layer(&layers[later])).last().map_or(index + 1, |last| last + 1);
+                for own in index..end {
+                    plan.add_layer_content(layers, effects, own, inputs, (&mut prepared, &mut stack_reads, &mut read_effects));
+                }
+            }
             let mask_has_fields = mask_count > 0
                 && *masks.entry(mask).or_insert_with(|| {
                     let before = plan.stages.len();
-                    plan.add_stack(effects, mask, mask_count, index as u32, None, inputs);
+                    plan.add_stack(effects, (mask, mask_count), (index as u32, None), None, inputs);
                     plan.stages.len() != before
                 });
-            let first = plan.stages.len();
-            plan.add_stack(effects, content, content_count, index as u32, Some(slot_kind(layer.ids[0])), inputs);
-            layer.spatial[..3].copy_from_slice(&[first as u32, u32::from(first != plan.stages.len()), u32::from(mask_has_fields)]);
+            plan.add_layer_content(layers, effects, index, inputs, (&mut prepared, &mut stack_reads, &mut read_effects));
+            layers[index].spatial[2] = u32::from(mask_has_fields);
         }
         // An anchor can carry a filter's footprint into the next layer. Independent
         // channels within a layer share a footprint instead of adding to one another.
@@ -504,17 +655,36 @@ impl FilterPlan {
         if outputs.is_empty() {
             return None;
         }
-        let mut stages = Vec::new();
-        let mut reach = 0u32;
+        let mut stacks = BTreeMap::<(u32, bool), (BTreeSet<usize>, Vec<usize>)>::new();
         for &output in &outputs {
             let stack = self.stages[output].stack();
-            let lower: Vec<usize> = (0..=output).filter(|&index| self.stages[index].stack() == stack && !self.stages[index].anchors()).collect();
-            reach = reach.max(lower.iter().fold(0u32, |sum, &index| sum.saturating_add(self.stages[index].reach())));
+            let lower = (0..=output).filter(|&index| self.stages[index].stack() == stack && !self.stages[index].anchors());
+            let (stages, own) = stacks.entry(stack).or_default();
             stages.extend(lower);
+            own.push(output);
         }
+        let passes: Vec<WholePass> = stacks
+            .into_values()
+            .map(|(stages, outputs)| {
+                let stages: Vec<usize> = stages.into_iter().collect();
+                let reach = stages.iter().fold(0u32, |sum, &index| sum.saturating_add(self.stages[index].reach()));
+                let topmost = stages.iter().rposition(|&index| self.stages[index].wrap);
+                let past_edges = topmost.map_or(0, |top| stages[..=top].iter().fold(0u32, |sum, &index| sum.saturating_add(self.stages[index].reach())));
+                let blur_fields = stages
+                    .iter()
+                    .map(|&index| {
+                        let stage = &self.stages[index];
+                        stage.filter.map_or(0, NeighbourhoodFilter::blur_fields).max(u32::from(stage.cell > 1))
+                    })
+                    .max()
+                    .unwrap_or(0);
+                WholePass { stages, outputs, reach, past_edges, blur_fields }
+            })
+            .collect();
+        let mut stages: Vec<usize> = passes.iter().flat_map(|pass| pass.stages.iter().copied()).collect();
         stages.sort_unstable();
-        stages.dedup();
-        Some(WholeSet { stages, outputs, reach })
+        let reach = passes.iter().map(|pass| pass.reach).max().unwrap_or(0);
+        Some(WholeSet { stages, outputs, reach, passes })
     }
 
     /// The halo of a band: every stack's reach, without the stages the whole-set pre-pass
@@ -539,6 +709,12 @@ impl FilterPlan {
     /// stage's slot plus one (`stack_at` in WGSL), and `effects[0]` the layer's own operation of
     /// that channel plus one (0: none; `this_layer_content` in WGSL). P3: Compare reading This
     /// Layer and Layers Below; P6: lighting's material.
+    ///
+    /// A package effect (`packages::EXTENDED_EFFECTS`) may ask for a second channel in
+    /// `spatial[2]` the same way, read with `stack_at_second` (P6: Stylized lighting's Metallic
+    /// and Roughness, or Glossiness and Specular). It is bound like the first, up to the same
+    /// operation, and shares a stage with any read of the same channel there; it gets no
+    /// `this_layer_content`.
     fn bind_stack_reads(
         &mut self,
         layers: &[Operation],
@@ -550,7 +726,7 @@ impl FilterPlan {
         let [mask, mask_count, content, content_count] = layer.effects.map(|word| word as usize);
         let reads: Vec<usize> = (mask..mask + mask_count)
             .chain(content..content + content_count)
-            .filter(|&effect| effects.get(effect).is_some_and(|op| op.spatial[3] != 0) && !done.contains(&effect))
+            .filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2]) && !done.contains(&effect))
             .collect();
         if reads.is_empty() {
             return;
@@ -562,29 +738,64 @@ impl FilterPlan {
         for effect in reads {
             done.insert(effect);
             let op = &mut effects[effect];
-            let slot = op.spatial[3] - 1;
-            let Some(channel) = Channel::ALL.into_iter().find(|&channel| channel_slot(channel) == slot) else {
-                op.spatial[3] = 0;
-                continue;
-            };
             let until =
                 if op.effects[1] == 1 { (first..end).find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor)).unwrap_or(end) } else { first };
-            let stage = *stages.entry((until as u32, channel)).or_insert_with(|| {
-                self.stages.push(FilterStage {
-                    layer: until as u32,
-                    preceding: MATERIAL_ANCHOR_STAGE,
-                    filter: None,
-                    cell: 1,
-                    anchor: Some((channel, u32::MAX, 0)),
-                    input: 0,
-                    wrap: false,
-                    whole: false,
+            let [first_read, second_read] = stack_reads(op);
+            let mut bind = |read: u32| {
+                let slot = read.checked_sub(1)?;
+                let channel = Channel::ALL.into_iter().find(|&channel| channel_slot(channel) == slot)?;
+                let stage = *stages.entry((until as u32, channel)).or_insert_with(|| {
+                    self.stages.push(FilterStage {
+                        layer: until as u32,
+                        preceding: MATERIAL_ANCHOR_STAGE,
+                        filter: None,
+                        cell: 1,
+                        anchor: Some((channel, u32::MAX, 0)),
+                        input: 0,
+                        input_kind: 0,
+                        wrap: false,
+                        whole: false,
+                    });
+                    self.stages.len() as u32
                 });
-                self.stages.len() as u32
-            });
-            op.spatial[3] = stage;
-            op.effects[0] = (first..end).find(|&own| layers[own].ids[0] == slot).map_or(0, |own| own as u32 + 1);
+                Some((slot, stage))
+            };
+            let first_stage = bind(first_read);
+            let second_stage = bind(second_read);
+            op.spatial[3] = first_stage.map_or(0, |(_, stage)| stage);
+            if packages::EXTENDED_EFFECTS.contains(&op.ids[1]) {
+                op.spatial[2] = second_stage.map_or(0, |(_, stage)| stage);
+            }
+            if let Some((slot, _)) = first_stage {
+                op.effects[0] = (first..end).find(|&own| layers[own].ids[0] == slot).map_or(0, |own| own as u32 + 1);
+            }
         }
+    }
+
+    /// The stack reads and the content stack of layer operation `index`, once: its first stage
+    /// and whether it has any in the layer's `spatial[0..2]`. A Normal operation whose stack has a
+    /// Height To Normal stage reads its layer's own Height operation (`INPUT_LAYER`), whose stack
+    /// goes first so the Normal stage's prepare pass reads prepared Height fields.
+    fn add_layer_content(
+        &mut self,
+        layers: &mut [Operation],
+        effects: &mut [Operation],
+        index: usize,
+        inputs: &ProceduralInputs,
+        (prepared, stages, done): ContentProgress,
+    ) {
+        if !prepared.insert(index) {
+            return;
+        }
+        let height = layer_height(layers, effects, index, inputs);
+        if let Some(height) = height.filter(|&height| height != index) {
+            self.add_layer_content(layers, effects, height, inputs, (prepared, stages, done));
+        }
+        self.bind_stack_reads(layers, effects, index, (stages, done));
+        let [_, _, content, content_count] = layers[index].effects;
+        let first = self.stages.len();
+        self.add_stack(effects, (content, content_count), (index as u32, height.map(|height| height as u32)), Some(slot_kind(layers[index].ids[0])), inputs);
+        layers[index].spatial[..2].copy_from_slice(&[first as u32, u32::from(first != self.stages.len())]);
     }
 
     fn add_anchor(&mut self, publication: u32, layer: u32, preceding: u32, inputs: &AnchorInputs, material: Option<(u32, u32)>) {
@@ -598,6 +809,7 @@ impl FilterPlan {
                 cell: 1,
                 anchor: material.map(|(first, cut)| (channel, first, cut)),
                 input: 0,
+                input_kind: 0,
                 wrap: false,
                 whole: false,
             });
@@ -613,7 +825,15 @@ impl FilterPlan {
     #[allow(clippy::too_many_arguments)]
     /// The stages of one effect stack: a mask's when `channel` is None, else the content of a
     /// channel of that kind (the stage context the packages' stages read).
-    fn add_stack(&mut self, effects: &mut [Operation], start: u32, count: u32, layer: u32, channel: Option<ChannelKind>, inputs: &ProceduralInputs) {
+    /// `height` is the layer's own Height operation a Height To Normal stage reads (`layer_height`).
+    fn add_stack(
+        &mut self,
+        effects: &mut [Operation],
+        (start, count): (u32, u32),
+        (layer, height): (u32, Option<u32>),
+        channel: Option<ChannelKind>,
+        inputs: &ProceduralInputs,
+    ) {
         let mask = channel.is_none();
         let first = self.stages.len();
         let mut reach: u32 = 0;
@@ -636,6 +856,7 @@ impl FilterPlan {
                     cell,
                     anchor: None,
                     input: 0,
+                    input_kind: 0,
                     wrap: false,
                     whole: false,
                 });
@@ -650,11 +871,22 @@ impl FilterPlan {
             let whole = filter.whole_set(inputs.resolution);
             effect.spatial[0] = if mask { slot } else { slot - first } as u32;
             let preceding = preceding as u32 | if mask { MASK_STAGE } else { 0 };
-            // An image input the effect registered (`ProceduralInputs::register_input`)
-            let input = effect.effects[3];
+            // An image input the effect registered (`ProceduralInputs::register_input`), read as
+            // colour when registered so; Height To Normal on a Normal operation reads the layer's
+            // own Height in its place
+            let (input, input_kind) = match height.filter(|_| matches!(inputs.filters[effect.ids[2] as usize].0, Filter::HeightToNormal(_))) {
+                Some(height) => (height + 1, INPUT_LAYER),
+                None => {
+                    let input = effect.effects[3];
+                    let color = input != 0 && inputs.color_inputs.contains(&input.saturating_sub(self.input_base));
+                    (input, if color { INPUT_COLOR } else { 0 })
+                }
+            };
+            // The pre-pass carries the lower stages of the stage's own stack only, not the Height's
+            let whole = whole && input_kind != INPUT_LAYER;
             // P4: Blur and Bevel with Wrap read the set periodically past its edges
             let wrap = gpu_neighbourhood::box_family::wraps(filter);
-            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input, wrap, whole });
+            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None, input, input_kind, wrap, whole });
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);
@@ -675,11 +907,56 @@ impl FilterPlan {
     }
 
     /// Words per field texel: four premultiplied components and the UV coverage, plus a sixth
-    /// word when a stage carries an input ([`FilterStage::input`]). One stride for every field
-    /// of the program; the shaders read it from the uniform, never from a literal.
+    /// word when a stage carries an input ([`FilterStage::input`]), or three when one reads its
+    /// input as colour. One stride for every field of the program; the shaders read it from the
+    /// uniform, never from a literal.
     fn field_words(&self) -> u32 {
-        if self.stages.iter().any(|stage| stage.input != 0) { FIELD_WORDS + 1 } else { FIELD_WORDS }
+        if self.stages.iter().any(|stage| stage.input_kind == INPUT_COLOR) {
+            FIELD_WORDS + 3
+        } else if self.stages.iter().any(|stage| stage.input != 0) {
+            FIELD_WORDS + 1
+        } else {
+            FIELD_WORDS
+        }
     }
+
+    /// The kernels' `NeighbourhoodRegion::input` bits for `stage`: the fields carry input words
+    /// (1), the stage has an input of its own (2), the fields carry colour words 5..8 (4).
+    fn input_bits(&self, stage: &FilterStage) -> u32 {
+        let words = self.field_words();
+        u32::from(words > FIELD_WORDS) | (u32::from(stage.input != 0) << 1) | (u32::from(words >= FIELD_WORDS + 3) << 2)
+    }
+}
+
+/// The layer's own Height operation (in the run of operations of layer operation `index`) when
+/// `index` is a Normal operation whose content has a Height To Normal stage: the CPU's stage
+/// reads the layer's Height content times its coverage as its gray (`plan_in(.., Height)`).
+fn layer_height(layers: &[Operation], effects: &[Operation], index: usize, inputs: &ProceduralInputs) -> Option<usize> {
+    let layer = &layers[index];
+    if layer.ids[0] != channel_slot(Channel::Normal) {
+        return None;
+    }
+    let [_, _, content, count] = layer.effects.map(|word| word as usize);
+    let reads = effects.iter().skip(content).take(count).any(|op| {
+        op.ids[1] == NEIGHBOURHOOD_OPCODE && inputs.filters.get(op.ids[2] as usize).is_some_and(|(filter, _)| matches!(filter, Filter::HeightToNormal(_)))
+    });
+    if !reads {
+        return None;
+    }
+    let same_layer = |op: &Operation| op.effects[..2] == layer.effects[..2] && !groups::is_group(op) && op.ids[1] != ANCHOR_PUBLISH_LAYER;
+    let first = (0..index).rev().take_while(|&earlier| same_layer(&layers[earlier])).last().unwrap_or(index);
+    let end = (index..layers.len()).take_while(|&later| same_layer(&layers[later])).last().map_or(index + 1, |last| last + 1);
+    (first..end).find(|&own| layers[own].ids[0] == channel_slot(Channel::Height))
+}
+
+/// The channel slots plus one an effect operation asks the stack for (`FilterPlan::bind_stack_reads`):
+/// `spatial[3]`, and `spatial[2]` for a package effect; 0 for none. Generators use those words for
+/// their own stages.
+fn stack_reads(op: &Operation) -> [u32; 2] {
+    if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]) {
+        return [0; 2];
+    }
+    [op.spatial[3], if packages::EXTENDED_EFFECTS.contains(&op.ids[1]) { op.spatial[2] } else { 0 }]
 }
 
 /// Append the effects' image input sources and rebind each effect's `effects[3]` reference to
@@ -811,6 +1088,34 @@ pub struct CompositeProgram {
     mask_layers: BTreeMap<LayerId, u32>,
     /// Side-table words to fill with image record offsets at upload (`ProceduralInputs::pack_image`)
     image_words: Vec<(u32, u32)>,
+    /// The environment's diffuse light the program reads (`ProceduralInputs::reserve_environment`)
+    environment: Option<LateEnvironment>,
+    /// Upload the second bake row block (`ProceduralInputs::read_bake_rows`)
+    bake_rows: bool,
+}
+
+/// A program's late-bound environment words: where they start in the side table, the display
+/// settings of the compiled project (environment and rotation) and, once the images are known,
+/// the words.
+#[derive(Debug)]
+struct LateEnvironment {
+    word: u32,
+    display: DisplaySettings,
+    words: Option<[u32; ENVIRONMENT_WORDS]>,
+}
+
+impl LateEnvironment {
+    fn new(word: Option<u32>, display: &DisplaySettings) -> Option<Self> {
+        word.map(|word| Self { word, display: display.clone(), words: None })
+    }
+
+    fn set(&mut self, environment: &EnvironmentSh) {
+        let mut words = [0; ENVIRONMENT_WORDS];
+        for (word, value) in words.iter_mut().zip(environment.coefficients().iter().flatten().chain([environment.rotation()].iter())) {
+            *word = value.to_bits();
+        }
+        self.words = Some(words);
+    }
 }
 
 fn display_bit(kind: DisplayKind) -> u32 {
@@ -887,10 +1192,50 @@ impl CompositeProgram {
         self.coverage = Some((coverage, if self.mask_preview { 0 } else { radius.min(15) }));
     }
 
-    /// Resolve named images used by authored fills, decals and Tile Generators.
+    /// Resolve named images used by authored fills, decals and Tile Generators, and the
+    /// environment's diffuse light (an imported environment is an image).
     pub fn set_tile_images(&mut self, images: &ImageStore) {
         self.tile_patterns.set_images(images);
         self.material_images.set_images(images);
+        if let Some(environment) = &mut self.environment {
+            environment.set(&EnvironmentSh::of(&environment.display, images));
+        }
+    }
+
+    /// The environment and rotation (degrees) the program lights with, from the compiled
+    /// project's display settings; None when nothing reads the environment. A viewport compiles
+    /// again when either changes (or the imported environment image does).
+    pub fn environment(&self) -> Option<(&str, f32)> {
+        self.environment.as_ref().map(|environment| (environment.display.environment.as_str(), environment.display.env_rotation))
+    }
+
+    /// Tests: the stage of the layer's Height operation and the stage reading it as its input.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn input_stages(&self) -> (usize, usize) {
+        let stages = &self.filters.stages;
+        let height = stages.iter().position(|stage| self.operations[stage.layer as usize].ids[0] == channel_slot(Channel::Height));
+        let reader = stages.iter().position(|stage| stage.input_kind == INPUT_LAYER);
+        (height.unwrap_or(usize::MAX), reader.unwrap_or(usize::MAX))
+    }
+
+    /// Tests: each whole-set pass's stage count and reach past the set's edges.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn whole_set_passes(&self) -> Vec<(usize, u32)> {
+        self.filters.whole_set().map_or_else(Vec::new, |whole| whole.passes.iter().map(|pass| (pass.stages.len(), pass.past_edges)).collect())
+    }
+
+    /// Tests: the last stage's input and input kind.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn input_of_last_stage(&self) -> (u32, u32) {
+        self.filters.stages.last().map_or((u32::MAX, u32::MAX), |stage| (stage.input, stage.input_kind))
+    }
+
+    /// Replace the environment's diffuse light (tests: a stub reader instead of `EnvironmentSh::of`).
+    #[cfg(test)]
+    fn set_environment(&mut self, environment: &EnvironmentSh) {
+        if let Some(late) = &mut self.environment {
+            late.set(environment);
+        }
     }
 
     /// Mesh-space projections and generators share the viewport's surface and bake inputs.
@@ -904,7 +1249,7 @@ impl CompositeProgram {
         if self.mask_preview || ((!self.filters.stages.is_empty() || !self.geometry.parts.is_empty()) && self.coverage.is_none()) {
             self.set_coverage(gbuf.clone(), 0);
         }
-        self.baked = baked.map(BakedInputs::new).transpose()?.flatten();
+        self.baked = baked.map(|baked| BakedInputs::new(baked, self.bake_rows)).transpose()?.flatten();
         self.id_bake = baked.filter(|_| self.operations.iter().any(|op| op.ids[1] == COLOR_SELECTION_OPCODE && op.procedural[2] != 0)).and_then(IdBake::new);
         if !self.mask_preview && self.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some()) {
             self.display_outputs |= display_bit(DisplayKind::Normal);
@@ -1292,6 +1637,8 @@ impl CompositeProgram {
             mask_layer: 0,
             mask_layers,
             image_words: procedural.image_words,
+            environment: LateEnvironment::new(procedural.environment_word, &project.display),
+            bake_rows: procedural.bake_rows,
         })
     }
 
@@ -1372,6 +1719,8 @@ impl CompositeProgram {
             mask_layer: 0,
             mask_layers: BTreeMap::new(),
             image_words: procedural.image_words,
+            environment: LateEnvironment::new(procedural.environment_word, &project.display),
+            bake_rows: procedural.bake_rows,
         })
     }
 }
@@ -1619,8 +1968,9 @@ fn compile_mask(
                 }
                 operation
             }
-            // Lighting reads the base color, which a mask does not have
-            EffectKind::Filter(Filter::BakedLighting { .. } | Filter::EnvironmentLighting { .. }) => continue,
+            // Lighting and PBR Validate read the base color, which a mask does not have: the CPU
+            // leaves the mask as it is (`Filter::point` is None), so they lower to nothing here
+            EffectKind::Filter(Filter::BakedLighting { .. } | Filter::EnvironmentLighting { .. } | Filter::PbrValidate(_)) => continue,
             _ => {
                 let first_input = procedural.input_sources.len();
                 let mut operation = point_effect(effect, procedural).ok_or("A mask effect uses CPU compositing.")?;
@@ -1978,7 +2328,8 @@ struct SurfaceCache {
 
 struct BakeCache {
     size: (u32, u32),
-    maps: [Option<Weak<Vec<f32>>>; BAKE_MAPS.len()],
+    /// The built-in maps, then the second row block's
+    maps: Vec<Option<Weak<Vec<f32>>>>,
     view: wgpu::TextureView,
 }
 
@@ -2023,6 +2374,10 @@ pub(crate) struct GpuCompositor {
     default_tile_images: wgpu::TextureView,
     tile_images: BTreeMap<usize, TileImageAtlas>,
     paint_upload: Option<wgpu::Buffer>,
+    /// The working buffer of the last update, reused while the next one fits it
+    scratch: Option<wgpu::Buffer>,
+    /// Bytes of the last update's working space and paint upload (tests report them)
+    update_bytes: [u64; 2],
 }
 
 impl GpuCompositor {
@@ -2123,6 +2478,8 @@ impl GpuCompositor {
             default_tile_images: TileImageAtlas::empty_view(device),
             tile_images: BTreeMap::new(),
             paint_upload: None,
+            scratch: None,
+            update_bytes: [0; 2],
         }
     }
 
@@ -2171,7 +2528,8 @@ impl GpuCompositor {
             return Ok((view.clone(), vertices.clone()));
         }
         let limits = device.limits();
-        let vertex_bytes = mesh.indices.len() as u64 * 32;
+        // Two vec4 per vertex, then the tangents two per 32-byte element (`surface_tangent` in WGSL)
+        let vertex_bytes = (mesh.indices.len() as u64 + (mesh.indices.len() as u64).div_ceil(2)) * 32;
         if gbuf.width.max(gbuf.height) > limits.max_texture_dimension_2d || vertex_bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
             return Err("UV surface data exceeds the GPU limits".into());
         }
@@ -2179,7 +2537,7 @@ impl GpuCompositor {
         let (lo, hi) = mesh.bounds();
         let center = (lo + hi) * 0.5;
         let radius = ((hi - lo).length() * 0.5).max(1e-4);
-        let vertex_data: Vec<[[f32; 4]; 2]> = mesh
+        let mut vertex_data: Vec<[[f32; 4]; 2]> = mesh
             .indices
             .iter()
             .map(|&index| {
@@ -2190,6 +2548,10 @@ impl GpuCompositor {
                 [pos.extend(uv.x).to_array(), normal.extend(uv.y).to_array()]
             })
             .collect();
+        // The MikkTSpace tangents after the vertices, two per element: the brush and the stencil
+        // read the vertices at the same stride
+        let tangent = |index: Option<&u32>| index.and_then(|&index| mesh.tangents.get(index as usize)).copied().unwrap_or_default().to_array();
+        vertex_data.extend(mesh.indices.chunks(2).map(|pair| [tangent(pair.first()), tangent(pair.get(1))]));
         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tc_composite_surface_vertices"),
             contents: bytemuck::cast_slice(&vertex_data),
@@ -2311,9 +2673,10 @@ impl GpuCompositor {
             return Ok(self.default_baked.clone());
         };
         let size = (baked.width, baked.height);
-        let refs = baked.maps.each_ref().map(|map| map.as_ref().map(Arc::downgrade));
+        let refs: Vec<_> = baked.maps.iter().chain(&baked.rows).map(|map| map.as_ref().map(Arc::downgrade)).collect();
         if let Some(cache) = self.baked.get(&ts).filter(|cache| {
             size == cache.size
+                && refs.len() == cache.maps.len()
                 && refs.iter().zip(&cache.maps).all(|(a, b)| match (a, b) {
                     (Some(a), Some(b)) => a.ptr_eq(b),
                     (None, None) => true,
@@ -2322,13 +2685,15 @@ impl GpuCompositor {
         }) {
             return Ok(cache.view.clone());
         }
-        if size.0.max(size.1) > device.limits().max_texture_dimension_2d {
+        // The second row block (Height and World Normal) sits below the built-in maps
+        let rows = size.1.checked_mul(baked.blocks()).ok_or("Baked maps exceed the GPU texture dimensions")?;
+        if size.0.max(rows) > device.limits().max_texture_dimension_2d {
             return Err("Baked maps exceed the GPU texture dimensions".into());
         }
         self.baked.remove(&ts);
         // Keep all three scalar inputs at f32 precision for narrow generator ramps. The
         // normal uses the remaining word, keeping the atlas at 16 bytes per texel.
-        let texture = input_texture(device, "tc_composite_bakes", size, 1, wgpu::TextureFormat::Rgba32Uint);
+        let texture = input_texture(device, "tc_composite_bakes", (size.0, rows), 1, wgpu::TextureFormat::Rgba32Uint);
         let value = |map: usize, i: usize, fallback: f32| baked.maps[map].as_ref().and_then(|data| data.get(i).copied()).unwrap_or(fallback);
         for top in (0..size.1).step_by(ROWS as usize) {
             let end = (top + ROWS).min(size.1);
@@ -2345,6 +2710,19 @@ impl GpuCompositor {
                 })
                 .collect();
             write_input(queue, &texture, (size.0, end - top), (top, 0), &texels);
+        }
+        if baked.blocks() > 1 {
+            // Height in x, the stored world normal in yzw; zeros where a map is not baked
+            let row = |map: usize, i: usize, component: usize| {
+                let components = BAKE_ROW_MAPS[map].components();
+                baked.rows[map].as_ref().and_then(|data| data.get(i * components + component).copied()).unwrap_or(0.0).to_bits()
+            };
+            for top in (0..size.1).step_by(ROWS as usize) {
+                let end = (top + ROWS).min(size.1);
+                let indices = top as usize * size.0 as usize..end as usize * size.0 as usize;
+                let texels: Vec<[u32; 4]> = indices.into_par_iter().map(|i| [row(0, i, 0), row(1, i, 0), row(1, i, 1), row(1, i, 2)]).collect();
+                write_input(queue, &texture, (size.0, end - top), (size.1 + top, 0), &texels);
+            }
         }
         let view = texture.create_view(&Default::default());
         self.baked.insert(ts, BakeCache { size, maps: refs, view: view.clone() });
@@ -2504,6 +2882,7 @@ impl GpuCompositor {
         let curvature = self.curvature_inputs(device, queue, ts, program, &baked)?;
         let id_bake = self.id_bake_input(device, queue, ts, program.id_bake.as_ref())?;
         let [id_width, id_height] = program.id_bake.as_ref().map_or([0; 2], |id| id.size);
+        let bake_words = program.baked.as_ref().map_or([0; 2], BakedInputs::uniform_words);
         let mut words_per_pixel = 0;
         let copies = DisplayKind::ALL.map(|kind| {
             if !program.writes_display(kind) {
@@ -2559,12 +2938,29 @@ impl GpuCompositor {
         // The whole-set results follow the larger of the bands' and the pre-pass's working space
         let working = whole.as_ref().map_or(0, WholeSetPass::stripe_bytes).max(required(band_width, band_rows));
         let whole_base = u32::try_from(working / 4).map_err(|_| "The GPU working memory exceeds 32-bit word addressing.")?;
-        let scratch = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tc_composite_scratch"),
-            size: working + whole_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        // The working buffer of the last update when it is large enough and at most four times
+        // this one's size (a larger one is released), cleared as a new buffer would be
+        let size = working + whole_bytes;
+        let scratch = match &self.scratch {
+            Some(buffer) if buffer.size() >= size && buffer.size() / 4 <= size => {
+                let mut clear = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_composite_clear") });
+                clear.clear_buffer(buffer, 0, Some(size));
+                queue.submit([clear.finish()]);
+                buffer.clone()
+            }
+            _ => {
+                self.scratch = None;
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("tc_composite_scratch"),
+                    size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.scratch = Some(buffer.clone());
+                buffer
+            }
+        };
+        self.update_bytes = [size, 0];
         let atlas = self.tile_atlas(device, queue, ts, program)?;
         let tile_images = atlas.map(|atlas| atlas.view.clone());
         let (operations, lookup) =
@@ -2582,6 +2978,11 @@ impl GpuCompositor {
                 for &(word, image) in &program.image_words {
                     let at = LOOKUP_WORDS as usize + word as usize;
                     words[at] = images.get(image as usize).copied().unwrap_or(u32::MAX);
+                }
+                // The environment's diffuse light, late-bound (`reserve_environment`)
+                if let Some(LateEnvironment { word, words: Some(light), .. }) = &program.environment {
+                    let at = LOOKUP_WORDS as usize + *word as usize;
+                    words[at..at + ENVIRONMENT_WORDS].copy_from_slice(light);
                 }
                 let limits = device.limits();
                 // The operation stores the offset as an exactly represented float.
@@ -2673,8 +3074,8 @@ impl GpuCompositor {
                     field_rect[3],
                     id_width,
                     id_height,
-                    0,
-                    0,
+                    bake_words[0],
+                    bake_words[1],
                     0,
                     0,
                     0,
@@ -2734,102 +3135,154 @@ impl GpuCompositor {
             submission
         };
         // The whole-set pre-pass: its stages once over the region the bands read, in stripes,
-        // their outputs copied into the results the bands read through `filter_value`
+        // one stack after another in the same working space, their outputs copied into the
+        // results the bands read through `filter_value`
         if let (Some(whole), Some(prepare), Some(kernels)) = (&whole, &prepare, &self.filter_gpu) {
             let [x0, y0, x1, y1] = whole.region;
             let fields = program.filters.stages.len() as u32;
-            // Stripes from the top; one whose paint does not fit the upload budget splits in two
-            let mut stripes: Vec<(u32, u32)> = (y0..y1).step_by(whole.stripe_rows as usize).map(|top| (top, whole.stripe_rows.min(y1 - top))).rev().collect();
-            while let Some((top, rows)) = stripes.pop() {
-                let (low, high) = whole.paint_window(source_size, top, rows);
-                let window = CompositePaintWindow::covering(low, high, [source_size.0, source_size.1], &program.paint);
-                let Some(words) = window.words(&program.paint, max_words) else {
-                    if rows < 2 {
-                        return Err("Paint inputs of the whole-set filter exceed the adapter's upload budget.".into());
-                    }
-                    stripes.extend([(top + rows / 2, rows - rows / 2), (top, rows / 2)]);
-                    continue;
-                };
-                window.pack(&program.paint, words, &mut packed);
+            let paint_limit = (max_words * 4) as u64;
+            // Pack and upload a paint window, after submitting what reads the previous one
+            let upload = |window: &CompositePaintWindow,
+                          words: usize,
+                          encoder: &mut wgpu::CommandEncoder,
+                          (buffer, packed): (&mut Option<wgpu::Buffer>, &mut Vec<u32>)| {
+                queue.submit([std::mem::replace(encoder, make_encoder()).finish()]);
+                window.pack(&program.paint, words, packed);
                 let bytes = (words * 4) as u64;
-                if self.paint_upload.as_ref().is_none_or(|buffer| buffer.size() < bytes) {
-                    self.paint_upload = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                let paint = match buffer {
+                    Some(paint) if paint.size() >= bytes => paint,
+                    _ => buffer.insert(device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("tc_composite_paint"),
-                        size: bytes.next_power_of_two().min((max_words * 4) as u64),
+                        size: bytes.next_power_of_two().min(paint_limit),
                         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
-                    }));
-                }
-                let paint = self.paint_upload.as_ref().ok_or("paint upload buffer is missing")?;
-                queue.write_buffer(paint, 0, bytemuck::cast_slice(&packed));
-                let field_rect = whole.field_rect(top, rows);
-                let set_bounds = field_bounds(field_rect, source_size);
-                let values = band_values((0, 0, 0, 0), window.params(), field_rect, 0);
-                let field_words = field_rect[2] * field_rect[3] * texel_words;
-                let offset = |slot: u32| slot * field_words;
-                let (source_width, source_rows) = if tile_work == 0 { (field_rect[2], field_rect[3]) } else { composite_band_size(field_rect[2], tile_work) };
+                    })),
+                };
+                queue.write_buffer(paint, 0, bytemuck::cast_slice(packed));
+            };
+            for top in (y0..y1).step_by(whole.stripe_rows as usize) {
+                let rows = whole.stripe_rows.min(y1 - top);
                 let mut encoder = make_encoder();
-                let mut work = 0u64;
-                for &output in &whole.stages.stages {
-                    let stage = &program.filters.stages[output];
-                    let mut source = values;
-                    let direct = stage.filter.is_none() && stage.cell == 1;
-                    let slot = if direct { output as u32 } else { fields };
-                    source[25..28].copy_from_slice(&[slot, stage.layer, stage.preceding]);
-                    source[packages::FIELD_LAYOUT + 2] = stage.input;
-                    source[packages::FIELD_LAYOUT + 3] = u32::from(wraps);
-                    for y in (0..field_rect[3]).step_by(source_rows as usize) {
-                        for x in (0..field_rect[2]).step_by(source_width as usize) {
-                            let columns = source_width.min(field_rect[2] - x);
-                            let chunk_rows = source_rows.min(field_rect[3] - y);
+                // One paint window for the stripe when it fits the upload budget, else one per
+                // source chunk of each stage (a whole-tile stripe reads the whole set)
+                let (low, high) = whole.paint_window(source_size, top, rows);
+                let stripe_window = CompositePaintWindow::covering(low, high, [source_size.0, source_size.1], &program.paint);
+                let paint_words = pre_pass_paint_words(max_words);
+                let stripe_words = stripe_window.words(&program.paint, paint_words);
+                if let Some(words) = stripe_words {
+                    upload(&stripe_window, words, &mut encoder, (&mut self.paint_upload, &mut packed));
+                }
+                for pass in &whole.stages.passes {
+                    let field_rect = whole.field_rect(pass, top, rows);
+                    let set_bounds = field_bounds(field_rect, source_size);
+                    let field_words = field_rect[2] * field_rect[3] * texel_words;
+                    let offset = |slot: u32| pass.slot(slot, fields) * field_words;
+                    let values = |paint_params: [u32; 4]| {
+                        let mut values = band_values((0, 0, 0, 0), paint_params, field_rect, 0);
+                        values[packages::WHOLE_COMPACT..packages::WHOLE_COMPACT + 4].copy_from_slice(&pass.compact(fields));
+                        values
+                    };
+                    let (source_width, source_rows) =
+                        if tile_work == 0 { (field_rect[2], field_rect[3]) } else { composite_band_size(field_rect[2], tile_work) };
+                    let mut work = 0u64;
+                    for &output in &pass.stages {
+                        let stage = &program.filters.stages[output];
+                        let direct = stage.filter.is_none() && stage.cell == 1;
+                        let slot = if direct { output as u32 } else { fields };
+                        let stage_values = |paint_params: [u32; 4]| {
+                            let mut source = values(paint_params);
+                            source[25..28].copy_from_slice(&[slot, stage.layer, stage.preceding]);
+                            source[packages::FIELD_LAYOUT + 2] = stage.input;
+                            source[packages::FIELD_LAYOUT + 3] = u32::from(wraps) | stage.input_kind;
+                            source
+                        };
+                        let mut chunks: Vec<[u32; 4]> = (0..field_rect[3])
+                            .step_by(source_rows as usize)
+                            .flat_map(|y| {
+                                (0..field_rect[2])
+                                    .step_by(source_width as usize)
+                                    .map(move |x| [x, y, source_width.min(field_rect[2] - x), source_rows.min(field_rect[3] - y)])
+                            })
+                            .rev()
+                            .collect();
+                        while let Some(chunk @ [x, y, columns, chunk_rows]) = chunks.pop() {
+                            let paint_params = if stripe_words.is_some() {
+                                stripe_window.params()
+                            } else {
+                                // The chunk's own paint, split in two while it does not fit
+                                let (low, high) = chunk_paint(field_rect, chunk, source_size, wraps);
+                                let window = CompositePaintWindow::covering(low, high, [source_size.0, source_size.1], &program.paint);
+                                let Some(words) = window.words(&program.paint, paint_words) else {
+                                    if chunk_rows < 2 {
+                                        return Err("Paint inputs of the whole-set filter exceed the adapter's upload budget.".into());
+                                    }
+                                    let half = chunk_rows / 2;
+                                    chunks.extend([[x, y + half, columns, chunk_rows - half], [x, y, columns, half]]);
+                                    continue;
+                                };
+                                upload(&window, words, &mut encoder, (&mut self.paint_upload, &mut packed));
+                                #[cfg(all(test, not(target_arch = "wasm32")))]
+                                PRE_PASS_CHUNK_WINDOWS.set(PRE_PASS_CHUNK_WINDOWS.get() + 1);
+                                work = 0;
+                                window.params()
+                            };
                             let work_here = u64::from(columns).saturating_mul(u64::from(chunk_rows)).saturating_mul(tile_work);
                             if work > 0 && work.saturating_add(work_here) > MAX_TILE_WORK_PER_SUBMISSION {
                                 queue.submit([std::mem::replace(&mut encoder, make_encoder()).finish()]);
                                 work = 0;
                             }
-                            source[28..32].copy_from_slice(&[x, y, columns, chunk_rows]);
+                            let mut source = stage_values(paint_params);
+                            source[28..32].copy_from_slice(&chunk);
+                            let paint = self.paint_upload.as_ref().ok_or("paint upload buffer is missing")?;
                             let source_bindings = make_bindings(&source, paint);
-                            let mut pass =
+                            let mut compute =
                                 encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tc_whole_set_source"), timestamp_writes: None });
-                            pass.set_pipeline(prepare);
-                            pass.set_bind_group(0, &source_bindings, &[]);
-                            pass.dispatch_workgroups(columns.div_ceil(WORKGROUP), chunk_rows.div_ceil(WORKGROUP), 1);
+                            compute.set_pipeline(prepare);
+                            compute.set_bind_group(0, &source_bindings, &[]);
+                            compute.dispatch_workgroups(columns.div_ceil(WORKGROUP), chunk_rows.div_ceil(WORKGROUP), 1);
+                            drop(compute);
                             work = work.saturating_add(work_here);
                         }
+                        let region = NeighbourhoodRegion {
+                            rect: field_rect,
+                            original: offset(fields),
+                            blur: pass.blur(fields, offset),
+                            output: offset(output as u32),
+                            field_words: texel_words,
+                            input: program.filters.input_bits(stage),
+                            wrap: stage.wrap,
+                            bounds: set_bounds,
+                        };
+                        // The stage's kernels over the whole field, the gathers in row chunks
+                        // within the submission budget
+                        queue.submit([std::mem::replace(&mut encoder, make_encoder()).finish()]);
+                        work = 0;
+                        let _budget = kernels.budget(queue, stage.filter.map_or(1, NeighbourhoodFilter::work_per_texel), pre_pass_budget());
+                        if stage.cell > 1 {
+                            let target = if stage.filter.is_some() { region.original } else { region.output };
+                            kernels.encode_cells(device, &mut encoder, &scratch, NeighbourhoodRegion { output: target, ..region }, stage.cell);
+                        }
+                        if let Some(filter) = stage.filter {
+                            kernels.encode(device, &mut encoder, &scratch, region, filter);
+                        }
                     }
-                    let region = NeighbourhoodRegion {
-                        rect: field_rect,
-                        original: offset(fields),
-                        blur: [offset(fields + 1), offset(fields + 2)],
-                        output: offset(output as u32),
-                        field_words: texel_words,
-                        input: u32::from(texel_words > FIELD_WORDS),
-                        wrap: stage.wrap,
-                        bounds: set_bounds,
-                    };
-                    if stage.cell > 1 {
-                        let target = if stage.filter.is_some() { region.original } else { region.output };
-                        kernels.encode_cells(device, &mut encoder, &scratch, NeighbourhoodRegion { output: target, ..region }, stage.cell);
+                    // The stripe's rows of the pass's outputs, from their fields into the results
+                    let from = [(x0 as i32 - field_rect[0] as i32) as u32, (top as i32 - field_rect[1] as i32) as u32];
+                    for &output in &pass.outputs {
+                        let index = whole.stages.outputs.iter().position(|&own| own == output).ok_or("A whole-set output has no result.")?;
+                        let result = whole.result_base(whole_base, index);
+                        kernels.encode_copy(
+                            device,
+                            &mut encoder,
+                            &scratch,
+                            (offset(output as u32), field_rect[2], from),
+                            (result, x1 - x0, top - y0),
+                            [x1 - x0, rows],
+                            texel_words,
+                        );
                     }
-                    if let Some(filter) = stage.filter {
-                        kernels.encode(device, &mut encoder, &scratch, region, filter);
-                    }
+                    queue.submit([std::mem::replace(&mut encoder, make_encoder()).finish()]);
                 }
-                // The stripe's rows of each output, from its field into the results
-                let from = [(x0 as i32 - field_rect[0] as i32) as u32, (top as i32 - field_rect[1] as i32) as u32];
-                for (index, &output) in whole.stages.outputs.iter().enumerate() {
-                    let result = whole.result_base(whole_base, index);
-                    kernels.encode_copy(
-                        device,
-                        &mut encoder,
-                        &scratch,
-                        (offset(output as u32), field_rect[2], from),
-                        (result, x1 - x0, top - y0),
-                        [x1 - x0, rows],
-                        texel_words,
-                    );
-                }
-                queue.submit([encoder.finish()]);
             }
         }
         for (chunk, window, words) in windows {
@@ -2901,7 +3354,7 @@ impl GpuCompositor {
                         source[packages::FIELD_LAYOUT + 2] = stage.input;
                         // In a wrapping program every stage's field is a periodic copy of the set
                         // past its edges; the stages keep apart what lies across a seam (`bounds`)
-                        source[packages::FIELD_LAYOUT + 3] = u32::from(wraps);
+                        source[packages::FIELD_LAYOUT + 3] = u32::from(wraps) | stage.input_kind;
                         if let Some((channel, first, cut)) = stage.anchor {
                             source[36..39].copy_from_slice(&[channel_slot(channel), first, cut]);
                             source[40..43].copy_from_slice(&channel.default_value().map(f32::to_bits));
@@ -2935,7 +3388,7 @@ impl GpuCompositor {
                             blur: [offset(fields + 1), offset(fields + 2)],
                             output: offset(output as u32),
                             field_words: texel_words,
-                            input: u32::from(texel_words > FIELD_WORDS),
+                            input: program.filters.input_bits(stage),
                             wrap: stage.wrap,
                             bounds: set_bounds,
                         };
@@ -2975,8 +3428,43 @@ impl GpuCompositor {
             }
             pending_bytes += bytes;
         }
+        self.update_bytes[1] = self.paint_upload.as_ref().map_or(0, wgpu::Buffer::size);
         Ok(())
     }
+
+    /// Bytes of the last update's working buffer and paint upload buffer.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn update_bytes(&self) -> [u64; 2] {
+        self.update_bytes
+    }
+}
+
+/// The work one submission of the whole-set pre-pass's kernels may hold
+fn pre_pass_budget() -> u64 {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    if let Some(budget) = PRE_PASS_TEST_BUDGET.get() {
+        return budget;
+    }
+    MAX_TILE_WORK_PER_SUBMISSION
+}
+
+/// The paint words one upload of the whole-set pre-pass may hold
+fn pre_pass_paint_words(max_words: usize) -> usize {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    if let Some(words) = PRE_PASS_TEST_PAINT_WORDS.get() {
+        return words;
+    }
+    max_words
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    /// Test seam: a smaller work budget for the pre-pass's kernels (their row chunks)
+    pub(crate) static PRE_PASS_TEST_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// Test seam: a smaller paint upload for the pre-pass (its per-chunk windows)
+    pub(crate) static PRE_PASS_TEST_PAINT_WORDS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Tests: the per-chunk paint windows the pre-pass uploaded
+    pub(crate) static PRE_PASS_CHUNK_WINDOWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A later user-set limit on the GPU memory one update of the compositor may hold (bytes).
@@ -3003,8 +3491,8 @@ struct WholeSetPass {
     size: (u32, u32),
     wraps: bool,
     texel_words: u32,
-    /// Field slots of the program (stages plus the three working fields)
-    slots: u64,
+    /// The program's stage count: its first working field's slot
+    fields: u32,
     stripe_rows: u32,
 }
 
@@ -3016,7 +3504,7 @@ impl WholeSetPass {
         };
         let [x0, x1] = axis(region.min[0], region.max[0], size.0);
         let [y0, y1] = axis(region.min[1], region.max[1], size.1);
-        Self { region: [x0, y0, x1, y1], size, wraps, texel_words, slots: stage_count as u64 + 3, stripe_rows: (y1 - y0).max(1), stages }
+        Self { region: [x0, y0, x1, y1], size, wraps, texel_words, fields: stage_count as u32, stripe_rows: (y1 - y0).max(1), stages }
     }
 
     fn result_words(&self) -> u64 {
@@ -3033,32 +3521,39 @@ impl WholeSetPass {
         (u64::from(base) + self.result_words() * index as u64) as u32
     }
 
-    /// The field of the stripe of `rows` from row `top`: the reach on every side, clamped to the
-    /// set unless the program wraps (origin as i32 bits).
-    fn field_rect(&self, top: u32, rows: u32) -> [u32; 4] {
+    /// The field of `pass` for the stripe of `rows` from row `top`: the pass's reach on every
+    /// side, clamped to the set, or in a wrapping program to the set plus how far the pass's
+    /// fields reach past its edges (origin as i32 bits).
+    fn field_rect(&self, pass: &WholePass, top: u32, rows: u32) -> [u32; 4] {
         let [x0, _, x1, _] = self.region;
-        let (left, right) = self.span(x0, x1, self.size.0);
-        let (upper, lower) = self.span(top, top + rows, self.size.1);
+        let (left, right) = self.span(pass, x0, x1, self.size.0);
+        let (upper, lower) = self.span(pass, top, top + rows, self.size.1);
         [left as i32 as u32, upper as i32 as u32, (right - left) as u32, (lower - upper) as u32]
     }
 
-    /// `low..high` plus the reach on both sides: clamped to the set (`side`) unless the program
-    /// wraps, where the field holds periodic copies past the set's edges.
-    fn span(&self, low: u32, high: u32, side: u32) -> (i64, i64) {
-        let reach = i64::from(self.stages.reach);
-        let (low, high) = (i64::from(low) - reach, i64::from(high) + reach);
-        if self.wraps { (low, high) } else { (low.max(0), high.min(i64::from(side))) }
+    /// `low..high` plus the pass's reach on both sides, clamped to the set (`side`) widened by
+    /// the pass's reach past the edges in a wrapping program (periodic copies there).
+    fn span(&self, pass: &WholePass, low: u32, high: u32, side: u32) -> (i64, i64) {
+        let reach = i64::from(pass.reach);
+        let past = if self.wraps { i64::from(pass.past_edges) } else { 0 };
+        ((i64::from(low) - reach).max(-past), (i64::from(high) + reach).min(i64::from(side) + past))
     }
 
-    /// Bytes of the largest stripe's fields: every slot of the program over the stripe plus its
-    /// reach, as `field_rect` clamps it to the set.
+    /// Bytes of the largest stripe's fields: the largest pass's slots over the stripe plus its
+    /// reach, as `field_rect` clamps it.
     fn stripe_bytes(&self) -> u64 {
         let [x0, _, x1, _] = self.region;
-        let (left, right) = self.span(x0, x1, self.size.0);
-        let reach = u64::from(self.stages.reach) * 2;
-        let rows = u64::from(self.stripe_rows) + reach;
-        let rows = if self.wraps { rows } else { rows.min(u64::from(self.size.1)) };
-        (right - left) as u64 * rows * self.slots * u64::from(self.texel_words) * 4
+        self.stages
+            .passes
+            .iter()
+            .map(|pass| {
+                let (left, right) = self.span(pass, x0, x1, self.size.0);
+                let past = if self.wraps { u64::from(pass.past_edges) } else { 0 };
+                let rows = (u64::from(self.stripe_rows) + 2 * u64::from(pass.reach)).min(u64::from(self.size.1) + 2 * past);
+                (right - left) as u64 * rows * pass.slots(self.fields) * u64::from(self.texel_words) * 4
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// The tallest stripes whose fields fit in `limit` bytes beside the results.
@@ -3099,6 +3594,28 @@ impl WholeSetPass {
         let [x0, y0, x1, y1] = self.region;
         table[8..].copy_from_slice(&[x0, y0, x1 - x0, y1 - y0]);
     }
+}
+
+/// The source texels [low, high) a prepare chunk `[x, y, columns, rows]` of a pre-pass field at
+/// `field_rect` (origin as i32 bits) reads paint at: the chunk itself, moved into the set when it
+/// lies in one periodic copy of a wrapping program, else the whole axis there.
+fn chunk_paint(field_rect: [u32; 4], [x, y, columns, rows]: [u32; 4], size: (u32, u32), wraps: bool) -> ([u32; 2], [u32; 2]) {
+    let axis = |origin: u32, start: u32, count: u32, side: u32| -> (u32, u32) {
+        let low = i64::from(origin as i32) + i64::from(start);
+        let high = low + i64::from(count);
+        let side = i64::from(side.max(1));
+        if !wraps {
+            return (low.clamp(0, side) as u32, high.clamp(0, side) as u32);
+        }
+        let copy = low.div_euclid(side);
+        if (high - 1).div_euclid(side) != copy {
+            return (0, side as u32);
+        }
+        ((low - copy * side) as u32, (high - copy * side) as u32)
+    };
+    let (left, right) = axis(field_rect[0], x, columns, size.0);
+    let (upper, lower) = axis(field_rect[1], y, rows, size.1);
+    ([left, upper], [right, lower])
 }
 
 /// The set in the field-local texels of `field_rect` (origin as i32 bits) [x0, y0, x1, y1]:
@@ -4864,6 +5381,8 @@ mod paint_window_tests {
             mask_layer: 0,
             mask_layers: BTreeMap::new(),
             image_words: Vec::new(),
+            environment: None,
+            bake_rows: false,
         };
         let region = CompositeRegion { min: [0, 0], max: [128, 128] };
         let limit = 6 * 64 * 64 * 2 + 32;

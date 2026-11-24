@@ -160,8 +160,9 @@ pub(super) fn read_layers(op: &mut Operation, left: CompareSource, right: Compar
     op.effects[1] = 0;
 }
 
-/// Whether a mask operation compares this layer's own content.
-fn reads_own_layer(op: &Operation) -> bool {
+/// Whether a mask operation compares this layer's own content (`this_layer_content`): the hub then
+/// prepares the layer's content stacks before its mask stack (`FilterPlan::compile`).
+pub(super) fn reads_own_layer(op: &Operation) -> bool {
     let reads = |side: u32| side & SIDE_MASK == THIS_LAYER_SIDE;
     op.ids[1] == LAYER_COMPARE && (reads(op.ids[3]) || reads(op.ids[3] >> SIDE_BITS))
 }
