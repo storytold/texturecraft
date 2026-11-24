@@ -84,14 +84,18 @@ impl Gpu {
             // The aux texture behind the mesh-map and mask views (rebuilt every render)
             let resolution = texturecraft_render::aux_size(cache.size);
             let aux = match session.view {
-                ViewMode::MeshMap(map) => {
-                    Some(texturecraft_render::mesh_maps::mesh_map_rgba(session.doc.baked.get(&set_index), map, resolution, cache.size, &composite.block_scales))
+                ViewMode::MeshMap(map) => Some((
+                    (resolution, resolution),
+                    texturecraft_render::mesh_maps::mesh_map_rgba(session.doc.baked.get(&set_index), map, resolution, cache.size, &composite.block_scales),
+                )),
+                ViewMode::Mask(id) if session.doc.project.locate(id).is_some_and(|(set, _, _)| set == set_index) => {
+                    let extent = texturecraft_render::mask_view_extent(cache.size);
+                    session.mask_view_rgba(id, extent).map(|rgba| (extent, rgba))
                 }
-                ViewMode::Mask(id) if session.doc.project.locate(id).is_some_and(|(set, _, _)| set == set_index) => session.mask_view_rgba(id, resolution),
                 _ => None,
             };
-            if let Some(rgba) = aux {
-                headless.renderer.upload_aux(&headless.device, &headless.queue, set_index, resolution, &rgba);
+            if let Some((extent, rgba)) = aux {
+                headless.renderer.upload_aux_sized(&headless.device, &headless.queue, set_index, extent, &rgba);
             }
         }
     }

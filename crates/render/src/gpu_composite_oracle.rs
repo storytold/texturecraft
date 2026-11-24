@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
+use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image_sized};
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore, tile_bytes};
 use texturecraft_core::{Channel, ContentsOffset, Effect, EffectKind, Fill, Layer, LayerId, LayerKind, Mask, MaskBackground, Project, Source, TextureSet};
 use texturecraft_geom::{Mesh, UvGBuffer};
@@ -71,7 +71,7 @@ pub(crate) struct OracleCase<'a> {
     pub(crate) baked: &'a BakedMaps,
     pub(crate) images: &'a ImageStore,
     pub(crate) mesh: &'a Arc<Mesh>,
-    /// Also compare this layer's mask preview with `mask_image`.
+    /// Also compare this layer's mask preview with `mask_image_sized` at the mask view's extent.
     pub(crate) mask_owner: Option<LayerId>,
     /// Also recomposite only this region and require the full result (a filter's halo).
     pub(crate) region: Option<CompositeRegion>,
@@ -86,11 +86,11 @@ impl<'a> OracleCase<'a> {
 
 /// Composite `case` on the CPU and the GPU and panic, naming `label`, where they differ beyond
 /// `tolerance`: every display map the GPU program writes, then the mask preview and the partial
-/// update when the case asks for them. The texture set's size must be a multiple of the tile.
+/// update when the case asks for them. The texture set's sides must be multiples of the tile.
 pub(crate) fn assert_matches_cpu(gpu: &mut Headless, case: &OracleCase, tolerance: Tolerance, label: &str) {
     let set = &case.project.texture_sets[case.ts];
     let (width, height) = set.size();
-    assert!(width.is_multiple_of(TILE) && width == height, "{label}: oracle sets are square and whole tiles");
+    assert!(width.is_multiple_of(TILE) && height.is_multiple_of(TILE), "{label}: oracle sets are whole tiles");
     let gbuf = Arc::new(UvGBuffer::new(case.mesh, set.material, width, height));
     let channels: Vec<Channel> = set.channels.iter().map(|&(channel, _)| channel).collect();
     let inputs = Inputs {
@@ -107,7 +107,7 @@ pub(crate) fn assert_matches_cpu(gpu: &mut Headless, case: &OracleCase, toleranc
     };
     let tiles: Vec<(u32, u32)> = (0..height / TILE).flat_map(|ty| (0..width / TILE).map(move |tx| (tx, ty))).collect();
     // A UV tile atlas's displays read the bakes and tile scales per block, as the session's do
-    let mut oracle = Composite { block_scales: set.block_scales(), ..Composite::new(&channels, width) };
+    let mut oracle = Composite { block_scales: set.block_scales(), ..Composite::with_size(&channels, width, height) };
     composite_tiles(&inputs, &mut oracle, &tiles);
 
     let sets: Vec<_> = case.project.texture_sets.iter().map(|set| (set.size(), set.material)).collect();
@@ -148,7 +148,8 @@ pub(crate) fn assert_matches_cpu(gpu: &mut Headless, case: &OracleCase, toleranc
     }
 
     if let Some(owner) = case.mask_owner {
-        let expected = mask_image(&inputs, owner, width).unwrap_or_else(|| panic!("{label}: no CPU mask"));
+        let extent = crate::mask_view_extent((width, height));
+        let expected = mask_image_sized(&inputs, owner, extent).unwrap_or_else(|| panic!("{label}: no CPU mask"));
         let mut mask = CompositeProgram::try_compile_mask_preview(case.project, case.pixels, case.ts, owner, None, None)
             .unwrap_or_else(|reason| panic!("{label}: {reason}"));
         mask.set_surface_inputs(case.mesh, &gbuf, Some(case.baked)).unwrap_or_else(|reason| panic!("{label}: {reason}"));
