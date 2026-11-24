@@ -1696,7 +1696,7 @@ pub(crate) mod tests {
         let replay = gpu.sync(&mut s, None, None, 0, FRAME_BUDGET_MS);
         assert_eq!(replay.tiles.first().map(|t| (t.2, t.3)), Some((15, 15)), "a dropped callback must preserve the dab's priority");
         #[cfg(not(target_arch = "wasm32"))]
-        if let Ok(mut gpu) = texturecraft_render::headless::Headless::new() {
+        if let Ok(mut gpu) = texturecraft_render::headless::Headless::for_tests() {
             let (_, errors, _) = replay.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
             assert!(errors.is_empty());
             assert!(!s.tile_demand(None).focused(), "a consumed callback clears the released dab's priority");
@@ -1770,7 +1770,7 @@ pub(crate) mod tests {
         execute(&mut source, "layer.add.fill", &json!({"color":[1.0, 0.0, 0.0]})).unwrap();
         let mut s = Session::from_project_bytes(&source.to_project_bytes().unwrap()).unwrap();
         let mut gpu = link();
-        let Ok(mut h) = Headless::new() else { return };
+        let Ok(mut h) = Headless::for_tests() else { return };
         let frame = Frame {
             view_id: 2,
             size: [128, 128],
@@ -1841,7 +1841,7 @@ pub(crate) mod tests {
     #[test]
     fn gpu_layers_cover_uv_islands_and_their_padding() {
         use texturecraft_render::{headless::Headless, readback::Readback};
-        let Ok(mut headless) = Headless::new() else { return };
+        let Ok(mut headless) = Headless::for_tests() else { return };
         let mut mesh = primitives::plane(1.0, 1);
         for uv in &mut mesh.uvs {
             *uv = *uv * 0.5 + Vec2::splat(0.25);
@@ -1901,7 +1901,7 @@ pub(crate) mod tests {
     fn project_open_and_4k_resize_compose_multiple_sets_on_gpu() {
         use texturecraft_render::{headless::Headless, readback::Readback};
 
-        let Ok(mut headless) = Headless::new() else { return };
+        let Ok(mut headless) = Headless::for_tests() else { return };
         let mut original = Session::new_project("multi-material", primitives::material_ball(), "builtin:material_ball", None, 2048).unwrap();
         assert_eq!(original.caches.len(), 2);
         for (ts, color) in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]].into_iter().enumerate() {
@@ -1965,7 +1965,7 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn every_builtin_material_uses_gpu_layers() {
-        let mut gpu = texturecraft_render::headless::Headless::new().ok();
+        let mut gpu = texturecraft_render::headless::Headless::for_tests().ok();
         let mut rejected = Vec::new();
         for material in texturecraft_engine::materials::MATERIALS {
             let mut session = Session::new_project("Material shelf", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
@@ -2027,7 +2027,7 @@ pub(crate) mod tests {
         use texturecraft_engine::{core::GeneratorKind, materials::MATERIALS, smart_masks::SMART_MASKS};
         use texturecraft_render::readback::Readback;
 
-        let Ok(mut gpu) = Headless::new() else { return };
+        let Ok(mut gpu) = Headless::for_tests() else { return };
         const SIZE: u32 = 256;
         let mut session = texturecraft_engine::sample_session(SIZE, SIZE).unwrap();
         execute(&mut session, "layer.add.fill", &json!({"color": [1.0, 0.0, 1.0], "roughness": 0.123})).unwrap();
@@ -2109,7 +2109,7 @@ pub(crate) mod tests {
     fn moss_and_leather_display_procedurals_and_sheen_on_gpu() {
         use texturecraft_render::{headless::Headless, readback::Readback};
 
-        let Ok(mut gpu) = Headless::new() else { return };
+        let Ok(mut gpu) = Headless::for_tests() else { return };
         for (material, kind) in [("moss", DisplayKind::Sheen), ("leather", DisplayKind::BaseColor)] {
             let mut session = Session::new_project("Material shelf", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
             execute(&mut session, "material.apply", &json!({"material": material})).unwrap();
@@ -2167,7 +2167,7 @@ pub(crate) mod tests {
         link.gpu_composite_enabled = true;
         let update = link.sync(&mut session, None, None, 0, 0.0);
         assert_eq!(link.compositor_status().0, "Layers: GPU", "{}", link.compositor_status().1);
-        let Ok(mut gpu) = Headless::new() else { return };
+        let Ok(mut gpu) = Headless::for_tests() else { return };
         let (_, errors, _) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
         assert!(errors.is_empty(), "{errors:?}");
         session.update();
@@ -2198,7 +2198,7 @@ pub(crate) mod tests {
         let mut link = link();
         link.gpu_composite_enabled = true;
         link.material_start_preview = false;
-        let mut headless = Headless::new().ok();
+        let mut headless = Headless::for_tests().ok();
         let opened = std::time::Instant::now();
         for (size, sets) in [(2048, &[0, 1][..]), (4096, &[0][..])] {
             let started = std::time::Instant::now();
@@ -2286,7 +2286,7 @@ pub(crate) mod tests {
         };
         use texturecraft_render::{headless::Headless, readback::Readback};
 
-        let Ok(mut gpu) = Headless::new() else { return };
+        let Ok(mut gpu) = Headless::for_tests() else { return };
         let name = gpu.adapter_name.to_lowercase();
         if name.contains("llvmpipe") || name.contains("lavapipe") || name.contains("warp") || gpu.device.limits().max_texture_dimension_2d < 8192 {
             return;
@@ -2352,7 +2352,7 @@ pub(crate) mod tests {
     fn gpu_layers_keep_sparse_paint_and_return_to_cpu_when_requested() {
         use texturecraft_render::{headless::Headless, readback::Readback};
 
-        let Ok(mut gpu) = Headless::new() else { return };
+        let Ok(mut gpu) = Headless::for_tests() else { return };
         let mut s = procedural_stack(1024);
         use texturecraft_engine::core::{Effect, EffectKind, Filter, Mask, MaskBackground, Projection, Source};
         let masked = s.doc.project.texture_sets[0].stack[1];
@@ -2439,7 +2439,7 @@ pub(crate) mod tests {
         use texturecraft_engine::core::{Effect, EffectKind, Fill, Layer, LayerKind, Mask, MaskBackground, Projection, Source};
         use texturecraft_render::{headless::Headless, readback::Readback};
 
-        let Ok(mut gpu) = Headless::new() else { return };
+        let Ok(mut gpu) = Headless::for_tests() else { return };
         let render = |gpu: &mut Headless, session: &mut Session, aux: Option<AuxView>| {
             let mut link = link();
             link.gpu_composite_enabled = true;
@@ -2533,7 +2533,7 @@ pub(crate) mod tests {
     fn gpu_brush_previews_empty_layer_and_survives_switch_to_cpu() {
         use texturecraft_render::readback::Readback;
 
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let mut s = Session::new_project("GPU brush", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
         let layer = s.selected_layer().unwrap();
@@ -2702,7 +2702,7 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_mask_image_stroke_previews_its_gray_on_the_gpu() {
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let texels = [(64, 64), (52, 60), (70, 75), (64, 50)];
         let display = |link: &mut GpuLink, s: &mut Session, aux: Option<AuxView>| -> [[u8; 4]; 4] {
@@ -2776,7 +2776,7 @@ pub(crate) mod tests {
     fn a_layer_stroke_with_a_mask_image_loaded_previews_on_the_gpu() {
         use texturecraft_render::readback::Readback;
 
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let mut s = Session::new_project("Layer with a mask image", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
         let layer = s.selected_layer().unwrap();
@@ -2817,7 +2817,7 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_eraser_previews_what_it_commits_on_layers_and_masks() {
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let display = |link: &mut GpuLink, s: &mut Session, aux: Option<AuxView>| -> [u8; 4] {
             let scene = link.sync(s, aux, None, 0, 0.0);
@@ -2880,7 +2880,7 @@ pub(crate) mod tests {
     #[test]
     fn a_path_paints_its_curve_with_the_gpu_brush() {
         const EIGHT_BIT_STEP: u16 = 257;
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let new_session = || {
             let mut s = Session::new_project("GPU path", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
@@ -2921,7 +2921,7 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_particle_eraser_stroke_stays_off_the_gpu_brush() {
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let mut s = Session::new_project("Particle eraser", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
         execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [0.9, 0.3, 0.1]})).unwrap();
@@ -2951,7 +2951,7 @@ pub(crate) mod tests {
     #[test]
     fn symmetric_strokes_preview_their_copies_on_the_gpu() {
         const SIZE: u32 = 128;
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         for in_3d in [false, true] {
             let mut s = Session::new_project("GPU symmetry", primitives::plane(1.0, 1), "builtin:plane", None, SIZE).unwrap();
@@ -3004,7 +3004,7 @@ pub(crate) mod tests {
     #[test]
     fn a_gpu_stroke_feeds_an_instance_on_another_texture_set() {
         const SIZE: u32 = 128;
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let mut s = Session::new_project("GPU instance stroke", primitives::material_ball(), "builtin:material_ball", None, SIZE).unwrap();
         let paint = s.selected_layer().unwrap();
@@ -3049,7 +3049,7 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_pickup_stroke_composites_live_on_the_gpu() {
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let mut s = Session::new_project("GPU pickup preview", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
         execute(&mut s, "tool.material", &json!({"material": "copper"})).unwrap();
@@ -3084,7 +3084,7 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_2d_view_projection_stroke_previews_its_stencil_on_the_gpu() {
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let (mut session, layer) = projection_session(128, false);
         let uvs = [144.0, 200.0, 256.0].map(|x| session.pick(Vec2::new(x, 200.0), session.viewport).unwrap().uv);
@@ -3129,7 +3129,7 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_mask_brush_previews_commits_and_cancels_in_both_views() {
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         check_gpu_mask_stroke(128, gpu);
     }
 
@@ -3138,14 +3138,14 @@ pub(crate) mod tests {
     #[ignore = "native 4K/8K GPU regression; requires an adapter with sufficient VRAM"]
     fn smoke_gpu_mask_brush_at_4k_and_8k() {
         for size in [4096, 8192] {
-            check_gpu_mask_stroke(size, Headless::new().unwrap());
+            check_gpu_mask_stroke(size, Headless::for_tests().unwrap());
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn quick_mask_tracks_delayed_base_color_and_keeps_its_brush_on_gpu() {
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let mut s = Session::new_project("Mixed Quick Mask", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
         execute(&mut s, "layer.add.fill", &json!({"color": [0.0, 0.5, 0.0]})).unwrap();
@@ -3324,7 +3324,7 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn quick_mask_edits_and_limits_gpu_strokes_without_switching_material_to_cpu() {
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         check_gpu_quick_mask(128, gpu, true);
     }
 
@@ -3333,7 +3333,7 @@ pub(crate) mod tests {
     #[ignore = "native 4K/8K GPU regression; requires an adapter with sufficient VRAM"]
     fn smoke_gpu_quick_mask_at_4k_and_8k() {
         for size in [4096, 8192] {
-            check_gpu_quick_mask(size, Headless::new().unwrap(), false);
+            check_gpu_quick_mask(size, Headless::for_tests().unwrap(), false);
         }
     }
 
@@ -3483,7 +3483,7 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn gpu_projection_previews_cancels_commits_and_undoes_in_both_views() {
-        let Ok(gpu) = Headless::new() else { return };
+        let Ok(gpu) = Headless::for_tests() else { return };
         check_gpu_projection_stroke(128, gpu, true);
     }
 
@@ -3492,7 +3492,7 @@ pub(crate) mod tests {
     #[ignore = "native 4K/8K GPU regression; requires an adapter with sufficient VRAM"]
     fn smoke_gpu_projection_at_4k_and_8k() {
         for size in [4096, 8192] {
-            check_gpu_projection_stroke(size, Headless::new().unwrap(), false);
+            check_gpu_projection_stroke(size, Headless::for_tests().unwrap(), false);
         }
     }
 
@@ -3502,7 +3502,7 @@ pub(crate) mod tests {
     fn bench_gpu_layer_stack() {
         use std::time::Instant;
         use texturecraft_render::headless::Headless;
-        let mut h = Headless::new().unwrap();
+        let mut h = Headless::for_tests().unwrap();
         for size in [1024, 4096, 8192] {
             let mut s = procedural_stack(size);
             let program = CompositeProgram::compile(&s.doc.project, &s.doc.pixels, 0).unwrap();
@@ -3529,7 +3529,7 @@ pub(crate) mod tests {
         let mut s = Session::new_project("latency", primitives::plane(1.0, 1), "builtin:plane", None, 1024).unwrap();
         execute(&mut s, "tool.brush", &json!({"size": 3, "hardness": 100})).unwrap();
         let mut gpu = link();
-        let mut h = Headless::new().unwrap();
+        let mut h = Headless::for_tests().unwrap();
         h.renderer.set_mesh(&h.device, &h.queue, &s.mesh, s.mesh_id);
         h.renderer.set_texture_sets(&h.device, &h.queue, &[((1024, 1024), 0)], 1);
         let uv = Vec2::new(15.5, 5.5) / 16.0;
