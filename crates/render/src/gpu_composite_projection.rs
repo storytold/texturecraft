@@ -855,6 +855,28 @@ mod tests {
         }
     }
 
+    /// A fill on a mesh whose UVs cover half the set, with no stage, leaves the uncovered half at
+    /// the channels' defaults as the CPU does
+    #[test]
+    fn uncovered_texels_keep_the_defaults_without_a_stage() {
+        let Some(mut gpu) = headless() else { return };
+        let mut half = primitives::plane(1.0, 1);
+        for uv in &mut half.uvs {
+            uv.x *= 0.5;
+        }
+        let mesh = Arc::new(half);
+        let mut project = Project::new("Half covered", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Set", 0, SIZE));
+        let sources = BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.8, 0.2, 0.1]))]);
+        let layer = Layer::new(project.alloc_id(), "Fill", LayerKind::Fill(Fill { sources, ..Fill::default() }), &[Channel::BaseColor]);
+        assert!(project.insert_layer(0, layer, None, false).is_ok());
+        let (pixels, baked, images) = (PixelStore::default(), BakedMaps::default(), ImageStore::default());
+
+        let case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+
+        assert_matches_cpu(&mut gpu, &case, Tolerance::POINT, "a fill on a half covered set");
+    }
+
     /// A spherical projection reads a tall image's nearest row from the polar angle, so the
     /// angle must agree with the CPU's acos within about one ulp: a backend's own acos (llvmpipe's
     /// is off by about 1e-5) moves rows across texel edges, 732 of these texels there. Rows

@@ -1644,7 +1644,9 @@ impl CompositeProgram {
             self.surface = Some((mesh.clone(), gbuf.clone()));
         }
         self.geometry.resolve(mesh);
-        if self.mask_preview || ((!self.filters.stages.is_empty() || !self.geometry.parts.is_empty()) && self.coverage.is_none()) {
+        // Texels no triangle covers keep the channels' defaults, as the CPU leaves them
+        let partly_covered = gbuf.tri.contains(&NO_TRI);
+        if self.mask_preview || ((partly_covered || !self.filters.stages.is_empty() || !self.geometry.parts.is_empty()) && self.coverage.is_none()) {
             self.set_coverage(gbuf.clone(), 0);
         }
         self.baked = baked.map(|baked| BakedInputs::new(baked, self.bake_rows)).transpose()?.flatten();

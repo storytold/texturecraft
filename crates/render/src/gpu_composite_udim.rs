@@ -426,8 +426,6 @@ mod tests {
             let checker_mask = Source::Procedural { pattern: checker.clone(), low: [0.2; 3], high: [0.9; 3], ramp: Vec::new() };
             let mask_fill = EffectKind::Fill { source: checker_mask, projection: Projection::UvTile, sampling: Sampling::default() };
             mask.effects.push(Effect::new(project.alloc_id(), mask_fill));
-            // A stage, so the GPU leaves the texels the mesh does not cover as the CPU does
-            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false })));
             layer.mask = Some(mask);
             assert!(project.insert_layer(0, layer, None, false).is_ok());
             let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
@@ -489,8 +487,6 @@ mod tests {
                 masked.opacity = 0.6;
                 mask.effects.push(masked);
             }
-            // A stage, so the GPU leaves the texels the mesh does not cover as the CPU does
-            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false })));
             layer.mask = Some(mask);
             assert!(project.insert_layer(0, layer, None, false).is_ok());
             let pixels = PixelStore::default();
@@ -909,16 +905,12 @@ mod tests {
             Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43], uv: Default::default(), projector: Default::default() };
         let planar = Projection::Planar { scale: 0.8, axis: 1, offset: [0.03, 0.0, 0.34], uv: Default::default(), projector: Default::default(), placed: None };
 
-        // The image read is the path under test: no patterns
+        // The image read is the path under test: no patterns, no stages
         for (label, projection) in [("triplanar", triplanar), ("planar", planar)] {
             let (mut project, mesh) = atlas(true, &channels);
             let owner = project.alloc_id();
             let sources = BTreeMap::from([(Channel::BaseColor, Source::image("stripes")), (Channel::Roughness, Source::image("stripes"))]);
-            let mut layer = Layer::new(owner, "World", LayerKind::Fill(Fill { sources, projection, ..Fill::default() }), &channels);
-            // A stage, so the GPU leaves the texels the mesh does not cover as the CPU does
-            let mut mask = Mask::new(MaskBackground::White);
-            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false })));
-            layer.mask = Some(mask);
+            let layer = Layer::new(owner, "World", LayerKind::Fill(Fill { sources, projection, ..Fill::default() }), &channels);
             project.insert_layer(0, layer, None, false).unwrap();
             let pixels = PixelStore::default();
             let case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
