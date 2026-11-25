@@ -96,6 +96,24 @@ fn new_info_run_bake_export_batch() {
 }
 
 #[test]
+fn run_does_not_print_a_result_when_saving_fails() {
+    let d = tmp("run-save-error");
+    let project = d.join("input.tcraft");
+    ok(&["new", "builtin:cube", p(&project), "--resolution", "128"]);
+    let params = r#"{"color":[1,0,0],"roughness":0.3}"#;
+    assert!(json(&["run", p(&project), "layer.add.fill", params])["layer"].is_u64());
+
+    let blocker = d.join("not-a-directory");
+    std::fs::write(&blocker, b"file").unwrap();
+    let out = blocker.join("out.tcraft");
+    let result = cli(&["run", p(&project), "layer.add.fill", params, "-o", p(&out)]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("texturecraft-cli run: error:"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn info_on_a_mesh_reports_uvs() {
     let d = tmp("mesh");
     let obj = d.join("quad.obj");

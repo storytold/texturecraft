@@ -273,11 +273,11 @@ fn run(a: &Args) -> R {
         None => json!({}),
     };
     let mut h = open(input, None)?;
-    print_json(&h.command_run(id, params).map_err(s)?)?;
-    match a.get("-o") {
-        Some(out) => save(&mut h, out),
-        None => Ok(()),
+    let reply = h.command_run(id, params).map_err(s)?;
+    if let Some(out) = a.get("-o") {
+        save(&mut h, out)?;
     }
+    print_json(&reply)
 }
 
 fn batch(a: &Args) -> R {
