@@ -456,7 +456,7 @@ mod tests {
 
         use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
         use texturecraft_compose::{BakedMaps, DisplayKind, ImageRes, ImageStore, tile_bytes};
-        use texturecraft_core::{BakedMap, Effect, Generator, GeneratorKind};
+        use texturecraft_core::{BakedMap, Effect, GeneratorKind};
         use texturecraft_geom::{UvGBuffer, primitives};
         use texturecraft_texel::{TILE, TileImage, to_u16};
 
@@ -480,7 +480,7 @@ mod tests {
             let mut mask = Mask::new(MaskBackground::Black);
             let mask_paint = project.alloc_id();
             mask.effects.push(Effect::new(mask_paint, EffectKind::Paint));
-            let mut generator = Generator::new(GeneratorKind::Dirt);
+            let mut generator = crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Dirt);
             generator.noise_amount = 0.0;
             generator.global.blur = 0.85;
             generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("AO override"));

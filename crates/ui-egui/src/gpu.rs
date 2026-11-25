@@ -2054,10 +2054,13 @@ pub(crate) mod tests {
         assert_submitted_mask_view_matches_the_cpu(&mut session, layer, "dust_top smart mask");
     }
 
-    /// A default generator added to a black mask as the layer toolbar does shows on the GPU
+    /// A Dirt generator on the earlier model (its level, softness and noise given, as projects saved
+    /// before the reference app's controls have them) added to a black mask through the control
+    /// protocol shows on the GPU; a default generator starts on those controls, which compose on
+    /// the CPU
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn a_default_generator_renders_its_mask_view_on_the_gpu() {
+    fn an_earlier_model_dirt_generator_renders_its_mask_view_on_the_gpu() {
         const SIZE: u32 = 128;
         let mut session = texturecraft_engine::sample_session(SIZE, SIZE).unwrap();
         session.active_set = 1;
@@ -2065,9 +2068,11 @@ pub(crate) mod tests {
         let layer = session.selected_layer().unwrap();
         execute(&mut session, "mask.add.black", &json!({"layer": layer.0})).unwrap();
 
-        execute(&mut session, "effect.add.generator", &json!({"target": "mask", "layer": layer.0, "generator": "Dirt"})).unwrap();
+        let earlier = texturecraft_engine::core::Generator::new(texturecraft_engine::core::GeneratorKind::Dirt);
+        let params = json!({"target": "mask", "layer": layer.0, "generator": "Dirt", "level": earlier.level, "softness": earlier.softness, "noise": earlier.noise_amount});
+        execute(&mut session, "effect.add.generator", &params).unwrap();
 
-        assert_submitted_mask_view_matches_the_cpu(&mut session, layer, "default Dirt generator");
+        assert_submitted_mask_view_matches_the_cpu(&mut session, layer, "earlier-model Dirt generator");
     }
 
     /// Every built-in material, smart mask and default generator on the baked sample composites on
@@ -2098,7 +2103,16 @@ pub(crate) mod tests {
         session.active_set = 1;
         execute(&mut session, "material.apply", &json!({"material": "gold_polished"})).unwrap();
         let layer = session.selected_layer().unwrap();
-        let mut check_mask = |session: &mut Session, name: &str| {
+        // `on_gpu`: the mask composes on the GPU, else on the CPU, saying why
+        let mut check_mask = |session: &mut Session, name: &str, on_gpu: bool| {
+            if !on_gpu {
+                session.view = ViewMode::Mask(layer);
+                link.sync(session, Some(AuxView::Mask(layer)), None, 0, 0.0);
+                if link.compositor_status() != ("Mask: CPU", "A mask generator uses CPU compositing.") {
+                    failures.push(format!("{name}: {:?}, expected the CPU", link.compositor_status()));
+                }
+                return;
+            }
             session.view = ViewMode::Material;
             if let Err(reason) = plan_library_preview(&mut link, session, None) {
                 failures.push(format!("{name} on the material: {reason}"));
@@ -2110,14 +2124,18 @@ pub(crate) mod tests {
         };
         for mask in SMART_MASKS {
             execute(&mut session, "mask.smart.apply", &json!({"name": mask.id, "layer": layer.0})).unwrap();
-            check_mask(&mut session, mask.id);
+            check_mask(&mut session, mask.id, true);
         }
+        // A default generator on the earlier model (ThinAreas) composes on the GPU; the others start
+        // on the reference app's controls, which compose on the CPU
         for generator in GeneratorKind::ALL {
             execute(&mut session, "mask.remove", &json!({"layer": layer.0})).unwrap();
             execute(&mut session, "mask.add.black", &json!({"layer": layer.0})).unwrap();
             let name = format!("{generator:?}");
             execute(&mut session, "effect.add.generator", &json!({"target": "mask", "layer": layer.0, "generator": name})).unwrap();
-            check_mask(&mut session, &name);
+            let effects = &session.doc.project.layer(layer).unwrap().mask.as_ref().unwrap().effects;
+            let on_gpu = matches!(&effects.last().unwrap().kind, texturecraft_engine::core::EffectKind::Generator(added) if added.on_earlier_model());
+            check_mask(&mut session, &name, on_gpu);
         }
 
         assert!(failures.is_empty(), "GPU library sweep errors: {failures:#?}");

@@ -120,8 +120,18 @@ fn version() -> String {
     }
 }
 
+/// The desktop app's Nightly launch options. The CLI never takes them: a Nightly install ships the
+/// GUI only, and a script that passes them to the CLI has the wrong program.
+fn is_launch_profile_flag(arg: &str) -> bool {
+    arg == "--launch-profile" || arg == "--profile-root" || arg.starts_with("--launch-profile=") || arg.starts_with("--profile-root=")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(flag) = args.iter().find(|arg| is_launch_profile_flag(arg.as_str())) {
+        eprintln!("texturecraft-cli: `{flag}` is a TextureCraft desktop launch option, not a CLI argument");
+        std::process::exit(2);
+    }
     let code = match args.first().map(String::as_str) {
         None => {
             eprint!("{USAGE}");

@@ -45,6 +45,21 @@ impl super::PropertySheet<'_> {
         draft.original.trim() == draft.text.trim()
     }
 
+    /// Whether Escape was pressed this frame, even where a shortcut took it before the field lost its focus to it
+    pub(super) fn escape_pressed(&self) -> bool {
+        self.ui.input(|input| input.raw.events.iter().any(|event| matches!(event, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })))
+    }
+
+    /// Drops the draft of field `field_id`, if it is being typed in, without applying it
+    pub(super) fn drop_typing(&self, field_id: Id) {
+        if self.typing_draft(field_id).is_some() {
+            self.ui.memory_mut(|memory| {
+                memory.caches.cache::<ValueTextDrafts>().set(field_id, None);
+                memory.surrender_focus(field_id);
+            });
+        }
+    }
+
     /// Shows an edit in place of the displayed value, without shifting the sheet's rows
     pub(super) fn typing_edit(&mut self, left: f32, right: f32, center_y: f32, field_id: Id, draft: &mut ValueTextDraft) -> egui::Response {
         let font = semibold(super::TEXT_SIZE);

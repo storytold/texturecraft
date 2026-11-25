@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, Weak};
 use texturecraft_geom::Mesh;
 
 use crate::fill_depth::{FillDepth, FillDepthKey};
+use crate::micro_detail::AnchorHeightCache;
 
 pub(crate) type ViewDepth = (FillDepthKey, Option<Arc<FillDepth>>);
 
@@ -14,12 +15,14 @@ const MAX_CACHED_VIEWS: usize = 8;
 pub struct ProjectorDepthCache {
     mesh: Weak<Mesh>,
     maps: Mutex<Vec<ViewDepth>>,
+    pub(crate) micro_heights: AnchorHeightCache,
 }
 
 impl ProjectorDepthCache {
     pub(crate) fn bind(&mut self, mesh: &Arc<Mesh>) {
         if !std::ptr::eq(self.mesh.as_ptr(), mesh.as_ref()) {
             self.maps.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+            self.micro_heights = AnchorHeightCache::default();
             self.mesh = Arc::downgrade(mesh);
         }
     }

@@ -1,9 +1,14 @@
-//! Triangles of one material grouped into the pieces polygon fill selects and fills.
+//! Triangles of one material grouped into pieces joined across shared edges: the UV islands, polygons or connected meshes polygon fill selects and the UV island generators colour
 
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use texturecraft_geom::Mesh;
+use glam::Vec2;
+
+use crate::Mesh;
+
+/// Corners closer than one step of this grid (per unit of position or UV) count as the same corner
+pub const CORNER_GRID_STEPS: f32 = 1e5;
 
 /// A material's triangles split into groups joined across shared edges
 pub struct TrianglePartition {
@@ -40,6 +45,7 @@ impl TrianglePartition {
             while let Some(triangle) = stack.pop() {
                 members.push(triangle);
                 let triangle_edges = position_of.get(&triangle).and_then(|position| edge_lists.get_mut(*position)).map(std::mem::take).unwrap_or_default();
+
                 // Visit a shared edge once, including when many collapsed faces share the same key
                 for neighbour in triangle_edges.iter().flat_map(|edge| by_edge.remove(edge).into_iter().flatten()) {
                     if let std::collections::hash_map::Entry::Vacant(entry) = group_of.entry(neighbour) {
@@ -58,15 +64,34 @@ impl TrianglePartition {
         self.group_of.get(&triangle).copied()
     }
 
+    /// `material`'s UV islands: triangles joined where they share an edge in UV space
+    pub fn uv_islands(mesh: &Mesh, material: usize) -> TrianglePartition {
+        TrianglePartition::new(mesh, material, uv_edges)
+    }
+
     /// The group holding `triangle` (None for a triangle of another material)
     pub fn group(&self, triangle: u32) -> Option<&[u32]> {
         self.index_of(triangle).and_then(|group| self.groups.get(group)).map(Vec::as_slice)
     }
 }
 
+/// Texture coordinates of `triangle`'s corners
+fn uv_corners(mesh: &Mesh, triangle: usize) -> Option<[Vec2; 3]> {
+    let [first, second, third] = mesh.tri(triangle)?;
+    Some([*mesh.uvs.get(first)?, *mesh.uvs.get(second)?, *mesh.uvs.get(third)?])
+}
+
+/// `triangle`'s edges in UV space: imports often split vertices along hard edges where the UVs run on, so vertex indices alone break islands apart
+pub fn uv_edges(mesh: &Mesh, triangle: usize) -> Vec<([i64; 2], [i64; 2])> {
+    let corner = |uv: Vec2| (uv * CORNER_GRID_STEPS).round().to_array().map(|step| step as i64);
+    let Some([first, second, third]) = uv_corners(mesh, triangle).map(|uvs| uvs.map(corner)) else { return Vec::new() };
+
+    [(first, second), (second, third), (third, first)].map(|(from, to)| (from.min(to), from.max(to))).to_vec()
+}
+
 #[cfg(test)]
 mod tests {
-    use texturecraft_geom::primitives;
+    use crate::primitives;
 
     use super::*;
 

@@ -8,6 +8,7 @@ use super::Inputs;
 use crate::ProjectorDepthCache;
 use crate::environment_sh::EnvironmentSh;
 use crate::fill_depth::FillDepth;
+use crate::generator_maps::GeneratorMaps;
 use crate::pattern::mesh_frame;
 use crate::projector_depth_cache::ViewDepth;
 use crate::projector_view::ProjectorView;
@@ -17,11 +18,19 @@ const MAX_EVALUATION_VIEWS: usize = 10;
 
 pub(super) struct EvaluationInputs<'a> {
     inputs: &'a Inputs<'a>,
-    projectors: &'a ProjectorDepthCache,
+    pub(super) projectors: &'a ProjectorDepthCache,
     environment: OnceLock<EnvironmentSh>,
     instance_draws: OnceLock<HashMap<(usize, LayerId), usize>>,
     depth_maps: Mutex<Vec<ViewDepth>>,
+    /// The disabled mask being sampled directly by clone or smudge
+    pub(super) sampled_disabled_mask: Option<LayerId>,
+    pub(super) anchor_readers: HashMap<((LayerId, usize), LayerId), usize>,
+    pub(super) whole_maps: HashMap<LayerId, GeneratorMaps>,
+    pub(super) anchor_maps: HashMap<(LayerId, usize), GeneratorMaps>,
     gradients: Mutex<HashMap<usize, Arc<PreparedGradient>>>,
+    field_geometry: OnceLock<u64>,
+    /// The project is the session's own stack as the viewport composites it, not one cut down (a histogram's, a thumbnail's, a solo layer's)
+    session_stack: bool,
 }
 
 impl<'a> EvaluationInputs<'a> {
@@ -32,8 +41,29 @@ impl<'a> EvaluationInputs<'a> {
             environment: OnceLock::new(),
             instance_draws: OnceLock::new(),
             depth_maps: Mutex::new(Vec::new()),
+            sampled_disabled_mask: None,
+            anchor_readers: HashMap::new(),
+            whole_maps: HashMap::new(),
+            anchor_maps: HashMap::new(),
             gradients: Mutex::default(),
+            field_geometry: OnceLock::new(),
+            session_stack: false,
         }
+    }
+
+    /// These inputs evaluating the session's own stack: they keep the anchor heights the stack reads and drop the rest
+    pub(super) fn of_the_session_stack(self) -> Self {
+        Self { session_stack: true, ..self }
+    }
+
+    /// Whether the project evaluated is the session's own stack (see [`EvaluationInputs::of_the_session_stack`])
+    pub(super) fn is_session_stack(&self) -> bool {
+        self.session_stack
+    }
+
+    /// The whole-map fields share one fingerprint of the sampled geometry and layout
+    pub(super) fn field_identity(&self) -> u64 {
+        *self.field_geometry.get_or_init(|| crate::field_cache::field_identity(self.inputs))
     }
 
     pub(super) fn environment(&self) -> EnvironmentSh {

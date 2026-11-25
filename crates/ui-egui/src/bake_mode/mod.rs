@@ -6,6 +6,13 @@ mod bake_visualization_panel;
 mod bake_visualization_toggles;
 mod breadcrumb;
 mod common_settings;
+mod glyph_look;
+mod live_preview;
+mod live_preview_target;
+mod map_preview_fold;
+mod preview_input;
+mod running_preview;
+pub(crate) use live_preview::LivePreview;
 mod section_opening;
 pub(crate) use bake_checks::bake_warnings;
 pub use bake_paint_brush::BakePaintBrush;
@@ -13,18 +20,30 @@ pub(crate) use bake_visualization_panel::bake_visualization_panel;
 pub use bake_visualization_toggles::BakeVisualizationToggles;
 mod controls;
 mod map_settings;
+mod map_thumbnails;
 mod mesh_map_bakers;
+pub use map_thumbnails::MapThumbnails;
+mod set_picker;
+mod set_picker_purpose;
+mod set_picker_row;
 
 use egui::{Ui, vec2};
 use egui_phosphor::regular as icon;
 use serde_json::{Value, json};
+use texturecraft_engine::Session;
 use texturecraft_engine::bake::settings_patch;
-use texturecraft_engine::core::{BakeSettings, BakedMap};
+use texturecraft_engine::core::{BakeSettings, BakeSyncGroup, BakedMap, CageType};
 
 use crate::TextureCraftApp;
 use crate::i18n::{tr, trf};
+use crate::property_sheet::PropertySheet;
 use crate::state::Mode;
 use crate::widgets::{icon_button, primary_button};
+
+/// Whether the high poly shows its matching error for `session`'s selected texture set: the automatic cage has no distances to fall short, as in the reference
+pub(crate) fn matching_error_applies(session: &Session) -> bool {
+    session.doc.project.texture_sets.get(session.ts()).is_none_or(|set| set.bake.cage.kind != CageType::Automatic)
+}
 
 pub fn texture_sets(app: &mut TextureCraftApp, ui: &mut Ui) {
     egui::ScrollArea::vertical().id_salt("bake_texture_sets").auto_shrink([false; 2]).show(ui, |ui| {
@@ -156,20 +175,41 @@ pub fn mesh_map_settings_panel(app: &mut TextureCraftApp, ui: &mut Ui) {
     let Some(texture_set) = app.session.doc.project.texture_sets.get(app.session.ts()) else { return };
 
     let selected = selected_map(app.ui.selected_baked_map, &texture_set.bake);
-    breadcrumb::show(app, ui, selected);
-    ui.separator();
-    edit_settings(app, ui, "mesh_map_settings", json!("all"), |_, ui, settings| {
-        ui.push_id(selected, |ui| map_settings::show(ui, selected, &mut settings.maps)).inner
+    let restore = ui.horizontal(|ui| {
+        ui.add_space(crate::property_sheet::SIDE_PADDING_POINTS);
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width() - crate::property_sheet::SIDE_PADDING_POINTS);
+            breadcrumb::show(app, ui, selected, map_settings::has_parameters(selected))
+        })
+        .inner
     });
+    let texture_sets = json!(app.session.doc.project.bake_synced_sets(app.session.ts(), BakeSyncGroup::Map(selected)));
+    let changed = edit_settings(app, ui, "mesh_map_settings", texture_sets, |_, ui, settings| {
+        PropertySheet::show(ui, ("mesh_map_settings_sheet", selected), |sheet| map_settings::show(sheet, selected, &mut settings.maps, restore.inner))
+    });
+
+    // Other changes reach the preview through its check of what its picture was made from
+    if changed && ui.ctx().dragged_id().is_some() {
+        let ctx = ui.ctx().clone();
+        live_preview::slider_dragged(app, &ctx);
+    }
+}
+
+/// Once a frame: the map preview follows the selected map and takes its finished bakes
+pub(crate) fn poll_live_preview(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    live_preview::poll(app, ctx);
 }
 
 /// The Common Settings panel: output, high poly, cage and skew settings
 pub fn common_settings_panel(app: &mut TextureCraftApp, ui: &mut Ui) {
-    edit_settings(app, ui, "bake_common_settings", json!("all"), common_settings::show);
+    let texture_sets = json!(app.session.doc.project.bake_synced_sets(app.session.ts(), BakeSyncGroup::Common));
+    edit_settings(app, ui, "bake_common_settings", texture_sets, |app, ui, settings| {
+        PropertySheet::show(ui, "bake_common_sheet", |sheet| common_settings::show(app, sheet, settings))
+    });
 }
 
 /// The map whose settings show: the chosen one, else the first enabled map, else Normal
-fn selected_map(selection: Option<BakedMap>, settings: &BakeSettings) -> BakedMap {
+pub(super) fn selected_map(selection: Option<BakedMap>, settings: &BakeSettings) -> BakedMap {
     selection.or_else(|| settings.maps.enabled().next()).unwrap_or(BakedMap::Normal)
 }
 
@@ -180,14 +220,14 @@ fn edit_settings(
     scroll_id: &str,
     texture_sets: Value,
     contents: impl FnOnce(&mut TextureCraftApp, &mut Ui, &mut BakeSettings) -> Option<Value>,
-) {
+) -> bool {
     let set_index = app.session.ts();
-    let Some(before) = app.session.doc.project.texture_sets.get(set_index).map(|texture_set| texture_set.bake.clone()) else { return };
+    let Some(before) = app.session.doc.project.texture_sets.get(set_index).map(|texture_set| texture_set.bake.clone()) else { return false };
 
     let mut settings = before.clone();
     let reset = egui::ScrollArea::vertical().id_salt(scroll_id).auto_shrink([false; 2]).show(ui, |ui| contents(app, ui, &mut settings)).inner;
     if settings == before && reset.is_none() {
-        return;
+        return false;
     }
 
     let mut patch = settings_patch(&before, &settings);
@@ -195,6 +235,7 @@ fn edit_settings(
         fields.extend(reset);
     }
     app.run("bake.settings", json!({ "ts": texture_sets, "patch": patch }));
+    true
 }
 
 /// What the 3D view shows while a bake runs: the newest finished map, one finished map or the material

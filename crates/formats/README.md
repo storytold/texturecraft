@@ -119,7 +119,11 @@ pub fn preset_to_json(preset: &ExportPreset) -> Result<String>;
   the normal channel, then with the baked normal map, by Reoriented Normal Mapping. DirectX
   flips green.
 
-Built-in presets:
+File names may hold folders: `/` separates folder names inside the output directory (each one
+sanitized; a backslash, `..`, a leading `/` and empty folder names are refused), and the folders
+are created when the files are written.
+
+Built-in presets (each one lists the public specification its packing follows in `src/presets.rs`):
 
 | Preset | Files (`$mesh_$textureSet_…`) |
 |---|---|
@@ -131,6 +135,8 @@ Built-in presets:
 | Blender (Principled BSDF) | `BaseColor`, `Metallic`, `Roughness`, `Normal` (OpenGL), `Height` (16-bit), `Emission`, `Specular` |
 | Godot 4 (ORM) | `albedo` (A = opacity), `orm` (R AO, G roughness, B metal), `normal` (OpenGL), `emission` |
 | OpenPBR (separate maps) | one map per OpenPBR Surface input the set has: `base_color`, `base_metalness`, `specular_roughness`, `specular_roughness_anisotropy`, `coat_weight`, `coat_roughness`, `fuzz_weight`, `fuzz_color`, `fuzz_roughness`, `transmission_weight`, `subsurface_weight`, `emission_color`, `geometry_opacity`, `geometry_normal` (OpenGL), `height` (16-bit) |
+| Unity URP Lit (Metallic Smoothness) | `BaseMap`, `MetallicMap` (R metal, A smoothness), `NormalMap` (OpenGL), `OcclusionMap`, `EmissionMap` |
+| USD Preview Surface (separate maps) | one map per UsdPreviewSurface input the set has, named like it: `diffuseColor`, `emissiveColor`, `metallic`, `roughness`, `normal` (OpenGL), `occlusion`, `opacity`, `clearcoat`, `clearcoatRoughness` |
 | Separate maps | one file per channel, gray where scalar, height 16-bit |
 | Mesh maps | every baked map (`$channel` = map id), 16-bit |
 

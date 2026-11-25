@@ -17,4 +17,19 @@ pub(crate) struct StackSlider<'a> {
 
     /// A unit after the value ("°")
     pub(crate) suffix: &'a str,
+
+    /// An angle: a small dial before its value, as an angle row has
+    pub(crate) dial: bool,
+}
+
+impl<'a> StackSlider<'a> {
+    /// A 0..1 setting with two decimals
+    pub(crate) fn unit(label: &'a str, value: &'a mut f32) -> StackSlider<'a> {
+        StackSlider { label, value, range: 0.0..=1.0, typed: 0.0..=1.0, decimals: 2, suffix: "", dial: false }
+    }
+
+    /// A whole-number setting across `range`
+    pub(crate) fn whole(label: &'a str, value: &'a mut f32, range: RangeInclusive<f32>) -> StackSlider<'a> {
+        StackSlider { label, value, range: range.clone(), typed: range, decimals: 0, suffix: "", dial: false }
+    }
 }

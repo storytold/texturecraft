@@ -248,7 +248,7 @@ impl PropertySheet<'_> {
                 if let Ok(typed) = draft.text.trim().parse::<u32>()
                     && !untouched
                     && typed != *seed
-                    && !self.ui.input(|input| input.key_pressed(egui::Key::Escape))
+                    && !self.escape_pressed()
                 {
                     *seed = typed;
                     changed = true;

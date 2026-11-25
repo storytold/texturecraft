@@ -152,3 +152,14 @@ fn a_map_the_template_no_longer_has_is_ignored() {
     h.run_steps(3);
     assert_eq!(selected(&h), before, "the export still plans every file");
 }
+
+#[test]
+fn each_row_names_its_own_map() {
+    let h = harness();
+
+    // The default template names its maps with $channel: each row shows the map it writes
+    assert!(h.query_all_by_label_contains("$channel").next().is_none(), "the channel variable is filled in");
+    for id in ["baseColor", "metallic", "roughness"] {
+        assert!(h.query_all_by_label_contains(&format!("_{id}")).next().is_some(), "a row for {id}");
+    }
+}

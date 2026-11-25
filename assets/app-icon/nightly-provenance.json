@@ -1,0 +1,81 @@
+{
+  "title": "TextureCraft nightly deep-background icons",
+  "license": "MIT OR Apache-2.0",
+  "generator": "packaging/nightly-icons.py",
+  "generator_sha256": "745786e3bfbecf29077df1e4a64ed717953694038f95533d2d37507c520b791c",
+  "inputs": [
+    {
+      "path": "assets/app-icon/texturecraft.icns",
+      "sha256": "eb5e1b19679aa9a23531219d92922e37edbdc3e2046454b8f6c64423f471b57b"
+    },
+    {
+      "path": "assets/app-icon/texturecraft.ico",
+      "sha256": "9c3366e4af9f2c0772e00193c348feba834d407fc8b826d4276a8fcb4cc01dcb"
+    },
+    {
+      "path": "assets/app-icon/texturecraft-1024.png",
+      "sha256": "8451f91be8c1bc9c2e1a594e193ae5d1793d2d12f26a8bc64d2bd83fe4b789e4"
+    },
+    {
+      "path": "assets/app-icon/hicolor/16x16/apps/ai.storyteller.texturecraft.png",
+      "sha256": "79ee309754be54b56052ab05fff87a2427bbc38bb057c96094f8f070ee13ca1d"
+    },
+    {
+      "path": "assets/app-icon/hicolor/24x24/apps/ai.storyteller.texturecraft.png",
+      "sha256": "f8f89220ce68be236d63edfd94d4fef2aad2aa9840a50e430f874649a9816171"
+    },
+    {
+      "path": "assets/app-icon/hicolor/32x32/apps/ai.storyteller.texturecraft.png",
+      "sha256": "ff8578ffc95f5123bb2e4a00636080f02adf259334ecb0ac9f952fac3378ddb2"
+    },
+    {
+      "path": "assets/app-icon/hicolor/48x48/apps/ai.storyteller.texturecraft.png",
+      "sha256": "f7f19ffbd8904ff462bc6d785b865153112025bbdeb868bc0f136e39c7d725e1"
+    },
+    {
+      "path": "assets/app-icon/hicolor/64x64/apps/ai.storyteller.texturecraft.png",
+      "sha256": "39d17421579ace5dbe4705fb0a52cd6002d433ded7ba0ee2fdeb5d6d7cd16c8c"
+    },
+    {
+      "path": "assets/app-icon/hicolor/128x128/apps/ai.storyteller.texturecraft.png",
+      "sha256": "ac629a038a215a13d86172286142502b6efd17618869652050f291d9745346d2"
+    },
+    {
+      "path": "assets/app-icon/hicolor/256x256/apps/ai.storyteller.texturecraft.png",
+      "sha256": "757f858b26897cb0e9f0c8cd43db9ade9664dd6199bd190d1af406839769c71f"
+    },
+    {
+      "path": "assets/app-icon/hicolor/512x512/apps/ai.storyteller.texturecraft.png",
+      "sha256": "705513dc82aa908f962b9a466743b42e53b0f586752d2d69a5b6596b8ff928f0"
+    }
+  ],
+  "method": {
+    "kind": "derivative of the project-owned stable renders; no badge, crescent or letter",
+    "original_palette": {
+      "ink": "#0b0b0c",
+      "paper": "#efe9dc",
+      "background": "#c2672b"
+    },
+    "nightly_background": "#643418",
+    "transform": "Fit each pixel as the tile background plus one engraved foreground (ink or paper) and replace only the background contribution; keep alpha, padding and foreground detail. Each frame comes from the stable master of its own size: the .icns and .ico PNG frames are recoloured in place, and the per-size PNGs (in nightly/) and the 1024 master are recoloured from their own renders. No upscaling."
+  },
+  "outputs": {
+    "assets/app-icon/texturecraft-nightly.icns": "e21e2c90f7402e6289038ad7db896a14780766e07f33d9cb68cbe0d423efe66d",
+    "assets/app-icon/texturecraft-nightly.ico": "b0dc8817a3b07f0eb8175241c1fdc1ce21ffb8d5a54e6b03979ba2f73e62d47e",
+    "assets/app-icon/nightly/16.png": "657c7a39547828b0eaafe4b78df28771bb953afdb62440d0c001c695ff586e76",
+    "assets/app-icon/nightly/24.png": "b4c263436402faa93276b77614291107f6b44309ccfe329b71c3562c1f382c11",
+    "assets/app-icon/nightly/32.png": "cefb99a330d103f32a07d07e49542da2231897224a3dfe479e9c9d4a53a0a17b",
+    "assets/app-icon/nightly/48.png": "126316a058f4a225fbea7e1c0e49dc3d27941e2a91a7f033f35b84bc6d646f22",
+    "assets/app-icon/nightly/64.png": "d471a4bd691fca348603571bfe9c05357120e492566e31c7b2c936361a4a2510",
+    "assets/app-icon/nightly/128.png": "b36b07739b98b7884ce308641407725bb499adfefd87a4286c3aa117abdb57d5",
+    "assets/app-icon/nightly/256.png": "82c417bbcafd9b90929b117b7f80f403e631a77a327ee868bc9e8ca7a44c7fe2",
+    "assets/app-icon/nightly/512.png": "de756e67f16076a08cb5c2726d1a63181a0a8b61c73ff3df0cf49e065f1c8bc2",
+    "assets/app-icon/texturecraft-nightly-1024.png": "509ebc6130db6c10c380bc4ee2280a6b1810eea5dc03293b86a575c1ef120736",
+    "assets/app-icon/texturecraft-nightly.png": "82c417bbcafd9b90929b117b7f80f403e631a77a327ee868bc9e8ca7a44c7fe2"
+  },
+  "ico_frames": [
+    "the stable .ico's own frames (16, 20, 24, 32, 40, 48, 64, 128, 256)"
+  ],
+  "icns_slots": "the stable .icns's own PNG slots (icp4 through ic10)",
+  "validation": "Byte comparison against the committed assets (packaging/nightly-archive-tests.py and the icon check in packaging/nightly-tests.py); native Explorer/Finder rendering is not exercised here. The per-size PNGs are kept out of hicolor/ because Stable's Linux and FreeBSD packages copy that theme tree whole."
+}

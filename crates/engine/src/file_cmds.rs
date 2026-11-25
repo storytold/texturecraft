@@ -217,8 +217,11 @@ impl Session {
         let source = pf.mesh.clone();
         let resources = pf.resources.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
         let mesh_time = Instant::now();
-        let mut s =
-            Session::new(Document { bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, baked: pf.baked, resources }, mesh, source)?;
+        let mut s = Session::new(
+            Document { bake_meshes: Default::default(), bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, baked: pf.baked, resources },
+            mesh,
+            source,
+        )?;
 
         let cache_time = Instant::now();
         s.sync_images();
@@ -628,10 +631,7 @@ impl Session {
         Some(self.doc.project.mesh_path.as_str()).filter(|m| !m.is_empty() && std::path::Path::new(m).is_file())
     }
 
-    /// Replace the mesh with `file` (or re-read the project's own copy) and keep the project:
-    /// texture sets map by material index. Nothing changes unless the new mesh fits the project.
-    /// With `preserve_strokes`, painted pixels follow the surface where the UVs changed. Replies
-    /// like `file.reimportMesh`: `{preserved?}`.
+    /// Replace the mesh with `file` (or re-read the project's own copy), keeping the project when the new mesh fits it; `preserve_strokes` moves painted pixels with the surface; replies `{preserved?}`
     pub fn reimport_mesh(&mut self, file: Option<texturecraft_formats::MeshFile>, preserve_strokes: bool) -> Result<Value> {
         let (mesh, source, warnings, mesh_file) = match file {
             Some(f) => {
@@ -645,27 +645,29 @@ impl Session {
                 None => return Err(bad("file.reimportMesh", "built-in meshes can't be reimported; give `path`")),
             },
         };
+
         check_materials(&self.doc.project, &mesh)?;
         let mut doc = self.doc.clone();
         if let Some((ext, _)) = &source {
             doc.project.mesh = format!("mesh.{ext}");
             doc.project.mesh_file = mesh_file;
         }
+
         let mut next = Session::new(doc, mesh, source)?;
         next.log.warnings("Importer", warnings);
         next.path = self.path.clone();
         next.sync_images();
 
         // The cage uses triangle indices and barycentrics, so it needs identical geometry
-        next.bake_meshes = self.bake_meshes.clone();
-        next.bake_meshes.low_base_color = Default::default();
-        if next.bake_meshes.cage.is_some() && *next.mesh != *self.mesh {
-            next.bake_meshes.cage = None;
+        next.doc.bake_meshes.low_base_color = Default::default();
+        if next.doc.bake_meshes.cage.is_some() && *next.mesh != *self.mesh {
+            next.doc.bake_meshes.cage = None;
             next.log.warn("Project", "the cage mesh was dropped: the low-poly mesh changed");
         }
         if self.doc.bake_paint.keys().any(|(_, target)| *target == texturecraft_core::BakePaintTarget::Skew) && self.source.uvs != next.source.uvs {
             next.log.warn("Project", "the skew map is laid over the old UV layout; check it in Bake mode");
         }
+
         next.modified = true;
         next.project_id = self.project_id;
         let preserved = preserve_strokes.then(|| crate::preserve::preserve_strokes(self, &mut next));
@@ -1506,19 +1508,24 @@ f 1/1 2/2 3/3
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.obj");
         std::fs::write(&a, "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n").unwrap();
-        // Same triangle count, other vertices.
+
+        // Same triangle count, other vertices
         let b = dir.join("b.obj");
         std::fs::write(&b, "v 0 0 0\nv 2 0 0\nv 0 2 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n").unwrap();
         let mut s = Session::from_mesh_bytes("a.obj", &std::fs::read(&a).unwrap(), 128, "a").unwrap();
-        let cage = crate::bake::BakeMesh { name: "cage".into(), bytes: Default::default(), mesh: s.mesh.clone(), base_color: Vec::new() };
-        s.bake_meshes.cage = Some(cage);
-        let _ = s.bake_meshes.low_base_color.set(Err("old".into()));
-        // The same mesh again keeps the cage but not the cached colours.
+        let cage = crate::bake::BakeMesh { name: "cage".into(), folder: None, bytes: Default::default(), mesh: s.mesh.clone(), base_color: Vec::new() };
+        s.doc.bake_meshes.cage = Some(cage);
+        let _ = s.doc.bake_meshes.low_base_color.set(Err("old".into()));
+
+        // The same mesh again keeps the cage but not the cached colours
         crate::execute(&mut s, "file.changeMesh", &json!({"path": a.display().to_string()})).unwrap();
-        assert!(s.bake_meshes.cage.is_some());
-        assert!(s.bake_meshes.low_base_color.get().is_none(), "the colours are read again");
+
+        assert!(s.doc.bake_meshes.cage.is_some());
+        assert!(s.doc.bake_meshes.low_base_color.get().is_none(), "the colours are read again");
+
         crate::execute(&mut s, "file.changeMesh", &json!({"path": b.display().to_string()})).unwrap();
-        assert!(s.bake_meshes.cage.is_none(), "the cage was made for another mesh");
+
+        assert!(s.doc.bake_meshes.cage.is_none(), "the cage was made for another mesh");
         std::fs::remove_dir_all(&dir).ok();
     }
 

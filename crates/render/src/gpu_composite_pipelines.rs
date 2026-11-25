@@ -456,8 +456,8 @@ mod tests {
 
         use texturecraft_compose::PixelStore;
         use texturecraft_core::{
-            Channel, CompareOp, CompareSource, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, Layer, LayerKind, Levels, Mask, MaskBackground,
-            Project, Source, StylizedLighting, TextureSet,
+            Channel, CompareOp, CompareSource, Effect, EffectKind, Fill, Filter, GeneratorKind, Layer, LayerKind, Levels, Mask, MaskBackground, Project,
+            Source, StylizedLighting, TextureSet,
         };
 
         use crate::gpu_composite::CompositeProgram;
@@ -520,7 +520,7 @@ mod tests {
                         EffectKind::Levels(Levels::default()),
                         EffectKind::Filter(lighting.clone()),
                     ],
-                    vec![EffectKind::Generator(Generator::new(GeneratorKind::Dirt))],
+                    vec![EffectKind::Generator(crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Dirt))],
                 ),
             ),
             ("mask comparing Layers Below and This Layer", project(Vec::new(), vec![compare(CompareSource::LayersBelow), compare(CompareSource::ThisLayer)])),
@@ -534,7 +534,7 @@ mod tests {
                         EffectKind::Levels(Levels::default()),
                         EffectKind::Filter(lighting.clone()),
                     ],
-                    vec![EffectKind::Generator(Generator::new(GeneratorKind::Dirt))],
+                    vec![EffectKind::Generator(crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Dirt))],
                 )),
             ),
             ("UV tile atlas: plain fill", uv_tiles(project(Vec::new(), Vec::new()))),

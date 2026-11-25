@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BakeSettings, BakedMap, Channel, ChannelFormat, ContentsOffset, CoreError, Effect, Layer, LayerId, LayerKind, Result};
+use crate::{BakeSettings, BakeSyncGroup, BakedMap, Channel, ChannelFormat, ContentsOffset, CoreError, Effect, Layer, LayerId, LayerKind, Result};
 
 pub use crate::env_alignment::EnvAlignment;
 pub use crate::shadow_mode::ShadowMode;
@@ -478,6 +478,23 @@ impl Project {
         self.texture_sets.get_mut(ts).ok_or(CoreError::NoTextureSet(ts))
     }
 
+    /// The texture sets an edit of `group` on texture set `active` reaches: every set sharing `group` with it, or `active` alone
+    pub fn bake_synced_sets(&self, active: usize, group: BakeSyncGroup) -> Vec<usize> {
+        match self.texture_sets.get(active) {
+            Some(set) if set.bake.sync.shares(group) => {
+                self.texture_sets.iter().enumerate().filter(|(_, set)| set.bake.sync.shares(group)).map(|(index, _)| index).collect()
+            }
+            Some(_) => vec![active],
+            None => Vec::new(),
+        }
+    }
+
+    /// The set whose `group` settings the sets joining a sync of `members` take: one of them already sharing the group, else `active` when it is one of them, else the first
+    pub fn bake_sync_source(&self, group: BakeSyncGroup, members: &[usize], active: usize) -> Option<usize> {
+        let staying = members.iter().copied().find(|index| self.texture_sets.get(*index).is_some_and(|set| set.bake.sync.shares(group)));
+        staying.or_else(|| members.contains(&active).then_some(active)).or_else(|| members.first().copied())
+    }
+
     pub fn layer(&self, id: LayerId) -> Result<&Layer> {
         self.layers.get(&id).ok_or(CoreError::NoLayer(id))
     }
@@ -785,6 +802,23 @@ mod tests {
         let mut p = Project::new("t", "builtin:sphere");
         p.texture_sets.push(TextureSet::new("Body", 0, 512));
         p
+    }
+
+    #[test]
+    fn a_sync_takes_settings_from_a_staying_member_else_the_active_set_else_the_first() {
+        let group = BakeSyncGroup::Common;
+        let mut project = project();
+        for name in ["Legs", "Arms"] {
+            project.texture_sets.push(TextureSet::new(name, 0, 512));
+        }
+        for (index, set) in project.texture_sets.iter_mut().enumerate() {
+            set.bake.sync.set_shares(group, index == 2);
+        }
+
+        assert_eq!(project.bake_sync_source(group, &[0, 1, 2], 0), Some(2), "a member already sharing the group");
+        assert_eq!(project.bake_sync_source(group, &[0, 1], 1), Some(1), "the active set when it joins");
+        assert_eq!(project.bake_sync_source(group, &[0, 1], 2), Some(0), "else the first member");
+        assert_eq!(project.bake_sync_source(group, &[], 0), None);
     }
 
     fn paint(p: &mut Project, name: &str) -> Layer {

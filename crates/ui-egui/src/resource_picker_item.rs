@@ -31,7 +31,10 @@ impl<K> ResourcePickerItem<K> {
 
     /// Whether a search for `query` (from [`search_query`]) keeps the item; compares as it lowercases, so the open picker builds no lowercase copy of every label each frame
     pub fn matches(&self, query: &str) -> bool {
-        query.is_empty() || self.label.char_indices().any(|(start, _)| self.label.get(start..).is_some_and(|rest| starts_with_lowercase(rest, query)))
+        let matches = |label: &str| label.char_indices().any(|(start, _)| label.get(start..).is_some_and(|rest| starts_with_lowercase(rest, query)));
+        query.is_empty()
+            || matches(&self.label)
+            || matches!(self.picture, TilePicture::Generator(kind) if kind.former_labels().iter().any(|label| matches(label)))
     }
 }
 

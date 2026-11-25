@@ -201,9 +201,9 @@ mod tests {
         BakedMaps, Composite, DisplayKind, ImageRes, ImageStore, Inputs, MaskGray, PaintTarget, PixelStore, StrokePreview, composite_tiles, tile_bytes,
     };
     use texturecraft_core::{
-        BakedMap, Bevel, BlendMode, Channel, ColorSelection, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, GradientInput, HeightToNormal, Layer,
-        LayerId, LayerKind, Mask, MaskBackground, Mirror, Procedural, ProceduralKind, Project, Projection, Sampling, Source, SourceWarp, StylizedLighting,
-        TextureSet, TileTransform, WarpMode, WarpSource, WarpSourceMode,
+        BakedMap, Bevel, BlendMode, Channel, ColorSelection, Effect, EffectKind, Fill, Filter, GeneratorKind, GradientInput, HeightToNormal, Layer, LayerId,
+        LayerKind, Mask, MaskBackground, Mirror, Procedural, ProceduralKind, Project, Projection, Sampling, Source, SourceWarp, StylizedLighting, TextureSet,
+        TileTransform, WarpMode, WarpSource, WarpSourceMode,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::{Mesh, UvGBuffer, primitives};
@@ -599,7 +599,7 @@ mod tests {
             return;
         }
         let Some(mut gpu) = headless() else { return };
-        let mut generator = Generator::new(GeneratorKind::Dirt);
+        let mut generator = crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Dirt);
         generator.global.blur = 0.4;
         generator.resolution.factor = -2;
         generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("Occlusion"));
@@ -709,7 +709,7 @@ mod tests {
             let generators: Vec<Effect> = [GeneratorKind::Curvature, GeneratorKind::AmbientOcclusion, GeneratorKind::ThinAreas]
                 .into_iter()
                 .map(|kind| {
-                    let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(Generator::new(kind)));
+                    let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(crate::gpu_composite::oracle::earlier_generator(kind)));
                     generated.blend = BlendMode::Multiply;
                     generated
                 })
@@ -768,7 +768,7 @@ mod tests {
                 let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.7, 0.4, 0.2]))]), ..Fill::default() };
                 let mut layer = Layer::new(owner, "Curvature", LayerKind::Fill(fill), &[Channel::BaseColor]);
                 let mut mask = Mask::new(MaskBackground::Black);
-                mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(Generator::new(kind))));
+                mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(crate::gpu_composite::oracle::earlier_generator(kind))));
                 layer.mask = Some(mask);
                 project.insert_layer(0, layer, None, false).unwrap();
                 let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);

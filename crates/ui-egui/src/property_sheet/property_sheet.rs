@@ -27,6 +27,8 @@ pub(crate) struct PropertySheet<'u> {
     pub(super) sections: Vec<(String, f32)>,
     pub(super) info: Option<&'u str>,
     pub(super) held: bool,
+    /// Sub-headers so far in the current folding section: a later one takes air above it
+    pub(super) sub_headers: usize,
 }
 
 impl<'u> PropertySheet<'u> {
@@ -53,6 +55,7 @@ impl<'u> PropertySheet<'u> {
             sections: Vec::new(),
             info: None,
             held: false,
+            sub_headers: 0,
             ui,
         };
         let result = body(&mut sheet);

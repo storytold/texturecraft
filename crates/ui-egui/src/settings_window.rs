@@ -562,6 +562,12 @@ fn general(
 
         section(ui, n_("FOLDERS"));
         row(ui, tr("Data folder"), |ui, label| {
+            // A Nightly install keeps every folder inside its own profile (the Launcher picks it),
+            // so the Setting would be ignored: show where they are instead of editing it.
+            if crate::has_data_root() {
+                ui.label(RichText::new(crate::data_dir().display().to_string()).small().color(tk.text_dim));
+                return;
+            }
             let default = crate::data_folder("").display().to_string();
             ui.add(egui::TextEdit::singleline(&mut p.data_folder).hint_text(default).desired_width(CONTROL_WIDTH - 30.0)).labelled_by(label);
             if ui.button("...").on_hover_text(tr("Choose the data folder")).clicked() {
@@ -573,9 +579,13 @@ fn general(
         }
         note(
             ui,
-            tr(
-                "Autosaves, smart materials, presets, templates and UI layouts go to the data folder. A new folder applies on restart; files already saved stay where they are.",
-            ),
+            if crate::has_data_root() {
+                tr("TextureCraft Nightly keeps its autosaves, smart materials, presets, templates and UI layouts in its own profile, beside its settings.")
+            } else {
+                tr(
+                    "Autosaves, smart materials, presets, templates and UI layouts go to the data folder. A new folder applies on restart; files already saved stay where they are.",
+                )
+            },
         );
     }
 }

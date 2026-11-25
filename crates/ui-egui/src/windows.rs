@@ -33,6 +33,7 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     unsaved(app, ctx);
     reset_ui(app, ctx);
     crate::named_layouts::show(app, ctx);
+    crate::generator_preview_window::show(app, ctx);
 }
 
 /// Window ▸ Reset UI asks first: Escape closes the question, Enter answers Reset.
@@ -307,10 +308,13 @@ fn export_mesh(app: &mut TextureCraftApp, ctx: &egui::Context) {
 fn about(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let tk = Tokens::get(ctx);
     let mut open = app.ui.windows.about;
-    dialog(ctx, "about", tr("About TextureCraft"), &mut open).show(ctx, |ui| {
+    let name = crate::os_window::name();
+    // A Nightly window names its channel in the title too; the stable title keeps its translations.
+    let title = if name == "TextureCraft" { tr("About TextureCraft").to_owned() } else { trf("About {app}", &[("app", &name)]) };
+    dialog(ctx, "about", &title, &mut open).show(ctx, |ui| {
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("TextureCraft").size(22.0).strong().color(tk.text_strong));
-            ui.label(trf("Version {version}", &[("version", &texturecraft_engine::VERSION)]));
+            ui.label(RichText::new(name).size(22.0).strong().color(tk.text_strong));
+            ui.label(trf("Version {version}", &[("version", &crate::os_window::display_version())]));
             ui.add_space(6.0);
             ui.label(tr("3D texture painting: layers, masks, smart materials, mesh map baking and export."));
             ui.label(tr("Free and open source (MIT OR Apache-2.0), written in Rust."));

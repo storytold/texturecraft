@@ -21,6 +21,13 @@ use super::{CompositeProgram, CompositeRegion};
 use crate::headless::Headless;
 use crate::readback::Readback;
 
+/// A `kind` generator on the earlier model (no wear, section, light or kind controls), the one
+/// the GPU composes; [`texturecraft_core::Generator::new`] gives the reference app's controls,
+/// which compose on the CPU
+pub(crate) fn earlier_generator(kind: texturecraft_core::GeneratorKind) -> texturecraft_core::Generator {
+    texturecraft_core::Generator { wear: None, section: None, light: None, controls: None, ..texturecraft_core::Generator::new(kind) }
+}
+
 /// The GPU for an oracle test, or None without an adapter: the test then returns, as the other
 /// GPU tests do. With `TC_CI_LAVAPIPE` set (CI promises an adapter) a missing one fails the test.
 pub(crate) fn headless() -> Option<Headless> {

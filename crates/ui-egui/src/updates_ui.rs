@@ -22,12 +22,19 @@ impl Default for Runtime {
 impl TextureCraftApp {
     /// Whether the app asks for a newer release when it starts (off until the desktop app turns it on).
     pub fn set_startup_update_check(&mut self, on: bool) {
-        self.updates_rt.startup_check = on;
+        // A Nightly install is updated by ArtCraft Launcher with the rest of the suite, never by
+        // the app: an in-app update would replace a copy the Launcher believes it manages.
+        self.updates_rt.startup_check = on && crate::os_window::stable_services_allowed();
     }
 }
 
-/// Help > Check for Updates: the next frame starts a check that reports its outcome.
+/// Help > Check for Updates: the next frame starts a check that reports its outcome. In a Nightly
+/// build the Launcher owns updates, so it says so instead of checking.
 pub(crate) fn request_check(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    if !crate::os_window::stable_services_allowed() {
+        app.toast(crate::i18n::tr("TextureCraft Nightly is updated by ArtCraft Launcher."), false);
+        return;
+    }
     app.updates_rt.check_requested = true;
     ctx.request_repaint();
 }
@@ -45,6 +52,9 @@ fn holds_keyboard(status: &Status, prompt_open: bool) -> bool {
 }
 
 pub(crate) fn tick(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    if !crate::os_window::stable_services_allowed() {
+        return;
+    }
     let rt = &mut app.updates_rt;
     if std::mem::take(&mut rt.check_requested) {
         rt.updater.check_now(ctx);
@@ -64,7 +74,7 @@ fn result_window_shows(status: &Status, prompt_open: bool) -> bool {
 /// Whether an update may install and close the app: the project has no unsaved changes and no
 /// stroke, bake or resize is running.
 fn safe_to_close(app: &TextureCraftApp) -> bool {
-    !app.session.modified && !app.session.stroke_active() && app.bake.is_none() && app.resize.is_none()
+    !app.session.modified && !app.session.stroke_active() && app.bake.is_none() && app.resize.is_none() && app.high_poly_job.is_none()
 }
 
 pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
@@ -253,9 +263,13 @@ mod tests {
         assert!(!safe_to_close(h.state()), "unsaved changes");
         h.state_mut().session.modified = false;
 
-        h.state_mut().bake = Some(crate::BakeJob { queue: Vec::new(), current: None, total: 0, mesh_id: 0 });
+        h.state_mut().bake = Some(crate::BakeJob { queue: Vec::new(), current: None, total: 0, mesh_id: 0, only: None });
         assert!(!safe_to_close(h.state()), "a bake");
         h.state_mut().bake = None;
+
+        h.state_mut().load_high_polys(["missing-high.obj".to_owned()]);
+        assert!(!safe_to_close(h.state()), "an accepted high-poly import is still pending");
+        h.state_mut().high_poly_job = None;
 
         let project = h.state().session.project_id;
         h.state_mut().resize = Some(crate::ResizeJob { progress: Arc::new(Progress::new()), rx: channel().1, project });
@@ -266,6 +280,7 @@ mod tests {
         texturecraft_engine::execute(session, "layer.add.paint", &serde_json::Value::Null).unwrap();
         session.modified = false;
         session.begin_stroke_uv(Vec2::new(0.5, 0.5), 1.0).unwrap();
+
         assert!(!safe_to_close(h.state()), "a stroke");
         h.state_mut().session.cancel_stroke();
         assert!(safe_to_close(h.state()));

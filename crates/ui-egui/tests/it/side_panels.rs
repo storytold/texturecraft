@@ -101,10 +101,12 @@ fn the_export_panel_leads_to_export_textures_and_the_mesh_options() {
 
     assert_eq!(harness.state().ui.rail_panel, Some(Panel::Export));
     assert!(!harness.state().ui.windows.export, "the rail opens the Export panel, not a window");
-    for label in ["SEND TO", "EXPORT", "Export to image editor", "Send to compositing app", "Send to 3D staging app"] {
-        assert!(harness.query_all_by_label(label).next().is_some(), "{label}");
+    assert!(harness.query_all_by_label("EXPORT").next().is_some(), "the EXPORT caption");
+    for label in ["SEND TO", "Export to image editor", "Send to compositing app", "Send to 3D staging app"] {
+        assert!(harness.query_all_by_label(label).next().is_none(), "the dock has no {label} row");
     }
-    assert!(says_not_available(&mut harness, "Send to compositing app"));
+    assert!(harness.query_all_by_label_contains("Send to").next().is_none(), "no SEND TO text at all");
+    button_left_of_rail(&harness, "Export Mesh...");
 
     button_left_of_rail(&harness, "Export Textures...").click();
     harness.run_steps(SETTLE_FRAMES);

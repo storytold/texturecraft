@@ -13,7 +13,7 @@ use crate::theme::semibold;
 pub(super) const KNOB_RADIUS: f32 = 5.0;
 
 /// Width of a slider's knob outline
-const KNOB_STROKE: f32 = 1.5;
+pub(super) const KNOB_STROKE: f32 = 1.5;
 
 /// Width of a slider's track
 const TRACK_WIDTH: f32 = 2.0;
@@ -22,13 +22,13 @@ const TRACK_WIDTH: f32 = 2.0;
 const ZERO_TICK_HALF: f32 = 4.0;
 
 /// Radius of an angle row's dial
-const DIAL_RADIUS: f32 = 8.0;
+pub(super) const DIAL_RADIUS: f32 = 8.0;
 
 /// The quarter turn back from the screen's 0 rad (pointing right) that points the dial's hand straight up at 0°
 const DIAL_ZERO_DEGREES: f32 = 90.0;
 
 /// Air between the dial and the value, and between the track's end and the dial
-const DIAL_AIR: f32 = 6.0;
+pub(super) const DIAL_AIR: f32 = 6.0;
 
 /// Air between a tinted slider's track end and its right-hand color name
 const TINT_WORD_AIR: f32 = 8.0;
@@ -128,16 +128,21 @@ impl PropertySheet<'_> {
         let name = lead.text();
         let dragged = self.track(id, name, &track, degrees, &range);
 
-        let tokens = self.tokens;
-        let painter = self.ui.painter();
-        painter.circle_stroke(pos2(dial_x, center_y), DIAL_RADIUS, Stroke::new(KNOB_STROKE, tokens.button_border));
-        let turn = (*degrees - DIAL_ZERO_DEGREES).to_radians();
-        let hand = pos2(dial_x + DIAL_RADIUS * turn.cos(), center_y + DIAL_RADIUS * turn.sin());
-        painter.line_segment([pos2(dial_x, center_y), hand], Stroke::new(TRACK_WIDTH, tokens.text));
+        self.paint_dial(pos2(dial_x, center_y), *degrees);
 
         let shown = if plus { format!("{:+.0}°", *degrees) } else { format!("{:.0}°", *degrees) };
         let typed = self.column_value_field(id, &name, center_y, &shown, "°", *degrees, &range, 0);
         Self::apply_typed(degrees, typed, dragged)
+    }
+
+    /// The small dial of an angle row centred on `center`, its hand at `degrees`
+    pub(super) fn paint_dial(&self, center: egui::Pos2, degrees: f32) {
+        let tokens = self.tokens;
+        let painter = self.ui.painter();
+        painter.circle_stroke(center, DIAL_RADIUS, Stroke::new(KNOB_STROKE, tokens.button_border));
+        let turn = (degrees - DIAL_ZERO_DEGREES).to_radians();
+        let hand = pos2(center.x + DIAL_RADIUS * turn.cos(), center.y + DIAL_RADIUS * turn.sin());
+        painter.line_segment([center, hand], Stroke::new(TRACK_WIDTH, tokens.text));
     }
 
     /// A slider with a small dropdown chip before its value (Intensity's divider); returns the edit and the chip
@@ -187,6 +192,20 @@ impl PropertySheet<'_> {
 
     /// Paints a track with its knob and moves `value` while it is clicked or dragged
     pub(super) fn track(&mut self, id: Id, label: impl std::fmt::Display, track: &Track, value: &mut f32, range: &RangeInclusive<f32>) -> Option<bool> {
+        let fill = self.tokens.accent;
+        self.track_filled(id, label, track, value, range, fill)
+    }
+
+    /// [`Self::track`] whose fill is `fill` (an axis card's in its axis color)
+    pub(super) fn track_filled(
+        &mut self,
+        id: Id,
+        label: impl std::fmt::Display,
+        track: &Track,
+        value: &mut f32,
+        range: &RangeInclusive<f32>,
+        fill: Color32,
+    ) -> Option<bool> {
         let (minimum, maximum) = (*range.start(), *range.end());
         let span = (maximum - minimum).max(f32::EPSILON);
         let length = (track.end - track.start).max(1.0);
@@ -195,7 +214,13 @@ impl PropertySheet<'_> {
             pos2(track.end + KNOB_RADIUS, track.center_y + ROW_HIT_HALF_HEIGHT),
         );
         let response = self.ui.interact(hit, id, Sense::click_and_drag());
-        response.widget_info(|| WidgetInfo::slider(true, f64::from(*value), &label));
+        let enabled = self.ui.is_enabled();
+        response.widget_info(|| WidgetInfo::slider(enabled, f64::from(*value), &label));
+
+        // A press on the track drops what was typed in its value: the track's value is the one wanted
+        if response.is_pointer_button_down_on() {
+            self.drop_typing(id.with((self.id, "typed")));
+        }
 
         let mut moved = false;
         if (response.dragged() || response.drag_stopped() || response.clicked())
@@ -218,7 +243,7 @@ impl PropertySheet<'_> {
         let painter = self.ui.painter();
         if !track.ramp {
             painter.line_segment([pos2(track.start, track.center_y), pos2(track.end, track.center_y)], Stroke::new(TRACK_WIDTH, tokens.button_border));
-            painter.line_segment([pos2(zero_x.min(knob_x), track.center_y), pos2(zero_x.max(knob_x), track.center_y)], Stroke::new(TRACK_WIDTH, tokens.accent));
+            painter.line_segment([pos2(zero_x.min(knob_x), track.center_y), pos2(zero_x.max(knob_x), track.center_y)], Stroke::new(TRACK_WIDTH, fill));
         }
         if track.zero.is_some() {
             let tick = [pos2(zero_x, track.center_y - ZERO_TICK_HALF), pos2(zero_x, track.center_y + ZERO_TICK_HALF)];
@@ -294,7 +319,8 @@ impl PropertySheet<'_> {
         let Some(mut draft) = editing else {
             self.skip_typing_edit();
             let response = self.ui.interact(rect, id.with("value"), Sense::click()).on_hover_cursor(egui::CursorIcon::Text);
-            response.widget_info(|| WidgetInfo::labeled(egui::Role::Label, true, crate::i18n::trf("{label} value", &[("label", label)])));
+            let enabled = self.ui.is_enabled();
+            response.widget_info(|| WidgetInfo::labeled(egui::Role::Label, enabled, crate::i18n::trf("{label} value", &[("label", label)])));
             self.ui.painter().text(pos2(right, center_y), Align2::RIGHT_CENTER, shown, semibold(TEXT_SIZE), tokens.text);
 
             if response.hovered() {
@@ -317,7 +343,7 @@ impl PropertySheet<'_> {
 
         let untouched = self.end_typing(field_id, &draft);
         let typed_text = draft.text.trim();
-        if self.ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        if self.escape_pressed() {
             return None;
         }
 

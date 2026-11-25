@@ -1,9 +1,11 @@
 use egui::collapsing_header::CollapsingState;
 use egui::{Rect, Ui, vec2};
 use egui_phosphor::regular as icon;
+use texturecraft_engine::core::{BakeResolution, BakedMap};
 use texturecraft_render::BakeOverlay;
 
 use super::BakeVisualizationToggles;
+use super::map_preview_fold::MapPreviewFold;
 use super::section_opening::SectionOpening;
 use crate::TextureCraftApp;
 use crate::i18n::{n_, tr, trf};
@@ -25,6 +27,10 @@ const ROW_BUTTON_SIZE: f32 = 18.0;
 /// Width of an overlay's color swatch
 const SWATCH_WIDTH: f32 = 44.0;
 
+/// The map preview's sizes and how the list names them
+const PREVIEW_SIZES: [(BakeResolution, &str); 4] =
+    [(BakeResolution::R128, "128"), (BakeResolution::R256, "256"), (BakeResolution::R512, "512"), (BakeResolution::R1024, "1K")];
+
 /// The neutral material's quality steps: samples per pixel and their names
 const QUALITIES: [(u32, &str); 6] = [
     (4, n_("Very Low (4 spp)")),
@@ -37,6 +43,8 @@ const QUALITIES: [(u32, &str); 6] = [
 
 /// The Baking Visualization panel in the top-left corner of bake mode's 3D view `view`
 pub(crate) fn bake_visualization_panel(app: &mut TextureCraftApp, ui: &Ui, view: Rect) {
+    let matching_error_applies = super::matching_error_applies(&app.session);
+    let (shown, selected) = (app.live_preview.shown(), super::live_preview::map_settings_shown(app).map(|target| target.map));
     let toggles = &mut app.ui.bake_visualization;
     let tokens = Tokens::get(ui.ctx());
     egui::Area::new(ui.scope_id().with("bake_visualization_panel")).fixed_pos(view.left_top() + vec2(PANEL_MARGIN, PANEL_MARGIN)).constrain_to(view).show(
@@ -46,20 +54,20 @@ pub(crate) fn bake_visualization_panel(app: &mut TextureCraftApp, ui: &Ui, view:
             egui::Frame::popup(ui.style()).fill(tokens.panel.gamma_multiply(PANEL_OPACITY)).show(ui, |ui| {
                 ui.set_width(PANEL_WIDTH);
 
-                // Ids renamed with the reference defaults, so open/closed states saved by earlier builds don't carry over
+                // New section IDs keep legacy fold states separate
                 let mut collapsing_state = CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id("baking_visualization_open"), true);
                 if header(ui, toggles, collapsing_state.is_open()).clicked() {
                     collapsing_state.toggle(ui);
                 }
 
-                collapsing_state.show_body_unindented(ui, |ui| sections(ui, toggles));
+                collapsing_state.show_body_unindented(ui, |ui| sections(ui, toggles, matching_error_applies, shown, selected));
             });
         },
     );
 }
 
-/// The panel's sections below its header
-fn sections(ui: &mut Ui, toggles: &mut BakeVisualizationToggles) {
+/// The panel's sections below its header; the Matching Error row greys unless `matching_error_applies`
+fn sections(ui: &mut Ui, toggles: &mut BakeVisualizationToggles, matching_error_applies: bool, shown: Option<BakedMap>, selected: Option<BakedMap>) {
     ui.horizontal(|ui| {
         ui.checkbox(&mut toggles.selected_set_only, tr("Show for Selected Texture Set Only"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -72,7 +80,7 @@ fn sections(ui: &mut Ui, toggles: &mut BakeVisualizationToggles) {
     let meshes_editable = !toggles.hide_baking_meshes;
     if collapsible(ui, "high_poly", tr("High Definition Mesh (HP)"), SectionOpening::Open, true, meshes_editable, |ui| {
         overlay_row(ui, "bake_high_poly_color", tr("Mesh"), &mut toggles.high_poly_mesh);
-        overlay_row(ui, "bake_matching_error_color", tr("Matching Error"), &mut toggles.matching_error);
+        ui.add_enabled_ui(matching_error_applies, |ui| overlay_row(ui, "bake_matching_error_color", tr("Matching Error"), &mut toggles.matching_error));
     }) {
         toggles.reset_high_poly();
     }
@@ -100,6 +108,42 @@ fn sections(ui: &mut Ui, toggles: &mut BakeVisualizationToggles) {
     }) {
         toggles.reset_project_mesh();
     }
+
+    map_preview_section(ui, toggles, shown, selected);
+}
+
+/// The Map Preview section: whether the selected map shows on the model, and the size it bakes at; it opens by itself while a preview shows
+fn map_preview_section(ui: &mut Ui, toggles: &mut BakeVisualizationToggles, shown: Option<BakedMap>, selected: Option<BakedMap>) {
+    let fold_id = ui.make_persistent_id("map_preview_fold");
+    let mut fold: MapPreviewFold = ui.ctx().data(|data| data.get_temp(fold_id)).unwrap_or_default();
+    let section = section_id(ui, "map_preview");
+    let mut state = CollapsingState::load_with_default_open(ui.ctx(), section, false);
+    if let Some(open) = fold.follow(shown, selected, !toggles.map_preview) {
+        state.set_open(open);
+        state.store(ui.ctx());
+    }
+    let open_before = state.is_open();
+
+    let reset = collapsible(ui, "map_preview", tr("Map Preview"), SectionOpening::Closed, true, true, |ui| {
+        ui.checkbox(&mut toggles.map_preview, tr("Preview the Selected Map"));
+        ui.add_enabled_ui(toggles.map_preview, |ui| {
+            let size = &mut toggles.map_preview_size;
+            let selected = PREVIEW_SIZES.iter().find(|(option, _)| option == size).map_or("", |(_, name)| *name);
+            combo(ui, tr("Resolution"), selected, |ui| {
+                for (option, name) in PREVIEW_SIZES {
+                    ui.selectable_value(size, option, name);
+                }
+            });
+        });
+    });
+    let open_after = CollapsingState::load_with_default_open(ui.ctx(), section, false).is_open();
+    if open_after != open_before {
+        fold.toggled(open_after);
+    }
+    ui.ctx().data_mut(|data| data.insert_temp(fold_id, fold));
+    if reset {
+        toggles.reset_map_preview();
+    }
 }
 
 /// The project mesh's neutral material (picked in the 3D view's view menu): its quality, roughness, metallic, occlusion strength and bent normal
@@ -126,8 +170,7 @@ fn neutral_material(ui: &mut Ui, toggles: &mut BakeVisualizationToggles) {
 /// A section `title`, open or closed at first as `opening` says, with a reset button on its header when `resettable` and its contents greyed unless `editable`; returns whether the reset was clicked
 fn collapsible(ui: &mut Ui, id: &str, title: &str, opening: SectionOpening, resettable: bool, editable: bool, body: impl FnOnce(&mut Ui)) -> bool {
     let tokens = Tokens::get(ui.ctx());
-    let mut collapsing_state =
-        CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("baking_visualization_section", id)), opening == SectionOpening::Open);
+    let mut collapsing_state = CollapsingState::load_with_default_open(ui.ctx(), section_id(ui, id), opening == SectionOpening::Open);
     let (header, reset) = ui
         .horizontal(|ui| {
             ui.set_min_height(EYE_BUTTON_SIZE);
@@ -151,10 +194,18 @@ fn collapsible(ui: &mut Ui, id: &str, title: &str, opening: SectionOpening, rese
         collapsing_state.toggle(ui);
     }
 
+    header.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, title));
+    ui.ctx().accesskit_node_builder(header.id, |node| node.set_expanded(collapsing_state.is_open()));
+    crate::property_sheet::paint_keyboard_focus(ui, &header, &tokens);
     collapsing_state.show_body_indented(&header, ui, |ui| {
         ui.add_enabled_ui(editable, body);
     });
     reset.is_some_and(|reset| reset.clicked())
+}
+
+/// The id a section keeps its open state under
+fn section_id(ui: &Ui, id: &str) -> egui::Id {
+    ui.make_persistent_id(("baking_visualization_section", id))
 }
 
 /// A checkbox for whether `overlay` shows, with its color swatch and an eyedropper for it on the right

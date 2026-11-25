@@ -1,4 +1,5 @@
-//! Export dialog › Output templates: each output channel has an Invert toggle that is saved in the template.
+//! Export dialog › Output templates: each output channel can be inverted from its swatch's
+//! right-click menu, and the inversion is saved in the template.
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
@@ -26,12 +27,17 @@ fn harness() -> (Harness<'static, TextureCraftApp>, Library) {
     (h, Library(dir))
 }
 
-/// The channel toggles of the open dialog (the dialog sits left of the properties panel, which has its own Invert controls)
-fn toggles<'h>(h: &'h Harness<'_, TextureCraftApp>) -> Vec<egui_kittest::Node<'h>> {
-    h.get_all_by_label("Invert").filter(|n| n.rect().max.x < DIALOG_RIGHT_EDGE).collect()
-}
+/// Right-click the swatch `swatch` and click the Invert of its menu (the properties panel has Invert controls of its own)
+fn toggle_invert(h: &mut Harness<'_, TextureCraftApp>, swatch: &str) {
+    let node = h.get_all_by_label(swatch).next().unwrap_or_else(|| panic!("no {swatch} swatch"));
+    let at = node.rect().center();
+    node.click_secondary();
+    h.run_steps(4);
 
-const DIALOG_RIGHT_EDGE: f32 = 1200.0;
+    let invert = h.get_all_by_label("Invert").min_by(|a, b| a.rect().center().distance(at).total_cmp(&b.rect().center().distance(at))).unwrap();
+    invert.click();
+    h.run_steps(4);
+}
 
 fn template() -> ExportPreset {
     let ch = |channel| SourceRef::Channel { channel, component: 0 };
@@ -60,12 +66,12 @@ fn invert_toggle_changes_the_saved_template() {
     let saved = |h: &Harness<'_, TextureCraftApp>| h.state().session.export_preset(TEMPLATE).unwrap().maps[0].inverted.clone();
     assert!(saved(&h).is_empty());
 
-    // One Invert toggle per channel: R, G, B
-    assert_eq!(toggles(&h).len(), 3);
-    toggles(&h)[1].click();
-    h.run_steps(4);
+    // Three maps in R, G and B: one swatch per channel
+    for swatch in ["R: Roughness, gray value", "G: Metallic, gray value", "B: Constant 0.50"] {
+        assert!(h.query_all_by_label(swatch).next().is_some(), "{swatch}");
+    }
+    toggle_invert(&mut h, "G: Metallic, gray value");
     assert_eq!(saved(&h), vec![Dest::G], "the second channel (G) is inverted");
-    toggles(&h)[1].click();
-    h.run_steps(4);
+    toggle_invert(&mut h, "G: Metallic, gray value, inverted");
     assert!(saved(&h).is_empty(), "a second click turns it off");
 }

@@ -522,8 +522,8 @@ mod tests {
     use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
     use texturecraft_core::{
         BakedMap, Bevel, BevelBlur, BevelCorner, BevelDirection, BevelSmooth, BlendMode, Channel, ChannelKind, ContentsOffset, DirectionalDistance, Effect,
-        EffectKind, Fill, Filter, Generator, GeneratorKind, GradientInput, GrayscaleMode, HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground,
-        MaskOutline, OutlinePosition, Procedural, ProceduralKind, Project, Source, TextureSet,
+        EffectKind, Fill, Filter, GeneratorKind, GradientInput, GrayscaleMode, HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground, MaskOutline,
+        OutlinePosition, Procedural, ProceduralKind, Project, Source, TextureSet,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::primitives;
@@ -810,7 +810,7 @@ mod tests {
         // A wrapping Blur after a mask generator's blurred coarse cells
         let stack = vec![(Filter::Blur { radius: 160.0, wrap: true }, 1.0, BlendMode::Normal)];
         let (mut project, pixels, owner) = painted_project(&stack, BlendMode::Normal, (true, SIZE)).unwrap();
-        let mut generator = Generator::new(GeneratorKind::Dirt);
+        let mut generator = crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Dirt);
         generator.global.blur = 0.85;
         generator.resolution.factor = -3;
         generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("Occlusion"));
@@ -886,7 +886,7 @@ mod tests {
         let Some(mut gpu) = headless() else { return };
         let stack = vec![(Filter::Blur { radius: 160.0, wrap: true }, 1.0, BlendMode::Normal)];
         let (mut project, pixels, owner) = painted_project(&stack, BlendMode::Normal, (true, SIZE)).unwrap();
-        let mut generator = Generator::new(GeneratorKind::Dirt);
+        let mut generator = crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Dirt);
         generator.global.blur = 0.85;
         generator.resolution.factor = -3;
         generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("Occlusion"));
