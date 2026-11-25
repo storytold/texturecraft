@@ -223,6 +223,8 @@ pub(super) fn shared(device: &wgpu::Device, supports_curvature: bool, supports_i
         static SHARED: std::sync::OnceLock<Arc<Mutex<CompositePipelines>>> = std::sync::OnceLock::new();
         return SHARED.get_or_init(|| Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)))).clone();
     }
+    #[cfg(not(all(any(test, feature = "test-support"), not(target_arch = "wasm32"))))]
+    let _ = device;
     Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)))
 }
 
