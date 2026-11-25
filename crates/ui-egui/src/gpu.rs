@@ -2014,7 +2014,7 @@ pub(crate) mod tests {
         const CLOSE_LEVELS: u8 = 2;
         const FLIPPED_SHARE: usize = 200;
 
-        let Ok(mut gpu) = Headless::for_tests() else { return };
+        let Some(mut gpu) = Headless::for_required_tests() else { return };
         let mut link = link();
         link.gpu_composite_enabled = true;
         session.view = ViewMode::Mask(layer);

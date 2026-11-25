@@ -760,6 +760,59 @@ mod tests {
         }
     }
 
+    /// A mask comparing Layers Below with This Layer on Roughness, on a layer in nested folders
+    /// with Scale and Rotation and on an instance of it in another such folder, matches the CPU in
+    /// the material and in both mask previews: each draw compares its own placed roughness with
+    /// what lies below it.
+    #[test]
+    fn layer_comparisons_in_transformed_nested_folders_match_the_cpu_for_owner_and_instance() {
+        let Some(mut gpu) = crate::headless::Headless::for_required_tests() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images, pixels) = (BakedMaps::default(), pattern_images(), PixelStore::default());
+        let channels = [Channel::BaseColor, Channel::Roughness];
+        let image = || Source::Image { name: "Pattern".into(), normal_format: NormalFormat::default() };
+        let folder = |project: &mut Project, offset: ContentsOffset, parent: Option<LayerId>| {
+            let id = project.alloc_id();
+            let mut group = Layer::new(id, "Folder", LayerKind::folder(), &channels);
+            if let LayerKind::Group { contents, .. } = &mut group.kind {
+                *contents = offset;
+            }
+            assert!(project.insert_layer(0, group, parent, parent.is_some()).is_ok());
+            id
+        };
+
+        // Roughness below, then the compared layer in two nested folders, then its instance in a third
+        let mut project = Project::new("Folder comparisons", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, TILE * 2));
+        let below_projection = Projection::Uv { scale: [1.0, 2.0], rotation: -20.0, offset: [0.0, 0.2] };
+        let below_fill = Fill { sources: BTreeMap::from([(Channel::Roughness, image())]), projection: below_projection, ..Default::default() };
+        let below = Layer::new(project.alloc_id(), "Below", LayerKind::Fill(below_fill), &channels);
+        assert!(project.insert_layer(0, below, None, false).is_ok());
+        let outer = folder(&mut project, ContentsOffset::new(2.0, 30.0), None);
+        let inner = folder(&mut project, ContentsOffset::new(1.5, -10.0), Some(outer));
+        let owner = project.alloc_id();
+        let own = Projection::Uv { scale: [2.0, 1.0], rotation: 15.0, offset: [0.1, 0.0] };
+        let fill = Fill { sources: BTreeMap::from([(Channel::Roughness, image())]), projection: own, ..Default::default() };
+        let mut layer = Layer::new(owner, "Compared", LayerKind::Fill(fill), &channels);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(effect(EffectKind::Fill { source: Source::Uniform([0.6; 3]), projection: Projection::default(), sampling: Sampling::default() }));
+        let sides = (CompareSource::LayersBelow, CompareSource::ThisLayer);
+        mask.effects.push(compare_effect(CompareOp::GreaterThan, sides, Channel::Roughness, 0.6, BlendMode::Multiply, 0.8));
+        layer.mask = Some(mask);
+        assert!(project.insert_layer(0, layer, Some(inner), true).is_ok());
+        let around = folder(&mut project, ContentsOffset::new(0.5, 45.0), None);
+        let instance = project.alloc_id();
+        let instance_layer = Layer::new(instance, "Instance", LayerKind::Instance { source: owner }, &channels);
+        assert!(project.insert_layer(0, instance_layer, Some(around), true).is_ok());
+
+        for mask_owner in [owner, instance] {
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(mask_owner);
+
+            assert_matches_cpu(&mut gpu, &case, Tolerance::BILINEAR, &format!("layer comparison in transformed folders, mask of {mask_owner:?}"));
+        }
+    }
+
     /// How a layer-comparison project is laid out: whether a layer lies below, how many folders
     /// hold the compared layer, whether the innermost folder's mask (not the layer's) holds the
     /// effects, the compared layer's content effects, and whether the layer below publishes an

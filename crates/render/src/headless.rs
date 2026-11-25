@@ -57,6 +57,20 @@ impl Headless {
         Ok(headless)
     }
 
+    /// [`Headless::for_tests`] for a test that must run on a GPU: None without an adapter on a
+    /// developer's machine, but a failure on CI (`CI` or `TC_CI_LAVAPIPE` set), which promises one,
+    /// so the test cannot pass there by skipping.
+    pub fn for_required_tests() -> Option<Headless> {
+        match Self::for_tests() {
+            Ok(gpu) => Some(gpu),
+            Err(error) => {
+                let on_ci = std::env::var_os("CI").is_some() || std::env::var_os("TC_CI_LAVAPIPE").is_some();
+                assert!(!on_ci, "CI promises a GPU adapter but none is available: {error}");
+                None
+            }
+        }
+    }
+
     /// [`Headless::new`] with the limits `limits` picks for the adapter (a test of a smaller GPU).
     pub fn with_limits(limits: impl FnOnce(&wgpu::Adapter) -> wgpu::Limits) -> Result<Headless, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
