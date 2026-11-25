@@ -40,50 +40,6 @@ pub(crate) fn headless() -> Option<Headless> {
     }
 }
 
-/// Whether the full per-path parity matrix runs. The CI gate runs each family's packed test
-/// (one test that covers every feature of the family once, with few shader programs); the
-/// per-path tests return at once unless `TC_GPU_PARITY_FULL=1`, as in
-/// `TC_GPU_PARITY_FULL=1 cargo test -p texturecraft-render --lib`.
-pub(crate) fn full_parity_matrix() -> bool {
-    full_matrix_asked() || PACKED_RUN.get()
-}
-
-/// `TC_GPU_PARITY_FULL=1`
-fn full_matrix_asked() -> bool {
-    std::env::var("TC_GPU_PARITY_FULL").is_ok_and(|value| value == "1")
-}
-
-thread_local! {
-    /// Set while a family's packed test runs its per-path tests with one case each ([`packed_run`])
-    static PACKED_RUN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Run a family's per-path tests from its packed test, each with only its first case
-/// ([`gate_cases`]), unless the full matrix runs anyway
-pub(crate) fn packed_run(tests: impl FnOnce()) {
-    PACKED_RUN.set(true);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(tests));
-    PACKED_RUN.set(false);
-    if let Err(failure) = result {
-        std::panic::resume_unwind(failure);
-    }
-}
-
-/// `cases` in the full matrix; their first one alone inside a family's packed test
-pub(crate) fn gate_cases<T>(cases: impl IntoIterator<Item = T>) -> Vec<T> {
-    let reduced = PACKED_RUN.get() && !full_matrix_asked();
-    cases.into_iter().take(if reduced { 1 } else { usize::MAX }).collect()
-}
-
-/// Run `packed`, a family's check of all its cases at once; when it fails, run `one_by_one`,
-/// which checks each case on its own and panics naming the first one that differs, and fail
-/// with the packed check's panic when every case passes alone.
-pub(crate) fn check_packed(gpu: &mut Headless, packed: impl FnOnce(&mut Headless), one_by_one: impl FnOnce(&mut Headless)) {
-    let Err(failure) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| packed(gpu))) else { return };
-    one_by_one(gpu);
-    std::panic::resume_unwind(failure);
-}
-
 /// How far the GPU may differ from the CPU oracle (plan section 6).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Tolerance {

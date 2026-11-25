@@ -642,7 +642,7 @@ mod tests {
     use texturecraft_texel::{TileImage, to_u16, to_u16_signed};
 
     use crate::gpu_composite::CompositeRegion;
-    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, full_parity_matrix, headless};
+    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
     use crate::headless::Headless;
 
     /// Side of the oracle sets, in texels.
@@ -929,78 +929,8 @@ mod tests {
     /// FXAA matches the CPU in Base Color, Roughness, Height and the mask: the library's (alpha
     /// kept), smoothing the alpha too, below full opacity under a Multiply layer, set to Disable
     /// (the mask applies it anyway), after a blur and before one, and in a partial update.
-    /// The gate's check of P5's gather family (the per-path tests below run with
-    /// `TC_GPU_PARITY_FULL=1`): each filter once at its library settings in the content and the
-    /// mask, a wrapping blur over a gather across the set's edges, Kuwahara on its larger set,
-    /// each kind of linked input once, Color Match with both inputs linked and over nothing
-    /// covered, and Height To Normal laid over the Normal after a Blur of the Height.
-    #[test]
-    fn gather_family_matches_the_cpu() {
-        let Some(mut gpu) = headless() else { return };
-        let normal = BlendMode::Normal;
-        let turned = Filter::Transform(TileTransform { rotation: 30.0, tile_safe: false, ..TileTransform::LIBRARY });
-        let decisions = [
-            ("FXAA with alpha", vec![(Filter::Fxaa { alpha: true }, 1.0, normal)], normal),
-            ("Warp", vec![(Filter::SourceWarp(WIDE_WARP), 1.0, normal)], normal),
-            ("Blur Slope", vec![(Filter::SourceSlopeBlur(SourceSlopeBlur::LIBRARY), 0.8, normal)], BlendMode::Multiply),
-        ];
-        assert!(check_cases(&mut gpu, &decisions, MIDDLE_PAINT, MIDDLE, GATHER_DECISIONS).is_some());
-        let smooth = [
-            ("Mirror", vec![(Filter::Mirror(Mirror::LIBRARY), 1.0, normal)], normal),
-            ("Transform before a mirror", vec![(turned, 1.0, normal), (Filter::Mirror(Mirror::LIBRARY), 0.9, normal)], normal),
-        ];
-        assert!(check_cases(&mut gpu, &smooth, MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
-        let color_match = [("Color Match", vec![(Filter::ColorMatch(ColorMatch::LIBRARY), 1.0, normal)], normal)];
-        assert!(check_cases(&mut gpu, &color_match, MIDDLE_PAINT, MIDDLE, Tolerance::TRANSCENDENTAL).is_some());
-        let wrapped = Filter::Blur { radius: 160.0, wrap: true };
-        let under_a_wrap = [("Warp under a wrapping Blur", vec![(Filter::SourceWarp(WIDE_WARP), 1.0, normal), (wrapped, 1.0, normal)], normal)];
-        assert!(check_cases(&mut gpu, &under_a_wrap, EDGE_PAINT, CORNER, GATHER_DECISIONS).is_some());
-        let widest = AnisotropicKuwahara { radius: AnisotropicKuwahara::MAX_RADIUS, ..AnisotropicKuwahara::LIBRARY };
-        let kuwahara = [("Kuwahara", vec![(Filter::AnisotropicKuwahara(widest), 1.0, normal)], normal)];
-        assert!(check_cases(&mut gpu, &kuwahara, (false, KUWAHARA_SIZE), KUWAHARA_MIDDLE, KUWAHARA_DECISIONS).is_some());
-
-        // Linked inputs: a noise, a Color Match Input and Image Input
-        let custom_noise = WarpSource { mode: WarpSourceMode::CustomNoise, ..WarpSource::LIBRARY };
-        let gray = procedural(ProceduralKind::Perlin, [0.0; 3], [1.0; 3]);
-        let colours = procedural(ProceduralKind::Clouds, [0.7, 0.2, 0.1], [0.1, 0.3, 0.8]);
-        let both = ColorMatch { source_mode: SourceColorMode::Input, target_mode: TargetColorMode::ImageInput, ..ColorMatch::LIBRARY };
-        let linked = [
-            (
-                "Warp from a linked noise",
-                vec![(Filter::SourceWarp(SourceWarp { source: custom_noise, ..WIDE_WARP }), 1.0, normal)],
-                vec![(ImageInput::CUSTOM_NOISE.id, gray)],
-            ),
-            (
-                "Color Match from a uniform Input to a linked Image Input",
-                vec![(Filter::ColorMatch(both), 1.0, normal)],
-                vec![(ImageInput::SOURCE_INPUT.id, Source::Uniform([0.6, 0.3, 0.2])), (ImageInput::TARGET_INPUT.id, colours)],
-            ),
-        ];
-        assert!(check_linked(&mut gpu, &linked, MIDDLE_PAINT, MIDDLE, GATHER_DECISIONS).is_some());
-
-        // Color Match over nothing covered, and Height To Normal after a Blur of the Height
-        let mesh = Arc::new(primitives::plane(1.0, 1));
-        let (baked, images) = (BakedMaps::default(), ImageStore::default());
-        let (project, _, owner) = painted_project(&[(Filter::ColorMatch(ColorMatch::LIBRARY), 1.0, normal)], normal, MIDDLE_PAINT).unwrap();
-        let pixels = PixelStore::default();
-        let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
-        case.mask_owner = Some(owner);
-        case.region = Some(MIDDLE);
-        assert_matches_cpu(&mut gpu, &case, Tolerance::TRANSCENDENTAL, "Color Match over nothing covered");
-        let laid_over = Filter::HeightToNormal(HeightToNormal { overwrite: false, ..HeightToNormal::LIBRARY });
-        let stack = vec![(Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal, Some(Channel::Height)), (laid_over, 0.85, normal, None)];
-        let (project, pixels, owner) = normal_project(&stack, true).unwrap();
-        let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
-        case.mask_owner = Some(owner);
-        case.region = Some(MIDDLE);
-        assert_matches_cpu(&mut gpu, &case, Tolerance::TRANSCENDENTAL, "Height To Normal after a Blur of the Height");
-    }
-
     #[test]
     fn fxaa_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let fxaa = |alpha: bool| Filter::Fxaa { alpha };
         let blur = Filter::Blur { radius: 24.0, wrap: false };
@@ -1050,9 +980,6 @@ mod tests {
     /// disabled, between filters (the blur below runs in the pre-pass too) and in a partial update.
     #[test]
     fn color_match_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let cases = filter_cases(color_matches().into_iter().map(Filter::ColorMatch), &Filter::ColorMatch(ColorMatch::LIBRARY));
 
@@ -1063,9 +990,6 @@ mod tests {
     /// does: the mean's passes leave no texel changed, every map and the mask match.
     #[test]
     fn color_match_over_nothing_covered_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let normal = BlendMode::Normal;
         let stack = vec![(Filter::ColorMatch(ColorMatch::LIBRARY), 1.0, normal)];
@@ -1083,9 +1007,6 @@ mod tests {
     /// edges: the mean counts each texel of the set once, and the ellipses read each texel's copy.
     #[test]
     fn color_match_and_kuwahara_under_a_wrapping_blur_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let normal = BlendMode::Normal;
         let wrapped = Filter::Blur { radius: 160.0, wrap: true };
@@ -1102,9 +1023,6 @@ mod tests {
     /// budget (each chunk submitted on its own) and still match the CPU.
     #[test]
     fn own_passes_in_row_chunks_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         use crate::gpu_composite::PRE_PASS_TEST_BUDGET;
         use crate::gpu_neighbourhood::{NeighbourhoodFilter, WHOLE_SET_TEST_REACH};
 
@@ -1163,9 +1081,6 @@ mod tests {
     /// uniform beside one read at the texels too.
     #[test]
     fn linked_inputs_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let normal = BlendMode::Normal;
         let custom_noise = WarpSource { mode: WarpSourceMode::CustomNoise, ..WarpSource::LIBRARY };
@@ -1227,9 +1142,6 @@ mod tests {
     /// round, with and without Custom Color Variation, below full opacity under Multiply.
     #[test]
     fn color_match_with_both_inputs_linked_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
@@ -1276,9 +1188,6 @@ mod tests {
     /// under Multiply, disabled, between filters and in a partial update.
     #[test]
     fn anisotropic_kuwahara_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let widest = AnisotropicKuwahara { radius: AnisotropicKuwahara::MAX_RADIUS, ..AnisotropicKuwahara::LIBRARY };
         let cases = filter_cases(kuwaharas().into_iter().map(Filter::AnisotropicKuwahara), &Filter::AnisotropicKuwahara(widest));
@@ -1293,9 +1202,6 @@ mod tests {
     /// stepped source is a hard decision.
     #[test]
     fn warp_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let cases = filter_cases(warps().into_iter().map(Filter::SourceWarp), &Filter::SourceWarp(WIDE_WARP));
 
@@ -1306,9 +1212,6 @@ mod tests {
     /// full opacity under Multiply, disabled, between filters and in a partial update.
     #[test]
     fn blur_slope_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let cases = filter_cases(slope_blurs().into_iter().map(Filter::SourceSlopeBlur), &Filter::SourceSlopeBlur(SourceSlopeBlur::LIBRARY));
 
@@ -1319,9 +1222,6 @@ mod tests {
     /// repeating sources follow each texel's home position, as the CPU's wrapped lower stages do.
     #[test]
     fn warp_and_blur_slope_under_a_wrapping_blur_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let normal = BlendMode::Normal;
         let wrapped = Filter::Blur { radius: 160.0, wrap: true };
@@ -1344,9 +1244,6 @@ mod tests {
     /// partial update, whose bands read the whole UV tile's result.
     #[test]
     fn mirror_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let cases = filter_cases(mirrors().into_iter().map(Filter::Mirror), &Filter::Mirror(Mirror::LIBRARY));
 
@@ -1358,9 +1255,6 @@ mod tests {
     /// a mirror and in a partial update.
     #[test]
     fn transform_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let normal = BlendMode::Normal;
         let turned = Filter::Transform(TileTransform { rotation: 30.0, tile_safe: false, ..TileTransform::LIBRARY });
@@ -1374,9 +1268,6 @@ mod tests {
     /// fields hold periodic copies, and each texel reads its tile in its own copy.
     #[test]
     fn mirror_and_transform_under_a_wrapping_blur_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let normal = BlendMode::Normal;
         let wrapped = Filter::Blur { radius: 160.0, wrap: true };
@@ -1448,9 +1339,6 @@ mod tests {
     /// Height (a flat height) and in a partial update. Normals compare by direction.
     #[test]
     fn height_to_normal_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
@@ -1489,9 +1377,6 @@ mod tests {
     /// stage does.
     #[test]
     fn fxaa_under_a_wrapping_blur_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let normal = BlendMode::Normal;
         let stack = vec![(Filter::Fxaa { alpha: true }, 1.0, normal), (Filter::Blur { radius: 160.0, wrap: true }, 1.0, normal)];

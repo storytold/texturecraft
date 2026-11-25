@@ -532,7 +532,7 @@ mod tests {
 
     use super::super::{FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion, Params, StageInputs};
     use crate::gpu_composite::CompositeRegion;
-    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, full_parity_matrix, headless};
+    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
     use crate::headless::Headless;
 
     /// Side of the oracle sets, in texels.
@@ -711,129 +711,11 @@ mod tests {
         Some(())
     }
 
-    /// The gate's check of P4's box and distance family (the per-path tests below run with
-    /// `TC_GPU_PARITY_FULL=1`): each filter once in the content and the mask (some below full
-    /// opacity under Multiply), wrapped filters across the set's edges, distance smoothing off the
-    /// mesh, a Distance Map from a pattern and from a painted layer's anchor, a large reach stage
-    /// read through an anchor, and a wrapping Blur after a mask generator's coarse cells.
-    #[test]
-    fn box_family_matches_the_cpu() {
-        let Some(mut gpu) = headless() else { return };
-        let normal = BlendMode::Normal;
-        let highpass = Filter::HighPass { radius: 96.0, space: HighpassSpace::SrgbFromLinear, alpha: true };
-        let shadow = Filter::DropShadow { angle: 30.0, distance: -0.05, size: 0.6, spread: 0.5, opacity: 0.9, color: [0.2, 0.4, 0.9] };
-        let inner_glow = Filter::HaloGlow { on_mask: true, precise: true, width: -0.6, spread: 0.4, opacity: 0.8, color: [0.2, 0.7, 0.4] };
-        let angular = Bevel { corner: BevelCorner::Angular, smoothing: 2.0, blur: BevelBlur::Uniform, ..Bevel::LIBRARY };
-        let inward_smooth = BevelSmooth { direction: BevelDirection::In, curve_offset: 0.2, curve_shape: 0.5, ..BevelSmooth::LIBRARY };
-        let trail = DirectionalDistance { angle: 30.0, contrast: 0.6, multiplier: 0.5, ..DirectionalDistance::LIBRARY };
-        // Two chains, each filter checked alone when its chain differs
-        let halos = vec![
-            (highpass, 0.7, normal),
-            (LIBRARY_GLOW, 1.0, normal),
-            (inner_glow, 0.75, normal),
-            (shadow, 1.0, normal),
-            (Filter::MaskOutline(MaskOutline::LIBRARY), 1.0, normal),
-        ];
-        let distances = vec![
-            (Filter::DistanceBevel(angular), 0.8, normal),
-            (Filter::BevelSmooth(inward_smooth), 0.7, normal),
-            (Filter::DirectionalDistance(trail), 0.85, normal),
-        ];
-        for (label, chain, channel_blend) in [("halos chained", halos, normal), ("distances chained", distances, BlendMode::Multiply)] {
-            let packed = |gpu: &mut Headless| {
-                assert!(check_cases(gpu, &[(label, chain.clone(), channel_blend)], MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some())
-            };
-            crate::gpu_composite::oracle::check_packed(&mut gpu, packed, |gpu| {
-                for filter in &chain {
-                    let label = format!("{:?}", filter.0);
-                    assert!(
-                        check_cases(gpu, &[(label.as_str(), vec![filter.clone()], channel_blend)], MIDDLE_PAINT, MIDDLE, Tolerance::NEIGHBOURHOOD).is_some()
-                    );
-                }
-            });
-        }
-        let pixelate = [(
-            "Pixelate after a blur",
-            vec![(Filter::Blur { radius: 24.0, wrap: false }, 1.0, normal), (Filter::Mosaic { size: 96.0, alpha: false }, 0.85, normal)],
-            normal,
-        )];
-        assert!(check_cases(&mut gpu, &pixelate, MIDDLE_PAINT, MIDDLE, CELL_CENTRES).is_some());
-        let wrapped = [
-            ("wrapped Blur between filters", vec![(Filter::Invert, 1.0, normal), (Filter::Blur { radius: 160.0, wrap: true }, 0.8, normal)], normal),
-            ("wrapped Bevel Smooth", vec![(Filter::BevelSmooth(BevelSmooth { wrap: true, ..BevelSmooth::LIBRARY }), 0.8, normal)], normal),
-        ];
-        assert!(check_cases(&mut gpu, &wrapped, EDGE_PAINT, CORNER, Tolerance::NEIGHBOURHOOD).is_some());
-        let smoothed = [(
-            "smoothed uniform Bevel",
-            vec![(Filter::DistanceBevel(Bevel { smoothing: 5.0, blur: BevelBlur::Uniform, ..Bevel::LIBRARY }), 0.8, normal)],
-            BlendMode::Multiply,
-        )];
-        assert!(check_cases(&mut gpu, &smoothed, (false, SMOOTHING_SIZE, true), SMOOTHING_MIDDLE, Tolerance::NEIGHBOURHOOD).is_some());
-
-        // Distance Maps from a pattern and from a painted layer's anchor
-        let checker = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.3; 3], high: [0.9; 3], ramp: Vec::new() };
-        let smooth = Filter::BevelSmooth(BevelSmooth { distance: 0.2, ..BevelSmooth::LIBRARY });
-        let (mut project, pixels, owner) = painted_project(&[(smooth, 0.9, normal)], normal, (false, SIZE)).unwrap();
-        set_distance_map(&mut project, owner, &checker).unwrap();
-        let tolerance = Tolerance::NEIGHBOURHOOD.with_flips((SIZE * SIZE / 1000) as usize);
-        check_project(&mut gpu, (&project, &pixels, owner), false, MIDDLE, tolerance, "Bevel Smooth, procedural map");
-        let directional = Filter::DirectionalDistance(DirectionalDistance { angle: 30.0, ..DirectionalDistance::LIBRARY });
-        let (mut project, mut pixels, owner) = painted_project(&[(directional, 1.0, normal)], normal, (false, SIZE)).unwrap();
-        let (donor, anchor) = (project.alloc_id(), project.alloc_id());
-        let mut layer = Layer::new(donor, "Map", LayerKind::Paint, &[Channel::BaseColor]);
-        layer.content_effects.push(Effect::new(anchor, EffectKind::Anchor));
-        project.insert_layer(0, layer, None, false).unwrap();
-        let stack = &mut project.texture_sets[0].stack;
-        stack.retain(|id| *id != donor);
-        stack.insert(0, donor);
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let gray = to_u16(0.2 + 0.8 * x as f32 / SIZE as f32);
-                pixels.layer_mut(donor, Channel::BaseColor, (SIZE, SIZE)).set(x, y, &[gray, gray, gray, u16::MAX]);
-            }
-        }
-        set_distance_map(&mut project, owner, &Source::Anchor { anchor, channel: Channel::BaseColor, ramp: Vec::new() }).unwrap();
-        check_project(&mut gpu, (&project, &pixels, owner), false, MIDDLE, Tolerance::NEIGHBOURHOOD, "Directional Distance, painted map");
-
-        // A large reach stage read through an anchor
-        let stack = vec![(Filter::DistanceBevel(Bevel::LIBRARY), 1.0, normal), (LIBRARY_GLOW, 0.8, normal)];
-        let (mut project, pixels, owner) = painted_project(&stack, normal, (false, SIZE)).unwrap();
-        let anchor = project.alloc_id();
-        project.layers.get_mut(&owner).unwrap().content_effects.insert(0, Effect::new(anchor, EffectKind::Anchor));
-        let reader = project.alloc_id();
-        let sources = BTreeMap::from([(Channel::BaseColor, Source::Anchor { anchor, channel: Channel::BaseColor, ramp: Vec::new() })]);
-        let mut layer = Layer::new(reader, "Reader", LayerKind::Fill(Fill { sources, ..Fill::default() }), &[Channel::BaseColor]);
-        layer.channels.get_mut(&Channel::BaseColor).unwrap().mode = BlendMode::Multiply;
-        project.insert_layer(0, layer, None, false).unwrap();
-        check_project(&mut gpu, (&project, &pixels, owner), false, MIDDLE, Tolerance::NEIGHBOURHOOD, "Bevel and Glow with an anchor read");
-
-        // A wrapping Blur after a mask generator's blurred coarse cells
-        let stack = vec![(Filter::Blur { radius: 160.0, wrap: true }, 1.0, BlendMode::Normal)];
-        let (mut project, pixels, owner) = painted_project(&stack, BlendMode::Normal, (true, SIZE)).unwrap();
-        let mut generator = crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Dirt);
-        generator.global.blur = 0.85;
-        generator.resolution.factor = -3;
-        generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("Occlusion"));
-        let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(generator));
-        generated.blend = BlendMode::Multiply;
-        project.layers.get_mut(&owner).and_then(|layer| layer.mask.as_mut()).unwrap().effects.insert(1, generated);
-        let occlusion: Vec<[f32; 4]> = (0..64).map(|texel| [0.1 + 0.8 * ((texel % 8 + texel / 8 * 3) % 8) as f32 / 7.0; 4]).collect();
-        let images = ImageStore::from([("Occlusion".into(), Arc::new(ImageRes::new(8, 8, occlusion, false)))]);
-        let (mesh, baked) = (oracle_mesh(false), BakedMaps::default());
-        let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
-        case.mask_owner = Some(owner);
-        case.region = Some(CORNER);
-        assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, "wrapped Blur after a generator's cells");
-    }
-
     /// Pixelate with Alpha off matches the CPU in Base Color, Roughness, Height and the mask: at
     /// the library's size, below full opacity under a Multiply layer, set to Disable (the mask
     /// applies it anyway), after a blur and before one, and in a partial update that reads the halo.
     #[test]
     fn pixelate_keeping_alpha_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let pixelate = |size: f32| Filter::Mosaic { size, alpha: false };
         let blur = Filter::Blur { radius: 24.0, wrap: false };
@@ -854,9 +736,6 @@ mod tests {
     /// after another blur, whose field the wrapping stage reads past the set's edges.
     #[test]
     fn wrapping_blur_and_bevel_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let blur = Filter::Blur { radius: 160.0, wrap: true };
         let normal = BlendMode::Normal;
@@ -880,9 +759,6 @@ mod tests {
     /// matches the CPU near the set's edges.
     #[test]
     fn a_wrapping_blur_after_a_blurred_generator_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let stack = vec![(Filter::Blur { radius: 160.0, wrap: true }, 1.0, BlendMode::Normal)];
         let (mut project, pixels, owner) = painted_project(&stack, BlendMode::Normal, (true, SIZE)).unwrap();
@@ -910,9 +786,6 @@ mod tests {
     /// Color only, the alpha to content only), below full opacity, disabled and between filters.
     #[test]
     fn highpass_spaces_and_alpha_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let highpass = |space, alpha| Filter::HighPass { radius: 96.0, space, alpha };
         let normal = BlendMode::Normal;
@@ -1004,9 +877,6 @@ mod tests {
     /// in other channels and masks; a normal map gets the blurred normal mixed in by the opacity.
     #[test]
     fn the_pre_blur_stage_keeps_the_texel_and_leaves_the_blurred_gray() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(gpu) = headless() else { return };
         let (width, height) = (40u32, 24u32);
         let texels: Vec<([f32; 4], f32)> = (0..width * height)
@@ -1080,9 +950,6 @@ mod tests {
     /// a soft spread shadow cast the other way in colour, below full opacity, disabled and chained.
     #[test]
     fn glow_and_drop_shadow_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let inner_glow = Filter::HaloGlow { on_mask: true, precise: true, width: -0.6, spread: 0.4, opacity: 0.8, color: [0.2, 0.7, 0.4] };
         let outer_glow = Filter::HaloGlow { on_mask: false, precise: true, width: 0.8, spread: 0.0, opacity: 1.0, color: [0.9, 0.5, 0.1] };
@@ -1109,9 +976,6 @@ mod tests {
     /// faded with a curve, below full opacity, disabled and chained.
     #[test]
     fn mask_outline_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let outline = |position, from_black, blur, curve| Filter::MaskOutline(MaskOutline { position, from_black, threshold: 0.5, width: 0.08, blur, curve });
         let normal = BlendMode::Normal;
@@ -1135,9 +999,6 @@ mod tests {
     /// curves, below full opacity, disabled and chained.
     #[test]
     fn bevel_and_bevel_smooth_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let angular = Bevel { corner: BevelCorner::Angular, smoothing: 2.0, blur: BevelBlur::Uniform, ..Bevel::LIBRARY };
         let outward = Bevel { distance: 0.08, smoothing: 1.0, ..Bevel::LIBRARY };
@@ -1166,9 +1027,6 @@ mod tests {
     /// on a mesh that leaves the set's border uncovered, where Bevel Smooth's Distance Map reads 0.
     #[test]
     fn distance_smoothing_matches_the_cpu_off_the_mesh_too() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let non_uniform = Bevel { smoothing: 4.0, ..Bevel::LIBRARY };
         let uniform = Bevel { smoothing: 5.0, blur: BevelBlur::Uniform, corner: BevelCorner::Angular, ..Bevel::LIBRARY };
@@ -1192,9 +1050,6 @@ mod tests {
     /// without it matches in a program whose wrapping Blur widens every field past the edges.
     #[test]
     fn wrapping_and_mixed_distance_filters_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let normal = BlendMode::Normal;
         let smoothed = Bevel { smoothing: 1.0, ..Bevel::LIBRARY };
@@ -1267,9 +1122,6 @@ mod tests {
     /// f64 ones bit for bit, straight and chessboard.
     #[test]
     fn edge_distances_equal_the_cpu_exactly() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(gpu) = headless() else { return };
         let (width, height) = (77usize, 53usize);
         let inside = shapes(width, height);
@@ -1293,9 +1145,6 @@ mod tests {
     /// shorter reach, below full opacity, disabled and chained.
     #[test]
     fn directional_distance_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let trail = DirectionalDistance { angle: 30.0, contrast: 0.6, multiplier: 0.5, ..DirectionalDistance::LIBRARY };
         let normal = BlendMode::Normal;
@@ -1326,9 +1175,6 @@ mod tests {
     /// layer below read through an anchor (in bands), each with a partial update.
     #[test]
     fn distance_maps_scale_bevel_smooth_and_directional_distance_like_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let checker = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.3; 3], high: [0.9; 3], ramp: Vec::new() };
         let smooth = Filter::BevelSmooth(BevelSmooth { distance: 0.2, ..BevelSmooth::LIBRARY });
@@ -1375,9 +1221,6 @@ mod tests {
     /// Every texel's trail finds the same shape at the same share of the reach as the CPU's.
     #[test]
     fn trail_distances_equal_the_cpu_exactly() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(gpu) = headless() else { return };
         let (width, height) = (77usize, 53usize);
         let inside = shapes(width, height);
@@ -1409,9 +1252,6 @@ mod tests {
     /// whole-set pre-pass, and still match the CPU.
     #[test]
     fn large_reach_stages_with_an_anchor_read_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let normal = BlendMode::Normal;
         let stack = vec![(Filter::DistanceBevel(Bevel::LIBRARY), 1.0, normal), (LIBRARY_GLOW, 0.8, normal)];

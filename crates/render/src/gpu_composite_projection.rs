@@ -598,7 +598,7 @@ mod tests {
     use texturecraft_texel::TILE;
 
     use crate::gpu_composite::CompositeProgram;
-    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, full_parity_matrix, headless};
+    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
     use crate::gpu_tile_pattern::AtlasMips;
     use crate::headless::Headless;
 
@@ -908,157 +908,10 @@ mod tests {
         assert_matches_cpu(&mut gpu, &case, Tolerance::POINT.with_flips(DIRECTION_ROUNDING_FLIPS), "spherical nearest rows");
     }
 
-    /// The gate's check of the projection family (the per-path tests below run with
-    /// `TC_GPU_PARITY_FULL=1`): each projection setting once, on images (P1's path) and, for the
-    /// built-in paths, on patterns, in the material. Every projection's mask preview is checked by
-    /// `nearest_image_fills_match_the_cpu`; a placed frame's here. The cases share P1's programs.
-    #[test]
-    fn projection_family_matches_the_cpu() {
-        let mut gpu = headless();
-        let uv = UvTransform::default();
-        let placed_uv = UvTransform { tiling: [1.5, 1.2], rotation: 15.0, offset: [0.1, 0.0] };
-        let sharp = Sampling::SAVED_BEFORE;
-        let hq = Sampling { filtering: Filtering::BilinearHq, ..sharp };
-        let nearest = Sampling { filtering: Filtering::Nearest, ..sharp };
-        let cropped = Projector { crop: ShapeCrop::Cropped, ..Projector::default() };
-        let soft = Backface { on: true, angle: 70.0, hardness: 0.2 };
-        let both = Projector { rotation: [-15.0, 60.0, 5.0], scale: [0.7, 1.3, 1.1], ..Projector::default() };
-        let mirror = FillSymmetry { on: true, axis: 1, position: [0.0, 0.2, 0.0], flip: [true, false], ..FillSymmetry::OFF };
-        let radial = FillSymmetry { on: true, kind: SymmetryKind::Radial, axis: 1, count: 5, position: OFF_POLE, ..FillSymmetry::OFF };
-        let flipped_down =
-            Decal { symmetry: Some(texturecraft_core::DecalSymmetry { axis: 0, flip: texturecraft_core::DecalFlip::V, offset: -0.05 }), ..frame() };
-        let pulled = [[-0.6, 0.45], [0.55, 0.6], [0.4, -0.5], [-0.45, -0.4]];
-        let culled = Projector::depth_culled();
-        let cases = [
-            (
-                "UV repeating across",
-                plane(),
-                Projection::Uv { scale: [1.31, 0.83], rotation: 9.0, offset: [0.17, -0.12] },
-                Sampling { wrap: UvWrap::RepeatHorizontally, ..sharp },
-                true,
-            ),
-            ("UV shrunk, bilinear HQ", plane(), Projection::Uv { scale: [3.3, 2.1], rotation: 17.0, offset: [0.1, -0.2] }, hq, false),
-            (
-                "UV not wrapping, bilinear HQ",
-                plane(),
-                Projection::Uv { scale: [2.6, 1.2], rotation: 5.0, offset: [0.2, 0.1] },
-                Sampling { wrap: UvWrap::None, ..hq },
-                false,
-            ),
-            (
-                "cylindrical over 120 degrees",
-                sphere(),
-                Projection::Cylindrical { scale: 1.1, axis: 0, uv, offset: [0.05, 0.1, -0.1], projector: Projector::default(), angle: 120.0 },
-                sharp,
-                true,
-            ),
-            (
-                "tri-planar with a UV transformation",
-                sphere(),
-                Projection::Triplanar {
-                    scale: 0.8,
-                    sharpness: 5.0,
-                    offset: [0.2, -0.1, 0.3],
-                    uv: UvTransform { tiling: [1.7, 0.6], rotation: 23.0, offset: [0.11, -0.3] },
-                    projector: Projector::default(),
-                },
-                sharp,
-                true,
-            ),
-            (
-                "spherical, turned and stretched",
-                sphere(),
-                Projection::Spherical { scale: 1.3, uv: placed_uv, offset: [0.1, 0.0, -0.2], projector: both },
-                hq,
-                true,
-            ),
-            (
-                "tri-planar cropped small",
-                sphere(),
-                Projection::Triplanar { scale: 0.8, sharpness: 4.0, offset: [0.0; 3], uv, projector: Projector { scale: [0.45, 0.5, 0.4], ..cropped } },
-                sharp,
-                true,
-            ),
-            (
-                "planar culled hard",
-                sphere(),
-                Projection::Planar {
-                    scale: 0.9,
-                    axis: 0,
-                    offset: [0.0; 3],
-                    uv,
-                    projector: Projector { backface: Backface { on: true, angle: 60.0, hardness: 0.0 }, ..Projector::default() },
-                    placed: None,
-                },
-                sharp,
-                true,
-            ),
-            (
-                "planar mirrored off centre",
-                sphere(),
-                Projection::Planar { scale: 1.6, axis: 0, offset: [0.2, 0.1, 0.0], uv, projector: cropped, placed: None },
-                Sampling { symmetry: mirror, ..sharp },
-                true,
-            ),
-            ("decal radial", sphere(), Projection::decal(frame()), Sampling { symmetry: radial, ..sharp }, false),
-            ("decal shrunk, nearest", sphere(), Projection::decal(Decal { size: [0.35, 0.3], ..frame() }), nearest, false),
-            (
-                "warp turned and placed",
-                sphere(),
-                Projection::Warp {
-                    frame: frame(),
-                    corners: pulled,
-                    depth: 0.5,
-                    uv: UvTransform { tiling: [1.4, 0.7], rotation: 30.0, offset: [0.2, -0.1] },
-                    projector: Projector { rotation: [0.0, 0.0, -20.0], scale: [1.2, 0.9, 1.0], ..cropped },
-                },
-                sharp,
-                false,
-            ),
-            ("warp, bilinear HQ", sphere(), Projection::Warp { frame: frame(), corners: pulled, depth: 0.4, uv, projector: cropped }, hq, false),
-            ("planar depth culled", sphere(), Projection::Planar { scale: 0.9, axis: 0, offset: [0.0; 3], uv, projector: culled, placed: None }, sharp, true),
-            (
-                "warp depth culled",
-                sphere(),
-                Projection::Warp { frame: frame(), corners: Projection::FRAME_CORNERS, depth: 0.5, uv, projector: culled },
-                sharp,
-                false,
-            ),
-        ];
-        for (label, mesh, projection, sampling, patterns) in cases {
-            let images = fill_project(&projection, sampling, Some(NormalFormat::DirectX));
-            assert_project_matches(&mut gpu, &mesh, images, Tolerance::BILINEAR.with_flips(FLIPS), (true, false), &format!("{label} images"));
-            if patterns {
-                let patterns = fill_project(&projection, sampling, None);
-                assert_project_matches(&mut gpu, &mesh, patterns, Tolerance::POINT.with_flips(FLIPS), (false, false), &format!("{label} patterns"));
-            }
-        }
-
-        // A placed frame turned, cropped and culled, and one mirrored and flipped, with the mask preview
-        let placed = Projector { rotation: [0.0, 0.0, 25.0], scale: [1.3, 0.8, 1.0], crop: ShapeCrop::Cropped, backface: soft, ..Projector::default() };
-        let frames = [
-            ("turned and placed", frame(), placed, placed_uv),
-            ("mirrored and flipped down", flipped_down, Projector { crop: ShapeCrop::Cropped, backface: soft, ..Projector::default() }, uv),
-        ];
-        for (label, frame, projector, uv) in frames {
-            let projection = Projection::Planar { scale: 1.0, axis: 2, offset: [0.0; 3], uv, projector, placed: Some(frame) };
-            let images = fill_project(&projection, sharp, Some(NormalFormat::DirectX));
-            assert_project_matches(&mut gpu, &sphere(), images, Tolerance::BILINEAR.with_flips(FLIPS), (true, true), &format!("placed frame {label}"));
-        }
-
-        // An OpenGL normal map read through Bilinear HQ
-        let triplanar = Projection::Triplanar { scale: 2.0, sharpness: 4.0, offset: [0.0; 3], uv, projector: Projector::default() };
-        let opengl = fill_project(&triplanar, hq, Some(NormalFormat::OpenGl));
-        assert_project_matches(&mut gpu, &sphere(), opengl, Tolerance::BILINEAR.with_flips(FLIPS), (true, false), "OpenGL normal map, bilinear HQ");
-    }
-
     /// Every wrap stops the fill at its tile's edges on the axes that do not repeat, and stops
     /// image reads at the edge texel there; tri-planar never leaves its tile but clamps its reads
     #[test]
     fn uv_wrap_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         let uv = Projection::Uv { scale: [1.31, 0.83], rotation: 9.0, offset: [0.17, -0.12] };
         let triplanar =
@@ -1087,9 +940,6 @@ mod tests {
     /// every axis, for images and patterns
     #[test]
     fn cylindrical_angles_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         for (axis, angle) in [(0, 120.0), (1, 45.0), (2, 270.0), (1, 10.0)] {
             let projection =
@@ -1115,9 +965,6 @@ mod tests {
     /// A UV transformation tiles, turns and moves the source on every 3D projection
     #[test]
     fn uv_transformations_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         let uv = UvTransform { tiling: [1.7, 0.6], rotation: 23.0, offset: [0.11, -0.3] };
         for (label, projection) in turned_projections(uv, Projector::default()) {
@@ -1129,9 +976,6 @@ mod tests {
     /// projection, alone and with a UV transformation
     #[test]
     fn projector_rotation_and_scale_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         let uv = UvTransform { tiling: [0.8, 1.4], rotation: -35.0, offset: [0.2, 0.05] };
         let rotated = Projector { rotation: [20.0, 35.0, -10.0], ..Projector::default() };
@@ -1150,9 +994,6 @@ mod tests {
     /// sphere or cylinder (sized here so the shape's edge crosses the sphere)
     #[test]
     fn shape_crops_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         let cropped = Projector { crop: ShapeCrop::Cropped, ..Projector::default() };
         let shrunk = Projector { scale: [0.45, 0.5, 0.4], ..cropped };
@@ -1174,9 +1015,6 @@ mod tests {
     /// and soft, also inside a cropped and turned projector
     #[test]
     fn backface_culling_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         let uv = UvTransform::default();
         let hard = Backface { on: true, angle: 60.0, hardness: 0.0 };
@@ -1201,9 +1039,6 @@ mod tests {
     /// with a UV transformation, and with a mirrored copy
     #[test]
     fn placed_frames_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         let mirrored = Decal { symmetry: Some(texturecraft_core::DecalSymmetry { axis: 2, flip: texturecraft_core::DecalFlip::U, offset: 0.1 }), ..frame() };
         let flipped_down =
@@ -1237,9 +1072,6 @@ mod tests {
     /// over each other with the texel's own copy on top, cropped so copies overlap partly
     #[test]
     fn fill_symmetry_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         let on = FillSymmetry { on: true, ..FillSymmetry::OFF };
         let symmetries = [
@@ -1271,9 +1103,6 @@ mod tests {
     /// to it and its Projection Depth, turned, and with a UV transformation
     #[test]
     fn warp_projections_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         let pulled = [[-0.6, 0.45], [0.55, 0.6], [0.4, -0.5], [-0.45, -0.4]];
         let parallel = [[-0.5, 0.5], [0.6, 0.5], [0.6, -0.5], [-0.5, -0.5]];
@@ -1302,9 +1131,6 @@ mod tests {
     /// it to (linear levels for sRGB colour), through every projection, with wrap and copies
     #[test]
     fn bilinear_hq_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         let hq = Sampling { filtering: Filtering::BilinearHq, ..Sampling::SAVED_BEFORE };
         let uv = UvTransform::default();
@@ -1362,9 +1188,6 @@ mod tests {
     /// Normal maps read with the OpenGL and DirectX conventions (the DirectX green flipped) through Nearest and Bilinear HQ
     #[test]
     fn normal_map_formats_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         let triplanar = Projection::Triplanar { scale: 2.0, sharpness: 4.0, offset: [0.0; 3], uv: UvTransform::default(), projector: Projector::default() };
         for normal in [NormalFormat::OpenGl, NormalFormat::DirectX] {
@@ -1387,9 +1210,6 @@ mod tests {
     /// Nearest and Bilinear HQ, also with wrap and copies
     #[test]
     fn decal_filtering_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         let shrunk = Decal { size: [0.35, 0.3], ..frame() };
         let mirror = FillSymmetry { on: true, ..FillSymmetry::OFF };
@@ -1420,9 +1240,6 @@ mod tests {
     /// planar axes, hard and soft, turned, placed frames, warps and symmetry copies' own grids
     #[test]
     fn depth_culling_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let mut gpu = headless();
         let uv = UvTransform::default();
         let culled = Projector::depth_culled();

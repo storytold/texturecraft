@@ -262,154 +262,13 @@ mod tests {
     use texturecraft_geom::primitives;
     use texturecraft_texel::{TILE, to_u16, to_u16_signed};
 
-    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, check_packed, compile_effects, effect, full_parity_matrix, headless};
+    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
     use crate::gpu_composite::{CompositeProgram, CompositeRegion};
-    use crate::headless::Headless;
-
-    /// The gate's check of the stack and mask family (the per-path tests below run with
-    /// `TC_GPU_PARITY_FULL=1`): every comparison side pair on a colour, a scalar, a signed and a
-    /// normal channel with each comparison and blend, chained in one mask; the same inside two
-    /// folders with the folder's mask comparing, with nothing below, and before a mask stage after
-    /// a content stage; per-channel blends, Levels, a material deposit and a stage chained in the
-    /// content and mask; soft colour selections on the baked ID map and a hard one on an ID image;
-    /// and an image Custom Input. A failing chain is checked effect by effect.
-    #[test]
-    fn stack_family_matches_the_cpu() {
-        let Some(mut gpu) = headless() else { return };
-        let mesh = Arc::new(primitives::plane(1.0, 1));
-        let (baked, images) = (BakedMaps::default(), pattern_images());
-        let check = |gpu: &mut Headless, (project, pixels, owner): (Project, PixelStore, LayerId), baked: &BakedMaps, tolerance: Tolerance, label: &str| {
-            let mut case = OracleCase::new(&project, &pixels, baked, &images, &mesh);
-            case.mask_owner = Some(owner);
-            case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
-            assert_matches_cpu(gpu, &case, tolerance, label);
-        };
-        let compares = |tolerance: Tolerance| tolerance.with_flips(16);
-        let layout = || (true, 0, false, Vec::new(), false);
-
-        // Comparisons, each side pair on its own channel kind, chained in one mask
-        let invert = effect(EffectKind::Filter(Filter::Invert));
-        let chained = vec![
-            compare_effect(CompareOp::GreaterThan, SIDES[0], Channel::BaseColor, 0.6, BlendMode::Normal, 1.0),
-            compare_effect(CompareOp::LesserThan, SIDES[1], Channel::Roughness, 1.0, BlendMode::Multiply, 0.8),
-            invert.clone(),
-            compare_effect(CompareOp::WithinTolerance, SIDES[2], Channel::Height, 0.3, BlendMode::Screen, 0.9),
-            compare_effect(CompareOp::GreaterThan, SIDES[3], Channel::Normal, 0.6, BlendMode::Disable, 0.7),
-            compare_effect(CompareOp::GreaterThan, (CompareSource::ThisLayer, CompareSource::LayersBelow), Channel::Height, 0.9, BlendMode::Multiply, 0.9),
-        ];
-        let packed =
-            |gpu: &mut Headless| check(gpu, compare_stack_in(chained.clone(), layout()), &baked, compares(Tolerance::NEIGHBOURHOOD), "comparisons chained");
-        check_packed(&mut gpu, packed, |gpu| {
-            for effect in &chained {
-                check(gpu, compare_stack_in(vec![effect.clone()], layout()), &baked, compares(Tolerance::NEIGHBOURHOOD), &format!("{effect:?}"));
-            }
-        });
-        let layer_compare = || vec![compare_effect(CompareOp::GreaterThan, SIDES[3], Channel::Height, 0.6, BlendMode::Normal, 1.0)];
-        check(
-            &mut gpu,
-            compare_stack_in(layer_compare(), (true, 2, true, Vec::new(), false)),
-            &baked,
-            compares(Tolerance::NEIGHBOURHOOD),
-            "a folder's mask comparing",
-        );
-        check(&mut gpu, compare_stack_in(layer_compare(), (false, 0, false, Vec::new(), false)), &baked, compares(Tolerance::NEIGHBOURHOOD), "nothing below");
-        let blur = |radius| effect(EffectKind::Filter(Filter::Blur { radius, wrap: false }));
-        let staged = compare_stack_in(vec![own_layer_compare(), blur(24.0)], (true, 0, false, vec![blur(12.0)], false));
-        check(&mut gpu, staged, &baked, compares(Tolerance::NEIGHBOURHOOD), "a mask stage after This Layer");
-
-        // Per-channel blends, Levels, a material deposit and a stage, chained in the content and the mask
-        let with = |kind: EffectKind, opacity: f32, blends: &[(Channel, BlendMode, f32)], off: &[Channel]| {
-            let mut effect = effect(kind);
-            effect.opacity = opacity;
-            effect.channel_blends.extend(blends.iter().map(|&(channel, mode, opacity)| (channel, ChannelBlend { mode, opacity })));
-            effect.off_channels.extend(off.iter().copied());
-            effect
-        };
-        let levels = Levels { in_low: 0.2, in_high: 0.8, gamma: 1.6, out_low: 0.1, out_high: 0.85, affects: Some(Channel::Height), clamp: false };
-        let material = EffectKind::Material(Fill {
-            sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.2, 0.6, 0.35])), (Channel::Roughness, Source::Uniform([0.8; 3]))]),
-            ..Default::default()
-        });
-        let content = vec![
-            with(EffectKind::Filter(Filter::Invert), 0.77, &[(Channel::Height, BlendMode::Multiply, 0.5)], &[Channel::Roughness]),
-            with(EffectKind::Levels(levels), 0.6, &[], &[]),
-            with(material, 0.8, &[(Channel::BaseColor, BlendMode::Multiply, 0.6)], &[Channel::Roughness]),
-            with(
-                EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false }),
-                0.9,
-                &[(Channel::Roughness, BlendMode::Normal, 0.3), (Channel::BaseColor, BlendMode::Disable, 1.0)],
-                &[Channel::Height],
-            ),
-        ];
-        let mask: Vec<Effect> = content.iter().filter(|effect| !matches!(effect.kind, EffectKind::Material(_))).cloned().collect();
-        check(&mut gpu, painted_layer(content, mask), &baked, Tolerance::NEIGHBOURHOOD, "per-channel effects chained");
-
-        // Colour selections: soft ones on the baked ID map, a hard one on an ID image
-        let picked = vec![[0.40101, 0.69217, 0.05289], [0.375; 3], [0.21875, 0.78125, 0.09375]];
-        let ids = [
-            [0.40101, 0.69217, 0.05289],
-            [0.38; 3],
-            [0.42, 0.375, 0.375],
-            [0.21875, 0.78125, 0.09375],
-            [0.1, 0.9, 0.2],
-            [0.8, 0.1, 0.9],
-            [0.37; 3],
-            [0.0; 3],
-            [0.3, 0.6, 0.1],
-        ];
-        let id_bake = BakedMaps { resolution: 3, maps: BTreeMap::from([(BakedMap::Id, Arc::new(ids.into_iter().flatten().collect()))]) };
-        let selection = |colors: Vec<[f32; 3]>, id_map: Option<&str>, output, hardness, background, blend| {
-            let mut selection = ColorSelection::new(colors, 1.0 / 64.0);
-            selection.id_map = id_map.map(Into::into);
-            selection.output = output;
-            selection.hardness = hardness;
-            selection.background = background;
-            let mut effect = effect(EffectKind::ColorSelection(selection));
-            effect.blend = blend;
-            effect.opacity = 0.9;
-            effect
-        };
-        let soft = vec![
-            selection(picked.clone(), None, 0.6, 0.5, SelectionBackground::White, BlendMode::Normal),
-            selection(picked.clone(), None, 0.8, 0.2, SelectionBackground::Gray, BlendMode::Multiply),
-        ];
-        check(&mut gpu, ramp_mask_layer(soft), &id_bake, Tolerance::POINT, "soft colour selections");
-        let byte = |k: u8| f32::from(k) / 255.0;
-        let id_colors = [[200, 40, 10], [10, 180, 90], [60, 60, 220], [201, 41, 11], [100, 100, 100], [0, 0, 0], [255, 255, 255], [12, 178, 92], [5, 5, 5]];
-        let id_image = ImageStore::from([(
-            "Ids".into(),
-            Arc::new(ImageRes::new(3, 3, id_colors.into_iter().map(|[r, g, b]| [byte(r), byte(g), byte(b), 1.0]).collect(), true)),
-        )]);
-        let hard = vec![selection(
-            vec![[byte(200), byte(40), byte(10)], [byte(10), byte(180), byte(90)]],
-            Some("Ids"),
-            1.0,
-            1.0,
-            SelectionBackground::Transparent,
-            BlendMode::Normal,
-        )];
-        let (project, pixels, owner) = ramp_mask_layer(hard);
-        let mut case = OracleCase::new(&project, &pixels, &baked, &id_image, &mesh);
-        case.mask_owner = Some(owner);
-        assert_matches_cpu(&mut gpu, &case, Tolerance::POINT, "a colour selection reading an ID image");
-
-        // Grayscale Conversion's Custom Input linked to an image
-        let conversion = texturecraft_core::GrayscaleConversion { custom_input: true, ..texturecraft_core::GrayscaleConversion::LIBRARY };
-        let mut image_input = effect(EffectKind::Filter(Filter::GrayscaleConversion(conversion)));
-        image_input
-            .inputs
-            .insert(texturecraft_core::ImageInput::CUSTOM_INPUT.id.into(), Source::Image { name: "Pattern".into(), normal_format: NormalFormat::default() });
-        let custom = compare_stack_in(vec![image_input.clone()], (false, 0, false, vec![image_input], false));
-        check(&mut gpu, custom, &baked, Tolerance::BILINEAR, "an image Custom Input");
-    }
 
     /// Grayscale Conversion's Custom Input linked to an sRGB image reads it with the CPU's
     /// default sampling (Bilinear HQ, P1's image path) on the content and in the mask.
     #[test]
     fn an_image_custom_input_matches_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let baked = BakedMaps::default();
@@ -577,9 +436,6 @@ mod tests {
     /// ignores the per-channel settings.
     #[test]
     fn content_effects_laid_on_each_channel_apart_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
@@ -662,9 +518,6 @@ mod tests {
     /// settings, which matches the CPU in colour, the other channels and the mask.
     #[test]
     fn a_staged_lowering_keeps_every_channel_aligned_for_the_anchor_above() {
-        if !full_parity_matrix() {
-            return;
-        }
         let build = |staged: bool| {
             let per_channel = |kind: EffectKind, opacity: f32| {
                 let mut effect = effect(kind);
@@ -748,9 +601,6 @@ mod tests {
     /// comparison, at opacity below 1, with a non-Normal blend and set to Disable, chained.
     #[test]
     fn soft_mask_comparisons_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
@@ -791,9 +641,6 @@ mod tests {
     /// 1, with a non-Normal blend, chained, and with no colours picked.
     #[test]
     fn soft_colour_selections_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let images = ImageStore::default();
@@ -849,9 +696,6 @@ mod tests {
     /// `an_anchored_mask_inside_an_offset_folder_matches_the_cpu`.
     #[test]
     fn fills_inside_folders_with_scale_and_rotation_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let baked = BakedMaps::default();
@@ -1097,9 +941,6 @@ mod tests {
     /// the blur below with a partial update, and in the mask preview through the material program.
     #[test]
     fn mask_comparisons_reading_layers_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let invert = effect(EffectKind::Filter(Filter::Invert));
         // Each side pair, channel kind and comparison once: they are parameters of one compare path
         let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height, Channel::Normal];
@@ -1127,9 +968,6 @@ mod tests {
     /// the comparison) match the CPU.
     #[test]
     fn mask_comparisons_reading_layers_in_other_stacks_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let cases = || {
             [Channel::BaseColor, Channel::Height]
                 .into_iter()
@@ -1147,9 +985,6 @@ mod tests {
     /// folder nested in another, chained, around the blur below with a partial update.
     #[test]
     fn folder_mask_comparisons_read_the_stack_below_as_the_cpu_does() {
-        if !full_parity_matrix() {
-            return;
-        }
         let invert = effect(EffectKind::Filter(Filter::Invert));
         let mut cases = Vec::new();
         for channel in [Channel::BaseColor, Channel::Height] {
@@ -1166,9 +1001,6 @@ mod tests {
     /// stage: the hub prepares the content stacks before the mask stack that reads them.
     #[test]
     fn a_mask_stage_after_this_layer_reads_the_filtered_content() {
-        if !full_parity_matrix() {
-            return;
-        }
         let blur = |radius| effect(EffectKind::Filter(Filter::Blur { radius, wrap: false }));
         assert_compare_cases(vec![vec![own_layer_compare(), blur(24.0)]], || (true, 0, false, vec![blur(12.0)], false));
     }
@@ -1179,9 +1011,6 @@ mod tests {
     /// missing (nothing selected).
     #[test]
     fn colour_selections_reading_an_id_map_image_match_the_cpu() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let baked = BakedMaps::default();
@@ -1233,9 +1062,6 @@ mod tests {
     /// channel, chained, and from inputs varying per texel (an anchor and a Tile Generator).
     #[test]
     fn grayscale_conversion_reads_its_custom_input_as_the_cpu_does() {
-        if !full_parity_matrix() {
-            return;
-        }
         let Some(mut gpu) = headless() else { return };
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
