@@ -931,14 +931,9 @@ mod tests {
             ("Slope Blur", Filter::SlopeBlur { radius: 2.0, scale: 2.0, seed: 4, divider: 1 }),
             ("Pixelate", Filter::Mosaic { size: 24.0, alpha: true }),
         ];
-        // llvmpipe's noise turns Slope Blur's direction (a finite difference of 0.02) at a few
-        // texels inside the set, where the stripes' hard edges make that a large step; the other
-        // backends check its copies
-        let gl = gpu.device.adapter_info().backend == wgpu::Backend::Gl;
+        // Slope Blur's direction is nearly along an axis at a few texels, so its reads land just
+        // below a stripe's edge: the case of a sample's floor and weights that must agree
         for (label, filter) in cases {
-            if gl && label == "Slope Blur" {
-                continue;
-            }
             let (project, pixels, owner) = striped(&[filter, wrap.clone()]);
             let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
             case.mask_owner = Some(owner);
