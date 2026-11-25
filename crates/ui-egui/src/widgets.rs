@@ -460,6 +460,7 @@ pub fn color_swatch(ui: &mut Ui, id: &str, linear: &mut [f32; 3], width: f32) ->
     let mut changed = false;
     // Open state lives in memory (`toggle_id` above); `from_response` alone shows it always.
     egui::Popup::from_response(&resp).id(popup).open_memory(None).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        ui.data_mut(|d| d.insert_temp(egui::Id::unique("active_color_picker"), popup));
         // Wider than the R, G, B row at any value, so the popup keeps one size and place.
         if color_picker(ui, popup.with("picker"), &mut c, 275.0) {
             let lin = [c.r(), c.g(), c.b()].map(|v| texturecraft_engine::texel::srgb_to_linear(v as f32 / 255.0));
@@ -470,8 +471,54 @@ pub fn color_swatch(ui: &mut Ui, id: &str, linear: &mut [f32; 3], width: f32) ->
     changed
 }
 
-/// A color picker `width` wide: R, G, B (sRGB 0–255) with a copy button, a saturation/value
-/// square and a hue strip. Returns true when the color changed.
+/// The open picker owns paste events before the app can dispatch them as layer shortcuts.
+pub(crate) fn color_picker_open(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<egui::Id>(egui::Id::unique("active_color_picker"))).is_some_and(|popup| egui::Popup::is_id_open(ctx, popup))
+}
+
+/// Whether typing has completed a six-digit hex color; shorthand waits for Enter or blur.
+fn is_six_digit_hex(text: &str) -> bool {
+    let text = text.trim();
+    let hex = text.strip_prefix('#').unwrap_or(text);
+    hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Read sRGB hex (six digits or shorthand) or RGB bytes, including `rgb(r, g, b)`.
+fn parse_color_text(text: &str) -> Option<[u8; 3]> {
+    // Match the editor's limit before inspecting or splitting clipboard text.
+    if text.len() > 64 {
+        return None;
+    }
+    let text = text.trim();
+    let hex = text.strip_prefix('#').unwrap_or(text);
+    if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let [_, r, g, b] = u32::from_str_radix(hex, 16).ok()?.to_be_bytes();
+        return Some([r, g, b]);
+    }
+    if hex.len() == 3 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let r = u8::from_str_radix(hex.get(0..1)?, 16).ok()? * 17;
+        let g = u8::from_str_radix(hex.get(1..2)?, 16).ok()? * 17;
+        let b = u8::from_str_radix(hex.get(2..3)?, 16).ok()? * 17;
+        return Some([r, g, b]);
+    }
+    if text.starts_with('#') {
+        return None;
+    }
+    let rgb = if let Some(inner) = text.strip_prefix("rgb(") { inner.strip_suffix(')')? } else { text };
+    let mut parts = rgb.split([',', ' ', ';']).filter(|part| !part.is_empty());
+    let mut rgb = [0; 3];
+    for channel in &mut rgb {
+        let part = parts.next()?.trim();
+        if !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *channel = part.parse().ok()?;
+    }
+    parts.next().is_none().then_some(rgb)
+}
+
+/// A color picker `width` wide: sRGB bytes, a Hex editor with a copy button, a saturation/value
+/// square and a hue strip. Paste applies a complete color without focusing a field.
 fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool {
     use egui::ecolor::{hsv_from_rgb, rgb_from_hsv};
     let tk = Tokens::get(ui.ctx());
@@ -481,13 +528,67 @@ fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool 
     // Remembered with the color it was for, so hue and saturation survive black, white and grays
     let (mut h, mut s, mut v) = ui.data(|d| d.get_temp::<(Color32, (f32, f32, f32))>(id)).filter(|(k, _)| k == c).map_or_else(|| hsv_of(srgb), |(_, hsv)| hsv);
     let mut typed = false;
+    let mut pasted = false;
     let mut dragged = false;
+    ui.input_mut(|input| {
+        // Consume invalid text and image pastes so they cannot edit a field or paste a layer.
+        input.events.retain(|event| {
+            if let egui::Event::Paste(text) = event {
+                if let Some(rgb) = parse_color_text(text) {
+                    typed |= srgb != rgb;
+                    srgb = rgb;
+                    pasted = true;
+                }
+                false
+            } else {
+                !matches!(event, egui::Event::PasteImage(_))
+            }
+        });
+    });
     ui.horizontal(|ui| {
         for (x, prefix) in srgb.iter_mut().zip(["R ", "G ", "B "]) {
             typed |= ui.add(egui::DragValue::new(x).speed(0.5).prefix(prefix)).changed();
         }
-        if icon_button(ui, egui_phosphor::regular::COPY, crate::i18n::tr("Copy RGB values"), false, 20.0).clicked() {
+        if icon_button(ui, egui_phosphor::regular::COPY, tr("Copy RGB values"), false, 20.0).clicked() {
             ui.copy_text(format!("{}, {}, {}", srgb[0], srgb[1], srgb[2]));
+        }
+    });
+    let hex_id = id.with("hex");
+    let hex_of = |[r, g, b]: [u8; 3]| format!("#{r:02X}{g:02X}{b:02X}");
+    let (mut hex, mut pending) = ui
+        .data(|d| d.get_temp::<(Color32, String, bool)>(hex_id))
+        .filter(|(color, _, _)| color == c && !typed && !pasted)
+        .map_or_else(|| (hex_of(srgb), false), |(_, text, pending)| (text, pending));
+    ui.horizontal(|ui| {
+        let label = ui.label(tr("Hex"));
+        let edit = ui.add(egui::TextEdit::singleline(&mut hex).id(hex_id).desired_width(160.0).char_limit(64)).labelled_by(label.id);
+        // Widget focus survives switching applications; response focus also needs window focus.
+        let focused = ui.memory(|memory| memory.has_focus(edit.id));
+        pending |= edit.changed();
+        let lost_focus = edit.lost_focus();
+        let parsed = parse_color_text(&hex);
+        let enter = (edit.has_focus() || lost_focus) && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        // Escape can clear focus before the text edit runs. Discard the draft before handling blur.
+        if (focused || lost_focus) && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            hex = hex_of(srgb);
+            pending = false;
+        } else if pending && ((edit.changed() && is_six_digit_hex(&hex)) || enter || lost_focus) {
+            if let Some(rgb) = parsed {
+                typed |= srgb != rgb;
+                srgb = rgb;
+            }
+            // The pinned egui fork reports focus loss for two frames; commit each edit only once.
+            pending = false;
+        }
+        if !focused {
+            hex = hex_of(srgb);
+            pending = false;
+        } else if parsed.is_none() && !hex.trim().is_empty() && hex.trim() != "#" {
+            ui.painter().rect_stroke(edit.rect, 2.0, Stroke::new(1.0, tk.warning), egui::StrokeKind::Outside);
+            edit.on_hover_text(tr("Invalid color format (use #RRGGBB, #RGB or R, G, B)"));
+        }
+        if icon_button(ui, egui_phosphor::regular::COPY, tr("Copy Hex code"), false, 20.0).clicked() {
+            ui.copy_text(hex_of(srgb));
         }
     });
     if typed {
@@ -517,9 +618,12 @@ fn color_picker(ui: &mut Ui, id: egui::Id, c: &mut Color32, width: f32) -> bool 
     ui.painter().rect_stroke(egui::Rect::from_x_y_ranges(x - 2.0..=x + 2.0, rect.y_range()), 1.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Middle);
     if dragged {
         srgb = rgb_from_hsv((h, s, v)).map(|x| (x * 255.0 + 0.5) as u8);
+        hex = hex_of(srgb);
+        pending = false;
     }
     let next = Color32::from_rgb(srgb[0], srgb[1], srgb[2]);
     ui.data_mut(|d| d.insert_temp(id, (next, (h, s, v))));
+    ui.data_mut(|d| d.insert_temp(hex_id, (next, hex, pending)));
     let changed = next != *c;
     *c = next;
     changed

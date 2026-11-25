@@ -15,7 +15,8 @@ texturecraft-engine = { workspace = true }
 texturecraft-ui-egui = { workspace = true }
 # The control channel's token, framing and connection limits (shared with `texturecraft-cli serve`).
 texturecraft-automation = { workspace = true }
-eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "persistence", "links"] }
+# Workspace defaults are disabled; clipboard must be explicit for copy/paste with other apps.
+eframe = { workspace = true, features = ["clipboard", "default_fonts", "wgpu", "accesskit", "wayland", "x11", "persistence", "links"] }
 egui = { workspace = true }
 image = { workspace = true }
 craft-image-codecs = { workspace = true }

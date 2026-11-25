@@ -42,7 +42,7 @@ fn save(harness: &mut Harness<'_, TextureCraftApp>, dir: &Path, name: &str) {
     img.save(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let tree = [egui::Role::Button, egui::Role::SpinButton, egui::Role::CheckBox]
         .into_iter()
-        .flat_map(|role| harness.get_all_by_role(role))
+        .flat_map(|role| harness.query_all_by_role(role))
         .filter_map(|button| {
             let node = button.accesskit_node();
             node.label().map(|label| format!("{label}: disabled={}, checked={:?}", node.is_disabled(), node.toggled()))
@@ -336,6 +336,26 @@ fn rendering_mode_snapshots() {
         harness.render().unwrap();
     }
     save(&mut harness, &output_dir, "rendering-settled");
+}
+
+#[test]
+#[ignore]
+fn color_picker_snapshots() {
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session = texturecraft_engine::sample_session(256, 64).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.state_mut().ui.prefs.language = "en".into();
+    h.run_steps(4);
+    h.get_by_role_and_label(egui::Role::Button, "Material").click();
+    h.run_steps(3);
+    let label = h.get_by_label("Base color").rect();
+    let swatch = egui::pos2(label.right() + 30.0, label.center().y);
+    h.drag_at(swatch);
+    h.drop_at(swatch);
+    save(&mut h, &output_dir, "color-picker");
+    h.event(egui::Event::Paste("32,128,240".into()));
+    save(&mut h, &output_dir, "color-picker-pasted");
 }
 
 #[test]
