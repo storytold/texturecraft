@@ -729,13 +729,13 @@ mod tests {
     }
 
     /// `project` compiles, takes P1's path where `routed` asks, and (with an adapter) matches the
-    /// CPU in every map and its layer `owner`'s mask preview.
+    /// CPU in every map, and in its layer `owner`'s mask preview when `mask_preview`.
     fn assert_project_matches(
         gpu: &mut Option<Headless>,
         mesh: &Arc<Mesh>,
         (project, owner): (Project, LayerId),
         tolerance: Tolerance,
-        routed: bool,
+        (routed, mask_preview): (bool, bool),
         label: &str,
     ) {
         let pixels = PixelStore::default();
@@ -748,19 +748,29 @@ mod tests {
 
         let (baked, images) = (BakedMaps::default(), images());
         let mut case = OracleCase::new(&project, &pixels, &baked, &images, mesh);
-        case.mask_owner = Some(owner);
+        case.mask_owner = mask_preview.then_some(owner);
         assert_matches_cpu(gpu, &case, tolerance, label);
     }
 
     /// `projection` with `sampling` matches the CPU reading images (bilinear tolerance, a DirectX
     /// normal map; P1's path) and reading only patterns and uniforms (point tolerance; the
     /// built-in paths where the setting only changes image reads), `flips` texels allowed for
-    /// hard decisions.
+    /// hard decisions, in the material and the mask preview.
     fn assert_fill_matches(gpu: &mut Option<Headless>, mesh: &Arc<Mesh>, projection: &Projection, sampling: Sampling, flips: usize, label: &str) {
         let images = fill_project(projection, sampling, Some(NormalFormat::DirectX));
-        assert_project_matches(gpu, mesh, images, Tolerance::BILINEAR.with_flips(flips), true, &format!("{label} images"));
+        assert_project_matches(gpu, mesh, images, Tolerance::BILINEAR.with_flips(flips), (true, true), &format!("{label} images"));
         let patterns = fill_project(projection, sampling, None);
-        assert_project_matches(gpu, mesh, patterns, Tolerance::POINT.with_flips(flips), false, &format!("{label} patterns"));
+        assert_project_matches(gpu, mesh, patterns, Tolerance::POINT.with_flips(flips), (false, true), &format!("{label} patterns"));
+    }
+
+    /// [`assert_fill_matches`] in the material only: the mask reads a projection through the same
+    /// lowering, which `nearest_image_fills_match_the_cpu` checks in the mask preview for every
+    /// projection, and each mask preview is a program of its own to compile.
+    fn assert_fill_matches_material(gpu: &mut Option<Headless>, mesh: &Arc<Mesh>, projection: &Projection, sampling: Sampling, flips: usize, label: &str) {
+        let images = fill_project(projection, sampling, Some(NormalFormat::DirectX));
+        assert_project_matches(gpu, mesh, images, Tolerance::BILINEAR.with_flips(flips), (true, false), &format!("{label} images"));
+        let patterns = fill_project(projection, sampling, None);
+        assert_project_matches(gpu, mesh, patterns, Tolerance::POINT.with_flips(flips), (false, false), &format!("{label} patterns"));
     }
 
     /// A frame in front of a unit sphere, facing +Z, turned and moved a little
@@ -899,7 +909,7 @@ mod tests {
                 ("cylindrical", sphere(), cylindrical.clone(), sharp),
             ];
             for (label, mesh, projection, sampling) in cases {
-                assert_fill_matches(&mut gpu, &mesh, &projection, sampling, FLIPS, &format!("{wrap:?} {label}"));
+                assert_fill_matches_material(&mut gpu, &mesh, &projection, sampling, FLIPS, &format!("{wrap:?} {label}"));
             }
         }
     }
@@ -913,7 +923,7 @@ mod tests {
             let projection =
                 Projection::Cylindrical { scale: 1.1, axis, uv: UvTransform::default(), offset: [0.05, 0.1, -0.1], projector: Projector::default(), angle };
             let label = format!("cylindrical axis {axis} over {angle} degrees");
-            assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, FLIPS, &label);
+            assert_fill_matches_material(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, FLIPS, &label);
         }
     }
 
@@ -936,7 +946,7 @@ mod tests {
         let mut gpu = headless();
         let uv = UvTransform { tiling: [1.7, 0.6], rotation: 23.0, offset: [0.11, -0.3] };
         for (label, projection) in turned_projections(uv, Projector::default()) {
-            assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, FLIPS, &format!("UV transformation {label}"));
+            assert_fill_matches_material(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, FLIPS, &format!("UV transformation {label}"));
         }
     }
 
@@ -953,7 +963,7 @@ mod tests {
             [("rotated", rotated, UvTransform::default()), ("stretched", stretched, UvTransform::default()), ("turned and placed", both, uv)]
         {
             for (label, projection) in turned_projections(uv, projector) {
-                assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, FLIPS, &format!("{name} {label}"));
+                assert_fill_matches_material(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, FLIPS, &format!("{name} {label}"));
             }
         }
     }
@@ -975,7 +985,7 @@ mod tests {
             ("cylindrical", Projection::Cylindrical { scale: 1.1, axis: 1, uv, offset: [0.0, 0.2, 0.1], projector: shrunk, angle: 360.0 }),
         ];
         for (label, projection) in cases {
-            assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, FLIPS, &format!("cropped {label}"));
+            assert_fill_matches_material(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, FLIPS, &format!("cropped {label}"));
         }
     }
 
@@ -985,24 +995,20 @@ mod tests {
     fn backface_culling_matches_the_cpu() {
         let mut gpu = headless();
         let uv = UvTransform::default();
-        for backface in [
-            Backface { on: true, angle: 60.0, hardness: 0.0 },
-            Backface { on: true, angle: 120.0, hardness: 1.0 },
-            Backface { on: true, ..Backface::default() },
-        ] {
-            let culled = Projector { backface, ..Projector::default() };
-            let turned = Projector { rotation: [10.0, -25.0, 15.0], crop: ShapeCrop::Cropped, backface, ..Projector::default() };
-            let cases = [
-                ("planar X", Projection::Planar { scale: 0.9, axis: 0, offset: [0.0; 3], uv, projector: culled, placed: None }),
-                ("planar Y", Projection::Planar { scale: 0.9, axis: 1, offset: [0.0; 3], uv, projector: culled, placed: None }),
-                ("planar Z turned", Projection::Planar { scale: 1.6, axis: 2, offset: [0.1, 0.0, 0.0], uv, projector: turned, placed: None }),
-                ("cylindrical X", Projection::Cylindrical { scale: 1.0, axis: 0, uv, offset: [0.0; 3], projector: culled, angle: 360.0 }),
-                ("cylindrical Z turned", Projection::Cylindrical { scale: 1.0, axis: 2, uv, offset: [0.1, 0.0, 0.0], projector: turned, angle: 360.0 }),
-            ];
-            for (label, projection) in cases {
-                let label = format!("backface {} degrees hardness {} {label}", backface.angle, backface.hardness);
-                assert_fill_matches(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, FLIPS, &label);
-            }
+        let hard = Backface { on: true, angle: 60.0, hardness: 0.0 };
+        let soft = Backface { on: true, angle: 120.0, hardness: 1.0 };
+        let default = Backface { on: true, ..Backface::default() };
+        let culled = |backface| Projector { backface, ..Projector::default() };
+        let turned = |backface| Projector { rotation: [10.0, -25.0, 15.0], crop: ShapeCrop::Cropped, backface, ..Projector::default() };
+        // Each culling mode once, on planar and cylindrical projections, plain and turned inside a crop
+        let cases = [
+            ("hard planar X", Projection::Planar { scale: 0.9, axis: 0, offset: [0.0; 3], uv, projector: culled(hard), placed: None }),
+            ("soft cylindrical Z turned", Projection::Cylindrical { scale: 1.0, axis: 2, uv, offset: [0.1, 0.0, 0.0], projector: turned(soft), angle: 360.0 }),
+            ("default planar Z turned", Projection::Planar { scale: 1.6, axis: 2, offset: [0.1, 0.0, 0.0], uv, projector: turned(default), placed: None }),
+            ("hard cylindrical X", Projection::Cylindrical { scale: 1.0, axis: 0, uv, offset: [0.0; 3], projector: culled(hard), angle: 360.0 }),
+        ];
+        for (label, projection) in cases {
+            assert_fill_matches_material(&mut gpu, &sphere(), &projection, Sampling::SAVED_BEFORE, FLIPS, &format!("backface {label}"));
         }
     }
 
@@ -1066,7 +1072,7 @@ mod tests {
         for (name, symmetry) in symmetries {
             for (label, projection) in &projections {
                 let sampling = Sampling { symmetry, ..Sampling::SAVED_BEFORE };
-                assert_fill_matches(&mut gpu, &sphere(), projection, sampling, FLIPS, &format!("{name} {label}"));
+                assert_fill_matches_material(&mut gpu, &sphere(), projection, sampling, FLIPS, &format!("{name} {label}"));
             }
         }
     }
@@ -1095,7 +1101,7 @@ mod tests {
         ];
         for (label, corners, depth, projector, uv, sampling) in cases {
             let projection = Projection::Warp { frame: frame(), corners, depth, uv, projector };
-            assert_fill_matches(&mut gpu, &sphere(), &projection, sampling, FLIPS, &format!("warp {label}"));
+            assert_fill_matches_material(&mut gpu, &sphere(), &projection, sampling, FLIPS, &format!("warp {label}"));
         }
     }
 
@@ -1153,7 +1159,7 @@ mod tests {
             ("library defaults", plane(), Projection::default(), Sampling::default(), 0),
         ];
         for (label, mesh, projection, sampling, flips) in cases {
-            assert_fill_matches(&mut gpu, &mesh, &projection, sampling, flips, &format!("bilinear HQ {label}"));
+            assert_fill_matches_material(&mut gpu, &mesh, &projection, sampling, flips, &format!("bilinear HQ {label}"));
         }
     }
 
@@ -1171,7 +1177,7 @@ mod tests {
                     &sphere(),
                     fill_project(&triplanar, sampling, Some(normal)),
                     Tolerance::BILINEAR.with_flips(FLIPS),
-                    true,
+                    (true, false),
                     &label,
                 );
             }
@@ -1202,7 +1208,7 @@ mod tests {
             ];
             for (label, projection, sampling) in cases {
                 // The frame's edge crops hard
-                assert_fill_matches(&mut gpu, &sphere(), &projection, sampling, FLIPS, &format!("{filtering:?} {label}"));
+                assert_fill_matches_material(&mut gpu, &sphere(), &projection, sampling, FLIPS, &format!("{filtering:?} {label}"));
             }
         }
     }

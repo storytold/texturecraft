@@ -398,18 +398,17 @@ mod tests {
     }
 
     /// The mask view of tile grids that are not 2 × 2 (2 × 1, 3 × 1, 3 × 2 with tiles at their own
-    /// resolutions, and a 3 × 1 grid of 1024-texel blocks the view halves) previews on the GPU,
-    /// each tile as the square of its block, as the CPU's `mask_image_sized` samples it.
+    /// resolutions) previews on the GPU, each tile as the square of its block, as the CPU's
+    /// `mask_image_sized` samples it. A view the set halves reads every second texel as a classic
+    /// set's does (`renderer::tests::the_mask_view_halves_a_set_until_it_fits`).
     #[test]
     fn mask_previews_of_tile_grids_match_the_cpu() {
         let Some(mut gpu) = headless() else { return };
-        const LARGE: u32 = 1024;
         type Grid = (&'static str, (u32, u32), u32, Vec<u32>);
-        let grids: [Grid; 4] = [
+        let grids: [Grid; 3] = [
             ("2 × 1", (2, 1), BLOCK, vec![BLOCK; 2]),
             ("3 × 1", (3, 1), BLOCK, vec![BLOCK; 3]),
             ("3 × 2, tiles at their own resolutions", (3, 2), BLOCK, vec![BLOCK, BLOCK / 2, BLOCK, 3 * BLOCK / 4, BLOCK, BLOCK / 4]),
-            ("3 × 1 of 1024-texel blocks, halved", (3, 1), LARGE, vec![LARGE, LARGE / 2, 3 * LARGE / 4]),
         ];
         let channels = [Channel::BaseColor];
         let mut checker = Procedural::new(ProceduralKind::Checker);
@@ -427,6 +426,7 @@ mod tests {
             let checker_mask = Source::Procedural { pattern: checker.clone(), low: [0.2; 3], high: [0.9; 3], ramp: Vec::new() };
             let mask_fill = EffectKind::Fill { source: checker_mask, projection: Projection::UvTile, sampling: Sampling::default() };
             mask.effects.push(Effect::new(project.alloc_id(), mask_fill));
+            // A stage, so the GPU leaves the texels the mesh does not cover as the CPU does
             mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false })));
             layer.mask = Some(mask);
             assert!(project.insert_layer(0, layer, None, false).is_ok());
@@ -908,16 +908,14 @@ mod tests {
         let triplanar =
             Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43], uv: Default::default(), projector: Default::default() };
         let planar = Projection::Planar { scale: 0.8, axis: 1, offset: [0.03, 0.0, 0.34], uv: Default::default(), projector: Default::default(), placed: None };
-        let clouds = Procedural { scale: 3.0, seed: 7, ..Procedural::new(ProceduralKind::Clouds) };
 
+        // The image read is the path under test: no patterns
         for (label, projection) in [("triplanar", triplanar), ("planar", planar)] {
             let (mut project, mesh) = atlas(true, &channels);
             let owner = project.alloc_id();
-            let sources = BTreeMap::from([
-                (Channel::BaseColor, Source::image("stripes")),
-                (Channel::Roughness, Source::Procedural { pattern: clouds.clone(), low: [0.2; 3], high: [0.9; 3], ramp: Vec::new() }),
-            ]);
+            let sources = BTreeMap::from([(Channel::BaseColor, Source::image("stripes")), (Channel::Roughness, Source::image("stripes"))]);
             let mut layer = Layer::new(owner, "World", LayerKind::Fill(Fill { sources, projection, ..Fill::default() }), &channels);
+            // A stage, so the GPU leaves the texels the mesh does not cover as the CPU does
             let mut mask = Mask::new(MaskBackground::White);
             mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false })));
             layer.mask = Some(mask);

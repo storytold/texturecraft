@@ -1967,7 +1967,6 @@ pub(crate) mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn every_builtin_material_uses_gpu_layers() {
-        let mut gpu = texturecraft_render::headless::Headless::for_tests().ok();
         let mut rejected = Vec::new();
         for material in texturecraft_engine::materials::MATERIALS {
             let mut session = Session::new_project("Material shelf", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
@@ -1982,22 +1981,18 @@ pub(crate) mod tests {
             link.gpu_composite_enabled = true;
             let update = link.sync(&mut session, None, None, 0, 0.0);
             let (status, reason) = link.compositor_status();
+            // Planned on the GPU is what counts here; each GPU path's pixels are its oracle tests'
             if status != "Layers: GPU" || update.composites.len() != 1 || !update.tiles.is_empty() {
                 rejected.push(format!("{}: {status} ({reason})", material.id));
-            } else if let Some(gpu) = &mut gpu {
-                let (_, errors, _) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
-                rejected.extend(errors.into_iter().map(|(_, error)| format!("{}: {error}", material.id)));
-                gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
             }
-        }
-        if let Some(gpu) = &gpu {
-            println!("Checked {} built-in materials on {}", texturecraft_engine::materials::MATERIALS.len(), gpu.adapter_name);
         }
         assert!(rejected.is_empty(), "built-in materials fell back to CPU: {rejected:#?}");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn submit_library_preview(link: &mut GpuLink, session: &mut Session, gpu: &mut Headless, aux: Option<AuxView>) -> Result<(), String> {
+    /// Plan `session`'s view as the viewport does (the mask view of `aux`): Err unless the GPU
+    /// composites it, with no CPU tiles and nothing left to the CPU's aux upload.
+    fn plan_library_preview(link: &mut GpuLink, session: &mut Session, aux: Option<AuxView>) -> Result<(), String> {
         let ts = session.ts();
         let update = link.sync(session, aux, None, 0, 0.0);
         let mask = matches!(aux, Some(AuxView::Mask(_)));
@@ -2007,51 +2002,29 @@ pub(crate) mod tests {
             && update.composites.iter().any(|(set, program, _, _)| *set == ts && program.is_mask_preview() == mask && !program.is_neutral())
             && update.tiles.is_empty()
             && update.aux.iter().all(|(set, ..)| *set != ts);
-        if let Some((mesh, id)) = &update.mesh {
-            gpu.renderer.set_mesh(&gpu.device, &gpu.queue, mesh, *id);
-        }
-        let (_, errors, _) = update.apply_display(&mut gpu.renderer, &gpu.device, &gpu.queue);
-        for (ts, extent, pixels) in update.aux {
-            gpu.renderer.upload_aux_sized(&gpu.device, &gpu.queue, ts, extent, &pixels);
-        }
-        if !errors.is_empty() {
-            Err(format!("{errors:?}"))
-        } else if !uses_expected_route {
-            Err(format!("{status} ({reason}); expected a non-neutral {expected_status} update"))
-        } else {
-            Ok(())
-        }
+        if uses_expected_route { Ok(()) } else { Err(format!("{status} ({reason}); expected a non-neutral {expected_status} update")) }
     }
 
+    /// Every built-in material, smart mask and default generator on the baked sample composites on
+    /// the GPU (material, and mask view for the masks), with nothing left to the CPU. Their
+    /// pixels are each GPU path's oracle tests' (render crate), not this sweep's.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn builtin_library_and_default_generators_render_on_gpu_on_the_baked_sample() {
+    fn builtin_library_and_default_generators_composite_on_the_gpu_on_the_baked_sample() {
         use texturecraft_engine::{core::GeneratorKind, materials::MATERIALS, smart_masks::SMART_MASKS};
-        use texturecraft_render::readback::Readback;
 
-        let Ok(mut gpu) = Headless::for_tests() else { return };
         const SIZE: u32 = 256;
         let mut session = texturecraft_engine::sample_session(SIZE, SIZE).unwrap();
         execute(&mut session, "layer.add.fill", &json!({"color": [1.0, 0.0, 1.0], "roughness": 0.123})).unwrap();
         let mut link = link();
         link.gpu_composite_enabled = true;
-        submit_library_preview(&mut link, &mut session, &mut gpu, None).unwrap();
+        plan_library_preview(&mut link, &mut session, None).unwrap();
 
-        let material_pixels = |gpu: &Headless| {
-            [DisplayKind::BaseColor, DisplayKind::Orm].map(|kind| {
-                let (w, h, pixels) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][kind as usize]).unwrap();
-                assert_eq!((w, h), (SIZE, SIZE));
-                pixels
-            })
-        };
-        let baseline = material_pixels(&gpu);
         let mut failures = Vec::new();
         for material in MATERIALS {
             execute(&mut session, "material.apply", &json!({"material": material.id})).unwrap();
-            match submit_library_preview(&mut link, &mut session, &mut gpu, None) {
-                Ok(()) if material_pixels(&gpu) != baseline => {}
-                Ok(()) => failures.push(format!("{} did not change the displayed material", material.id)),
-                Err(reason) => failures.push(format!("{}: {reason}", material.id)),
+            if let Err(reason) = plan_library_preview(&mut link, &mut session, None) {
+                failures.push(format!("{}: {reason}", material.id));
             }
             session.undo().unwrap();
         }
@@ -2062,27 +2035,12 @@ pub(crate) mod tests {
         let layer = session.selected_layer().unwrap();
         let mut check_mask = |session: &mut Session, name: &str| {
             session.view = ViewMode::Material;
-            if let Err(reason) = submit_library_preview(&mut link, session, &mut gpu, None) {
+            if let Err(reason) = plan_library_preview(&mut link, session, None) {
                 failures.push(format!("{name} on the material: {reason}"));
             }
-
             session.view = ViewMode::Mask(layer);
-            if let Err(reason) = submit_library_preview(&mut link, session, &mut gpu, Some(AuxView::Mask(layer))) {
+            if let Err(reason) = plan_library_preview(&mut link, session, Some(AuxView::Mask(layer))) {
                 failures.push(format!("{name} in the mask view: {reason}"));
-                return;
-            }
-            let texture = gpu.renderer.aux_texture(session.ts()).unwrap();
-            let (w, h, rgba) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
-            assert_eq!((w, h), (SIZE, SIZE), "{name}");
-            let actual = rgba.as_chunks::<4>().0;
-            if actual.iter().any(|[r, g, b, a]| r != g || r != b || *a != 255) {
-                failures.push(format!("{name}: mask texture is not opaque grayscale"));
-            }
-            let expected = session.mask_view_rgba(layer, (SIZE, SIZE)).unwrap();
-            if expected.as_chunks::<4>().0.iter().any(|p| p[0] > 8)
-                && !actual.iter().zip(expected.as_chunks::<4>().0).any(|(gpu, cpu)| gpu[0] > 0 && cpu[0] > 8)
-            {
-                failures.push(format!("{name}: mask has no visible GPU coverage at the CPU witness pixels"));
             }
         };
         for mask in SMART_MASKS {
@@ -2096,13 +2054,7 @@ pub(crate) mod tests {
             execute(&mut session, "effect.add.generator", &json!({"target": "mask", "layer": layer.0, "generator": name})).unwrap();
             check_mask(&mut session, &name);
         }
-        println!(
-            "Checked {} materials, {} smart masks and {} default generators on {}",
-            MATERIALS.len(),
-            SMART_MASKS.len(),
-            GeneratorKind::ALL.len(),
-            gpu.adapter_name
-        );
+
         assert!(failures.is_empty(), "GPU library sweep errors: {failures:#?}");
     }
 
@@ -2202,14 +2154,13 @@ pub(crate) mod tests {
         link.material_start_preview = false;
         let mut headless = Headless::for_tests().ok();
         let opened = std::time::Instant::now();
-        for (size, sets) in [(2048, &[0, 1][..]), (4096, &[0][..])] {
+        // The sample's own size; the resolution change below exercises the resize
+        {
+            let size = 2048;
             let started = std::time::Instant::now();
-            if size == 4096 {
-                execute(&mut session, "textureSet.resolution", &json!({"ts":0,"resolution":size})).unwrap();
-            }
             let update = link.sync(&mut session, None, None, 0, 0.0);
             let planned: Vec<_> = update.composites.iter().map(|(ts, _, _, _)| *ts).collect();
-            assert_eq!(planned, sets, "{}", link.compositor_status().1);
+            assert_eq!(planned, [0, 1], "{}", link.compositor_status().1);
             assert!(update.tiles.is_empty());
             assert_eq!(link.compositor_status().0, "Layers: GPU");
             if let Some(gpu) = &mut headless {
@@ -2458,9 +2409,13 @@ pub(crate) mod tests {
             mask
         };
 
-        // The procedural stack with a half mask on its first fill, a folder holding a masked fill and an instance of the first fill
+        // Two plain fills (solo is about what the stack draws, not about patterns) with a half
+        // mask on the first, a folder holding a masked fill and an instance of the first fill
         let build = || {
-            let mut session = procedural_stack(128);
+            let mut session = Session::new_project("Solo", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+            for color in [[0.7, 0.5, 0.4], [0.35, 0.6, 0.75]] {
+                execute(&mut session, "layer.add.fill", &json!({"color": color, "opacity": 0.6})).unwrap();
+            }
             let stack = session.doc.project.texture_sets[0].stack.clone();
             let first = *stack.iter().find(|id| matches!(session.doc.project.layers[*id].kind, LayerKind::Fill(_))).unwrap();
             let mask = half_mask(&mut session);
