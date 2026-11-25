@@ -2756,6 +2756,8 @@ pub(crate) struct GpuCompositor {
     bindings: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     filter_gpu: Option<NeighbourhoodGpu>,
+    /// Take the neighbourhood kernels the tests on the shared device share
+    shared_test_kernels: bool,
     lookup: wgpu::Buffer,
     uniform_coverage: wgpu::Buffer,
     coverage: Vec<(Weak<UvGBuffer>, wgpu::Buffer)>,
@@ -2790,7 +2792,14 @@ impl GpuCompositor {
             && limits.max_compute_workgroup_size_y >= WORKGROUP
     }
 
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn new(device: &wgpu::Device) -> Self {
+        Self::new_with(device, false)
+    }
+
+    /// [`GpuCompositor::new`], taking the pipelines and kernels the tests on the shared device
+    /// share when `shared` ([`crate::headless::Headless::for_tests`])
+    pub(crate) fn new_with(device: &wgpu::Device, shared: bool) -> Self {
         let binding = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
         let buffer = |ty| wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None };
         let uniform = buffer(wgpu::BufferBindingType::Uniform);
@@ -2855,7 +2864,8 @@ impl GpuCompositor {
         let default_brush_alpha =
             input_texture(device, "tc_composite_empty_brush_alpha", (1, 1), 1, wgpu::TextureFormat::R16Uint).create_view(&Default::default());
         Self {
-            pipelines: pipelines::shared(device, supports_curvature, supports_id),
+            pipelines: pipelines::shared(shared, supports_curvature, supports_id),
+            shared_test_kernels: shared,
             asynchronous: false,
             bindings,
             pipeline_layout,
@@ -3288,7 +3298,8 @@ impl GpuCompositor {
             if tile_work == 0 {
                 band_rows = height.min(256);
             }
-            self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::for_device(device));
+            let shared = self.shared_test_kernels;
+            self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::for_device(device, shared));
         }
         let (pipeline, prepare) = self.pipelines().get(device, &self.pipeline_layout, program, self.asynchronous).ok_or(GPU_PIPELINES_PENDING)?;
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;

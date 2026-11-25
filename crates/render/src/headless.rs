@@ -9,6 +9,10 @@ pub struct Headless {
     pub adapter_name: String,
     /// A test's turn on the GPU ([`Headless::for_tests`]), dropped after the device
     _serial: Option<serial::Turn>,
+    /// Whether this is the device the tests of the process share ([`Headless::for_tests`]),
+    /// whose compiled pipelines they share too
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) shared_test_device: bool,
 }
 
 impl Headless {
@@ -36,8 +40,17 @@ impl Headless {
         let turn = serial::Turn::take();
         #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
         if let Some((device, queue, adapter_name)) = shared_test_device()? {
-            let renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
-            return Ok(Headless { device, queue, renderer, adapter_name, _serial: Some(turn) });
+            let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+            renderer.share_test_pipelines();
+            return Ok(Headless {
+                device,
+                queue,
+                renderer,
+                adapter_name,
+                _serial: Some(turn),
+                #[cfg(all(test, not(target_arch = "wasm32")))]
+                shared_test_device: true,
+            });
         }
         let mut headless = Self::with_limits(crate::device_limits)?;
         headless._serial = Some(turn);
@@ -57,7 +70,15 @@ impl Headless {
         let descriptor = wgpu::DeviceDescriptor { required_limits: limits(&adapter), ..Default::default() };
         let (device, queue) = pollster::block_on(adapter.request_device(&descriptor)).map_err(|e| format!("no GPU device: {e}"))?;
         let renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
-        Ok(Headless { device, queue, renderer, adapter_name, _serial: serial })
+        Ok(Headless {
+            device,
+            queue,
+            renderer,
+            adapter_name,
+            _serial: serial,
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            shared_test_device: false,
+        })
     }
 
     /// Render a frame and read it back as RGBA8 (sRGB-encoded).
@@ -88,12 +109,6 @@ fn shared_test_device() -> Result<Option<SharedTestDevice>, String> {
             Ok(shares.then_some((gpu.device, gpu.queue, gpu.adapter_name)))
         })
         .clone()
-}
-
-/// Whether `device` is the one the tests of this process share
-#[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
-pub(crate) fn is_shared_test_device(device: &wgpu::Device) -> bool {
-    SHARED_TEST_DEVICE.get().is_some_and(|shared| matches!(shared, Ok(Some((shared, ..))) if shared == device))
 }
 
 /// Whether tests share one device on this adapter: a software one (GL here is llvmpipe or a

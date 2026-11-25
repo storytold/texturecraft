@@ -213,18 +213,18 @@ pub(super) struct CompositePipelines {
     variants: BTreeMap<Features, Variants>,
 }
 
-/// The pipelines a compositor uses: its own, or on the device tests share
-/// ([`crate::headless::Headless::for_tests`]) one set for every compositor, so a test does not
-/// compile the variants an earlier one compiled (llvmpipe keeps what it compiled until the
-/// process ends, and compiling dominates its tests' time).
-pub(super) fn shared(device: &wgpu::Device, supports_curvature: bool, supports_id: bool) -> Arc<Mutex<CompositePipelines>> {
+/// The pipelines a compositor uses: its own, or when `shared` (a compositor on the device tests
+/// share, [`crate::headless::Headless::for_tests`]) one set for every such compositor, so a test
+/// does not compile the variants an earlier one compiled (llvmpipe keeps what it compiled until
+/// the process ends, and compiling dominates its tests' time).
+pub(super) fn shared(shared: bool, supports_curvature: bool, supports_id: bool) -> Arc<Mutex<CompositePipelines>> {
     #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
-    if crate::headless::is_shared_test_device(device) {
+    if shared {
         static SHARED: std::sync::OnceLock<Arc<Mutex<CompositePipelines>>> = std::sync::OnceLock::new();
         return SHARED.get_or_init(|| Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)))).clone();
     }
     #[cfg(not(all(any(test, feature = "test-support"), not(target_arch = "wasm32"))))]
-    let _ = device;
+    let _ = shared;
     Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)))
 }
 

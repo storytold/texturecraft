@@ -416,14 +416,16 @@ pub(crate) struct NeighbourhoodGpu {
 }
 
 impl NeighbourhoodGpu {
-    /// [`NeighbourhoodGpu::new`], or on the device tests share
-    /// ([`crate::headless::Headless::for_tests`]) one set of kernels for all of them, compiled once.
-    pub(crate) fn for_device(device: &wgpu::Device) -> Self {
+    /// [`NeighbourhoodGpu::new`], or when `shared` (on the device tests share,
+    /// [`crate::headless::Headless::for_tests`]) one set of kernels for all of them, compiled once.
+    pub(crate) fn for_device(device: &wgpu::Device, shared: bool) -> Self {
         #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
-        if crate::headless::is_shared_test_device(device) {
+        if shared {
             static SHARED: std::sync::OnceLock<NeighbourhoodGpu> = std::sync::OnceLock::new();
             return SHARED.get_or_init(|| Self::new(device)).clone();
         }
+        #[cfg(not(all(any(test, feature = "test-support"), not(target_arch = "wasm32"))))]
+        let _ = shared;
         Self::new(device)
     }
 
