@@ -4196,8 +4196,38 @@ mod procedural_tests {
     use texturecraft_geom::primitives;
     use texturecraft_texel::{srgb_lut, to_u16};
 
+    /// The gate's check of the stack, generator, pattern and bake family: every test below with
+    /// its first case where it runs several (the full matrix runs with `TC_GPU_PARITY_FULL=1`;
+    /// `a_costly_4k_fill_composites_on_the_gpu`, a 4K banding check, runs only there). A failure
+    /// names the test and case.
+    #[test]
+    fn procedural_family_matches_the_cpu() {
+        oracle::packed_run(|| {
+            mask_and_content_anchors_match_cpu_in_material_and_mask_views();
+            restricted_passthrough_groups_publish_child_anchors_on_both_parts();
+            generator_global_blur_and_resolution_match_cpu_with_an_image_override();
+            content_material_and_sparse_sublayers_match_cpu_before_and_during_a_stroke();
+            neighbourhood_filter_chains_match_cpu_on_paint_and_masks();
+            point_filters_match_cpu_for_material_channels_and_mask_preview();
+            color_selection_matches_raw_rgb_in_material_and_mask_views();
+            linked_paint_resamples_the_source_and_uses_the_instance_mask_override();
+            geometry_and_height_masks_with_compare_match_cpu();
+            nested_group_masks_blend_children_over_the_incoming_material();
+            baked_lighting_uses_the_covered_padding_source_with_or_without_ao();
+            narrow_gpu_generator_ramp_preserves_baked_scalar_precision();
+            curvature_detail_modes_match_cpu_with_scaled_uv_coverage_and_missing_bake();
+            steep_baked_normal_keeps_its_direction_with_painted_detail();
+            material_patterns_match_cpu_as_fills_and_masks();
+            tile_generator_matches_cpu_with_shaped_and_authored_tiles();
+            authored_material_images_match_cpu_projections_and_decal_coverage();
+        });
+    }
+
     #[test]
     fn mask_and_content_anchors_match_cpu_in_material_and_mask_views() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
         use texturecraft_compose::tile_bytes;
         use texturecraft_core::MicroDetail;
@@ -4298,6 +4328,9 @@ mod procedural_tests {
 
     #[test]
     fn restricted_passthrough_groups_publish_child_anchors_on_both_parts() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::eval::{Composite, Inputs, composite_tiles};
         use texturecraft_compose::tile_bytes;
         use texturecraft_geom::SubMesh;
@@ -4390,6 +4423,9 @@ mod procedural_tests {
 
     #[test]
     fn generator_global_blur_and_resolution_match_cpu_with_an_image_override() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::{
             ImageRes,
             eval::{Inputs, mask_image},
@@ -4465,6 +4501,9 @@ mod procedural_tests {
 
     #[test]
     fn content_material_and_sparse_sublayers_match_cpu_before_and_during_a_stroke() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::{Composite, ImageRes, Inputs, PaintTarget, StrokePreview, composite_tiles, tile_bytes};
         use texturecraft_core::Decal;
         use texturecraft_texel::to_u16_signed;
@@ -4597,6 +4636,9 @@ mod procedural_tests {
 
     #[test]
     fn neighbourhood_filter_chains_match_cpu_on_paint_and_masks() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
         use texturecraft_compose::tile_bytes;
 
@@ -4630,7 +4672,7 @@ mod procedural_tests {
             (Filter::Blur { radius: 64.0, wrap: false }, BlendMode::Replace, BlendMode::Normal),
             (Filter::Blur { radius: 64.0, wrap: false }, BlendMode::Normal, BlendMode::Disable),
         ]);
-        for (filter, blend, effect_blend) in cases {
+        for (filter, blend, effect_blend) in oracle::gate_cases(cases) {
             let mut project = Project::new("Neighbourhood filters", "builtin:plane");
             project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
             let owner = project.alloc_id();
@@ -4758,6 +4800,9 @@ mod procedural_tests {
     /// submissions.
     #[test]
     fn a_costly_4k_fill_composites_on_the_gpu() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_core::{TileGenerator, TileSizeMode};
 
         let Ok(mut gpu) = Headless::new() else { return };
@@ -4799,6 +4844,9 @@ mod procedural_tests {
 
     #[test]
     fn point_filters_match_cpu_for_material_channels_and_mask_preview() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::display::tile_bytes;
         use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
 
@@ -4849,7 +4897,7 @@ mod procedural_tests {
         let kinds = filters.into_iter().map(EffectKind::Filter).chain([EffectKind::Levels(levels(true)), EffectKind::Levels(levels(false))]);
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
         // Each once more set to Disable: content filters then change nothing, mask filters apply anyway
-        for (filter, disabled) in kinds.flat_map(|kind| [(kind.clone(), false), (kind, true)]) {
+        for (filter, disabled) in oracle::gate_cases(kinds.flat_map(|kind| [(kind.clone(), false), (kind, true)])) {
             let mut project = Project::new("Point filters", "builtin:plane");
             project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
             let owner = project.alloc_id();
@@ -4921,6 +4969,9 @@ mod procedural_tests {
 
     #[test]
     fn color_selection_matches_raw_rgb_in_material_and_mask_views() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
         use texturecraft_compose::tile_bytes;
 
@@ -4961,7 +5012,7 @@ mod procedural_tests {
         let pixels = PixelStore::default();
         let images = ImageStore::default();
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
-        for (baked, tolerance) in [(&bake, 1.0 / 64.0), (&bake, 0.0), (&changed, 0.0), (&empty, 0.0)] {
+        for (baked, tolerance) in oracle::gate_cases([(&bake, 1.0 / 64.0), (&bake, 0.0), (&changed, 0.0), (&empty, 0.0)]) {
             project.layer_mut(owner).unwrap().mask.as_mut().unwrap().effects[1].kind = effect_kind(tolerance);
             let inputs = Inputs {
                 project: &project,
@@ -5002,6 +5053,9 @@ mod procedural_tests {
 
     #[test]
     fn linked_paint_resamples_the_source_and_uses_the_instance_mask_override() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::eval::{Composite, Inputs, all_tiles, composite_tiles, mask_image};
         use texturecraft_compose::tile_bytes;
         use texturecraft_texel::to_u16_signed;
@@ -5052,7 +5106,7 @@ mod procedural_tests {
         let images = ImageStore::default();
         let tiles = all_tiles(SIZE, SIZE);
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SOURCE, SOURCE), 0), ((SIZE, SIZE), 1)], 2);
-        for (case, mask) in [None, Some(own), Some(disabled)].into_iter().enumerate() {
+        for (case, mask) in oracle::gate_cases([None, Some(own), Some(disabled)].into_iter().enumerate()) {
             project.layer_mut(owner).unwrap().mask = mask;
             let inputs = Inputs {
                 project: &project,
@@ -5114,6 +5168,9 @@ mod procedural_tests {
 
     #[test]
     fn geometry_and_height_masks_with_compare_match_cpu() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::display::tile_bytes;
         use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
         use texturecraft_core::HeightMask;
@@ -5192,7 +5249,7 @@ mod procedural_tests {
         ];
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
         let mut red_with_height = 0;
-        for (op, value, tolerance, passes, height_enabled) in cases {
+        for (op, value, tolerance, passes, height_enabled) in oracle::gate_cases(cases) {
             let layer = project.layer_mut(owner).unwrap();
             layer.channels.get_mut(&Channel::Height).unwrap().mode = if height_enabled { BlendMode::Normal } else { BlendMode::Disable };
             layer.mask.as_mut().unwrap().effects[1].kind = EffectKind::Compare {
@@ -5255,6 +5312,9 @@ mod procedural_tests {
 
     #[test]
     fn nested_group_masks_blend_children_over_the_incoming_material() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::display::tile_bytes;
         use texturecraft_compose::eval::{Composite, Inputs, composite_tiles};
         use texturecraft_core::HeightMask;
@@ -5358,6 +5418,9 @@ mod procedural_tests {
 
     #[test]
     fn baked_lighting_uses_the_covered_padding_source_with_or_without_ao() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, pad_tiles};
         use texturecraft_compose::tile_bytes;
         use texturecraft_geom::glam::Vec2;
@@ -5394,7 +5457,7 @@ mod procedural_tests {
         let images = ImageStore::default();
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
         let mut reds = [0; 2];
-        for (i, baked) in [None, Some(&ao)].into_iter().enumerate() {
+        for (i, baked) in oracle::gate_cases([None, Some(&ao)].into_iter().enumerate()) {
             let inputs = Inputs {
                 project: &project,
                 ts: 0,
@@ -5427,6 +5490,9 @@ mod procedural_tests {
 
     #[test]
     fn narrow_gpu_generator_ramp_preserves_baked_scalar_precision() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::eval::{Inputs, mask_image};
 
         let Ok(mut gpu) = Headless::new() else { return };
@@ -5472,6 +5538,9 @@ mod procedural_tests {
 
     #[test]
     fn curvature_detail_modes_match_cpu_with_scaled_uv_coverage_and_missing_bake() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::eval::{Inputs, mask_image};
 
         let Ok(mut gpu) = Headless::new() else { return };
@@ -5502,7 +5571,7 @@ mod procedural_tests {
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
         // Changing the mode or generator shares the blurred bake. Removing the bake
         // at the end must go back to neutral curvature even after these cached reads.
-        for bake in [&baked, &absent] {
+        for bake in oracle::gate_cases([&baked, &absent]) {
             for kind in [GeneratorKind::Curvature, GeneratorKind::EdgeWear] {
                 let mut mode_checks = Vec::new();
                 for mode in CurvatureMode::ALL {
@@ -5558,6 +5627,9 @@ mod procedural_tests {
 
     #[test]
     fn steep_baked_normal_keeps_its_direction_with_painted_detail() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         let Ok(mut gpu) = Headless::new() else { return };
         const SIZE: u32 = 64;
         let mesh = Arc::new(primitives::plane(1.0, 1));
@@ -5587,6 +5659,9 @@ mod procedural_tests {
 
     #[test]
     fn material_patterns_match_cpu_as_fills_and_masks() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use ProceduralKind::*;
         const SIZE: u32 = 128;
         let mesh = Arc::new(primitives::plane(1.0, 1));
@@ -5659,6 +5734,9 @@ mod procedural_tests {
     }
     #[test]
     fn tile_generator_matches_cpu_with_shaped_and_authored_tiles() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::{ImageRes, ImageStore, PatternContext, pattern::procedural_in};
         use texturecraft_core::{TileBlending, TileGenerator, TileInputDistribution, TileShape, TileSizeMode};
 
@@ -5763,6 +5841,9 @@ mod procedural_tests {
 
     #[test]
     fn authored_material_images_match_cpu_projections_and_decal_coverage() {
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::{
             BakedMaps, ImageRes,
             display::tile_bytes,

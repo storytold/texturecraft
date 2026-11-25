@@ -209,7 +209,7 @@ mod tests {
     use texturecraft_geom::{Mesh, UvGBuffer, primitives};
     use texturecraft_texel::{TILE, TileImage, to_u16, to_u16_signed};
 
-    use super::super::oracle::{OracleCase, Tolerance, assert_matches_cpu, headless};
+    use super::super::oracle::{OracleCase, Tolerance, assert_matches_cpu, full_parity_matrix, gate_cases, headless, packed_run};
     use super::super::{BakedInputs, CompositeProgram, CompositeRegion, LiveBrush, LiveBrushTarget};
     use super::UdimLayout;
     use crate::headless::Headless;
@@ -233,6 +233,30 @@ mod tests {
     const SCALED: [u32; 4] = [BLOCK, BLOCK / 2, BLOCK, BLOCK / 4];
     /// Tile sides that do not divide the block (three quarters and three eighths of it).
     const UNEVEN: [u32; 4] = [BLOCK, 3 * BLOCK / 4, BLOCK, 3 * BLOCK / 8];
+
+    /// The gate's check of the UV tile family: every UV tile test below with one case (the scaled
+    /// atlas where a test runs both); the full matrix runs with `TC_GPU_PARITY_FULL=1`. A
+    /// failure names the test and case.
+    #[test]
+    fn uv_tile_family_matches_the_cpu() {
+        packed_run(|| {
+            fills_follow_each_uv_tile();
+            image_fills_follow_each_uv_tile();
+            the_gradient_debug_view_follows_each_uv_tile();
+            box_and_distance_stages_run_per_tile_scale();
+            whole_tile_gathers_stay_in_their_uv_tile();
+            a_reduced_generator_takes_each_tiles_cells();
+            lighting_reads_each_tiles_height_slopes_and_bakes();
+            baked_maps_of_different_heights_match_the_cpu();
+            a_live_mask_stroke_on_uv_tiles_matches_the_cpu();
+            curvature_detail_sizes_work_per_uv_tile_block();
+            a_colour_selection_reads_each_tiles_share_of_the_id_bake();
+            whole_set_filters_keep_the_pre_pass_on_atlases_of_many_scales();
+            a_live_layer_stroke_on_uv_tiles_matches_the_cpu();
+            height_to_normal_runs_per_tile_scale();
+            world_space_fills_match_the_cpu_on_uv_tiles();
+        });
+    }
 
     /// A set of the four tiles 1001, 1002, 1011 and 1012 in a 2 × 2 atlas of `block` texels per block, each
     /// tile at its resolution in `resolutions` (its block's when equal), and a mesh of four planes,
@@ -337,8 +361,8 @@ mod tests {
     /// scaled atlas: every map, the mask preview and a partial update across the block corner.
     fn check_stacks(gpu: &mut Headless, cases: &[(&str, Stack)], tolerance: Tolerance) {
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
-        for scaled in [false, true] {
-            for (label, stack) in cases {
+        for scaled in gate_cases([true, false]) {
+            for (label, stack) in gate_cases(cases) {
                 let (project, mesh, pixels, owner, _) = painted(scaled, stack);
                 let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
                 case.mask_owner = Some(owner);
@@ -381,6 +405,9 @@ mod tests {
     /// the Checker.
     #[test]
     fn fills_follow_each_uv_tile() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         let clouds = Procedural { scale: 3.0, seed: 7, ..Procedural::new(ProceduralKind::Clouds) };
         let roughness = Source::Procedural { pattern: clouds, low: [0.2; 3], high: [0.9; 3], ramp: Vec::new() };
@@ -393,6 +420,9 @@ mod tests {
     /// 9 GB on llvmpipe, this one alone to 8.6 GB.
     #[test]
     fn image_fills_follow_each_uv_tile() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         uv_tile_fills(&mut gpu, Some((Channel::Height, Source::image("stripes"))), false);
     }
@@ -439,6 +469,9 @@ mod tests {
     /// reduced Checker.
     #[test]
     fn the_gradient_debug_view_follows_each_uv_tile() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         uv_tile_fills(&mut gpu, None, true);
     }
@@ -461,7 +494,7 @@ mod tests {
             debug: true,
         };
 
-        for scaled in [false, true] {
+        for scaled in gate_cases([true, false]) {
             let (mut project, mesh) = atlas(scaled, &channels);
             let owner = project.alloc_id();
             let mut sources = BTreeMap::from([(
@@ -502,6 +535,9 @@ mod tests {
     /// to Disable (the mask applies it anyway) and chained.
     #[test]
     fn box_and_distance_stages_run_per_tile_scale() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         let normal = BlendMode::Normal;
         let blur = Filter::Blur { radius: 40.0, wrap: false };
@@ -523,6 +559,9 @@ mod tests {
     /// a Mirror, a Transform, and a Warp whose source repeats within the tile.
     #[test]
     fn whole_tile_gathers_stay_in_their_uv_tile() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         let normal = BlendMode::Normal;
         let mirror = Filter::Mirror(Mirror { offset: [0.4, 0.5], ..Mirror::LIBRARY });
@@ -543,7 +582,7 @@ mod tests {
 
         // Tiles whose sides do not divide their block: each starts at its block, not at a multiple of its side
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
-        for (label, stack) in &cases {
+        for (label, stack) in gate_cases(&cases) {
             let (project, mesh, pixels, owner, _) = painted_of((BLOCK, UNEVEN), &[Channel::BaseColor, Channel::Roughness, Channel::Height], stack);
             let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
             case.mask_owner = Some(owner);
@@ -556,6 +595,9 @@ mod tests {
     /// A mask generator at a coarser resolution and blurred takes each tile's cells and blur.
     #[test]
     fn a_reduced_generator_takes_each_tiles_cells() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         let mut generator = Generator::new(GeneratorKind::Dirt);
         generator.global.blur = 0.4;
@@ -565,7 +607,7 @@ mod tests {
         let images = ImageStore::from([("Occlusion".into(), Arc::new(ImageRes::new(8, 8, occlusion, false)))]);
         let baked = BakedMaps::default();
 
-        for scaled in [false, true] {
+        for scaled in gate_cases([true, false]) {
             let (mut project, mesh, pixels, owner, _) = painted(scaled, &[]);
             let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(generator.clone()));
             generated.blend = BlendMode::Multiply;
@@ -599,6 +641,9 @@ mod tests {
     /// from the bake atlas's share of each block, and the displays read the bakes so too.
     #[test]
     fn lighting_reads_each_tiles_height_slopes_and_bakes() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         let channels = [Channel::BaseColor, Channel::Metallic, Channel::Roughness];
         let lighting = Filter::BakedLighting {
@@ -611,7 +656,7 @@ mod tests {
         };
         let (baked, images) = (atlas_bakes(), ImageStore::default());
 
-        for scaled in [false, true] {
+        for scaled in gate_cases([true, false]) {
             let (mut project, mesh) = atlas(scaled, &channels);
             let owner = project.alloc_id();
             let sources = BTreeMap::from([
@@ -636,6 +681,9 @@ mod tests {
     /// set and on the scaled atlas.
     #[test]
     fn baked_maps_of_different_heights_match_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         let ramp = |side: usize, height: usize, value: fn(f32, f32) -> f32| -> Arc<Vec<f32>> {
             Arc::new((0..side * height).map(|index| value((index % side) as f32 / side as f32, (index / side) as f32 / height as f32)).collect())
@@ -679,6 +727,9 @@ mod tests {
     /// it, matches the CPU's preview of the same stroke.
     #[test]
     fn a_live_mask_stroke_on_uv_tiles_matches_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         let stack = [(Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal)];
         let (project, mesh, pixels, _, mask_paint) = painted(true, &stack);
@@ -695,6 +746,9 @@ mod tests {
     /// Wear generators with their default detail, on the uniform and the scaled atlas.
     #[test]
     fn curvature_detail_sizes_work_per_uv_tile_block() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         const BAKE_SIDE: u32 = 512;
         let curvature: Vec<f32> = (0..BAKE_SIDE * BAKE_SIDE)
@@ -707,7 +761,7 @@ mod tests {
         let baked = BakedMaps { resolution: BAKE_SIDE, maps: BTreeMap::from([(BakedMap::Curvature, Arc::new(curvature))]) };
         let (pixels, images) = (PixelStore::default(), ImageStore::default());
 
-        for scaled in [false, true] {
+        for scaled in gate_cases([true, false]) {
             for kind in [GeneratorKind::Curvature, GeneratorKind::EdgeWear] {
                 let (mut project, mesh) = atlas(scaled, &[Channel::BaseColor]);
                 let owner = project.alloc_id();
@@ -729,6 +783,9 @@ mod tests {
     /// block without a bake, as the CPU's missing ID, also under a Blur.
     #[test]
     fn a_colour_selection_reads_each_tiles_share_of_the_id_bake() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         const ID_SIDE: usize = 48;
         let palette = [[0.8, 0.1, 0.2], [0.1, 0.7, 0.3], [0.2, 0.3, 0.9]];
@@ -739,7 +796,7 @@ mod tests {
         soft.hardness = 0.5;
         soft.output = 0.8;
 
-        for blurred in [false, true] {
+        for blurred in gate_cases([true, false]) {
             let (mut project, mesh, pixels, owner, _) = painted(true, &[]);
             let mask = project.layers.get_mut(&owner).and_then(|layer| layer.mask.as_mut()).unwrap();
             mask.effects.push(Effect::new(LayerId(900), EffectKind::ColorSelection(soft.clone())));
@@ -759,6 +816,9 @@ mod tests {
     /// all run in the pre-pass, at a block of 256 texels.
     #[test]
     fn whole_set_filters_keep_the_pre_pass_on_atlases_of_many_scales() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         // Up to sixteen results of 256 K texels fit a 128 MiB storage binding
         const LARGE: u32 = 256;
@@ -773,7 +833,7 @@ mod tests {
             ("Mirror and Transform, four scales", four, vec![(mirror, 1.0, normal), (transform, 0.8, normal)]),
         ];
 
-        for (label, resolutions, stack) in cases {
+        for (label, resolutions, stack) in gate_cases(cases) {
             let scales = resolutions.iter().collect::<std::collections::BTreeSet<_>>().len();
             let (project, mesh, pixels, owner, _) = painted_of((LARGE, resolutions), &[Channel::BaseColor], &stack);
             let program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
@@ -792,6 +852,9 @@ mod tests {
     /// scale, matches the CPU's preview of the same stroke.
     #[test]
     fn a_live_layer_stroke_on_uv_tiles_matches_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         let stack = [(Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal)];
         let (project, mesh, pixels, owner, _) = painted(true, &stack);
@@ -879,6 +942,9 @@ mod tests {
     /// Height To Normal reads each tile's height at its own scale, on the scaled atlas.
     #[test]
     fn height_to_normal_runs_per_tile_scale() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         let channels = [Channel::BaseColor, Channel::Height, Channel::Normal];
         let (baked, images) = (BakedMaps::default(), ImageStore::default());
@@ -895,6 +961,9 @@ mod tests {
     /// the scaled atlas.
     #[test]
     fn world_space_fills_match_the_cpu_on_uv_tiles() {
+        if !full_parity_matrix() {
+            return;
+        }
         let Some(mut gpu) = headless() else { return };
         let channels = [Channel::BaseColor, Channel::Roughness];
         let stripes: Vec<[f32; 4]> =
@@ -906,7 +975,7 @@ mod tests {
         let planar = Projection::Planar { scale: 0.8, axis: 1, offset: [0.03, 0.0, 0.34], uv: Default::default(), projector: Default::default(), placed: None };
 
         // The image read is the path under test: no patterns, no stages
-        for (label, projection) in [("triplanar", triplanar), ("planar", planar)] {
+        for (label, projection) in gate_cases([("triplanar", triplanar), ("planar", planar)]) {
             let (mut project, mesh) = atlas(true, &channels);
             let owner = project.alloc_id();
             let sources = BTreeMap::from([(Channel::BaseColor, Source::image("stripes")), (Channel::Roughness, Source::image("stripes"))]);

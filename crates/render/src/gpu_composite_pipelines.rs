@@ -576,6 +576,10 @@ mod tests {
     /// above: on the adapter they only repeat these compiles.
     #[test]
     fn package_shaders_build_compute_pipelines_in_full_and_as_stubs() {
+        // The gate's family tests build the full programs on the adapter; this sweep runs with the full matrix
+        if !oracle::full_parity_matrix() {
+            return;
+        }
         let Some(gpu) = oracle::headless() else { return };
         let compositor = GpuCompositor::new(&gpu.device);
         let (curvature, id) = {

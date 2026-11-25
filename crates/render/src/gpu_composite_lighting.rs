@@ -205,6 +205,76 @@ mod tests {
 
     use crate::gpu_composite::oracle::{compile_effects, effect};
 
+    /// The gate's check of the lighting family (the per-path tests below run with
+    /// `TC_GPU_PARITY_FULL=1`): Stylized with extra lights, cavity and edges, Environment with
+    /// every setting changed at opacity below 1 with Multiply, and PBR Validate, chained on Base
+    /// Color before a Blur stage, with the mask preview and a partial update; then a mask
+    /// comparing its lit Base Color. A failing chain is checked filter by filter.
+    #[test]
+    fn lighting_family_matches_the_cpu() {
+        use texturecraft_core::{BlendMode, Channel, CompareOp, CompareSource, DirectionalLight, Effect, PbrValidate, StylizedLighting};
+
+        use crate::gpu_composite::oracle::{Tolerance, check_packed, headless};
+
+        let Some(mut gpu) = headless() else { return };
+        let detailed = StylizedLighting {
+            lights: [
+                DirectionalLight { azimuth: 120.0, elevation: 20.0, intensity: 0.6, color: [0.4, 0.6, 1.0] },
+                DirectionalLight { azimuth: 250.0, elevation: 60.0, intensity: 0.3, color: [1.0, 0.5, 0.3] },
+            ],
+            diffuse_cavity: 0.6,
+            specular_cavity: 0.4,
+            specular_ao: 0.5,
+            cavity_smoothness: 0.25,
+            edges_intensity: 0.7,
+            edges_smoothness: 0.3,
+            height_to_normal: 2.5,
+            ..StylizedLighting::library()
+        };
+        let environment = Filter::EnvironmentLighting {
+            horizontal: 75.0,
+            vertical: 30.0,
+            exposure: -1.5,
+            height_intensity: 2.5,
+            ambient_occlusion: 0.4,
+            specular_occlusion: 0.8,
+        };
+        let lighting = [
+            (stylized_lighting(detailed), 1.0, BlendMode::Normal, true),
+            (environment, 0.77, BlendMode::Multiply, true),
+            (Filter::PbrValidate(PbrValidate::LIBRARY), 1.0, BlendMode::Normal, false),
+        ];
+        let mut chain = lighting.to_vec();
+        chain.push((Filter::Blur { radius: 24.0, wrap: false }, 1.0, BlendMode::Normal, true));
+        let baked = lit_bakes(true, true);
+
+        let packed = |gpu: &mut crate::headless::Headless| {
+            assert_lit_matches(gpu, &lit_project(&chain, |_| {}), &baked, (true, Tolerance::TRANSCENDENTAL), "lighting chained before a Blur");
+        };
+        check_packed(&mut gpu, packed, |gpu| {
+            for lit in &lighting {
+                assert_lit_matches(gpu, &lit_project(std::slice::from_ref(lit), |_| {}), &baked, (false, Tolerance::TRANSCENDENTAL), &format!("{:?}", lit.0));
+            }
+        });
+
+        let compared = lit_project(&lighting[..1], |project| {
+            let compare = EffectKind::Compare {
+                op: CompareOp::GreaterThan,
+                value: 0.45,
+                tolerance: 0.12,
+                left: CompareSource::ThisLayer,
+                right: CompareSource::Constant,
+                channel: Channel::BaseColor,
+                hardness: 0.1,
+            };
+            let id = project.alloc_id();
+            if let Some(mask) = lit_layer(project).and_then(|layer| layer.mask.as_mut()) {
+                mask.effects = vec![Effect::new(id, compare)];
+            }
+        });
+        assert_lit_matches(&mut gpu, &compared, &baked, (false, Tolerance::TRANSCENDENTAL), "a mask comparing its lit Base Color");
+    }
+
     /// P6's filters that still composite on the CPU in content (a mask skips lighting on both
     /// sides). Port one: delete its row (this test fails while a ported row stays) and add its
     /// oracle test.
@@ -227,6 +297,9 @@ mod tests {
     /// Blur (a partial update covers its halo), and the mask, which PBR Validate leaves alone.
     #[test]
     fn pbr_validate_matches_the_cpu_on_the_layers_metal() {
+        if !crate::gpu_composite::oracle::full_parity_matrix() {
+            return;
+        }
         use std::sync::Arc;
 
         use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
@@ -383,6 +456,9 @@ mod tests {
     /// composite uses M2. The GPU prepares both (`FilterPlan::add_lit_mask_views`).
     #[test]
     fn a_mask_comparing_its_lit_base_color_matches_the_cpu() {
+        if !crate::gpu_composite::oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_core::{BlendMode, Channel, CompareOp, CompareSource, Effect, EffectKind, StylizedLighting};
 
         use crate::gpu_composite::oracle::{Tolerance, headless};
@@ -602,6 +678,9 @@ mod tests {
     /// Environment, then a Blur on Base Color, with a partial update
     #[test]
     fn lighting_before_a_stage_reads_the_blurred_material() {
+        if !crate::gpu_composite::oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_compose::PixelStore;
         use texturecraft_core::{BlendMode, Channel, EffectKind, LayerKind, StylizedLighting};
         use texturecraft_texel::{to_u16, to_u16_signed};
@@ -658,6 +737,9 @@ mod tests {
     /// or no bakes, and chained after Invert and before a Blur with a partial update.
     #[test]
     fn baked_lighting_stylized_matches_the_cpu() {
+        if !crate::gpu_composite::oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_core::{BlendMode, Channel, DirectionalLight, LightingOutput, StylizedLighting};
 
         use crate::gpu_composite::oracle::{Tolerance, headless};
@@ -758,6 +840,9 @@ mod tests {
     /// partial update.
     #[test]
     fn baked_lighting_environment_matches_the_cpu() {
+        if !crate::gpu_composite::oracle::full_parity_matrix() {
+            return;
+        }
         use texturecraft_core::{BlendMode, Effect, EffectKind};
 
         use crate::gpu_composite::oracle::{Tolerance, headless};

@@ -256,7 +256,8 @@ mod tests {
     use texturecraft_texel::{TILE, to_u16, to_u16_signed};
 
     use crate::gpu_composite::CompositeRegion;
-    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, compile_effects, effect, headless};
+    use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, check_packed, compile_effects, effect, full_parity_matrix, headless};
+    use crate::headless::Headless;
 
     /// The oracle's texture set is one tile across
     const SIZE: u32 = TILE;
@@ -366,8 +367,62 @@ mod tests {
         }
     }
 
+    /// The gate's check of every point filter (the per-path tests above run with
+    /// `TC_GPU_PARITY_FULL=1`): the soft ones chained in one stack on every content channel and
+    /// in the mask, each filter with hard steps alone, and a gradient after its input blur. The
+    /// cases share their shader programs; a failing chain is checked filter by filter.
+    #[test]
+    fn point_filter_family_matches_the_cpu() {
+        let three = vec![[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]];
+        let gradient =
+            |positions: Vec<f32>, quantity, input, linear, debug| Filter::GradientMap { colors: three.clone(), positions, quantity, input, linear, debug };
+        let shaped = GradientInput { mode: GrayscaleMode::Max, balance: 0.6, contrast: 0.3, invert: true, ..GradientInput::default() };
+        let soft = [
+            Filter::Hsl { hue: 0.2, saturation: 0.3, lightness: -0.1, perceptive: true },
+            Filter::Hsl { hue: -0.1, saturation: 0.2, lightness: 0.05, perceptive: false },
+            Filter::ColorBalance { shadows: [0.27, 0.06, -0.13], midtones: [-0.11, 0.23, 0.09], highlights: [0.08, 0.21, -0.08] },
+            Filter::ColorCorrect { shadows: [0.3, -0.1, 0.2], midtones: [-0.2, 0.15, 0.7], highlights: [0.1, 0.05, 0.4] },
+            Filter::ReplaceColor { from: [0.2, 0.43, 0.72], to: [0.62, 0.35, 0.33], tolerance: 0.09, softness: 0.28 },
+            Filter::HistogramScan { position: 0.4, contrast: 0.5, invert_position: true },
+            Filter::Smoothstep { min: 0.2, max: 0.8 },
+            Filter::GradientCurve { preset: CurvePreset::Ease, invert: true, balance: 0.65, contrast: 0.3 },
+            Filter::GradientDynamic { vertical: true, position: 0.3, color: [0.2, 0.7, 0.4] },
+            Filter::GrayscaleConversion(GrayscaleConversion { weights: [0.2, 0.3, 0.1, 0.4], ..GrayscaleConversion::LIBRARY }),
+            gradient(vec![0.0, 0.3, 0.9], None, shaped, true, false),
+            gradient(vec![0.1, 0.75, 1.0], None, GradientInput::default(), false, true),
+            Filter::BakedLighting { azimuth: 30.0, elevation: 60.0, light: 0.6, ambient: 0.35, occlusion: 0.72, stylized: None },
+            Filter::HeightAdjust { invert: true, offset: 0.1, multiply: 1.5 },
+            Filter::InvertOff,
+            Filter::Empty,
+        ];
+        let hard = [
+            Filter::Posterize { levels: 4.0, alpha: true },
+            Filter::Threshold { level: 0.4, mode: texturecraft_core::ThresholdMode::Greater },
+            gradient(Vec::new(), Some(2), GradientInput::default(), true, false),
+        ];
+        let blurred = gradient(vec![0.0, 0.4, 1.0], None, GradientInput { blur: 4.0, ..GradientInput::LIBRARY }, true, false);
+        let Some(mut gpu) = headless() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images) = (BakedMaps::default(), ImageStore::default());
+
+        let chained: Vec<(Filter, f32)> = soft.iter().map(|filter| (filter.clone(), EFFECT_OPACITY)).collect();
+        let packed = |gpu: &mut Headless| {
+            let (project, pixels, owner) = painted_case(&chained, BlendMode::Multiply, &CHANNELS);
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+            assert_matches_cpu(gpu, &case, Tolerance::TRANSCENDENTAL, "the soft point filters chained");
+        };
+        check_packed(&mut gpu, packed, |_| assert_contexts_match_cpu(&soft, &CHANNELS, true, Tolerance::TRANSCENDENTAL, None));
+        assert_filters_match_cpu(&hard, Tolerance::POINT.with_flips(4));
+        let region = CompositeRegion { min: [21, 17], max: [43, 39] };
+        assert_contexts_match_cpu(&[blurred], &[Channel::BaseColor, Channel::Height], true, Tolerance::NEIGHBOURHOOD, Some(region));
+    }
+
     #[test]
     fn hsl_perceptive_matches_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let filters = [
             // The library default
             Filter::Hsl { hue: 0.0, saturation: 0.0, lightness: 0.0, perceptive: true },
@@ -384,6 +439,9 @@ mod tests {
 
     #[test]
     fn posterize_apply_to_alpha_steps_the_coverage_as_the_cpu_does() {
+        if !full_parity_matrix() {
+            return;
+        }
         let filters = [
             Filter::Posterize { levels: 4.0, alpha: true },
             Filter::Posterize { levels: 8.0, alpha: true },
@@ -397,6 +455,9 @@ mod tests {
 
     #[test]
     fn histogram_scan_invert_position_matches_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let soft = [
             Filter::HistogramScan { position: 0.4, contrast: 0.5, invert_position: true },
             Filter::HistogramScan { position: 0.7, contrast: 0.0, invert_position: true },
@@ -411,6 +472,9 @@ mod tests {
 
     #[test]
     fn color_correct_matches_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let filters = [
             // The library default
             Filter::ColorCorrect { shadows: [0.0, 0.0, 0.5], midtones: [0.0, 0.0, 0.5], highlights: [0.0, 0.0, 0.5] },
@@ -424,6 +488,9 @@ mod tests {
 
     #[test]
     fn smoothstep_matches_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let soft = [
             // The library default
             Filter::Smoothstep { min: 0.0, max: 1.0 },
@@ -440,6 +507,9 @@ mod tests {
 
     #[test]
     fn gradient_curve_presets_match_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         // Each preset at the library's balance, contrast and invert (Round is the library default)
         let curve = |preset| Filter::GradientCurve { preset, invert: false, balance: 0.5, contrast: 0.0 };
         let mut filters: Vec<Filter> = [CurvePreset::Round, CurvePreset::Pinch, CurvePreset::EaseOut, CurvePreset::Ease, CurvePreset::EaseIn]
@@ -458,6 +528,9 @@ mod tests {
 
     #[test]
     fn gradient_dynamic_matches_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let filters = [
             // The library default
             Filter::GradientDynamic { vertical: false, position: 0.0, color: [0.6; 3] },
@@ -471,6 +544,9 @@ mod tests {
 
     #[test]
     fn grayscale_conversion_matches_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let library = GrayscaleConversion::LIBRARY;
         let mut conversions: Vec<GrayscaleConversion> = ConversionMode::ALL.into_iter().map(|mode| GrayscaleConversion { mode, ..library }).collect();
         // Alpha weighs the content's coverage, and 1 in a mask
@@ -486,6 +562,9 @@ mod tests {
 
     #[test]
     fn gradients_with_stops_quantity_srgb_and_input_match_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let three = [[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]];
         let ramp = |colors: &[[f32; 3]], positions: &[f32], quantity, input, linear| Filter::GradientMap {
             colors: colors.to_vec(),
@@ -528,6 +607,9 @@ mod tests {
 
     #[test]
     fn the_gradient_debug_view_matches_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let three = [[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]];
         let debug = |positions: &[f32], input, linear| Filter::GradientMap {
             colors: three.to_vec(),
@@ -558,6 +640,9 @@ mod tests {
 
     #[test]
     fn gradients_after_their_input_blur_match_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let three = [[0.05, 0.1, 0.6], [0.9, 0.4, 0.1], [0.3, 0.8, 0.2]];
         let blurred =
             |input, linear| Filter::GradientMap { colors: three.to_vec(), positions: vec![0.0, 0.4, 1.0], quantity: None, input, linear, debug: false };
@@ -580,6 +665,9 @@ mod tests {
 
     #[test]
     fn height_adjust_matches_the_cpu() {
+        if !full_parity_matrix() {
+            return;
+        }
         let filters = [
             // The library default
             Filter::HeightAdjust { invert: false, offset: 0.0, multiply: 1.0 },
