@@ -146,8 +146,9 @@ fn cmd_wasm() -> Result<(), String> {
 }
 
 /// The render crate's unit test modules that compile the most GPU pipelines, in groups tested in
-/// a process each on Linux (llvmpipe keeps what a process compiled: each group peaks under
-/// about 12 GB there); the rest of its unit tests run in one more process.
+/// a process each on Linux, all at once (Mesa keeps what a process compiled until it ends: on
+/// lavapipe each group peaks under about 4 GB); the rest of its unit tests run in one more
+/// process after them.
 const RENDER_TEST_GROUPS: &[&[&str]] = &[
     &["gpu_composite::procedural_tests::", "gpu_composite::fill_projection::", "gpu_composite::lighting::", "gpu_composite::point::", "gpu_composite::brush::"],
     &[
@@ -161,17 +162,59 @@ const RENDER_TEST_GROUPS: &[&[&str]] = &[
     &["gpu_composite::udim::"],
 ];
 
+/// Where Ubuntu's mesa-vulkan-drivers puts the Vulkan driver files
+const VULKAN_DRIVER_DIR: &str = "/usr/share/vulkan/icd.d";
+
+/// The environment of the render crate's tests on Linux CI (`CI` set): Mesa's lavapipe through
+/// Vulkan alone (its driver file the only one the loader sees), with LLVM's optimisation passes
+/// off, as they cost more than the tests' shaders then run. A variable the caller set wins. An
+/// error when lavapipe is missing, so the tests cannot fall back to another adapter or skip.
+fn render_ci_env() -> Result<Vec<(&'static str, String)>, String> {
+    if !cfg!(target_os = "linux") || std::env::var_os("CI").is_none() {
+        return Ok(Vec::new());
+    }
+    let driver =
+        match std::env::var("VK_DRIVER_FILES") {
+            Ok(files) => files,
+            Err(_) => {
+                let found =
+                    std::fs::read_dir(VULKAN_DRIVER_DIR).into_iter().flatten().flatten().map(|entry| entry.path()).find(|path| {
+                        path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("lvp_icd") && name.ends_with(".json"))
+                    });
+                let Some(found) = found else {
+                    return Err(format!("CI runs the render tests on lavapipe, but {VULKAN_DRIVER_DIR} has no lvp_icd*.json (install mesa-vulkan-drivers)"));
+                };
+                found.display().to_string()
+            }
+        };
+    let defaults = [
+        ("WGPU_BACKEND", "vulkan".to_owned()),
+        ("VK_DRIVER_FILES", driver.clone()),
+        ("VK_ICD_FILENAMES", driver),
+        ("GALLIVM_PERF", "nopt".to_owned()),
+        // Each group's adapter on two threads: the groups run at once
+        ("LP_NUM_THREADS", "2".to_owned()),
+        ("TC_CI_LAVAPIPE", "1".to_owned()),
+    ];
+    Ok(defaults.into_iter().filter(|(name, _)| std::env::var_os(name).is_none()).collect())
+}
+
 /// `cargo test --workspace`. On Linux the render crate's unit tests run in a few processes,
-/// with two malloc arenas: they compile many GPU pipelines on Mesa (llvmpipe), which keeps what
-/// it compiled until the process ends, so one process for all of them outgrows a 16 GB runner,
-/// and the default per-thread arenas fragment that memory. A MALLOC_ARENA_MAX the caller set wins.
+/// with two malloc arenas: they compile many GPU pipelines on Mesa, which keeps what it compiled
+/// until the process ends, so one process for all of them outgrows a 16 GB runner, and the
+/// default per-thread arenas fragment that memory. A MALLOC_ARENA_MAX the caller set wins. On
+/// Linux CI they run on lavapipe ([`render_ci_env`]), the groups at once.
 fn cmd_test() -> Result<(), String> {
     if !cfg!(target_os = "linux") {
         let mut c = cargo();
         c.args(["test", "--workspace"]);
         return run(c, "cargo test --workspace");
     }
-    let test = |args: &[&str], filter: &[&str]| {
+    let render_env = render_ci_env()?;
+    for (name, value) in &render_env {
+        eprintln!("render tests with {name}={value}");
+    }
+    let test = |args: &[&str], filter: &[&str], env: &[(&str, String)]| {
         let mut c = cargo();
         c.arg("test").args(args);
         if !filter.is_empty() {
@@ -180,24 +223,65 @@ fn cmd_test() -> Result<(), String> {
         if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
             c.env("MALLOC_ARENA_MAX", "2");
         }
+        c.envs(env.iter().map(|(name, value)| (name, value)));
         let what = format!("cargo test {} {}", args.join(" "), if filter.is_empty() { String::new() } else { format!("-- {}", filter.join(" ")) });
-        run(c, what.trim_end())
+        (c, what.trim_end().to_owned())
     };
     const RENDER: &str = "texturecraft-render";
     let mut failed = Vec::new();
-    let mut step = |result: Result<(), String>| {
-        if let Err(error) = result {
-            failed.push(error);
-        }
-    };
-    step(test(&["--workspace", "--exclude", RENDER], &[]));
-    step(test(&["-p", RENDER, "--doc"], &[]));
-    step(test(&["-p", RENDER, "--test", "*"], &[]));
-    for group in RENDER_TEST_GROUPS {
-        step(test(&["-p", RENDER, "--lib"], group));
+    for (c, what) in [
+        test(&["--workspace", "--exclude", RENDER], &[], &[]),
+        test(&["-p", RENDER, "--doc"], &[], &render_env),
+        test(&["-p", RENDER, "--test", "*"], &[], &render_env),
+    ] {
+        failed.extend(run(c, &what).err());
     }
+    // Built once before the groups start, so they do not wait on each other's build
+    let (c, what) = test(&["-p", RENDER, "--lib", "--no-run"], &[], &[]);
+    if let Err(error) = run(c, &what) {
+        failed.push(error);
+        return Err(failed.join("; "));
+    }
+    let groups = RENDER_TEST_GROUPS.iter().map(|group| test(&["-p", RENDER, "--lib"], group, &render_env)).collect();
+    failed.extend(run_at_once(groups).err());
     let rest: Vec<&str> = RENDER_TEST_GROUPS.iter().copied().flatten().flat_map(|module| ["--skip", module]).collect();
-    step(test(&["-p", RENDER, "--lib"], &rest));
+    let (c, what) = test(&["-p", RENDER, "--lib"], &rest, &render_env);
+    failed.extend(run(c, &what).err());
+    if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
+}
+
+/// Runs `commands` at once, each with its output captured and printed whole when it ends, then
+/// each one's exit; an error naming every command that failed.
+fn run_at_once(commands: Vec<(Command, String)>) -> Result<(), String> {
+    let printing = std::sync::Mutex::new(());
+    let results: Vec<(String, Result<(), String>)> = std::thread::scope(|scope| {
+        let runs: Vec<_> = commands
+            .into_iter()
+            .enumerate()
+            .map(|(index, (mut command, what))| {
+                eprintln!("$ [{}] {what}", index + 1);
+                let printing = &printing;
+                scope.spawn(move || {
+                    let result = match command.output() {
+                        Ok(output) => {
+                            let _turn = printing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            eprintln!("\n===== [{}] {what}: {} =====", index + 1, output.status);
+                            eprint!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                            if output.status.success() { Ok(()) } else { Err(format!("{what}: exited with {}", output.status)) }
+                        }
+                        Err(error) => Err(format!("{what}: failed to spawn: {error}")),
+                    };
+                    (what, result)
+                })
+            })
+            .collect();
+        runs.into_iter().map(|run| run.join().unwrap_or_else(|_| (String::from("a command"), Err(String::from("its thread panicked"))))).collect()
+    });
+    eprintln!();
+    for (index, (what, result)) in results.iter().enumerate() {
+        eprintln!("  [{}] {:<4} {what}", index + 1, if result.is_ok() { "ok" } else { "FAIL" });
+    }
+    let failed: Vec<String> = results.into_iter().filter_map(|(_, result)| result.err()).collect();
     if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
 }
 

@@ -190,21 +190,23 @@ mod limits_tests {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::Headless;
 
+    /// CI (Windows, and Linux through `cargo xtask ci`) promises lavapipe through Vulkan: no other
+    /// adapter takes its place
     #[test]
-    fn windows_ci_uses_lavapipe() {
+    fn ci_uses_lavapipe() {
         if std::env::var_os("TC_CI_LAVAPIPE").is_none() {
             return;
         }
-        let gpu = Headless::new().expect("the Windows CI Vulkan adapter must be available");
+        let gpu = Headless::new().expect("the CI Vulkan adapter must be available");
         let adapter = gpu.device.adapter_info();
         assert_eq!(adapter.backend, wgpu::Backend::Vulkan, "{adapter:?}");
         assert_eq!(adapter.device_type, wgpu::DeviceType::Cpu, "{adapter:?}");
         assert!(adapter.name.starts_with("llvmpipe"), "{adapter:?}");
         assert!(crate::gpu_composite::GpuCompositor::supports(&gpu.device), "{adapter:?}");
-        eprintln!("Windows CI renderer adapter: {adapter:?}");
+        eprintln!("CI renderer adapter: {adapter:?}");
     }
 }
