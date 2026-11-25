@@ -53,6 +53,16 @@ const ICONS: [(f32, &[u8]); 5] = [
     (64.0, include_bytes!("../../../assets/app-icon/hicolor/64x64/apps/ai.storyteller.texturecraft.png")),
 ];
 
+/// The Nightly strip's icon PNGs, same sizes: the deeper background tells the two windows apart at
+/// a glance and matches the packaged Nightly icon.
+const NIGHTLY_ICONS: [(f32, &[u8]); 5] = [
+    (16.0, include_bytes!("../../../assets/app-icon/nightly/16.png")),
+    (24.0, include_bytes!("../../../assets/app-icon/nightly/24.png")),
+    (32.0, include_bytes!("../../../assets/app-icon/nightly/32.png")),
+    (48.0, include_bytes!("../../../assets/app-icon/nightly/48.png")),
+    (64.0, include_bytes!("../../../assets/app-icon/nightly/64.png")),
+];
+
 impl TitleBar {
     /// Decide who draws the title bar; call once at startup, before the window is created.
     /// `system` is Settings › Interface › System title bar.
@@ -137,16 +147,17 @@ pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
 /// The app icon at the cursor, [`ICON`] points square, centred on the row and on whole pixels.
 fn paint_icon(ui: &mut Ui) {
     let ppp = ui.ctx().pixels_per_point();
-    let Some(&(px, png)) = ICONS.iter().find(|(px, _)| *px >= ICON * ppp - 0.5).or(ICONS.last()) else { return };
+    let icons = if crate::os_window::stable_services_allowed() { &ICONS } else { &NIGHTLY_ICONS };
+    let Some(&(px, png)) = icons.iter().find(|(px, _)| *px >= ICON * ppp - 0.5).or(icons.last()) else { return };
     let id = Id::unique(("app_icon", px as u32));
     let texture = match ui.data(|d| d.get_temp::<Option<egui::TextureHandle>>(id)) {
         Some(t) => t,
         None => {
             // Decoded once per size; a PNG that doesn't decode leaves the space empty.
-            let t = image::load_from_memory(png).ok().map(|img| {
-                let img = img.into_rgba8();
+            let t = craft_image_codecs::decode(png).ok().map(|img| {
                 let size = [img.width() as usize, img.height() as usize];
-                ui.ctx().load_texture("app_icon", egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR)
+                let rgba = img.to_rgba8();
+                ui.ctx().load_texture("app_icon", egui::ColorImage::from_rgba_unmultiplied(size, &rgba), egui::TextureOptions::LINEAR)
             });
             ui.data_mut(|d| d.insert_temp(id, t.clone()));
             t

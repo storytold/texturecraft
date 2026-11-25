@@ -146,7 +146,7 @@ The full list of what's in it is in [`docs/features.md`](docs/features.md).
 git clone https://github.com/storytold/texturecraft
 cd texturecraft
 
-cargo run --release -p texturecraft                          # desktop app (opens a sample project)
+cargo run --release -p texturecraft                          # desktop app (starts with no project)
 cargo run --release -p texturecraft -- model.glb             # a new project from a mesh
 cargo run --release -p texturecraft -- --control 7878        # + JSON control channel
 cargo run --release -p texturecraft-cli -- mcp               # MCP server (stdio)
@@ -157,8 +157,8 @@ cd apps/texturecraft-web && trunk serve                      # web build
 cargo xtask ci                                               # fmt, clippy, tests, layering, wasm
 ```
 
-You need Rust 1.95 or newer. The app opens with a baked sample project and a start window (new project, open, recent projects); **File ▸ New project** starts
-from a built-in mesh, a project template or your own mesh file (UVs are generated if it has none).
+You need Rust 1.95 or newer. The app opens with no project (**File ▸ Open sample project** loads a baked one, and **File ▸ Close** returns to the empty state).
+**File ▸ New project** starts from your own mesh file and a project template. TextureCraft generates UVs if the mesh has none.
 
 Japanese, Chinese, Korean and Arabic interface text uses the fonts of
 [storytold/craft-fonts](https://github.com/storytold/craft-fonts) where it has them, an optional

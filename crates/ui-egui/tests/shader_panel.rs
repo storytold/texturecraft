@@ -18,13 +18,15 @@ const STARTUP_FRAMES: usize = 4;
 fn shader_settings_leave_the_height_strength_to_the_texture_set_settings() {
     let session = texturecraft_engine::sample_session(TEXTURE_RESOLUTION, BAKE_RESOLUTION).unwrap();
     let mut harness = Harness::builder().with_size(WINDOW_SIZE).build_eframe(|cc| TextureCraftApp::new(cc, session));
+
     // The labels below are English; a first run would speak the system's language
     harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.dock.focus(Panel::Shader);
     harness.run_steps(STARTUP_FRAMES);
 
-    assert!(harness.query_by_label("AO intensity").is_some(), "the Shader Settings panel is shown");
-    // Texture Set Settings, the slider's other home, sits behind Layers in the default layout, so any match is in Shader Settings
+    assert!(harness.query_by_label("AO Intensity").is_some(), "the Shader Settings panel is shown");
+
+    // Only Shader Settings can show the slider while Texture Set Settings is hidden
     assert!(!harness.state().ui.dock.is_visible(Panel::TextureSetSettings), "Texture Set Settings is behind Layers");
     assert!(harness.query_by_label("Height to normal strength").is_none());
 }

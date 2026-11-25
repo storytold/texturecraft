@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use egui::{Id, Pos2, Ui};
 use egui_phosphor::regular as icon;
 
-use crate::widgets::icon_button;
+use crate::widgets::{icon_button, icon_button_without_tooltip};
 
 /// Where the pick in progress is kept between frames
 const PICK_ID: &str = "screen_color_pick";
@@ -23,11 +23,23 @@ struct ScreenColorPick {
 
 /// An eyedropper button for the linear RGB color `linear`, `size` points square; a picked color lands in `linear` a frame or two after the click
 pub fn eyedropper(ui: &mut Ui, id: Id, linear: &mut [f32; 3], tooltip: &str, size: f32) {
+    let button = |ui: &mut Ui, picking| icon_button(ui, icon::EYEDROPPER, tooltip, picking, size);
+    pick_with(ui, id, linear, button);
+}
+
+/// An `eyedropper` with no tooltip, where the reference shows none; `label` still names it for screen readers
+pub fn eyedropper_without_tooltip(ui: &mut Ui, id: Id, linear: &mut [f32; 3], label: &str, size: f32) {
+    let button = |ui: &mut Ui, picking| icon_button_without_tooltip(ui, icon::EYEDROPPER, label, picking, size);
+    pick_with(ui, id, linear, button);
+}
+
+/// The eyedropper behaviour behind `button`, which draws the button and gets whether a pick is waiting
+fn pick_with(ui: &mut Ui, id: Id, linear: &mut [f32; 3], button: impl FnOnce(&mut Ui, bool) -> egui::Response) {
     let key = Id::unique(PICK_ID);
     let mut pick: ScreenColorPick = ui.data(|data| data.get_temp(key)).unwrap_or_default();
     let picking = pick.target == Some(id);
 
-    let button = icon_button(ui, icon::EYEDROPPER, tooltip, picking, size);
+    let button = button(ui, picking);
     if button.clicked() {
         pick.target = if picking { None } else { Some(id) };
     } else if picking {

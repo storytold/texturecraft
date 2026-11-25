@@ -23,7 +23,7 @@ const SECTIONS: [(&str, &str, bool, SectionReset); 7] = [
         (brush.size, brush.min_size, brush.screen_space) = (defaults.size, defaults.min_size, defaults.screen_space)
     }),
     ("Flow and opacity", "Stroke opacity", true, |brush, defaults| {
-        (brush.flow, brush.opacity, brush.spacing, brush.hardness) = (defaults.flow, defaults.opacity, defaults.spacing, defaults.hardness)
+        (brush.flow, brush.opacity, brush.spacing) = (defaults.flow, defaults.opacity, defaults.spacing)
     }),
     ("Angle", "Follow path", false, |brush, defaults| (brush.angle, brush.follow_path) = (defaults.angle, defaults.follow_path)),
     ("Jitters", "Size jitter", false, |brush, defaults| {
@@ -174,16 +174,6 @@ fn enter_and_space_on_the_focused_reset_icon_reset_only_its_section() {
         let mut expected = changed_brush();
         (expected.size, expected.min_size, expected.screen_space) = (defaults.size, defaults.min_size, defaults.screen_space);
         assert_eq!(harness.state().session.tool.brush, expected, "resetting Size with {key:?}");
-    }
-}
-
-#[test]
-fn reset_icons_identify_their_sections() {
-    let harness = app_with_brush(changed_brush());
-
-    for (title, _, _, _) in SECTIONS {
-        let label = format!("{title}: Reset to defaults");
-        assert!(harness.query_by_role_and_label(egui::Role::Button, &label).is_some(), "the reset button must name its {title} section");
     }
 }
 

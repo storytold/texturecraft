@@ -1,2 +1,7 @@
 [alias]
 xtask = "run -p xtask --"
+
+# An explicit level for dependencies: Cargo drops the profile's default debug level from crates only build scripts and
+# macros use, and then clippy and test each build their own copy of them.
+[profile.dev.package."*"]
+debug = "line-tables-only"

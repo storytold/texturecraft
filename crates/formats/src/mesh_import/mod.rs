@@ -130,6 +130,9 @@ pub(crate) struct RawMesh {
     pub colors: Option<Vec<Vec4>>,
     /// Triangles (vertex indices) per (material, part name); an empty part is unnamed.
     pub groups: Vec<(String, String, Vec<u32>)>,
+    // Build-time index; group names are restored only after polygon collection ends
+    // Nested maps allow borrowed lookups without allocating keys for every polygon
+    group_index: HashMap<String, HashMap<String, usize>>,
     pub warnings: Vec<String>,
     pub cameras: Vec<RawCamera>,
     /// Materials whose base color is not plain white (glTF).
@@ -148,11 +151,13 @@ pub(crate) struct RawBaseColor {
 impl RawMesh {
     /// Triangle list of `material` in `part`, created on first use.
     pub fn group(&mut self, material: &str, part: &str) -> &mut Vec<u32> {
-        let i = match self.groups.iter().position(|(m, p, _)| m == material && p == part) {
+        let i = match self.group_index.get(material).and_then(|parts| parts.get(part)).copied() {
             Some(i) => i,
             None => {
-                self.groups.push((material.to_string(), part.to_string(), Vec::new()));
-                self.groups.len() - 1
+                let i = self.groups.len();
+                self.groups.push((material.to_owned(), part.to_owned(), Vec::new()));
+                self.group_index.entry(material.to_owned()).or_default().insert(part.to_owned(), i);
+                i
             }
         };
         &mut self.groups[i].2
@@ -330,11 +335,15 @@ pub fn import_high_poly_bytes(file_name: &str, bytes: &[u8]) -> Result<HighPolyM
     mesh.tangents = vec![Vec4::new(1.0, 0.0, 0.0, 1.0); n];
     mesh.validate()?;
     let mut budget = BASE_COLOR_TEXELS;
+    let mut color_by_material: HashMap<&str, &RawBaseColor> = HashMap::with_capacity(colors.len());
+    for color in &colors {
+        color_by_material.entry(color.material.as_str()).or_insert(color);
+    }
     let base_color = mesh
         .materials
         .iter()
         .map(|m| {
-            let c = colors.iter().find(|c| c.material == *m)?;
+            let c = color_by_material.get(m.as_str()).copied()?;
             let (width, height, texels) = match c.image.as_deref().map(|b| decode_base_color(b, &mut budget)) {
                 Some(Ok(t)) => t,
                 Some(Err(e)) => {
@@ -352,23 +361,49 @@ pub fn import_high_poly_bytes(file_name: &str, bytes: &[u8]) -> Result<HighPolyM
 /// Decode a base color texture to RGBA8, at most [`BASE_COLOR_SIDE`] per side, charging its
 /// texels to `budget`.
 fn decode_base_color(bytes: &[u8], budget: &mut u64) -> Result<(u32, u32, Vec<[u8; 4]>)> {
-    let bad = |e: image::ImageError| FormatError::Malformed { kind: "image", msg: e.to_string() };
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| bad(e.into()))?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(crate::MAX_IMAGE_SIZE);
-    limits.max_image_height = Some(crate::MAX_IMAGE_SIZE);
-    reader.limits(limits);
-    let img = crate::guard("image", || reader.decode().map_err(bad))?;
-    let img =
-        if img.width().max(img.height()) > BASE_COLOR_SIDE { img.resize(BASE_COLOR_SIDE, BASE_COLOR_SIDE, image::imageops::FilterType::Triangle) } else { img };
-    let rgba = img.into_rgba8();
-    let (w, h) = rgba.dimensions();
+    let bad = |e: craft_image_codecs::CodecError| FormatError::Malformed { kind: "image", msg: e.to_string() };
+    let mut opts = craft_image_codecs::DecodeOptions::default();
+    opts.limits.max_width = crate::MAX_IMAGE_SIZE;
+    opts.limits.max_height = crate::MAX_IMAGE_SIZE;
+    // Mesh UVs refer to stored pixels, not an EXIF-adjusted photograph.
+    opts.keep_orientation = true;
+    // Preserve the prior ImageReader allocation limit; this is not a total RSS cap.
+    opts.limits.max_alloc = 512 << 20;
+    let img = crate::guard("image", || craft_image_codecs::decode_with(bytes, &opts).map_err(bad))?;
+    let (w, h, rgba) = if img.width().max(img.height()) > BASE_COLOR_SIDE {
+        use craft_image_codecs::{ChannelLayout, SampleType};
+        let invalid = || FormatError::Malformed { kind: "image", msg: "invalid RGBA buffer".into() };
+        // Keep native precision through filtering. Converting HDR to u8 first clips highlights.
+        // Bound expanded RGBA storage before conversion as well as the decoder's native output.
+        let mut dyn_img = match img.sample_type() {
+            SampleType::F16 | SampleType::F32 => {
+                let rgba = img.to_rgba_f32(&opts.limits).map_err(bad)?;
+                image::DynamicImage::ImageRgba32F(image::Rgba32FImage::from_raw(img.width(), img.height(), rgba).ok_or_else(invalid)?)
+            }
+            SampleType::U16 => {
+                opts.limits.check(img.width(), img.height(), ChannelLayout::Rgba, SampleType::U16).map_err(bad)?;
+                image::DynamicImage::ImageRgba16(image::ImageBuffer::from_raw(img.width(), img.height(), img.to_rgba16()).ok_or_else(invalid)?)
+            }
+            SampleType::U8 => {
+                opts.limits.check(img.width(), img.height(), ChannelLayout::Rgba, SampleType::U8).map_err(bad)?;
+                image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(img.width(), img.height(), img.to_rgba8()).ok_or_else(invalid)?)
+            }
+        };
+        dyn_img = dyn_img.resize(BASE_COLOR_SIDE, BASE_COLOR_SIDE, image::imageops::FilterType::Triangle);
+        let rgba = dyn_img.into_rgba8();
+        let (w, h) = rgba.dimensions();
+        (w, h, rgba.pixels().map(|p| p.0).collect::<Vec<[u8; 4]>>())
+    } else {
+        let rgba = img.to_rgba8();
+        let pixels = rgba.as_chunks::<4>().0.to_vec();
+        (img.width(), img.height(), pixels)
+    };
     let texels = u64::from(w) * u64::from(h);
     if texels > *budget {
         return Err(FormatError::TooLarge(format!("the base color textures exceed {} megatexels", BASE_COLOR_TEXELS >> 20)));
     }
     *budget -= texels;
-    Ok((w, h, rgba.pixels().map(|p| p.0).collect()))
+    Ok((w, h, rgba))
 }
 
 fn read(file_name: &str, bytes: &[u8]) -> Result<RawMesh> {
@@ -400,14 +435,19 @@ fn geometry(raw: RawMesh) -> Result<(Mesh, Vec<String>, Option<Vec<Vec2>>)> {
     check_triangles(0, groups.iter().map(|(_, _, g)| g.len() / 3).sum())?;
 
     let mut mesh = Mesh { positions, ..Mesh::default() };
+    let mut material_ids: HashMap<String, usize> = HashMap::new();
     let mut groups: Vec<(usize, String, Vec<u32>)> = groups
         .into_iter()
         .filter(|(_, _, g)| g.len() >= 3)
         .map(|(material, part, tris)| {
-            let m = mesh.materials.iter().position(|x| *x == material).unwrap_or(mesh.materials.len());
-            if m == mesh.materials.len() {
-                mesh.materials.push(material);
-            }
+            let m = match material_ids.entry(material) {
+                Entry::Occupied(e) => *e.get(),
+                Entry::Vacant(e) => {
+                    let m = mesh.materials.len();
+                    mesh.materials.push(e.key().clone());
+                    *e.insert(m)
+                }
+            };
             (m, part, tris)
         })
         .collect();
@@ -501,6 +541,7 @@ fn orbit_cameras(raw: &[RawCamera], mesh: &Mesh) -> Vec<texturecraft_core::Camer
                 distance,
                 fov,
                 ortho: c.ortho_half_height.is_some(),
+                orientation: None,
             })
         })
         .collect()

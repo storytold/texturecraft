@@ -71,7 +71,23 @@ fn join(dir: &str, name: &str) -> String {
 
 impl Headless {
     pub fn new(session: Session, fs: Filesystem) -> Headless {
-        // Bakes run here (CLI, MCP) cast their rays on the GPU when there is one.
+        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".into());
+        let brush_dir = std::path::Path::new(&home).join("Documents").join("TextureCraft").join("brushes");
+        Self::new_with_brush_dir(session, fs, brush_dir)
+    }
+
+    fn new_with_brush_dir(mut session: Session, fs: Filesystem, brush_dir: std::path::PathBuf) -> Headless {
+        if matches!(fs, Filesystem::TrustedLocal) && session.brush_presets.dir.is_none() {
+            let warnings = session.load_brush_presets(brush_dir);
+            session.log.warnings(texturecraft_engine::log::LIBRARY_SOURCE, warnings.into_iter().map(|warning| format!("Brush preset skipped: {warning}")));
+        } else if !matches!(fs, Filesystem::TrustedLocal) {
+            session.brush_presets.dir = None;
+            for preset in &mut session.brush_presets.list {
+                preset.file = None;
+            }
+        }
+
+        // CLI and MCP bakes use GPU rays when available
         texturecraft_engine::bake::install_gpu_tracer(std::sync::Arc::new(texturecraft_render::gpu_bake::GpuBaker::new()));
         Headless { session, fs, gpu: None }
     }
@@ -83,6 +99,11 @@ impl Headless {
 
     fn trusted(&self) -> bool {
         matches!(self.fs, Filesystem::TrustedLocal)
+    }
+
+    /// Commands that act on the project refuse after `file.close`, as in the app
+    fn require_project(&self) -> Result<(), AutomationError> {
+        if self.session.project_open { Ok(()) } else { Err(bad("no project is open")) }
     }
 
     fn read(&self, path: &str) -> Result<Vec<u8>, AutomationError> {
@@ -124,10 +145,9 @@ impl Headless {
         }
     }
 
-    /// Replace the session, keeping the viewport size scripted strokes use.
-    fn replace(&mut self, mut next: Session) -> Value {
-        next.viewport = self.session.viewport;
-        self.session = next;
+    /// Replace the project, keeping the viewport size and user libraries.
+    fn replace(&mut self, next: Session) -> Value {
+        self.session.switch_to(next);
         self.inspect()
     }
 
@@ -176,7 +196,7 @@ impl Headless {
         let f = self.read_mesh(path)?;
         let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
         let mut next = Session::from_mesh_bytes(&f.name, &f.bytes, resolution.unwrap_or(2048), name.unwrap_or(stem))?;
-        next.log.extend(f.warnings);
+        next.log.warnings("Importer", f.warnings);
         Ok(self.replace(next))
     }
 
@@ -190,12 +210,15 @@ impl Headless {
 
     /// Add a high-definition mesh for baking from `path` (or, with `cage`, set the bake cage).
     pub fn add_bake_mesh(&mut self, path: &str, cage: bool) -> Result<Value, AutomationError> {
+        self.require_project()?;
+
         let f = self.read_mesh(path)?;
         Ok(self.session.add_bake_mesh(f, cage)?)
     }
 
     /// Reimport the mesh from `path`, or from the project's own copy, keeping the project.
     pub fn reimport_mesh(&mut self, path: Option<&str>, preserve_strokes: bool) -> Result<Value, AutomationError> {
+        self.require_project()?;
         let file = path.map(|p| self.read_mesh(p)).transpose()?;
         Ok(self.session.reimport_mesh(file, preserve_strokes)?)
     }
@@ -203,6 +226,7 @@ impl Headless {
     /// Export the working mesh to `path` (obj, glb, usda, usdc or usdz, from `format` or the
     /// extension); obj writes its .mtl and textures, usda and usdc their textures, next to it.
     pub fn export_mesh(&mut self, path: &str, format: Option<&str>) -> Result<Value, AutomationError> {
+        self.require_project()?;
         let out = self.session.mesh_export(path, format)?;
         let dir = Path::new(&out.path).parent().and_then(|d| d.to_str()).filter(|d| !d.is_empty()).unwrap_or(".");
         self.create_dir_all(dir)?;
@@ -218,12 +242,14 @@ impl Headless {
 
     /// Import an image file as a project resource (for `layer.add.image`, `tool.stencil`).
     pub fn import_resource(&mut self, path: &str) -> Result<Value, AutomationError> {
+        self.require_project()?;
         let bytes = self.read(path)?;
         Ok(json!({ "name": self.session.import_resource_bytes(path, bytes)? }))
     }
 
     /// Save a layer (default: the selected one) as a smart material file (`.tcmat`).
     pub fn material_save(&mut self, p: &Value) -> Result<Value, AutomationError> {
+        self.require_project()?;
         let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad("`path` is required"))?;
         let s = &self.session;
         let id = match p.get("layer").and_then(Value::as_u64) {
@@ -243,12 +269,14 @@ impl Headless {
 
     /// Add a smart material from a `.tcmat` file above the selection.
     pub fn material_load(&mut self, path: &str) -> Result<Value, AutomationError> {
+        self.require_project()?;
         let bytes = self.read(path)?;
         Ok(json!({ "layer": self.session.add_smart_material_bytes(&bytes)?.0 }))
     }
 
     /// Save as `.tcraft` to `path`, or to the project's own file.
     pub fn save(&mut self, path: Option<&str>) -> Result<Value, AutomationError> {
+        self.require_project()?;
         let target = match path.or(self.session.path.as_deref()) {
             Some(p) if ext_of(p) == PROJECT_EXT => p.to_string(),
             Some(p) => format!("{p}.{PROJECT_EXT}"),
@@ -262,6 +290,7 @@ impl Headless {
 
     /// Export textures to `dir` (`file.exportTextures` params: preset, ts, format, padding, size…).
     pub fn export(&mut self, p: &Value) -> Result<Value, AutomationError> {
+        self.require_project()?;
         let dir = p.get("dir").and_then(Value::as_str).filter(|d| !d.is_empty()).ok_or_else(|| bad("`dir` is required"))?;
         let opts = file_cmds::export_options(&self.session, p, "textures.export")?;
         let n = self.session.set_count();
@@ -284,39 +313,43 @@ impl Headless {
 
     /// Render the session to PNG. The viewport needs a GPU adapter; path tracing (`samples`)
     /// runs on the GPU when it has compute shaders and falls back to the CPU.
-    pub fn render_png(&mut self, o: &RenderOptions) -> Result<Rendered, AutomationError> {
-        let s = &self.session;
-        let kind = match o.view.as_deref().unwrap_or("3d") {
+    pub fn render_png(&mut self, options: &RenderOptions) -> Result<Rendered, AutomationError> {
+        self.require_project()?;
+
+        let session = &self.session;
+        let kind = match options.view.as_deref().unwrap_or("3d") {
             "3d" => ViewKind::Scene,
-            "2d" | "uv" => ViewKind::Uv { ts: s.ts(), zoom: 1.0, pan: [0.0, 0.0] },
+            "2d" | "uv" => ViewKind::Uv { ts: session.ts(), zoom: 1.0, pan: [0.0, 0.0], rotation: 0.0 },
             other => return Err(bad(format!("unknown view `{other}` (3d, 2d or uv)"))),
         };
-        let max = if self.trusted() { MAX_LOCAL_RENDER_SIDE } else { MAX_PNG_SIDE };
-        let side = |v: Option<u32>, d: f32| {
+        let max_side = if self.trusted() { MAX_LOCAL_RENDER_SIDE } else { MAX_PNG_SIDE };
+        let checked_side = |v: Option<u32>, d: f32| {
             let v = v.unwrap_or(d.round() as u32);
-            if (16..=max).contains(&v) { Ok(v) } else { Err(bad(format!("render size {v} must be 16 to {max} pixels"))) }
+            if (16..=max_side).contains(&v) { Ok(v) } else { Err(bad(format!("render size {v} must be 16 to {max_side} pixels"))) }
         };
-        let size = [side(o.width, s.viewport.x)?, side(o.height, s.viewport.y)?];
-        let mut camera = s.camera;
-        for (v, slot, lim) in [(o.yaw, &mut camera.yaw, 1e6), (o.pitch, &mut camera.pitch, 89.0)] {
+        let size = [checked_side(options.width, session.viewport.x)?, checked_side(options.height, session.viewport.y)?];
+        let mut camera = session.camera;
+        for (v, slot, max_degrees) in [(options.yaw, &mut camera.yaw, 1e6), (options.pitch, &mut camera.pitch, 89.0)] {
             if let Some(v) = v {
                 if !v.is_finite() {
                     return Err(bad("camera angles must be finite"));
                 }
-                *slot = v.clamp(-lim, lim).to_radians();
+
+                *slot = v.clamp(-max_degrees, max_degrees).to_radians();
             }
         }
-        if let Some(samples) = o.samples {
-            if !(1..=MAX_TRACE_SAMPLES).contains(&samples) || o.view.as_deref().is_some_and(|v| v != "3d") {
+        if let Some(samples) = options.samples {
+            if !(1..=MAX_TRACE_SAMPLES).contains(&samples) || options.view.as_deref().is_some_and(|v| v != "3d") {
                 return Err(bad(format!("path tracing renders the 3D view with 1 to {MAX_TRACE_SAMPLES} samples")));
             }
-            let settings = texturecraft_render::trace::TraceSettings { bounces: o.bounces.unwrap_or(6).clamp(1, 32) };
+
+            let settings = texturecraft_render::trace::TraceSettings { bounces: options.bounces.unwrap_or(6).clamp(1, 32) };
             let mut traced = None;
             let mut by = "CPU path tracer".to_string();
-            if !o.cpu
+            if !options.cpu
                 && let Ok(gpu) = self.gpu.get_or_insert_with(Gpu::new)
             {
-                // Last-resort guard, as for viewport renders below.
+                // Last-resort guard, as for viewport renders below
                 let session = &mut self.session;
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu.path_trace(session, size, camera, samples, &settings))) {
                     Ok(Ok(px)) => {
@@ -340,11 +373,13 @@ impl Headless {
             }
             return Ok(Rendered { width: w, height: h, png, by });
         }
+
         let gpu = match self.gpu.get_or_insert_with(Gpu::new) {
             Ok(g) => g,
             Err(e) => return Err(AutomationError::Other(format!("cannot render: {e}"))),
         };
-        // Last-resort guard: wgpu panics on device errors; drop the device and report instead.
+
+        // Last-resort guard: wgpu panics on device errors; drop the device and report instead
         let session = &mut self.session;
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu.render(session, kind, size, camera)));
         let (w, h, rgba) = match out {
@@ -375,4 +410,105 @@ pub fn batch_reply(results: Vec<Value>, failed: Option<(usize, &str, String)>) -
         "results": results,
         "failed": failed.map(|(index, id, error)| json!({ "index": index, "id": id, "error": error })),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_session_rejects_bake_mesh_before_reading_it() {
+        let mut client = Headless::new(Session::closed().unwrap(), Filesystem::Denied);
+
+        let error = client.add_bake_mesh("missing.obj", false).unwrap_err();
+
+        assert!(error.to_string().contains("no project is open"), "{error}");
+    }
+
+    #[test]
+    fn closed_session_rejects_render_before_view_validation() {
+        let mut client = Headless::new(Session::closed().unwrap(), Filesystem::Denied);
+        let options = RenderOptions { view: Some("unknown".into()), ..RenderOptions::default() };
+
+        let error = client.render_png(&options).err().unwrap();
+
+        assert!(error.to_string().contains("no project is open"), "{error}");
+    }
+
+    #[test]
+    fn fresh_headless_session_loads_saved_brushes() {
+        let brush_dir = std::env::temp_dir().join(format!("tc-headless-brush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&brush_dir);
+
+        let mut first_client = Headless::new_with_brush_dir(Headless::default_session().unwrap(), Filesystem::TrustedLocal, brush_dir.clone());
+        first_client.command_run("brush.preset.store", json!({"name": "Ink"})).unwrap();
+        let mut restarted_client = Headless::new_with_brush_dir(Headless::default_session().unwrap(), Filesystem::TrustedLocal, brush_dir.clone());
+
+        let listed = restarted_client.command_run("brush.preset.list", Value::Null).unwrap();
+        assert!(listed.as_array().unwrap().iter().any(|item| item["label"] == "Ink"));
+        restarted_client.command_run("brush.preset.apply", json!({"preset": "Ink"})).unwrap();
+        let _ = std::fs::remove_dir_all(&brush_dir);
+    }
+
+    #[test]
+    fn headless_project_switch_keeps_saved_brushes() {
+        let brush_dir = std::env::temp_dir().join(format!("tc-headless-switch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&brush_dir);
+
+        let mut client = Headless::new_with_brush_dir(Headless::default_session().unwrap(), Filesystem::TrustedLocal, brush_dir.clone());
+        client.command_run("brush.preset.store", json!({"name": "Ink"})).unwrap();
+        client.replace(Headless::default_session().unwrap());
+
+        let listed = client.command_run("brush.preset.list", Value::Null).unwrap();
+        assert!(listed.as_array().unwrap().iter().any(|item| item["label"] == "Ink"));
+        let _ = std::fs::remove_dir_all(&brush_dir);
+    }
+
+    #[test]
+    fn export_does_not_let_a_later_texture_set_replace_an_earlier_ones_file() {
+        let dir = std::env::temp_dir().join(format!("tc-headless-same-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let session = texturecraft_engine::sample_session(128, 64).unwrap();
+        let mut client = Headless::new_with_brush_dir(session, Filesystem::TrustedLocal, dir.join("brushes"));
+        let sets = client.session.set_count();
+        assert!(sets >= 2);
+
+        // A template without $textureSet gives every set the same file name
+        let preset =
+            json!({"name": "same", "maps": [{"file": "same", "format": "Png", "bit_depth": 8, "channels": [["L", {"Channel": {"channel": "Roughness"}}]]}]});
+        let r = client.export(&json!({"dir": dir.join("tex").display().to_string(), "preset": preset, "ts": "all"})).unwrap();
+        assert_eq!(r["files"].as_array().unwrap().len(), 1, "only the first set's file is written: {r}");
+        let warned = r["warnings"].as_array().unwrap().iter().filter(|w| w.as_str().unwrap().contains("so it was not written")).count();
+        assert_eq!(warned, sets - 1, "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn untrusted_headless_keeps_brushes_in_memory_only() {
+        let brush_dir = std::env::temp_dir().join(format!("tc-headless-denied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&brush_dir);
+        let mut trusted_client = Headless::new_with_brush_dir(Headless::default_session().unwrap(), Filesystem::TrustedLocal, brush_dir.clone());
+        trusted_client.command_run("brush.preset.store", json!({"name": "Ink"})).unwrap();
+
+        let mut untrusted_client = Headless::new_with_brush_dir(Headless::default_session().unwrap(), Filesystem::Denied, brush_dir.clone());
+
+        assert!(untrusted_client.session.brush_presets.dir.is_none());
+        assert!(untrusted_client.session.brush_presets.list.is_empty());
+        let listed = untrusted_client.command_run("brush.preset.list", Value::Null).unwrap();
+        assert!(!listed.as_array().unwrap().iter().any(|item| item["label"] == "Ink"));
+        untrusted_client.command_run("brush.preset.store", json!({"name": "Session only"})).unwrap();
+        assert!(untrusted_client.session.brush_presets.find("Session only").is_some());
+        assert!(!brush_dir.join("Session_only.tcbrush").exists());
+
+        let mut preloaded_session = Headless::default_session().unwrap();
+        preloaded_session.load_brush_presets(brush_dir.clone());
+        let mut preloaded_client = Headless::new_with_brush_dir(preloaded_session, Filesystem::Denied, brush_dir.clone());
+        assert!(preloaded_client.session.brush_presets.dir.is_none());
+        assert!(preloaded_client.session.brush_presets.list.iter().all(|preset| preset.file.is_none()));
+        preloaded_client.command_run("brush.preset.store", json!({"name": "Still private"})).unwrap();
+        assert!(!brush_dir.join("Still_private.tcbrush").exists());
+        preloaded_client.command_run("brush.preset.delete", json!({"name": "Ink"})).unwrap();
+        assert!(brush_dir.join("Ink.tcbrush").exists());
+        let _ = std::fs::remove_dir_all(&brush_dir);
+    }
 }

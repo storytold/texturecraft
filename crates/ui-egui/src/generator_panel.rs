@@ -3,29 +3,21 @@
 use egui::{RichText, Ui};
 use egui_phosphor::regular as ic;
 use serde_json::{Value, json};
-use texturecraft_engine::core::{BakedMap, CurvatureDetail, CurvatureMode, Generator, GeneratorKind, LayerId, OutputResolution, ResolutionMode, Source};
+use texturecraft_engine::core::{
+    BakedMap, CurvatureDetail, CurvatureMode, Generator, GeneratorKind, LayerId, MicroDetail, OutputResolution, ResolutionMode, Source,
+};
 
 use crate::TextureCraftApp;
-use crate::dock::{anchor_label, anchors_below, image_drop, image_menu, mesh_map_color};
+use crate::dock::{anchor_entries, anchor_label, anchors_below, effect_anchors_below, image_drop, image_menu, mesh_map_color};
 use crate::i18n::{baked_map_label, tr, trf};
+use crate::resource_panel::{ATTRIBUTE_KEY_WIDTH, NOTE_FONT_SIZE, factor_label, random_seed};
 use crate::theme::{Tokens, caption};
 use crate::widgets::{combo, section, slider_edit};
-
-/// Random seeds stay below this, short enough to read and type.
-const SEED_RANGE: u32 = 10_000;
-/// Knuth's multiplicative hash constant: spreads the clock's nanoseconds over the seed range.
-const SEED_MIX: u32 = 2_654_435_761;
-
-/// Font size of the notes under a control.
-const NOTE_FONT_SIZE: f32 = 10.5;
 
 /// Edge of the picture beside each image input, its corner rounding and the size of an icon drawn in it.
 const INPUT_TILE_SIZE: f32 = 32.0;
 const INPUT_TILE_ROUNDING: f32 = 2.0;
 const INPUT_TILE_ICON_SIZE: f32 = 16.0;
-
-/// Width of the names in the Attributes section, so their values line up.
-const ATTRIBUTE_KEY_WIDTH: f32 = 80.0;
 
 /// The settings of generator effect `id`.
 pub(crate) fn generator_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: LayerId, id: u64, generator: &Generator) {
@@ -50,6 +42,9 @@ pub(crate) fn generator_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer
         if matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear) {
             curvature_detail_properties(app, ui, id, generator.detail.as_ref());
         }
+        if !matches!(generator.kind, GeneratorKind::ThinAreas | GeneratorKind::Position | GeneratorKind::Direction) {
+            micro_detail_properties(app, ui, id, generator.micro, layer);
+        }
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(tr("Restore defaults")).clicked() {
@@ -66,9 +61,35 @@ pub(crate) fn generator_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer
         });
     }
     if !app.session.doc.baked.contains_key(&app.session.ts()) {
-        ui.label(
-            RichText::new(format!("{} {}", ic::WARNING, tr("Bake mesh maps (F8) for curvature, AO and thickness based generators."))).color(tokens.warning),
-        );
+        ui.label(RichText::new(format!("{} {}", ic::WARNING, tr("Bake mesh maps for curvature, AO and thickness based generators."))).color(tokens.warning));
+    }
+}
+
+/// The painted height anchor and its influence on this generator
+fn micro_detail_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, micro: Option<MicroDetail>, layer: LayerId) {
+    let tokens = Tokens::get(ui.ctx());
+    ui.label(caption(tr("Micro detail")))
+        .on_hover_text(tr("Painted height from an anchor point below: raised areas read as edges, recessed ones as cavities."));
+    let anchors = effect_anchors_below(app, layer, LayerId(id));
+    let current = match micro {
+        Some(detail) => anchors.iter().find(|(anchor, _)| *anchor == detail.anchor).map_or_else(|| tr("missing").to_string(), |(_, label)| label.clone()),
+        None => tr("None").to_string(),
+    };
+    combo(ui, tr("Anchor point"), current, |ui| {
+        if ui.selectable_label(micro.is_none(), tr("None")).clicked() {
+            app.run("effect.set", json!({"effect": id, "microAnchor": null}));
+        }
+        if let Some(anchor) = anchor_entries(ui, &anchors, micro.map(|detail| detail.anchor)) {
+            app.run("effect.set", json!({"effect": id, "microAnchor": anchor.0}));
+        }
+    });
+    if let Some(detail) = micro {
+        let mut amount = detail.amount;
+        if let Some(merge) = slider_edit(ui, tr("Amount"), &mut amount, 0.0..=1.0, 2) {
+            app.run("effect.set", json!({"effect": id, "microAmount": amount, "merge": merge}));
+        }
+    } else if anchors.is_empty() {
+        ui.label(RichText::new(tr("Add an anchor point to a layer below to use its height as micro detail.")).color(tokens.text_dim));
     }
 }
 
@@ -157,18 +178,6 @@ fn resolution(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, resolution: Outpu
     .on_hover_text(tr("An output finer than a UV tile gives the same result as that tile's resolution."));
 }
 
-/// The most powers of two a resolution factor scales by, either way.
-const LARGEST_FACTOR_STEPS: u8 = OutputResolution::FACTORS.end().unsigned_abs();
-
-/// "Same as context", or the fraction or multiple a resolution factor stands for.
-fn factor_label(factor: i8) -> String {
-    match factor {
-        0 => tr("Same as context").to_string(),
-        negative if negative < 0 => format!("1/{}", 1u32 << negative.unsigned_abs().min(LARGEST_FACTOR_STEPS)),
-        positive => format!("×{}", 1u32 << positive.unsigned_abs().min(LARGEST_FACTOR_STEPS)),
-    }
-}
-
 /// Global invert, blur, balance and contrast: what every generator applies to its finished value.
 fn global_adjustments(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, generator: &Generator) {
     let (mut invert, mut global) = (generator.invert, generator.global);
@@ -228,13 +237,6 @@ fn seed_row(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, seed: u32) {
     ui.data_mut(|data| data.insert_temp(typing_id, typing));
 }
 
-/// A seed different from `current`, from the clock.
-fn random_seed(current: u32) -> u32 {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.subsec_nanos());
-    let mixed = nanos.wrapping_mul(SEED_MIX) % SEED_RANGE;
-    if mixed == current { (mixed + 1) % SEED_RANGE } else { mixed }
-}
-
 /// The `effect.set` params that put generator effect `id` back to the defaults of its kind.
 fn defaults_of(id: u64, kind: GeneratorKind) -> Value {
     let defaults = Generator::new(kind);
@@ -254,6 +256,7 @@ fn defaults_of(id: u64, kind: GeneratorKind) -> Value {
         "resolution": format!("{:?}", defaults.resolution.mode),
         "customResolution": defaults.resolution.custom,
         "resolutionFactor": defaults.resolution.factor,
+        "microAnchor": null,
     });
     if let Some(detail) = defaults.detail {
         params["mode"] = json!(format!("{:?}", detail.mode));
@@ -349,7 +352,7 @@ fn input_slot(app: &mut TextureCraftApp, ui: &mut Ui, (layer, id): (LayerId, u64
         None => trf("Mesh map: {map}", &[("map", &tr(baked_map_label(map)))]),
         Some(Source::Image { name, .. }) => trf("Image: {name}", &[("name", name)]),
         Some(Source::Uniform(_)) => tr("Uniform value").to_string(),
-        Some(Source::Anchor { anchor, channel }) => anchor_label(app, *anchor, *channel),
+        Some(Source::Anchor { anchor, channel, .. }) => anchor_label(app, *anchor, *channel),
         Some(Source::Procedural { .. }) => tr("Procedural").to_string(),
     };
     let group = ui.group(|ui| {
@@ -366,7 +369,7 @@ fn input_slot(app: &mut TextureCraftApp, ui: &mut Ui, (layer, id): (LayerId, u64
             });
         });
         combo(ui, tr("Source"), current.clone(), |ui| {
-            let anchors = anchors_below(app, layer);
+            let anchors = anchors_below(&app.session.doc.project, layer);
             if ui.selectable_label(source.is_none(), tr("Mesh map")).clicked() {
                 app.run("effect.set", json!({"effect": id, "input": input, "inputBaked": true}));
             }

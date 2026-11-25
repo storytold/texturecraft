@@ -18,12 +18,13 @@
 //! count of 0, followed by `width × height × components` f32 LE. Pixels of a UV-tiled texture
 //! set cover its whole atlas (`resolution` per tile, see `TileGrid`).
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor, Read, Seek, Write};
 use std::sync::Arc;
 
 use texturecraft_compose::{BakedMaps, PixelStore};
-use texturecraft_core::{BakePaintTarget, Channel, FORMAT_VERSION, LayerId, Project};
+use texturecraft_core::{BakePaintTarget, BakedMap, Channel, FORMAT_VERSION, LayerId, Project, TANGENT_BENT_NORMAL_VERSION};
 use texturecraft_texel::{TILE_AREA, TileImage};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -35,9 +36,12 @@ use crate::{FormatError, MAX_IMAGE_SIZE, Result, malformed};
 mod entries;
 mod load_budget;
 mod project_open_limit;
+mod ram_operation;
+mod ram_reservation;
 #[cfg(not(target_arch = "wasm32"))]
-pub use entries::{DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, save_ram_budget, set_save_resources};
+pub use entries::{DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, configured_ram_budget, save_ram_budget, set_save_resources};
 pub use project_open_limit::{DEFAULT_PROJECT_OPEN_LIMIT_GIB, project_open_limit_gib, set_project_open_limit_gib};
+pub use ram_reservation::RamReservation;
 
 const KIND: &str = "project file";
 #[cfg(test)]
@@ -61,7 +65,7 @@ pub use bake_paint_data::BakePaintData;
 
 /// Everything a project file holds.
 #[derive(Clone, Debug)]
-pub struct ProjectFile {
+pub struct ProjectFile<Resource = Vec<u8>> {
     pub project: Project,
     pub pixels: PixelStore,
     /// Baked mesh maps per texture set index.
@@ -76,14 +80,17 @@ pub struct ProjectFile {
     pub bake_paint: BTreeMap<(usize, BakePaintTarget), BakePaintData>,
     pub thumbnail: Option<Vec<u8>>,
     /// Imported resources (images used by fills, alphas, stencils), by name: original bytes.
-    pub resources: BTreeMap<String, Vec<u8>>,
+    pub resources: BTreeMap<String, Resource>,
     /// Import warnings for the caller's log; never saved in the archive
     pub warnings: Vec<String>,
 }
 
+/// Maximum length of a resource name after sanitization.
+pub const MAX_RESOURCE_NAME_LEN: usize = 120;
+
 /// A resource name safe as a zip entry and a file name: `[A-Za-z0-9_.-]`, at most 120 chars.
 pub fn sanitize_resource_name(name: &str) -> String {
-    let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '_' }).take(120).collect();
+    let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '_' }).take(MAX_RESOURCE_NAME_LEN).collect();
     let s = s.trim_start_matches('.').to_string();
     if s.is_empty() { "resource".into() } else { s }
 }
@@ -92,14 +99,17 @@ pub fn sanitize_resource_name(name: &str) -> String {
 // Save.
 
 pub fn save_project_bytes(pf: &ProjectFile) -> Result<Vec<u8>> {
-    let mut out = Cursor::new(Vec::new());
-    write_project(&mut out, pf)?;
-    Ok(out.into_inner())
+    RamReservation::for_save()?.save_bytes(pf)
 }
 
 /// Save atomically through a newly created temporary file beside `path`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_project(path: &std::path::Path, project_file: &ProjectFile) -> Result<()> {
+    RamReservation::for_save()?.save(path, project_file)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_project_atomic(path: &std::path::Path, project_file: &ProjectFile<impl Borrow<Vec<u8>>>) -> Result<()> {
     let (temporary_path, file) = crate::create_temp(path)?;
     let result = (|| -> Result<()> {
         let mut file = std::io::BufWriter::new(file);
@@ -177,7 +187,7 @@ fn write_baked(w: &mut dyn Write, res: u32, h: u32, comps: usize, data: &[f32]) 
 }
 
 /// The zip entries of a project file, in file order. Bodies run later, possibly on other threads.
-fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
+fn entries(pf: &ProjectFile<impl Borrow<Vec<u8>>>) -> Result<Vec<Entry<'_>>> {
     let deflate = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).large_file(true);
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let json = serde_json::to_vec_pretty(&pf.project).map_err(|e| FormatError::Invalid(e.to_string()))?;
@@ -203,6 +213,7 @@ fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
         if map.width == 0 || map.height == 0 || map.values.len() as u64 != u64::from(map.width) * u64::from(map.height) {
             return Err(FormatError::Invalid("bake paint map dimensions do not match its values".into()));
         }
+
         let target_name = match target {
             BakePaintTarget::Cage => "cage",
             BakePaintTarget::Skew => "skew",
@@ -234,11 +245,12 @@ fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
     for (ts, maps) in &pf.baked {
         let r = maps.resolution;
         for (m, data) in &maps.maps {
-            // A map whose size disagrees with its width cannot be loaded; it can be re-baked.
+            // Skip inconsistent maps so the saved project can reopen and bake them again
             let h = maps.height(*m);
             if h == 0 || data.len() != (r as usize) * (h as usize) * m.components() {
                 continue;
             }
+
             let comps = m.components();
             out.push(Entry {
                 name: format!("baked/{ts}_{}.bin", m.id()),
@@ -252,7 +264,8 @@ fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
         out.push(Entry { name: "thumbnail.png".into(), options: stored, weight: png.len() as u64, body: Box::new(move |w| w.write_all(png)) });
     }
     used.clear();
-    for (name, bytes) in &pf.resources {
+    for (name, resource) in &pf.resources {
+        let bytes = resource.borrow();
         out.push(Entry {
             name: unique_entry_name("resources", name, &mut used),
             options: stored,
@@ -263,7 +276,7 @@ fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
     Ok(out)
 }
 
-fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
+fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile<impl Borrow<Vec<u8>>>) -> Result<()> {
     let mut zip = ZipWriter::new(out);
     entries::write_entries(&mut zip, entries(pf)?)?;
     zip.finish().map_err(zip_err)?;
@@ -281,6 +294,23 @@ pub fn load_project_bytes(bytes: &[u8]) -> Result<ProjectFile> {
 pub fn load_project(path: &std::path::Path) -> Result<ProjectFile> {
     let file = std::fs::File::open(path)?;
     crate::guard(KIND, || load(std::io::BufReader::new(file)))
+}
+
+/// Read a native smart material in place. MaterialCraft packages go to the bounded cook reader.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_smart_material_project(file: std::fs::File) -> Result<Option<ProjectFile>> {
+    crate::guard(KIND, || {
+        let archive = open_archive(std::io::BufReader::new(file), MAX_ZIP_METADATA_BYTES)?;
+        if archive.index_for_name(craft_mcmat::MANIFEST_ENTRY).is_some()
+            || archive.index_for_name("package.json").is_some()
+            || archive.file_names().any(|name| name.is_ok_and(|name| crate::mcmat::is_root_sbs(&name)))
+        {
+            return Ok(None);
+        }
+
+        let budget = LoadBudget::new(u64::from(project_open_limit_gib()) << 30);
+        load_archive(archive, budget).map(Some)
+    })
 }
 
 fn read_all(reader: &mut impl Read, cap: u64, budget: &mut LoadBudget, what: &str) -> Result<Vec<u8>> {
@@ -356,8 +386,11 @@ fn open_archive<R: Read + Seek>(reader: R, metadata_bytes: u64) -> Result<ZipArc
     Ok(archive)
 }
 
-fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result<ProjectFile> {
-    let mut zip = open_archive(reader, MAX_ZIP_METADATA_BYTES)?;
+fn load_with_budget<R: Read + Seek>(reader: R, budget: LoadBudget) -> Result<ProjectFile> {
+    load_archive(open_archive(reader, MAX_ZIP_METADATA_BYTES)?, budget)
+}
+
+fn load_archive<R: Read + Seek>(mut zip: ZipArchive<R>, mut budget: LoadBudget) -> Result<ProjectFile> {
     check_archive(&mut zip, budget.remaining())?;
 
     let json = read_all(&mut zip.by_name("project.json").map_err(zip_err)?, MAX_JSON, &mut budget, "project.json")?;
@@ -391,6 +424,8 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
         let declared_bytes = f.size();
         let name = f.name().map_err(zip_err)?.into_owned();
         let size_of = |id: LayerId| texture_set_of(&pf.project, id).and_then(|ts| pf.project.texture_sets.get(ts)).map(|t| t.size());
+
+        // Unrecognized entries from newer minor revisions may be skipped
         if name == "thumbnail.png" {
             pf.thumbnail = Some(read_all(&mut f, MAX_THUMBNAIL, &mut budget, &name)?);
         } else if let Some(res_name) = name.strip_prefix("resources/") {
@@ -431,6 +466,7 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
             let (id, chan) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
             let id = LayerId(id.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?);
             let c = Channel::ALL.into_iter().find(|c| c.id() == chan).ok_or_else(|| malformed(KIND, format!("unknown channel in {name}")))?;
+
             // Drop pixels of layers that are no longer in any stack
             let Some(size) = size_of(id) else { continue };
 
@@ -461,11 +497,14 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
             } else if maps.resolution != res || maps.maps.keys().next().is_some_and(|k| maps.height(*k) != height) {
                 return Err(malformed(KIND, format!("{name}: baked maps of one texture set differ in size")));
             }
+
             maps.maps.insert(m, Arc::new(data));
         }
-        // Ignore other entries from newer minor revisions
     }
 
+    if version < TANGENT_BENT_NORMAL_VERSION {
+        drop_world_space_bent_normals(&mut pf);
+    }
     pf.project.format_version = FORMAT_VERSION;
 
     if recovered {
@@ -475,6 +514,26 @@ fn load_with_budget<R: Read + Seek>(reader: R, mut budget: LoadBudget) -> Result
     }
 
     Ok(pf)
+}
+
+/// Older files hold bent normal maps in world space, which every reader now takes as tangent
+/// space: drop them (the bake settings stay) and ask for a re-bake.
+fn drop_world_space_bent_normals(pf: &mut ProjectFile) {
+    // Pixels and declaration go for every set, either one alone is enough to name the set in the warning
+    let mut names = Vec::new();
+    for (i, set) in pf.project.texture_sets.iter_mut().enumerate() {
+        let had_pixels = pf.baked.get_mut(&i).is_some_and(|maps| maps.maps.remove(&BakedMap::BentNormal).is_some());
+        if set.baked.remove(&BakedMap::BentNormal) || had_pixels {
+            names.push(format!("\"{}\"", set.name));
+        }
+    }
+    pf.baked.retain(|_, maps| !maps.maps.is_empty());
+    if !names.is_empty() {
+        pf.warnings.push(format!(
+            "Warning: This project was saved with bent normal maps in world space. TextureCraft now bakes them in tangent space and removed the old ones from texture set {}. Bake the Bent Normals map again, or set its image again if it came from a file.",
+            names.join(", ")
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -15,9 +15,10 @@ texturecraft-engine = { workspace = true }
 texturecraft-ui-egui = { workspace = true }
 # The control channel's token, framing and connection limits (shared with `texturecraft-cli serve`).
 texturecraft-automation = { workspace = true }
-eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "persistence"] }
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "persistence", "links"] }
 egui = { workspace = true }
 image = { workspace = true }
+craft-image-codecs = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 # The message box for errors that end the app (a Windows release build has no console).
@@ -29,13 +30,18 @@ ron = "0.12"
 # borderless (src/window_frame.rs; winsafe is MIT, User32 only).
 [target.'cfg(windows)'.dependencies]
 winit = { version = "0.30", default-features = false }
-winsafe = { version = "0.0.29", default-features = false, features = ["user"] }
+# `shell` carries SetCurrentProcessExplicitAppUserModelID, the Nightly taskbar identity (src/process_identity.rs).
+winsafe = { version = "0.0.29", default-features = false, features = ["user", "shell"] }
 # The update helper is a copy of this program (`main`).
 craft-update = { workspace = true }
 
 # Quit (Cmd+Q) asks about unsaved changes (src/main.rs); winit's own Quit does not.
 [target.'cfg(target_os = "macos")'.dependencies]
 craft-menu = { workspace = true }
+
+[dev-dependencies]
+# The pointer-hold test drives the windowed app's frames (src/main.rs)
+egui_kittest = { version = "0.37", features = ["eframe"] }
 
 [build-dependencies]
 winresource = "0.1"

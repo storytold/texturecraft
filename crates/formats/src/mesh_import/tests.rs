@@ -173,6 +173,23 @@ fn gltf_embedded_buffers_and_missing_attributes() {
 }
 
 #[test]
+fn gltf_mixed_primitive_uvs_warn_and_unwrap_the_whole_mesh() {
+    let mut json: serde_json::Value = serde_json::from_slice(&embedded_gltf()).unwrap();
+    let primitives = json["meshes"][0]["primitives"].as_array_mut().unwrap();
+    assert_eq!(primitives.len(), 2);
+    assert_eq!(primitives[0]["attributes"]["TEXCOORD_0"], 2);
+    let second_attributes = primitives[1]["attributes"].as_object_mut().unwrap();
+    assert_eq!(second_attributes.remove("TEXCOORD_0"), Some(serde_json::json!(2)));
+
+    let imported = import_mesh_bytes("mixed-uvs.gltf", &serde_json::to_vec(&json).unwrap()).unwrap();
+    assert!(imported.report.uvs_generated);
+    let warning = "some primitives have no UVs; the whole mesh was unwrapped automatically";
+    assert!(imported.report.warnings.iter().any(|w| w == warning));
+    assert_eq!(imported.report.triangles, 2);
+    assert_eq!(imported.mesh.materials, ["Red", "Material_1"]);
+}
+
+#[test]
 fn gltf_external_buffer_needs_a_path() {
     let mut json: serde_json::Value = serde_json::from_slice(&embedded_gltf()).unwrap();
     json["buffers"][0]["uri"] = "scene.bin".into();
@@ -318,6 +335,46 @@ fn polygons_keep_their_edges_for_the_wireframe() {
     let tris = import_mesh_bytes("t.obj", b"v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvt 0 0\nf 1/1 2/1 3/1\nf 1/1 3/1 4/1\n").unwrap().mesh;
     assert!(tris.diagonals.is_empty());
     assert_eq!(tris.wire_edges()[0].len(), 5);
+}
+
+#[test]
+fn imported_quads_get_quad_tangents() {
+    // A non-planar OBJ quad with sheared UVs: the importer keeps the quad for MikkTSpace, so its
+    // tangents differ from the same corners written as two triangles (Blender hands quads over).
+    let corners = "v 0 0 0
+v 1 0 0
+v 1 1 0.6
+v 0 1 0
+vt 0 0.1
+vt 1 0
+vt 0.9 1
+vt 0.3 0.8
+";
+    let quad = import_mesh_bytes(
+        "q.obj",
+        format!(
+            "{corners}f 1/1 2/2 3/3 4/4
+"
+        )
+        .as_bytes(),
+    )
+    .unwrap()
+    .mesh;
+    let tris = import_mesh_bytes(
+        "t.obj",
+        format!(
+            "{corners}f 1/1 2/2 3/3
+f 1/1 3/3 4/4
+"
+        )
+        .as_bytes(),
+    )
+    .unwrap()
+    .mesh;
+    assert_eq!((quad.indices.clone(), quad.positions.clone()), (tris.indices.clone(), tris.positions.clone()), "the render triangles are the same");
+    let widest = quad.tangents.iter().zip(&tris.tangents).map(|(a, b)| a.truncate().dot(b.truncate()).clamp(-1.0, 1.0).acos().to_degrees()).fold(0.0, f32::max);
+    assert!(widest > 1.0, "quad tangents differ from triangle tangents by only {widest} degrees");
+    assert!(quad.tangents.iter().all(|t| t.is_finite()));
 }
 
 fn ply_ascii() -> String {
@@ -609,4 +666,94 @@ fn ply_face_element_before_vertex_element() {
     assert_eq!(mesh.positions.len(), 3);
     let bad = format!("{head}3 0 1 5\n0 0 0\n1 0 0\n0 1 0\n");
     assert!(import_mesh_bytes("a.ply", bad.as_bytes()).is_err());
+}
+
+#[test]
+fn group_index_preserves_order_and_reuses_nonadjacent_material_parts() {
+    let mut raw = super::RawMesh::default();
+    for i in 0..1000 {
+        raw.group("shared", &i.to_string()).extend_from_slice(&[0, 1, 2]);
+    }
+    for i in (0..1000).rev() {
+        raw.group("shared", &i.to_string()).extend_from_slice(&[3, 4, 5]);
+    }
+    raw.group("other", "0").extend_from_slice(&[6, 7, 8]);
+    assert_eq!(raw.groups.len(), 1001);
+    for (i, (material, part, indices)) in raw.groups.iter().take(1000).enumerate() {
+        assert_eq!(material, "shared");
+        assert_eq!(part, &i.to_string());
+        assert_eq!(indices, &[0, 1, 2, 3, 4, 5]);
+    }
+    assert_eq!(raw.groups[1000], ("other".into(), "0".into(), vec![6, 7, 8]));
+}
+
+#[test]
+fn decode_base_color_resizes_oversized_and_rejects_corrupt_bytes() {
+    let mut budget = BASE_COLOR_TEXELS;
+    assert!(decode_base_color(b"not an image", &mut budget).is_err());
+
+    let side = BASE_COLOR_SIDE + 2;
+    let img = craft_image_codecs::Image::from_u8(side, 2, craft_image_codecs::ChannelLayout::Rgba, vec![128; (side * 2 * 4) as usize]).unwrap();
+    let png = craft_image_codecs::encode(&img, craft_image_codecs::Format::Png, &Default::default()).unwrap();
+    let (w, h, pixels) = decode_base_color(&png, &mut budget).unwrap();
+    assert!(w <= BASE_COLOR_SIDE && h <= BASE_COLOR_SIDE);
+    assert_eq!(pixels.len(), (w * h) as usize);
+}
+
+#[test]
+fn base_color_keeps_stored_jpeg_orientation_for_mesh_uvs() {
+    let pixels = image::RgbImage::from_fn(4, 2, |x, _| if x < 2 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 255]) });
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100).encode_image(&pixels).unwrap();
+    // Synthetic TIFF Orientation=6 inside EXIF APP1, not an external image fixture.
+    let exif = b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0";
+    let mut tagged = jpeg[..2].to_vec();
+    tagged.extend_from_slice(&[0xff, 0xe1]);
+    tagged.extend_from_slice(&u16::try_from(exif.len() + 2).unwrap().to_be_bytes());
+    tagged.extend_from_slice(exif);
+    tagged.extend_from_slice(&jpeg[2..]);
+    let expected = image::load_from_memory(&tagged).unwrap().into_rgba8();
+    let mut budget = BASE_COLOR_TEXELS;
+    let (w, h, actual) = decode_base_color(&tagged, &mut budget).unwrap();
+    assert_eq!((w, h), (4, 2));
+    assert_eq!(actual, expected.pixels().map(|p| p.0).collect::<Vec<_>>());
+}
+
+#[test]
+fn base_color_filters_hdr_before_clamping_to_eight_bits() {
+    let h = BASE_COLOR_SIDE * 2;
+    let samples: Vec<_> = (0..h).map(|y| image::Rgb([if y % 2 == 0 { 4.0 } else { 0.0 }; 3])).collect();
+    let mut hdr = Vec::new();
+    image::codecs::hdr::HdrEncoder::new(&mut hdr).encode(&samples, 1, h as usize).unwrap();
+    let expected = image::load_from_memory(&hdr).unwrap().resize(BASE_COLOR_SIDE, BASE_COLOR_SIDE, image::imageops::FilterType::Triangle).into_rgba8();
+    let mut budget = BASE_COLOR_TEXELS;
+    let (w, h, actual) = decode_base_color(&hdr, &mut budget).unwrap();
+    assert_eq!((w, h), expected.dimensions());
+    assert_eq!(actual, expected.pixels().map(|p| p.0).collect::<Vec<_>>());
+}
+
+#[test]
+fn duplicate_gltf_material_names_keep_first_wins_and_order() {
+    let mut raw = RawMesh {
+        positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+        base_colors: vec![
+            RawBaseColor { material: "Dup".into(), factor: Vec4::new(1.0, 0.0, 0.0, 1.0), image: None },
+            RawBaseColor { material: "Dup".into(), factor: Vec4::new(0.0, 0.0, 1.0, 1.0), image: None },
+            RawBaseColor { material: "Second".into(), factor: Vec4::new(0.0, 1.0, 0.0, 1.0), image: None },
+        ],
+        ..RawMesh::default()
+    };
+    raw.group("Dup", "p1").extend_from_slice(&[0, 1, 2]);
+    raw.group("Second", "p2").extend_from_slice(&[0, 1, 2]);
+    raw.group("Dup", "p3").extend_from_slice(&[0, 1, 2]);
+    let colors = std::mem::take(&mut raw.base_colors);
+    let (mesh, _, _) = geometry(raw).unwrap();
+    assert_eq!(mesh.materials, vec!["Dup", "Second"]);
+    let submesh_materials: Vec<_> = mesh.submeshes.iter().map(|s| (s.name.as_str(), s.material)).collect();
+    assert_eq!(submesh_materials, [("p1", 0), ("p3", 0), ("p2", 1)]);
+    let mut color_by_material: HashMap<&str, &RawBaseColor> = HashMap::with_capacity(colors.len());
+    for color in &colors {
+        color_by_material.entry(color.material.as_str()).or_insert(color);
+    }
+    assert_eq!(color_by_material.get("Dup").unwrap().factor, Vec4::new(1.0, 0.0, 0.0, 1.0));
 }

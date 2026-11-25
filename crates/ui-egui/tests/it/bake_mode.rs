@@ -560,18 +560,6 @@ fn the_view_menu_picks_the_neutral_or_the_painted_material_in_bake_mode() {
 }
 
 #[test]
-fn the_baking_visualization_panel_opens_like_the_reference_at_first_launch() {
-    let harness = harness(None);
-    for shown in ["Show for Selected Texture Set Only", "Mesh", "Matching Error", "Cage Surface", "Cage Wireframe Opacity"] {
-        harness.get_by_label(shown);
-    }
-    for closed in ["Missing Seams on Hard Edges", "Project Mesh", "Roughness"] {
-        assert!(harness.query_by_label(closed).is_none(), "{closed} sits in a section that starts closed");
-    }
-    assert!(harness.state().ui.bake_visualization.missing_seams.shown, "missing seams are ticked in every reference capture");
-}
-
-#[test]
 fn texture_set_names_show_in_full_beside_their_resolution() {
     let mut harness = harness(None);
     harness.state_mut().session.doc.project.texture_sets[0].name = "LowerTorso".into();

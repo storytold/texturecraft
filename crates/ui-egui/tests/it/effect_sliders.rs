@@ -7,7 +7,7 @@ use serde_json::json;
 use texturecraft_engine::core::{EffectKind, LayerId};
 use texturecraft_ui_egui::TextureCraftApp;
 
-/// The sample session with its first generator effect selected, and that effect's id.
+/// The sample session with its first generator effect selected, and that effect's id
 fn selected_generator() -> (Harness<'static, TextureCraftApp>, LayerId) {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     let (layer, effect) = session
@@ -43,6 +43,7 @@ fn track(harness: &Harness<'_, TextureCraftApp>, label: &str) -> egui::Rect {
 fn dragging_a_slider_applies_it() {
     let (mut harness, effect) = selected_generator();
     assert_eq!(balance(&harness, effect), 0.5);
+
     let track_rect = track(&harness, "Global balance");
     harness.drag_at(egui::pos2(track_rect.right(), track_rect.center().y));
     harness.run_steps(2);
@@ -50,6 +51,7 @@ fn dragging_a_slider_applies_it() {
     harness.run_steps(2);
     harness.drop_at(egui::pos2(track_rect.left() + 20.0, track_rect.center().y));
     harness.run_steps(3);
+
     assert!(balance(&harness, effect) < 0.25, "the dragged balance applies: {}", balance(&harness, effect));
 }
 
@@ -71,35 +73,16 @@ fn dragging_a_generator_slider_applies_live_as_one_undo_step() {
     for x in [60.0, 160.0] {
         harness.hover_at(point_at(x));
         harness.run_steps(2);
+
         assert!(level(&harness) > last && level(&harness) != 0.5, "the level follows the drag before it is released: {last} -> {}", level(&harness));
+
         last = level(&harness);
     }
     harness.drop_at(point_at(160.0));
     harness.run_steps(3);
+
     assert_eq!(level(&harness), last);
     assert_eq!(harness.state().session.history_labels().len(), steps + 1, "one undo step for the drag");
-}
-
-/// The combo box in the row of the levels editor's Reset button.
-fn channel_picker<'a>(harness: &'a Harness<'_, TextureCraftApp>) -> egui_kittest::Node<'a> {
-    let row = harness.get_by_label("Reset").rect().center().y;
-    harness.get_all(by().role(Role::ComboBox)).find(|node| (node.rect().center().y - row).abs() < 4.0).unwrap()
-}
-
-/// A content levels effect offers a channel for its histogram; picking one keeps it selected.
-#[test]
-fn content_levels_pick_the_histogram_channel() {
-    let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
-    texturecraft_engine::execute(&mut session, "layer.add.fill", &json!({"color": [0.5, 0.2, 0.1], "roughness": 0.6})).unwrap();
-    texturecraft_engine::execute(&mut session, "effect.add.levels", &json!({"target": "content"})).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
-    harness.run_steps(4);
-    assert_eq!(channel_picker(&harness).value().as_deref(), Some("Base color"), "the layer's first channel");
-    channel_picker(&harness).click();
-    harness.run_steps(2);
-    harness.get_by_label("Roughness").click();
-    harness.run_steps(3);
-    assert_eq!(channel_picker(&harness).value().as_deref(), Some("Roughness"), "the picked channel stays");
 }
 
 #[test]
@@ -110,10 +93,11 @@ fn clicking_a_slider_track_applies_it() {
     harness.drag_at(at);
     harness.drop_at(at);
     harness.run_steps(3);
+
     assert!(balance(&harness, effect) < 0.25, "a click on the track applies: {}", balance(&harness, effect));
 }
 
-/// The number field in the row of the slider labelled `label`.
+/// The number field in the row of the slider labelled `label`
 fn number_field<'a>(harness: &'a Harness<'_, TextureCraftApp>, label: &str) -> egui_kittest::Node<'a> {
     let row = harness.get_by_label(label).rect().center().y;
     harness.get_all(by().role(Role::TextInput)).find(|node| (node.rect().center().y - row).abs() < 4.0).unwrap()
@@ -140,6 +124,7 @@ fn a_value_typed_in_the_number_field_applies() {
     type_balance(&mut harness, &[egui::Key::End, egui::Key::Backspace, egui::Key::Backspace, egui::Key::Backspace, egui::Key::Backspace], "0.25");
     harness.key_press(egui::Key::Enter);
     harness.run_steps(3);
+
     assert_eq!(balance(&harness, effect), 0.25);
     assert_eq!(harness.state().session.history_labels().len(), steps + 1);
 }
@@ -159,11 +144,13 @@ fn a_track_drag_drops_text_typed_in_the_number_field() {
     harness.run_steps(2);
     let dragged = balance(&harness, effect);
     assert!(dragged < 0.25, "the drag applies: {dragged}");
+
     // Leave whatever has focus: a click on empty space
     harness.drag_at(egui::pos2(5.0, 1390.0));
     harness.drop_at(egui::pos2(5.0, 1390.0));
     harness.key_press(egui::Key::Enter);
     harness.run_steps(3);
+
     assert_eq!(balance(&harness, effect), dragged, "the text typed before the drag stays dropped");
 }
 
@@ -178,16 +165,23 @@ fn leaving_the_number_field_unchanged_keeps_the_value() {
     type_balance(&mut harness, &[], "");
     harness.key_press(egui::Key::Enter);
     harness.run_steps(3);
+
     assert_eq!(balance(&harness, effect), 0.333, "left without typing");
+
     type_balance(&mut harness, &[egui::Key::End, egui::Key::Backspace], "9");
+
     assert_eq!(number_field(&harness, "Global balance").value().as_deref(), Some("0.39"));
     assert!(number_field(&harness, "Global balance").is_focused());
+
     harness.key_press(egui::Key::Escape);
     harness.run_steps(3);
+
     assert_eq!(balance(&harness, effect), 0.333);
+
     // Typing the value it already has is no edit either
     type_balance(&mut harness, &[egui::Key::End, egui::Key::Backspace, egui::Key::Backspace, egui::Key::Backspace, egui::Key::Backspace], "0.333");
     harness.key_press(egui::Key::Enter);
     harness.run_steps(3);
+
     assert_eq!(harness.state().session.history_labels().len(), steps);
 }

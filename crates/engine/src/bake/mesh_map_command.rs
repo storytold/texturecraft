@@ -5,6 +5,7 @@
 use super::model_patch;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use texturecraft_core::BakePaintTarget;
 
@@ -37,7 +38,7 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "Bake settings",
             [],
             None,
-            "{ts?: index|[indices]|\"all\"|\"selected\" (default: the active set), model?: complete nested BakeSettings (named enum values), preserveEnabled?: keep each texture set enabled flag when replacing the model, patch?: nested BakeSettings fields to update after model (omitted fields stay unchanged, null clears optional fields), resolution?, antialiasing?: 1|2|4|8, dilation?, ao?: {rays?, maxDistance?, spread?: degrees (180 = hemisphere), distribution?: cosine|uniform, ignoreBackface?: never|always|byMeshName, selfOcclusion?: always|sameMeshName}, thickness?: {rays?, maxDistance?, spread?, distribution?}, bentNormal?: {rays?, maxDistance?, spread?, distribution?}, rays?, maxDistance? (all three ray maps), curvatureMethod?: normalMap|mesh, positionMode?: boundingBox|boundingSphere|none, maps?: [ids], enabled?, useLowAsHigh?, maxFrontal?, maxRear?, averageNormals?, lowSuffix?, highSuffix?}",
+            "{ts?: index|[indices]|\"all\"|\"selected\" (default: the active set), model?: complete nested BakeSettings (named enum values), preserveEnabled?: keep each texture set enabled flag when replacing the model, preset?: allow legacy flat-parameter ranges for the model, patch?: nested BakeSettings fields to update after model (omitted fields stay unchanged, null clears optional fields), resolution?, antialiasing?: 1|2|4|8, dilation?, ao?: {rays?, maxDistance?, spread?: degrees (180 = hemisphere), distribution?: cosine|uniform, ignoreBackface?: never|always|byMeshName, selfOcclusion?: always|sameMeshName}, thickness?: {rays?, maxDistance?, spread?, distribution?}, bentNormal?: {rays?, maxDistance?, spread?, distribution?}, rays?, maxDistance? (all three ray maps), curvatureMethod?: normalMap|mesh, positionMode?: boundingBox|boundingSphere|none, maps?: [ids], enabled?, useLowAsHigh?, maxFrontal?, maxRear?, averageNormals?, lowSuffix?, highSuffix?}",
             always,
             settings
         ),
@@ -65,11 +66,24 @@ pub(super) fn specs() -> Vec<CommandSpec> {
 type MeshFile = (String, Vec<u8>);
 
 static GPU_TRACER: OnceLock<Arc<dyn Tracer>> = OnceLock::new();
+/// Whether bakes may use the installed GPU tracer (Settings > Enable GPU raytracing).
+static GPU_RAYTRACING: AtomicBool = AtomicBool::new(true);
 
 /// Cast bake rays with `tracer` (the apps install the render crate's GPU baker at start-up);
 /// the first call wins.
 pub fn install_gpu_tracer(tracer: Arc<dyn Tracer>) {
     let _ = GPU_TRACER.set(tracer);
+}
+
+/// Let bakes cast their rays on the installed GPU tracer (`true`, the default) or keep them on
+/// the CPU (`false`). Applies to bakes started afterwards.
+pub fn set_gpu_raytracing(enabled: bool) {
+    GPU_RAYTRACING.store(enabled, Ordering::Relaxed);
+}
+
+/// The tracer a bake starting now uses: the installed one while GPU raytracing is on, else none (the CPU)
+fn chosen_tracer(installed: Option<&Arc<dyn Tracer>>, enabled: bool) -> Option<Arc<dyn Tracer>> {
+    installed.filter(|_| enabled).cloned()
 }
 
 /// A mesh file name made unique among `taken` (and safe as a project file entry).
@@ -125,7 +139,7 @@ impl Session {
         let excluded_tiles: Vec<_> = set.uv_tiles.iter().filter(|tile| set.bake_excluded_tiles.contains(tile)).filter_map(|tile| grid?.block(*tile)).collect();
         let previous_maps = if excluded_tiles.is_empty() { Default::default() } else { self.doc.baked.get(&texture_set).cloned().unwrap_or_default() };
 
-        let tracer = GPU_TRACER.get().cloned();
+        let tracer = chosen_tracer(GPU_TRACER.get(), GPU_RAYTRACING.load(Ordering::Relaxed));
         Ok(BakeTask {
             low_base_color,
             ts: texture_set,
@@ -204,7 +218,7 @@ impl Session {
     pub fn apply_bake(&mut self, texture_set: usize, output: BakeOutput) -> Result<()> {
         let tracer = output.tracer.clone();
         self.edit("Bake mesh maps", |session| session.store_bake(texture_set, output))?;
-        self.log.push(format!("Baked texture set {texture_set} ({tracer})"));
+        self.log.info("Baker", format!("Baked texture set {texture_set} ({tracer})"));
         Ok(())
     }
 
@@ -213,7 +227,7 @@ impl Session {
     pub fn apply_streamed_bake(&mut self, texture_set: usize, output: StreamedBake) -> Result<()> {
         let tracer = output.tracer.clone();
         self.edit("Bake mesh maps", |session| session.store_bake_maps(texture_set, output.resolution, output.height, output.maps))?;
-        self.log.push(format!("Baked texture set {texture_set} ({tracer})"));
+        self.log.info("Baker", format!("Baked texture set {texture_set} ({tracer})"));
         Ok(())
     }
 
@@ -253,7 +267,7 @@ impl Session {
         let taken: Vec<&str> = self.bake_meshes.high.iter().map(|h| h.name.as_str()).collect();
         m.name = unique_name(file_name, &taken);
         let textures = m.base_color.iter().flatten().filter(|c| !c.texels.is_empty()).count();
-        self.log.push(format!("High poly {}: {} triangles, {textures} base color textures", m.name, m.mesh.triangle_count()));
+        self.log.info("Baker", format!("High poly {}: {} triangles, {textures} base color textures", m.name, m.mesh.triangle_count()));
         let name = m.name.clone();
         self.bake_meshes.high.push(m);
         self.bake_meshes.rebuild();
@@ -297,7 +311,7 @@ impl Session {
     /// not fold in. Replies like `bake.highPoly.add` / `bake.cage.set`: `{name, meshes}`.
     pub fn add_bake_mesh(&mut self, f: texturecraft_formats::MeshFile, cage: bool) -> Result<Value> {
         let name = if cage { self.set_cage_bytes(&f.name, f.bytes)? } else { self.add_high_poly_bytes(&f.name, f.bytes)? };
-        self.log.extend(f.warnings);
+        self.log.warnings("Baker", f.warnings);
         Ok(json!({ "name": name, "meshes": meshes_json(self) }))
     }
 
@@ -306,29 +320,30 @@ impl Session {
         for (name, bytes) in high {
             match parse_mesh(&name, bytes) {
                 Ok(m) => self.bake_meshes.high.push(m),
-                Err(e) => self.log.push(format!("skipped high poly mesh: {e}")),
+                Err(e) => self.log.warn("Baker", format!("skipped high poly mesh: {e}")),
             }
         }
         self.bake_meshes.rebuild();
         if let Some((name, bytes)) = cage
             && let Err(e) = self.set_cage_bytes(&name, bytes)
         {
-            self.log.push(format!("skipped cage mesh: {e}"));
+            self.log.warn("Baker", format!("skipped cage mesh: {e}"));
         }
     }
 
     pub(crate) fn load_bake_paint(&mut self, maps: BTreeMap<(usize, BakePaintTarget), texturecraft_formats::BakePaintData>) {
         for (key, data) in maps {
             if key.0 >= self.doc.project.texture_sets.len() {
-                self.log.push(format!("skipped bake paint map for missing texture set {}", key.0));
+                self.log.warn("Baker", format!("skipped bake paint map for missing texture set {}", key.0));
                 continue;
             }
+
             let map = BakePaintMap { width: data.width, height: data.height, values: data.values };
             match map.validate() {
                 Ok(()) => {
                     self.doc.bake_paint.insert(key, Arc::new(map));
                 }
-                Err(error) => self.log.push(format!("skipped bake paint map: {error}")),
+                Err(error) => self.log.warn("Baker", format!("skipped bake paint map: {error}")),
             }
         }
     }
@@ -445,13 +460,11 @@ pub fn settings_params(settings: &BakeSettings) -> Value {
 
 /// Apply only the bake parameters supplied by the caller
 fn apply_settings(settings: &mut BakeSettings, params: &Value, command: &str) -> Result<()> {
-    // Preserve the legacy flat-parameter limits for existing callers
-    const MAX_DILATION_PIXELS: u32 = 256;
     const MAX_SUFFIX_CHARS: usize = 64;
 
     if let Some(model) = params.get("model") {
         let replacement: BakeSettings = serde_json::from_value(model.clone()).map_err(|error| bad(command, error.to_string()))?;
-        validate_model_settings(&replacement, command)?;
+        validate_model_settings(&replacement, command, boolp(params, "preset") == Some(true), None)?;
         let is_enabled = settings.common.is_enabled;
         *settings = replacement;
         if boolp(params, "preserveEnabled") == Some(true) {
@@ -463,7 +476,7 @@ fn apply_settings(settings: &mut BakeSettings, params: &Value, command: &str) ->
         let mut model = json!(settings);
         model_patch::apply_patch(&mut model, patch, command)?;
         let updated: BakeSettings = serde_json::from_value(model).map_err(|error| bad(command, error.to_string()))?;
-        validate_model_settings(&updated, command)?;
+        validate_model_settings(&updated, command, false, Some(settings))?;
         *settings = updated;
     }
 
@@ -538,7 +551,9 @@ fn apply_settings(settings: &mut BakeSettings, params: &Value, command: &str) ->
         };
     }
 
-    for (key, setting, minimum, maximum) in [("maxFrontal", &mut settings.cage.max_frontal, 0.0, 1.0), ("maxRear", &mut settings.cage.max_rear, 0.0, 1.0)] {
+    for (key, setting, minimum, maximum) in
+        [("maxFrontal", &mut settings.cage.max_frontal, 0.0, MAX_FLAT_CAGE_DISTANCE), ("maxRear", &mut settings.cage.max_rear, 0.0, MAX_FLAT_CAGE_DISTANCE)]
+    {
         if let Some(value) = f32p(params, key).filter(|value| value.is_finite()) {
             *setting = value.clamp(minimum, maximum);
         }
@@ -571,19 +586,43 @@ fn apply_settings(settings: &mut BakeSettings, params: &Value, command: &str) ->
     Ok(())
 }
 
-fn validate_model_settings(settings: &BakeSettings, command: &str) -> Result<()> {
+const MAX_DILATION_PIXELS: u32 = 256;
+const MAX_MODEL_DILATION_PIXELS: u32 = 128;
+const MAX_MODEL_SECONDARY_RAYS: u32 = 256;
+const MAX_MODEL_CAGE_DISTANCE: f32 = 0.05;
+const MAX_MODEL_RELATIVE_RAY_DISTANCE: f32 = 1.0;
+const MAX_FLAT_CAGE_DISTANCE: f32 = 1.0;
+const MAX_FLAT_RAY_DISTANCE: f32 = 10.0;
+
+fn validate_model_settings(settings: &BakeSettings, command: &str, from_preset: bool, previous: Option<&BakeSettings>) -> Result<()> {
     let range = |name: &str, value: f32, minimum: f32, maximum: f32| {
         if value.is_finite() && (minimum..=maximum).contains(&value) { Ok(()) } else { Err(bad(command, format!("{name} must be in {minimum}..={maximum}"))) }
     };
-    if settings.common.dilation > 128 {
-        return Err(bad(command, "dilation must be at most 128"));
+
+    // Presets may contain values set through the legacy flat parameters
+    // A patch may retain each of those values but must use ordinary limits for edits
+    let keeps_dilation = previous.is_some_and(|previous| previous.common.dilation == settings.common.dilation);
+    let max_dilation = if from_preset || keeps_dilation { MAX_DILATION_PIXELS } else { MAX_MODEL_DILATION_PIXELS };
+    if settings.common.dilation > max_dilation {
+        return Err(bad(command, format!("dilation must be at most {max_dilation}")));
     }
-    for rays in [&settings.maps.ao.parameters.rays, &settings.maps.thickness.parameters.rays, &settings.maps.bent_normal.parameters.rays] {
-        if !(1..=256).contains(&rays.rays) {
-            return Err(bad(command, "secondary rays must be in 1..=256"));
+
+    let ray_settings =
+        |settings: &BakeSettings| [settings.maps.ao.parameters.rays, settings.maps.thickness.parameters.rays, settings.maps.bent_normal.parameters.rays];
+    let previous_rays = previous.map(ray_settings).map_or([None; 3], |rays| rays.map(Some));
+    for (rays, previous_rays) in ray_settings(settings).into_iter().zip(previous_rays) {
+        let keeps_count = previous_rays.is_some_and(|previous| previous.rays == rays.rays);
+        let max_rays = if from_preset || keeps_count { MAX_RAYS } else { MAX_MODEL_SECONDARY_RAYS };
+        if !(1..=max_rays).contains(&rays.rays) {
+            return Err(bad(command, format!("secondary rays must be in 1..={max_rays}")));
         }
+
+        let keeps_distance = previous_rays
+            .is_some_and(|previous| previous.max_distance == rays.max_distance && previous.relative_to_bounding_box == rays.relative_to_bounding_box);
+        let max_distance =
+            if from_preset || keeps_distance || !rays.relative_to_bounding_box { MAX_FLAT_RAY_DISTANCE } else { MAX_MODEL_RELATIVE_RAY_DISTANCE };
         range("minimum occluder distance", rays.min_distance, 0.00001, 1.0)?;
-        range("maximum occluder distance", rays.max_distance, 0.00001, if rays.relative_to_bounding_box { 1.0 } else { 10.0 })?;
+        range("maximum occluder distance", rays.max_distance, 0.00001, max_distance)?;
         range("spread angle", rays.spread, 0.0, 180.0)?;
         if rays.min_distance > rays.max_distance {
             return Err(bad(command, "minimum occluder distance must not exceed maximum distance"));
@@ -593,13 +632,18 @@ fn validate_model_settings(settings: &BakeSettings, command: &str) -> Result<()>
     if !(1..=256).contains(&curvature.mesh.rays) {
         return Err(bad(command, "curvature rays must be in 1..=256"));
     }
+
     if !curvature.mesh.auto_tonemapping && curvature.mesh.value_min >= curvature.mesh.value_max {
         return Err(bad(command, "curvature minimum must be below maximum"));
     }
+
     range("sampling radius", curvature.mesh.sampling_radius, 0.00001, if curvature.mesh.relative_to_bounding_box { 10.0 } else { 1.0 })?;
+    let cage_limit = |unchanged: bool| if from_preset || unchanged { MAX_FLAT_CAGE_DISTANCE } else { MAX_MODEL_CAGE_DISTANCE };
+    let keeps_frontal = previous.is_some_and(|previous| previous.cage.max_frontal == settings.cage.max_frontal);
+    let keeps_rear = previous.is_some_and(|previous| previous.cage.max_rear == settings.cage.max_rear);
     for (name, value, minimum, maximum) in [
-        ("frontal distance", settings.cage.max_frontal, 0.0, 0.05),
-        ("rear distance", settings.cage.max_rear, 0.0, 0.05),
+        ("frontal distance", settings.cage.max_frontal, 0.0, cage_limit(keeps_frontal)),
+        ("rear distance", settings.cage.max_rear, 0.0, cage_limit(keeps_rear)),
         ("edge distance", settings.skew.edge_distance, 0.0, 1.0),
         ("edge contrast", settings.skew.edge_contrast, 0.0, 1.0),
         ("ground plane offset", settings.maps.ao.parameters.ground_plane.offset, 0.0, 100.0),
@@ -633,7 +677,9 @@ fn apply_rays(settings: &mut RaySettings, params: &Value, command: &str) -> Resu
         settings.rays = count.clamp(1, u64::from(MAX_RAYS)) as u32;
     }
 
-    for (key, setting, minimum, maximum) in [("maxDistance", &mut settings.max_distance, 0.001, 10.0), ("spread", &mut settings.spread, 0.0, 180.0)] {
+    for (key, setting, minimum, maximum) in
+        [("maxDistance", &mut settings.max_distance, 0.001, MAX_FLAT_RAY_DISTANCE), ("spread", &mut settings.spread, 0.0, 180.0)]
+    {
         if let Some(value) = f32p(params, key).filter(|value| value.is_finite()) {
             *setting = value.clamp(minimum, maximum);
         }
@@ -718,8 +764,62 @@ fn bake_run(session: &mut Session, params: &Value) -> Result<Value> {
         Ok(tracers)
     })?;
     for (index, tracer) in sets.iter().zip(&tracers) {
-        session.log.push(format!("Baked texture set {index} ({tracer})"));
+        session.log.info("Baker", format!("Baked texture set {index} ({tracer})"));
     }
     session.update();
     Ok(json!({ "baked": sets, "tracer": tracers }))
+}
+
+#[cfg(test)]
+mod named_tracer;
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn feedback_bake_patches_preserve_unchanged_preset_values() {
+        let mut session = crate::sample_session(128, 32).unwrap();
+        let mut model = session.doc.project.texture_sets[0].bake.clone();
+        model.common.dilation = 200;
+        model.cage.max_frontal = 0.5;
+        model.maps.ao.parameters.rays.rays = 300;
+        model.maps.ao.parameters.rays.relative_to_bounding_box = true;
+        model.maps.ao.parameters.rays.max_distance = 2.0;
+        crate::execute(&mut session, "bake.settings", &json!({"model": model, "preset": true})).unwrap();
+
+        crate::execute(&mut session, "bake.settings", &json!({"patch": {}})).unwrap();
+        crate::execute(&mut session, "bake.settings", &json!({"patch": {"common": {"is_enabled": false}}})).unwrap();
+        model.common.is_enabled = false;
+        assert_eq!(session.doc.project.texture_sets[0].bake, model);
+
+        for patch in [
+            json!({"common": {"dilation": 201}}),
+            json!({"cage": {"max_frontal": 0.6}}),
+            json!({"maps": {"ao": {"parameters": {"rays": {"rays": 301}}}}}),
+            json!({"maps": {"ao": {"parameters": {"rays": {"max_distance": 3.0}}}}}),
+        ] {
+            assert!(crate::execute(&mut session, "bake.settings", &json!({"patch": patch, "preset": true})).is_err(), "{patch}");
+            assert_eq!(session.doc.project.texture_sets[0].bake, model);
+        }
+
+        crate::execute(&mut session, "bake.settings", &json!({"patch": {"common": {"dilation": 128}}})).unwrap();
+        assert_eq!(session.doc.project.texture_sets[0].bake.common.dilation, 128);
+    }
+}
+
+#[cfg(test)]
+mod gpu_raytracing_tests {
+    use super::*;
+
+    use super::named_tracer::NamedTracer;
+
+    #[test]
+    fn bakes_use_the_installed_gpu_tracer_only_while_gpu_raytracing_is_on() {
+        let installed: Arc<dyn Tracer> = Arc::new(NamedTracer);
+
+        assert_eq!(chosen_tracer(Some(&installed), true).map(|tracer| tracer.name()), Some("gpu".to_string()));
+        assert!(chosen_tracer(Some(&installed), false).is_none(), "off keeps the rays on the CPU");
+        assert!(chosen_tracer(None, true).is_none(), "no installed tracer bakes on the CPU");
+    }
 }

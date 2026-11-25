@@ -51,14 +51,14 @@ fn masked_layer(session: &mut Session, with_id_map: bool) -> (LayerId, LayerId) 
     }
 
     let layer = LayerId(execute(session, "layer.add.fill", &json!({"color": [0.9, 0.1, 0.1]})).unwrap()["layer"].as_u64().unwrap());
-    execute(session, "mask.add.colorSelection", &json!({"color": NO_PART, "tolerance": 0.05})).unwrap();
-    let effect = session.doc.project.layer(layer).unwrap().mask.as_ref().unwrap().effects[0].id;
+    let added = execute(session, "mask.add.colorSelection", &json!({"color": NO_PART, "tolerance": 0.05})).unwrap();
+    let effect = LayerId(added["effect"].as_u64().unwrap());
     (layer, effect)
 }
 
 fn colors(session: &Session, effect: LayerId) -> Vec<[f32; 3]> {
     match &session.doc.project.effect(effect).unwrap().1.kind {
-        EffectKind::ColorSelection { colors, .. } => colors.clone(),
+        EffectKind::ColorSelection(selection) => selection.colors.clone(),
         other => panic!("not a color selection: {other:?}"),
     }
 }
@@ -88,14 +88,19 @@ fn a_uv_pick_adds_the_color_there_or_replaces_one() {
     let (_, effect) = masked_layer(&mut session, true);
 
     execute(&mut session, "effect.colorSelection.pick", &json!({"effect": effect.0, "uv": [0.25, 0.25]})).unwrap();
-    assert_close(colors(&session, effect)[1], stored(TOP_LEFT_ID));
+    let [_, picked] = colors(&session, effect)[..] else { panic!("the pick adds one color to the first") };
+    assert_close(picked, stored(TOP_LEFT_ID));
 
     let replaced = execute(&mut session, "effect.colorSelection.pick", &json!({"effect": effect.0, "uv": [0.75, 0.75], "index": 0})).unwrap();
+
     assert_eq!(replaced["index"], json!(0));
+
     let picked = colors(&session, effect);
     assert_eq!(picked.len(), 2);
+
     assert_close(picked[0], stored(BOTTOM_ID));
     execute(&mut session, "edit.undo", &Value::Null).unwrap();
+
     assert_eq!(colors(&session, effect)[0], NO_PART, "one undo step");
 }
 
@@ -106,11 +111,13 @@ fn the_colors_param_replaces_the_list_in_one_undo_step() {
     let edited = [stored(TOP_LEFT_ID), stored(TOP_RIGHT_ID)];
 
     execute(&mut session, "effect.set", &json!({"effect": effect.0, "colors": edited, "tolerance": 0.2})).unwrap();
+
     assert_eq!(colors(&session, effect), edited.to_vec());
     let Some((_, found)) = session.doc.project.effect(effect) else { panic!("effect gone") };
-    assert!(matches!(found.kind, EffectKind::ColorSelection { tolerance, .. } if tolerance == 0.2));
+    assert!(matches!(&found.kind, EffectKind::ColorSelection(selection) if selection.tolerance == 0.2));
 
     execute(&mut session, "edit.undo", &Value::Null).unwrap();
+
     assert_eq!(colors(&session, effect), vec![NO_PART]);
 }
 
@@ -118,13 +125,16 @@ fn the_colors_param_replaces_the_list_in_one_undo_step() {
 fn bad_colors_are_refused_and_change_nothing() {
     let mut session = session();
     let (_, effect) = masked_layer(&mut session, false);
-    let refused = [json!([]), json!([[0.5, 0.5]]), json!([[0.5, "x", 0.5]]), json!([[0.5, null, 0.5]]), json!("red")];
+    let refused = [json!([[0.5, 0.5]]), json!([[0.5, "x", 0.5]]), json!([[0.5, null, 0.5]]), json!("red")];
 
     for colors_param in &refused {
         assert!(execute(&mut session, "effect.set", &json!({"effect": effect.0, "colors": colors_param})).is_err(), "{colors_param}");
     }
+
     assert_eq!(colors(&session, effect), vec![NO_PART]);
+
     execute(&mut session, "effect.set", &json!({"effect": effect.0, "colors": [[1e300, 0.5, 0.5]]})).unwrap();
+
     assert_eq!(colors(&session, effect), vec![[1.0, 0.5, 0.5]], "out-of-range values clamp to 0..1");
 }
 
@@ -306,4 +316,114 @@ fn benchmark_color_selection_edits() {
             );
         }
     }
+}
+
+#[test]
+fn a_new_color_selection_selects_nothing_until_a_color_is_picked() {
+    let mut session = session();
+    execute(&mut session, "layer.add.fill", &json!({"color": [0.9, 0.1, 0.1]})).unwrap();
+    let added = execute(&mut session, "mask.add.colorSelection", &Value::Null).unwrap();
+    let effect = LayerId(added["effect"].as_u64().unwrap());
+
+    assert_eq!(colors(&session, effect), Vec::<[f32; 3]>::new());
+
+    execute(&mut session, "effect.set", &json!({"effect": effect.0, "colors": [[1.0, 0.0, 0.0]]})).unwrap();
+    execute(&mut session, "effect.set", &json!({"effect": effect.0, "colors": []})).unwrap();
+
+    assert_eq!(colors(&session, effect), Vec::<[f32; 3]>::new(), "the last color can be removed");
+}
+
+#[test]
+fn an_image_resource_can_be_the_id_map_without_a_mesh_map() {
+    let mut session = session();
+    let (layer, effect) = masked_layer(&mut session, false);
+    let image = session.import_resource_bytes("parts.png", id_map_png()).unwrap();
+    let pick = json!({"effect": effect.0, "uv": [0.75, 0.25]});
+    assert!(execute(&mut session, "effect.colorSelection.pick", &pick).is_err(), "no ID map yet");
+    assert!(execute(&mut session, "effect.set", &json!({"effect": effect.0, "idMap": "missing.png"})).is_err());
+
+    execute(&mut session, "effect.set", &json!({"effect": effect.0, "idMap": image})).unwrap();
+    execute(&mut session, "effect.colorSelection.pick", &pick).unwrap();
+    let [_, picked] = colors(&session, effect)[..] else { panic!("the pick adds one color to the first") };
+    assert_close(picked, stored(TOP_RIGHT_ID));
+    let (width, height) = session.caches[0].size;
+    let top_right = ((width as f32 * 0.75) as u32, (height as f32 * 0.25) as u32);
+    let bottom = ((width as f32 * 0.25) as u32, (height as f32 * 0.75) as u32);
+    assert_eq!(session.mask_at(layer, &[top_right, bottom]).unwrap(), vec![1.0, 0.0]);
+    assert_eq!(execute(&mut session, "project.inspect", &Value::Null).unwrap().to_string().matches(&format!("\"idMap\":\"{image}\"")).count(), 1);
+
+    execute(&mut session, "effect.set", &json!({"effect": effect.0, "idMap": null})).unwrap();
+
+    assert_eq!(session.mask_at(layer, &[top_right]).unwrap(), vec![0.0], "back on the missing mesh map");
+}
+
+#[test]
+fn output_hardness_and_background_shape_the_mask_in_one_undo_step_each() {
+    let mut session = session();
+    let (layer, effect) = masked_layer(&mut session, true);
+    execute(&mut session, "effect.set", &json!({"effect": effect.0, "colors": [stored(TOP_LEFT_ID)]})).unwrap();
+    let (width, height) = session.caches[0].size;
+    let texels = [((width as f32 * 0.25) as u32, (height as f32 * 0.25) as u32), ((width as f32 * 0.25) as u32, (height as f32 * 0.75) as u32)];
+    assert_eq!(session.mask_at(layer, &texels).unwrap(), vec![1.0, 0.0], "selected part, background");
+
+    execute(&mut session, "effect.set", &json!({"effect": effect.0, "output": 0.5, "background": "white"})).unwrap();
+
+    assert_eq!(session.mask_at(layer, &texels).unwrap(), vec![0.5, 1.0]);
+
+    execute(&mut session, "effect.set", &json!({"effect": effect.0, "background": "gray"})).unwrap();
+
+    assert_eq!(session.mask_at(layer, &texels).unwrap(), vec![0.5, 0.5]);
+
+    execute(&mut session, "edit.undo", &Value::Null).unwrap();
+
+    assert_eq!(session.mask_at(layer, &texels).unwrap(), vec![0.5, 1.0], "one undo step");
+
+    // A transparent background leaves the mask below it: the black mask background here
+    execute(&mut session, "effect.set", &json!({"effect": effect.0, "output": 1.0, "background": "transparent"})).unwrap();
+
+    assert_eq!(session.mask_at(layer, &texels).unwrap(), vec![1.0, 0.0]);
+
+    // The bottom part is far from the picked color: a soft edge reaches it only when wide enough
+    execute(&mut session, "effect.set", &json!({"effect": effect.0, "background": "black", "tolerance": 0.0, "hardness": 0.0})).unwrap();
+    let soft = session.mask_at(layer, &texels).unwrap();
+
+    assert_eq!(soft[0], 1.0);
+
+    let far = (200.0f32 - 10.0) / 255.0;
+    assert!((soft[1] - (1.0 - far)).abs() < 1e-2, "{soft:?}");
+    assert!(execute(&mut session, "effect.set", &json!({"effect": effect.0, "background": "purple"})).is_err());
+
+    let inspected = execute(&mut session, "project.inspect", &Value::Null).unwrap().to_string();
+    for key in ["\"output\":1.0", "\"hardness\":0.0", "\"background\":\"black\""] {
+        assert!(inspected.contains(key), "{key} in {inspected}");
+    }
+}
+
+#[test]
+fn the_id_mask_view_shows_the_chosen_image_where_the_mask_reads_it() {
+    let mut session = session();
+    let (_, effect) = masked_layer(&mut session, false);
+    assert!(session.id_mask_view_rgba(effect, 16).is_none(), "the ID mesh map is no image");
+
+    let image = session.import_resource_bytes("parts.png", id_map_png()).unwrap();
+    execute(&mut session, "effect.set", &json!({"effect": effect.0, "idMap": image})).unwrap();
+
+    assert_eq!(session.id_mask_image(effect).map(|(texture_set, _)| texture_set), Some(0));
+
+    let rgba = session.id_mask_view_rgba(effect, 16).unwrap();
+
+    assert_eq!(rgba.len(), 16 * 16 * 4);
+
+    let pixel = |x: usize, y: usize| -> [u8; 3] {
+        let start = (y * 16 + x) * 4;
+        [rgba[start], rgba[start + 1], rgba[start + 2]]
+    };
+    assert_eq!(pixel(1, 1), TOP_LEFT_ID);
+    assert_eq!(pixel(14, 1), TOP_RIGHT_ID);
+    assert_eq!(pixel(8, 14), BOTTOM_ID);
+
+    // Each view pixel shows the color a pick at the same UV adds
+    let picked = execute(&mut session, "effect.colorSelection.pick", &json!({"effect": effect.0, "uv": [14.5 / 16.0, 1.5 / 16.0]})).unwrap();
+    let picked: Vec<f32> = serde_json::from_value(picked["color"].clone()).unwrap();
+    assert_close([picked[0], picked[1], picked[2]], stored(pixel(14, 1)));
 }

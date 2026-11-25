@@ -82,6 +82,7 @@ fn paste(session: &mut Session, params: &Value) -> Result<Value> {
         Some(only) if only != content && asked => {
             return Err(bad(CMD, format!("{} effects go on the {}", effect.kind.name(), if only { "layer content" } else { "mask" })));
         }
+
         Some(only) => only,
         None => content,
     };
@@ -126,7 +127,7 @@ fn paste(session: &mut Session, params: &Value) -> Result<Value> {
 
         // The target belongs to the active set's selection: a paste into another set leaves it
         if let Some((layer_set, _, _)) = session.doc.project.locate(layer) {
-            session.selected.insert(layer_set, layer);
+            session.select_one(layer_set, layer);
             if layer_set == session.ts() {
                 session.target = StackTarget::Effect(pasted);
             }

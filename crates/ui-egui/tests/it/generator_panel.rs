@@ -4,7 +4,7 @@ use egui::Role;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use serde_json::json;
-use texturecraft_engine::core::{BakedMap, EffectKind, Generator, GeneratorKind, LayerId, Source};
+use texturecraft_engine::core::{BakedMap, EffectKind, Generator, GeneratorKind, LayerId, MicroDetail, Source};
 use texturecraft_engine::{ViewMode, execute};
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::docking::Panel;
@@ -68,11 +68,17 @@ fn restore_defaults_puts_the_generator_back_to_its_kind_defaults() {
     let (mut harness, effect) = harness(false);
     let edits = json!({"effect": effect.0, "level": 0.9, "blur": 0.5, "balance": 0.2, "resolutionFactor": -2, "seed": 99});
     execute(&mut harness.state_mut().session, "effect.set", &edits).unwrap();
+    if let EffectKind::Generator(generator) = &mut harness.state_mut().session.doc.project.effect_mut(effect).unwrap().kind {
+        generator.micro = Some(MicroDetail { anchor: LayerId(999), amount: 0.8 });
+    }
+
     harness.run_steps(3);
     harness.get_by_label("Restore defaults").scroll_to_me();
     harness.run_steps(2);
+
     harness.get_by_label("Restore defaults").click();
     harness.run_steps(3);
+
     assert_eq!(generator(&harness, effect), Generator::new(GeneratorKind::Curvature));
 }
 

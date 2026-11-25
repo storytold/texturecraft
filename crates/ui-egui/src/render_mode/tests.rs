@@ -30,7 +30,7 @@ fn height_strength_changes_restart_the_gpu_scene_without_displacement() {
     assert_ne!(gpu_scene_key(&session), before, "the GPU shader must receive the new bump strength");
 }
 
-/// Keeping an imported image alive prevents its cached identity from being reused for another image.
+/// A cached environment identifies its source without retaining deleted pixels.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn environment_cache_retains_source_identity_until_replaced() {
@@ -41,25 +41,43 @@ fn environment_cache_retains_source_identity_until_replaced() {
     let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut app = egui_kittest::Harness::builder().build_eframe(|context| crate::TextureCraftApp::new(context, session())).into_state();
     app.session.doc.project.display.environment = "resource:environment".into();
-    let source = Arc::new(ImageRes { width: 2, height: 1, rgba: vec![[1.0, 0.0, 0.0, 1.0]; 2], srgb: false });
+    let source = Arc::new(ImageRes::new(2, 1, vec![[1.0, 0.0, 0.0, 1.0]; 2], false));
     let original_source = Arc::downgrade(&source);
     app.session.images.insert("environment".into(), source);
+    let first_key = gpu_scene_key(&app.session);
     let first = super::trace_scene(&app).env;
+
     assert!(Arc::ptr_eq(&first, &super::trace_scene(&app).env), "unchanged images reuse the decoded environment");
 
-    let replacement = Arc::new(ImageRes { width: 2, height: 1, rgba: vec![[0.0, 1.0, 0.0, 1.0]; 2], srgb: false });
+    let replacement = Arc::new(ImageRes::new(2, 1, vec![[0.0, 1.0, 0.0, 1.0]; 2], false));
     app.session.images.insert("environment".into(), replacement.clone());
 
-    assert!(original_source.upgrade().is_some(), "the cache must retain its source so its address cannot be reused");
+    assert!(original_source.upgrade().is_none(), "replacing the resource releases its decoded pixels immediately");
+    assert_ne!(first_key, gpu_scene_key(&app.session), "a new source restarts tracing under the same environment name");
+
     let second = super::trace_scene(&app).env;
     assert!(!Arc::ptr_eq(&first, &second));
     assert_ne!(first.data, second.data, "replacing the image changes the lighting");
     assert!(Arc::ptr_eq(&second, &super::trace_scene(&app).env));
-    assert!(original_source.upgrade().is_none(), "replacing the cache releases the previous source");
 
     app.session.images.insert("renamed".into(), replacement);
     app.session.doc.project.display.environment = "resource:renamed".into();
+
     assert!(!Arc::ptr_eq(&second, &super::trace_scene(&app).env), "the environment name is also part of the key");
+}
+
+/// The display background is drawn into the render, so a new color starts it over.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_new_display_background_restarts_the_render() {
+    let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut app = egui_kittest::Harness::builder().build_eframe(|context| crate::TextureCraftApp::new(context, session())).into_state();
+    let before = super::key(&app, "scene", (64, 64));
+    assert_eq!(super::key(&app, "scene", (64, 64)), before);
+
+    app.ui.prefs.background[0] = [0.9, 0.1, 0.1];
+
+    assert_ne!(super::key(&app, "scene", (64, 64)), before);
 }
 
 /// Create one harness device, skipping unavailable or non-compute backends.
@@ -340,10 +358,4 @@ fn loading_textures_are_taken_in_at_a_limited_rate() {
     assert!(!take_in_textures(true, 1.0 + LOADING_RESTART_S * 0.5, 1.0));
     assert!(take_in_textures(true, 1.0 + LOADING_RESTART_S, 1.0));
     assert!(take_in_textures(true, 0.0, f64::MIN), "the first frame always");
-}
-
-/// The placeholder appears only before the first image has been traced.
-#[test]
-fn nothing_traced_yet_shows_the_placeholder() {
-    assert!(!show_image(false, 0));
 }

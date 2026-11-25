@@ -15,7 +15,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add text",
             [],
             None,
-            "{text (lines split at \\n), font?: family (text.fonts; default a common sans-serif), style?: e.g. Bold (default Regular), size?: 8..1024 texels per em (default 256), color?: [r,g,b] linear or \"#rrggbb\" (default white), name?} — draws the text as an image resource with an alpha (white for tool.brush {alpha: {image}}, colored for layer.add.decal)",
+            "{text (lines split at \\n), font?: family (text.fonts; default a common sans-serif), style?: e.g. Bold (default Regular), size?: 8..1024 texels per em (default 256), color?: [r,g,b] linear or \"#rrggbb\" sRGB (default white), name?} — draws the text as an image resource with an alpha (white for tool.brush {alpha: {image}}, colored for layer.add.decal)",
             always,
             add_text
         ),

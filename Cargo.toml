@@ -8,11 +8,9 @@ default-members = ["crates/core", "crates/texel", "crates/geom", "crates/compose
 version = "0.6.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.95"
-repository = "https://github.com/storytold/texturecraft"
 
 [workspace.dependencies]
-craft-usd = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "f7655fb3ea59d6b21681700c0ff880823f5bb709" }
+craft-usd = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "3dff4793f1a5bd1f99a4fe3280d48f515158dff3" }
 # internal
 texturecraft-core = { path = "crates/core" }
 texturecraft-texel = { path = "crates/texel" }
@@ -28,6 +26,7 @@ texturecraft-ui-egui = { path = "crates/ui-egui" }
 
 # external
 thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["now", "wasmbind"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 glam = { version = "0.30", features = ["serde", "bytemuck"] }
@@ -42,6 +41,7 @@ skrifa = { version = "0.44", default-features = false, features = ["std"] }
 epaint_default_fonts = "0.37"
 log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "tiff", "exr", "hdr", "bmp", "webp"] }
+craft-image-codecs = { git = "https://github.com/storytold/craft-libs", rev = "3dff4793f1a5bd1f99a4fe3280d48f515158dff3" }
 half = "2"
 exr = { version = "1.73", default-features = false }
 eframe = { version = "0.37", default-features = false }
@@ -51,10 +51,8 @@ rfd = "0.17"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names", "KHR_materials_emissive_strength"] }
 flate2 = "1"
-lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 quick-xml = "0.41"
 mikktspace = { version = "0.3", default-features = false, features = ["glam"] }
-proptest = "1"
 rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "net", "io-util", "time"] }
 schemars = "1"
@@ -70,9 +68,11 @@ craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0
 craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585", features = ["serde"] }
 craft-materialx = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585" }
 craft-tcraft = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
+# Isolated aligned writer; existing archive readers retain their pin and behavior.
+craft-zip-usdz = { package = "craft-zip", git = "https://github.com/storytold/craft-libs", rev = "5631e99fe126cffb74c673eb458db04299f2bb9b" }
 craft-zip = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
-craft-mesh = { git = "https://github.com/storytold/craft-libs", rev = "b952ca0231867c8ad6749ac44cab5fc903c3ad52", default-features = false, features = ["stl", "ply", "fbx", "obj"] }
-craft-mcmat = { git = "https://github.com/storytold/craft-libs", rev = "c376774f15ae7cd3b06a7ac664f01a8645af4b83" }
+craft-mesh = { git = "https://github.com/storytold/craft-libs", rev = "a20dfd1623709b0bd9830106d3a92a1a443902e3", default-features = false, features = ["stl", "ply", "fbx", "obj", "gltf", "dae", "abc"] }
+craft-mcmat = { git = "https://github.com/storytold/craft-libs", rev = "7a7a18cb40ac4cd5fca29c0dc224ac5178d40a89" }
 # Who draws the window frame, and the app-drawn strip as the title bar (crates/ui-egui/src/titlebar.rs).
 craft-window = { git = "https://github.com/storytold/craft-libs", rev = "390fe98b0dd3fb84db7c3af7cbd958db4e8cc585", features = ["egui"] }
 # Release checks, the update prompt and the update helper (crates/ui-egui/src/updates_ui.rs).

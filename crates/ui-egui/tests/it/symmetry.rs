@@ -19,13 +19,15 @@ const AXIS_PROBE: f32 = 0.05;
 const ON_THE_SHAFT: f32 = 40.0;
 const DRAG_DISTANCE: f32 = 60.0;
 
+/// Window wide enough that the top bar shows every paint control, Symmetry's included, with Properties at its least width
+const WINDOW_SIZE: egui::Vec2 = egui::vec2(1760.0, 960.0);
+
 /// A point inside the 3D view near its lower left corner, clear of the mesh and the popup (points from the corner)
 const VIEW_CORNER_INSET: f32 = 40.0;
 
 fn app_harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(1024, 256).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder().with_size(WINDOW_SIZE).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().session.tool.tool = Tool::Paint;
     harness.run_steps(4);
     harness
@@ -316,4 +318,83 @@ fn ctrl_drag_on_a_symmetry_handle_only_adjusts_the_brush() {
     assert_ne!(after.angle, before.angle);
     assert_eq!(after.symmetry, before.symmetry, "adjusting the brush must not also move symmetry");
     assert_eq!(harness.state().session.history_labels(), history);
+}
+
+/// A point in the 3D view that lies on the model, with the surface point there (the pointer is not at the mesh's center so the picked offset is non-trivial)
+fn point_on_model(harness: &Harness<'_, TextureCraftApp>) -> (Pos2, Vec3) {
+    let rect = harness.state().viewport_rect;
+    let viewport = harness.state().session.viewport;
+    let center = rect.center();
+    for step in 0..40 {
+        let at = center + egui::vec2(step as f32 * 7.0 - 100.0, step as f32 * 3.0 - 40.0);
+        let local = texturecraft_engine::geom::glam::Vec2::new(at.x - rect.left(), at.y - rect.top());
+        if let Some(hit) = harness.state().session.pick(local, viewport) {
+            return (at, hit.pos);
+        }
+    }
+    panic!("no model under the view");
+}
+
+fn model_center(harness: &Harness<'_, TextureCraftApp>) -> Vec3 {
+    let (lo, hi) = harness.state().session.mesh.bounds();
+    (lo + hi) * 0.5
+}
+
+#[test]
+fn the_center_button_puts_one_plane_back_in_the_middle_of_the_model() {
+    let mut harness = app_harness();
+    harness.state_mut().run("tool.brush", json!({"symmetryX": true, "symmetryY": true, "symmetryOffset": [0.1, 0.2, 0.0]})).unwrap();
+    harness.get_by_label("Symmetry settings").click();
+    harness.run_steps(2);
+    let history = harness.state().session.history_labels();
+
+    harness.get_by_label("Center Y").click();
+    harness.run_steps(2);
+
+    assert_eq!(harness.state().session.tool.brush.symmetry.offset, [0.1, 0.0, 0.0], "only the Y plane moved to the middle");
+    harness.get_by_label("Center X").click();
+    harness.run_steps(2);
+    assert_eq!(harness.state().session.tool.brush.symmetry.offset, [0.0; 3]);
+    assert_eq!(harness.state().session.history_labels(), history);
+}
+
+#[test]
+fn pick_point_puts_the_planes_through_the_clicked_point_without_painting() {
+    let mut harness = app_harness();
+    harness.state_mut().run("tool.brush", json!({"symmetryX": true, "symmetryY": true})).unwrap();
+    harness.get_by_label("Symmetry settings").click();
+    harness.run_steps(2);
+    let history = harness.state().session.history_labels();
+    harness.get_by_label("Pick point").click();
+    harness.run_steps(2);
+    assert!(harness.state().picking_symmetry_plane);
+
+    let (at, hit) = point_on_model(&harness);
+    click_at(&mut harness, at);
+
+    let center = model_center(&harness);
+    let offset = harness.state().session.tool.brush.symmetry.offset;
+    assert_eq!(offset[0], hit.x - center.x, "the X plane passes through the clicked point");
+    assert_eq!(offset[1], hit.y - center.y, "the Y plane passes through the clicked point");
+    assert_eq!(offset[2], 0.0, "Z has no plane, so it stays");
+    assert!(!harness.state().picking_symmetry_plane, "one click ends picking");
+    assert_eq!(harness.state().session.history_labels(), history, "the click paints nothing");
+    assert!(!harness.state().session.stroke_active());
+}
+
+#[test]
+fn escape_cancels_picking_the_symmetry_point() {
+    let mut harness = app_harness();
+    harness.state_mut().run("tool.brush", json!({"symmetryX": true})).unwrap();
+    harness.get_by_label("Symmetry settings").click();
+    harness.run_steps(2);
+    harness.get_by_label("Pick point").click();
+    harness.run_steps(2);
+    assert!(harness.state().picking_symmetry_plane);
+
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
+
+    assert!(!harness.state().picking_symmetry_plane);
+    assert_eq!(harness.state().session.tool.brush.symmetry.offset, [0.0; 3]);
 }

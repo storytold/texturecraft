@@ -55,21 +55,12 @@ pub(crate) fn read(bytes: &[u8]) -> Result<RawMesh> {
     if has_colors {
         raw.colors = Some(vertex_colors);
     }
-    raw.groups.push(("Default".into(), String::new(), (0..raw.positions.len() as u32).collect()));
+    let vertex_count = raw.positions.len() as u32;
+    raw.group("Default", "").extend(0..vertex_count);
     Ok(raw)
 }
 
 /// STL stores three positions per facet; retain the app's established triangle capacity.
 fn stl_limits() -> craft_mesh::Limits {
     craft_mesh::Limits { max_vertices: MAX_VERTICES, ..craft_mesh::Limits::default() }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn shared_reader_accepts_the_app_vertex_limit() {
-        let limits = super::stl_limits();
-        assert_eq!(limits.max_vertices, super::MAX_VERTICES);
-        assert_eq!(limits.max_triangles, texturecraft_geom::MAX_TRIANGLES);
-    }
 }

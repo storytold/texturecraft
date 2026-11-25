@@ -6,6 +6,7 @@ use texturecraft_engine::paint::{FULL_TURN_DEGREES, MAX_RADIAL_COPIES, Symmetry}
 use super::{DEFAULT_RADIAL_COUNT, movable_axes};
 use crate::TextureCraftApp;
 use crate::i18n::tr;
+use crate::theme::AXIS_NAMES;
 use crate::widgets::{color_swatch, section, slider};
 
 /// The popup's width (points)
@@ -13,8 +14,6 @@ const POPUP_WIDTH: f32 = 340.0;
 
 /// Width of the radial Axis row's label column
 const LABEL_WIDTH: f32 = 64.0;
-
-const AXIS_NAMES: [&str; 3] = ["X", "Y", "Z"];
 
 /// Space between the mirror section and the radial toggle
 const SECTIONS_GAP: f32 = 4.0;
@@ -29,7 +28,7 @@ const PREVIEW_SIZE: f32 = 96.0;
 /// The popup's content, applying brush changes through the engine and display preferences in place
 pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     ui.set_width(POPUP_WIDTH);
-    let (minimum, maximum) = app.session.mesh.bounds();
+    let (minimum, maximum) = app.viewport_mesh_bounds.get(&app.session.mesh);
     let half_extent = (maximum - minimum) * 0.5;
     let display = &mut app.ui.symmetry;
     let mut edited = app.session.tool.brush.symmetry;
@@ -79,6 +78,23 @@ pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     section(ui, "symmetry_axis_position", tr("Axis position"), true, |ui| {
         for (axis, name) in AXIS_NAMES.into_iter().enumerate() {
             ui.add_enabled_ui(movable[axis], |ui| slider(ui, name, &mut symmetry.offset[axis], -half_extent[axis]..=half_extent[axis], 2));
+        }
+
+        // One button per axis: the plane goes back to the middle of the model
+        ui.horizontal(|ui| {
+            let cell = vec2(ui.available_width() / AXIS_NAMES.len() as f32, ui.spacing().interact_size.y);
+            for (axis, name) in AXIS_NAMES.into_iter().enumerate() {
+                ui.allocate_ui_with_layout(cell, Layout::left_to_right(Align::Center), |ui| {
+                    let label = format!("{} {name}", tr("Center"));
+                    if ui.add_enabled(movable[axis], egui::Button::new(label)).clicked() {
+                        symmetry.offset[axis] = 0.0;
+                    }
+                });
+            }
+        });
+        let picking = app.picking_symmetry_plane;
+        if ui.add_enabled(movable.contains(&true), egui::Button::new(tr("Pick point")).selected(picking)).clicked() {
+            app.picking_symmetry_plane = !picking;
         }
     });
 

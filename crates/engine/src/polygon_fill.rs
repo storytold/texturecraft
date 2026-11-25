@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 
+use texturecraft_compose::MaskGray;
 use texturecraft_geom::glam::Vec2;
 use texturecraft_geom::{Mesh, NO_TRI};
 use texturecraft_paint::{EyeDepth, fill_triangles, screen_point};
@@ -104,6 +105,10 @@ impl Session {
 
         drag.last_box = Some((low, high));
         let selected = self.box_selection(low, high);
+        let selected = match self.polygon_fill_drag.as_ref() {
+            Some(drag) => self.with_symmetry_copies(&drag.fill_groups, selected),
+            None => selected,
+        };
         self.show_box_fill(selected)
     }
 
@@ -178,15 +183,16 @@ impl Session {
         }
     }
 
-    /// Fill the fill-mode group holding `triangle` (one undo step)
+    /// Fill the fill-mode group holding `triangle` and its symmetry copies (one undo step)
     fn fill_group_of(&mut self, triangle: u32) -> Result<usize> {
         let ts = self.ts();
         let groups = self.fill_partition(self.fill_material()?);
         let triangles: BTreeSet<u32> = groups.group(triangle).unwrap_or_default().iter().copied().collect();
+        let triangles = self.with_symmetry_copies(&groups, triangles);
 
         let (gbuf, mut canvas) = self.fill_canvas(ts)?;
         fill_triangles(&mut canvas, &gbuf, &triangles);
-        self.commit_fill("Polygon fill", ts, &canvas)?;
+        self.commit_fill("Polygon fill", ts, &canvas, &MaskGray::Value(self.tool.mask_value))?;
         Ok(triangles.len())
     }
 
@@ -257,7 +263,7 @@ impl Session {
         } else {
             self.fill_canvas(ts).and_then(|(gbuf, mut canvas)| {
                 fill_triangles(&mut canvas, &gbuf, &selected);
-                self.paint_fill(ts, &canvas)
+                self.paint_fill(ts, &canvas, &MaskGray::Value(self.tool.mask_value))
             })
         };
         self.invalidate_changed(&previous);

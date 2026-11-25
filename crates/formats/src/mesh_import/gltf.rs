@@ -1,8 +1,7 @@
 //! glTF 2.0 / GLB: the default scene's node tree, flattened to world space.
 
-use gltf::accessor::{Accessor, DataType, Dimensions};
-use gltf::mesh::Mode;
-use gltf::{Node, Semantic};
+use std::collections::{HashMap, HashSet};
+
 use texturecraft_geom::glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 
 use super::{RawMesh, check_triangles, check_vertices};
@@ -20,87 +19,75 @@ pub(crate) fn read(bytes: &[u8]) -> Result<RawMesh> {
     crate::guard(KIND, || read_inner(bytes))
 }
 
-/// Loads and validates the document like `gltf::Gltf::from_slice`, except that a scene without a
-/// `nodes` array is an empty scene. The `gltf` crate declares the field as required, but the
-/// glTF 2.0 schema lists no required properties for a scene, and exporters write such scenes
-/// for scenes that contain no objects.
-fn parse(bytes: &[u8]) -> Result<(gltf::Document, Option<Vec<u8>>)> {
-    let (json, blob) = if bytes.starts_with(b"glTF") {
-        let mut glb = gltf::Glb::from_slice(bytes).map_err(|e| malformed(KIND, e))?;
-        let blob = glb.bin.take().map(std::borrow::Cow::into_owned);
-        (glb.json, blob)
-    } else {
-        (std::borrow::Cow::Borrowed(bytes), None)
-    };
-    let mut value: serde_json::Value = serde_json::from_slice(&json).map_err(|e| malformed(KIND, e))?;
-    if let Some(scenes) = value.get_mut("scenes").and_then(serde_json::Value::as_array_mut) {
-        for scene in scenes {
-            if let Some(scene) = scene.as_object_mut() {
-                scene.entry("nodes").or_insert_with(|| serde_json::Value::Array(Vec::new()));
-            }
-        }
+fn limits() -> craft_mesh::Limits {
+    craft_mesh::Limits {
+        max_vertices: super::MAX_VERTICES,
+        max_triangles: texturecraft_geom::MAX_TRIANGLES,
+        max_meshes: super::MAX_VERTICES,
+        max_parts: super::MAX_VERTICES,
+        max_materials: super::MAX_VERTICES,
+        max_depth: MAX_DEPTH,
+        max_nodes: MAX_NODE_VISITS,
+        max_data_bytes: super::MAX_MESH_FILE_BYTES as usize,
+        ..craft_mesh::Limits::default()
     }
-    // Consume the DOM directly rather than serialising it back to a second full-size buffer.
-    let root: gltf::json::Root = serde_json::from_value(value).map_err(|e| malformed(KIND, e))?;
-    let document = gltf::Document::from_json(root).map_err(|e| malformed(KIND, e))?;
-    Ok((document, blob))
+}
+
+fn convert_error(e: craft_mesh::Error) -> FormatError {
+    match e {
+        craft_mesh::Error::Missing(_) => FormatError::Unsupported(
+            "this glTF's buffers are in files that were not found next to it; keep its .bin files beside the .gltf, or use a .glb".into(),
+        ),
+        craft_mesh::Error::TooLarge(s) => FormatError::TooLarge(s),
+        craft_mesh::Error::Unsupported(s) => FormatError::Unsupported(s),
+        craft_mesh::Error::Malformed(s) => malformed(KIND, s),
+    }
 }
 
 fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
-    let (document, blob) = parse(bytes)?;
-    check_buffer_uris(&document)?;
-    let buffers = gltf::import_buffers(&document, None, blob).map_err(|e| match e {
-        gltf::Error::ExternalReferenceInSliceImport => FormatError::Unsupported(
-            "this glTF's buffers are in files that were not found next to it; keep its .bin files beside the .gltf, or use a .glb".into(),
-        ),
-        e => malformed(KIND, e),
-    })?;
-
-    let roots: Vec<Node> = match document.default_scene().or_else(|| document.scenes().next()) {
-        Some(scene) => scene.nodes().collect(),
-        None => {
-            // No scene: every node that is nobody's child.
-            let mut is_child = vec![false; document.nodes().len()];
-            for n in document.nodes() {
-                for c in n.children() {
-                    if let Some(f) = is_child.get_mut(c.index()) {
-                        *f = true;
-                    }
-                }
-            }
-            document.nodes().filter(|n| !is_child.get(n.index()).copied().unwrap_or(true)).collect()
-        }
-    };
-    let mut raw = RawMesh { normals: Some(Vec::new()), ..RawMesh::default() };
+    let scene = craft_mesh::gltf::read(bytes, &limits(), &mut craft_mesh::no_external).map_err(convert_error)?;
+    let mut raw = RawMesh { normals: Some(Vec::new()), warnings: scene.warnings.clone(), ..RawMesh::default() };
     let mut attrs = Attrs::default();
-    let mut stack: Vec<(Node, Mat4, usize)> = roots.into_iter().rev().map(|n| (n, Mat4::IDENTITY, 0)).collect();
+    let mut stack: Vec<(usize, Mat4, usize)> = scene.roots.iter().rev().map(|&r| (r, Mat4::IDENTITY, 0)).collect();
     let mut visits = 0usize;
-    while let Some((node, parent, depth)) = stack.pop() {
+    while let Some((index, parent, depth)) = stack.pop() {
         visits += 1;
         if visits > MAX_NODE_VISITS {
             return Err(FormatError::TooLarge(format!("the glTF scene has more than {MAX_NODE_VISITS} node instances")));
         }
-        let m = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
-        if let Some(cam) = node.camera()
+        let Some(node) = scene.nodes.get(index) else {
+            return Err(malformed(KIND, format!("node {index} does not exist")));
+        };
+        let m = parent * Mat4::from_cols_array(&node.transform.map(|v| v as f32));
+        if let Some(cam_idx) = node.camera
+            && let Some(cam) = scene.cameras.get(cam_idx)
             && raw.cameras.len() < super::MAX_CAMERAS
         {
-            let (fov, ortho_half_height) = match cam.projection() {
-                gltf::camera::Projection::Perspective(p) => (p.yfov().to_degrees(), None),
-                gltf::camera::Projection::Orthographic(o) => (40.0, Some(o.ymag())),
+            let (fov, ortho_half_height) = match cam.projection {
+                craft_mesh::Projection::Perspective { yfov, .. } => (yfov.to_degrees() as f32, None),
+                craft_mesh::Projection::Orthographic { ymag, .. } => (40.0, Some(ymag as f32)),
             };
-            let name = cam.name().or_else(|| node.name()).map_or_else(|| format!("Camera {}", raw.cameras.len() + 1), str::to_string);
+            let name = if !cam.name.is_empty() {
+                cam.name.clone()
+            } else if !node.name.is_empty() {
+                node.name.clone()
+            } else {
+                format!("Camera {}", raw.cameras.len() + 1)
+            };
             raw.cameras.push(super::RawCamera::placed(name, m, Vec3::NEG_Z, fov, ortho_half_height));
         }
-        if let Some(mesh) = node.mesh() {
-            let part = node.name().or_else(|| mesh.name()).unwrap_or_default();
-            for prim in mesh.primitives() {
-                add_primitive(&mut raw, &mut attrs, &prim, m, &buffers, part)?;
+        if let Some(mesh_idx) = node.mesh
+            && let Some(mesh) = scene.meshes.get(mesh_idx)
+        {
+            let part = if !node.name.is_empty() { node.name.as_str() } else { mesh.name.as_str() };
+            for p in &mesh.parts {
+                add_part(&mut raw, &mut attrs, &scene, mesh, p, m, part)?;
             }
         }
         if depth >= MAX_DEPTH {
             return Err(malformed(KIND, "the node hierarchy is nested too deeply (or cyclic)"));
         }
-        stack.extend(node.children().collect::<Vec<_>>().into_iter().rev().map(|c| (c, m, depth + 1)));
+        stack.extend(node.children.iter().rev().map(|&c| (c, m, depth + 1)));
     }
     match attrs.uv_seen {
         (_, false) => raw.uvs = Some(attrs.uvs),
@@ -120,193 +107,142 @@ struct Attrs {
     /// White where a primitive has no COLOR_0.
     colors: Vec<Vec4>,
     color_seen: bool,
+    seen_materials: HashSet<String>,
+    triangles: usize,
 }
 
-fn add_primitive(raw: &mut RawMesh, attrs: &mut Attrs, primitive: &gltf::Primitive, transform: Mat4, buffers: &[gltf::buffer::Data], part: &str) -> Result<()> {
-    if primitive.mode() != Mode::Triangles {
-        raw.warnings.push(format!("skipped a primitive drawn as {:?} (only triangles are supported)", primitive.mode()));
+fn add_part(
+    raw: &mut RawMesh,
+    attrs: &mut Attrs,
+    scene: &craft_mesh::Scene,
+    mesh: &craft_mesh::Mesh,
+    part: &craft_mesh::Part,
+    transform: Mat4,
+    part_name: &str,
+) -> Result<()> {
+    let tris = part.corners.as_chunks::<3>().0;
+    if tris.is_empty() {
         return Ok(());
     }
-
-    let Some(position_accessor) = primitive.get(&Semantic::Positions) else {
-        raw.warnings.push("skipped a primitive without positions".into());
-        return Ok(());
-    };
-
-    check_accessor(&position_accessor, buffers, Dimensions::Vec3, &[DataType::F32], "position")?;
-    let normal_accessor = primitive.get(&Semantic::Normals);
-    if let Some(a) = &normal_accessor {
-        check_accessor(a, buffers, Dimensions::Vec3, &[DataType::F32], "normal")?;
-    }
-    let texcoord_accessor = primitive.get(&Semantic::TexCoords(0));
-    if let Some(a) = &texcoord_accessor {
-        check_accessor(a, buffers, Dimensions::Vec2, &[DataType::F32, DataType::U8, DataType::U16], "texcoord")?;
-    }
-    let color_accessor = primitive.get(&Semantic::Colors(0));
-    if let Some(a) = &color_accessor {
-        let dims = if a.dimensions() == Dimensions::Vec3 { Dimensions::Vec3 } else { Dimensions::Vec4 };
-        check_accessor(a, buffers, dims, &[DataType::F32, DataType::U8, DataType::U16], "color")?;
-    }
-    if let Some(a) = primitive.indices() {
-        check_accessor(&a, buffers, Dimensions::Scalar, &[DataType::U8, DataType::U16, DataType::U32], "index")?;
-    }
-
-    let reader = primitive.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
-    let positions: Vec<Vec3> = reader.read_positions().ok_or_else(|| malformed(KIND, "unreadable positions"))?.map(Vec3::from).collect();
-    let n = positions.len();
-    check_vertices(raw.positions.len().saturating_add(n))?;
-    let mut indices: Vec<u32> = match reader.read_indices() {
-        Some(i) => i.into_u32().collect(),
-        None => (0..n as u32).collect(),
-    };
-    indices.truncate(indices.len() / 3 * 3);
-    if let Some(bad) = indices.iter().find(|i| **i as usize >= n) {
-        return Err(malformed(KIND, format!("index {bad} out of range ({n} vertices)")));
-    }
-
-    check_triangles(raw.triangle_count(), indices.len() / 3)?;
-    let normals: Option<Vec<Vec3>> = normal_accessor.and_then(|_| reader.read_normals()).map(|it| it.map(Vec3::from).collect());
-    let texcoords: Option<Vec<Vec2>> = texcoord_accessor.and_then(|_| reader.read_tex_coords(0)).map(|t| t.into_f32().map(Vec2::from).collect());
-    let colors: Option<Vec<Vec4>> =
-        color_accessor.and_then(|_| reader.read_colors(0)).map(|c| c.into_rgba_f32().map(Vec4::from).collect()).filter(|c: &Vec<Vec4>| c.len() == n);
-    attrs.color_seen |= colors.is_some();
-    let color_of = |i: usize| colors.as_ref().and_then(|c| c.get(i)).copied().unwrap_or(Vec4::ONE);
+    check_triangles(attrs.triangles, tris.len())?;
+    attrs.triangles += tris.len();
 
     let linear_transform = Mat3::from_mat4(transform);
     let normal_transform = linear_transform.inverse().transpose();
     let flip = linear_transform.determinant() < 0.0;
-    let world: Vec<Vec3> = positions.iter().map(|p| transform.transform_point3(*p)).collect();
-    let name = match primitive.material().index() {
+
+    let mat_name = match part.material {
         None => "Default".to_string(),
-        Some(i) => primitive.material().name().map(str::to_string).unwrap_or_else(|| format!("Material_{i}")),
+        Some(i) => scene.materials.get(i).filter(|m| !m.name.is_empty()).map(|m| m.name.clone()).unwrap_or_else(|| format!("Material_{i}")),
     };
-    if !raw.base_colors.iter().any(|c| c.material == name) {
-        base_color(raw, &primitive.material(), &name, buffers);
-    }
-    let base = raw.positions.len() as u32;
-    let has_texcoords = texcoords.as_ref().is_some_and(|t| t.len() == n);
-    if has_texcoords {
-        attrs.uv_seen.0 = true
-    } else {
-        attrs.uv_seen.1 = true
+    if let Some(i) = part.material
+        && attrs.seen_materials.insert(mat_name.clone())
+        && let Some(mat) = scene.materials.get(i)
+    {
+        base_color(raw, scene, mat, &mat_name);
     }
 
-    let uv_of = |i: usize| texcoords.as_ref().and_then(|t| t.get(i)).copied().unwrap_or_default();
+    let uv_set = mesh.uv_sets.first();
+    let has_uvs = part.corners.iter().all(|c| c.uv != craft_mesh::NONE && uv_set.is_some_and(|s| (c.uv as usize) < s.len()));
+    if has_uvs {
+        attrs.uv_seen.0 = true;
+    } else {
+        attrs.uv_seen.1 = true;
+    }
+
+    let has_normals = part.corners.iter().all(|c| c.normal != craft_mesh::NONE && (c.normal as usize) < mesh.normals.len());
+    let has_colors = !mesh.colors.is_empty();
+    attrs.color_seen |= has_colors;
+
+    let pos_of = |i: u32| -> Vec3 {
+        let p = mesh.positions.get(i as usize).copied().unwrap_or_default();
+        transform.transform_point3(Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32))
+    };
+    let uv_of = |i: u32| -> Vec2 {
+        if i == craft_mesh::NONE { Vec2::ZERO } else { uv_set.and_then(|s| s.get(i as usize)).copied().map(Vec2::from).unwrap_or_default() }
+    };
+    let color_of = |i: u32| -> Vec4 { if has_colors { mesh.colors.get(i as usize).copied().map(Vec4::from).unwrap_or(Vec4::ONE) } else { Vec4::ONE } };
+
     let raw_normals = raw.normals.get_or_insert_with(Vec::new);
-    match normals.filter(|v| v.len() == n) {
-        Some(nrm) => {
-            raw.positions.extend_from_slice(&world);
-            raw_normals.extend(nrm.iter().map(|v| (normal_transform * *v).try_normalize().unwrap_or(Vec3::Y)));
-            attrs.uvs.extend((0..n).map(uv_of));
-            attrs.colors.extend((0..n).map(color_of));
-            let group = raw.group(&name, part);
-            for t in indices.as_chunks::<3>().0 {
-                let (a, b, c) = (t[0] + base, t[1] + base, t[2] + base);
-                group.extend_from_slice(&if flip { [a, c, b] } else { [a, b, c] });
+    if has_normals {
+        let mut remap: HashMap<(u32, u32, u32), u32> = HashMap::new();
+        let mut out_tris = Vec::with_capacity(part.corners.len());
+        for t in tris {
+            let order = if flip { [t[0], t[2], t[1]] } else { [t[0], t[1], t[2]] };
+            for c in order {
+                let id = match remap.entry((c.position, c.normal, c.uv)) {
+                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let id = raw.positions.len();
+                        check_vertices(id + 1)?;
+                        let n = mesh.normals.get(c.normal as usize).copied().unwrap_or([0.0, 1.0, 0.0]);
+                        let n = (normal_transform * Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32)).try_normalize().unwrap_or(Vec3::Y);
+                        raw.positions.push(pos_of(c.position));
+                        raw_normals.push(n);
+                        attrs.uvs.push(uv_of(c.uv));
+                        attrs.colors.push(color_of(c.position));
+                        *e.insert(id as u32)
+                    }
+                };
+                out_tris.push(id);
             }
         }
-        None => {
-            // glTF: flat normals when none are given, so every triangle gets its own corners
-            let mut triangles = Vec::with_capacity(indices.len());
-            for t in indices.as_chunks::<3>().0 {
-                let order = if flip { [t[0], t[2], t[1]] } else { [t[0], t[1], t[2]] };
-                let p = order.map(|i| world.get(i as usize).copied().unwrap_or_default());
-                let face = (p[1] - p[0]).cross(p[2] - p[0]).try_normalize().unwrap_or(Vec3::Y);
-                for (k, i) in order.iter().enumerate() {
-                    triangles.push(raw.positions.len() as u32);
-                    raw.positions.push(p[k]);
-                    raw_normals.push(face);
-                    attrs.uvs.push(uv_of(*i as usize));
-                    attrs.colors.push(color_of(*i as usize));
-                }
+        raw.group(&mat_name, part_name).extend_from_slice(&out_tris);
+    } else {
+        // glTF: flat normals when none are given, so every triangle gets its own corners
+        check_vertices(raw.positions.len().saturating_add(tris.len() * 3))?;
+        let mut out_tris = Vec::with_capacity(part.corners.len());
+        for t in tris {
+            let order = if flip { [t[0], t[2], t[1]] } else { [t[0], t[1], t[2]] };
+            let p = order.map(|c| pos_of(c.position));
+            let face = (p[1] - p[0]).cross(p[2] - p[0]).try_normalize().unwrap_or(Vec3::Y);
+            for (k, c) in order.iter().enumerate() {
+                out_tris.push(raw.positions.len() as u32);
+                raw.positions.push(p[k]);
+                raw_normals.push(face);
+                attrs.uvs.push(uv_of(c.uv));
+                attrs.colors.push(color_of(c.position));
             }
-            raw.group(&name, part).extend_from_slice(&triangles);
         }
+        raw.group(&mat_name, part_name).extend_from_slice(&out_tris);
     }
 
     Ok(())
 }
 
-/// Record `material`'s base color factor and embedded texture (GLB buffer view or data URI)
-/// unless it is plain white.
-fn base_color(raw: &mut RawMesh, material: &gltf::Material, name: &str, buffers: &[gltf::buffer::Data]) {
-    let pbr = material.pbr_metallic_roughness();
-    let factor = Vec4::from(pbr.base_color_factor());
-    let image = pbr.base_color_texture().and_then(|info| {
-        if info.tex_coord() != 0 {
-            raw.warnings.push(format!("the base color texture of {name} uses UV set {}; only the first is read", info.tex_coord()));
+/// Record `material`'s base color factor and embedded texture unless it is plain white.
+fn base_color(raw: &mut RawMesh, scene: &craft_mesh::Scene, material: &craft_mesh::Material, name: &str) {
+    let factor = Vec4::from(material.base_color);
+    let image = material.base_color_texture.and_then(|info| {
+        if info.uv_set != 0 {
+            raw.warnings.push(format!("the base color texture of {name} uses UV set {}; only the first is read", info.uv_set));
             return None;
         }
-        match info.texture().source().source() {
-            gltf::image::Source::View { view, .. } => {
-                let data = buffers.get(view.buffer().index())?;
-                data.0.get(view.offset()..view.offset().checked_add(view.length())?).map(<[u8]>::to_vec)
-            }
-            // Files next to the .gltf arrive as data URIs; anything else can't be read.
-            gltf::image::Source::Uri { uri, .. } if uri.starts_with("data:") => {
-                gltf::buffer::Data::from_source(gltf::buffer::Source::Uri(uri), None).ok().map(|d| d.0)
-            }
-            gltf::image::Source::Uri { .. } => None,
-        }
+        scene.images.get(info.image).and_then(|im| im.data.clone())
     });
     if image.is_some() || factor != Vec4::ONE {
         raw.base_colors.push(super::RawBaseColor { material: name.to_string(), factor, image });
     }
 }
 
-/// Reject accessors the `gltf` reader would panic on or read out of bounds.
-fn check_accessor(acc: &Accessor, buffers: &[gltf::buffer::Data], dims: Dimensions, types: &[DataType], what: &str) -> Result<()> {
-    let bad = |msg: &str| malformed(KIND, format!("{what} accessor {}: {msg}", acc.index()));
-    if acc.sparse().is_some() {
-        return Err(FormatError::Unsupported(format!("sparse glTF accessors ({what})")));
-    }
-    if acc.dimensions() != dims || !types.contains(&acc.data_type()) {
-        return Err(bad("unexpected element type"));
-    }
-    let view = acc.view().ok_or_else(|| bad("has no buffer view"))?;
-    let data_len = buffers.get(view.buffer().index()).map(|d| d.0.len()).ok_or_else(|| bad("buffer is missing"))?;
-    if view.offset().checked_add(view.length()).is_none_or(|end| end > data_len) {
-        return Err(bad("buffer view exceeds its buffer"));
-    }
-    let size = acc.size();
-    let stride = view.stride().unwrap_or(size);
-    let end = acc.count().checked_sub(1).and_then(|k| k.checked_mul(stride)).and_then(|x| x.checked_add(acc.offset())).and_then(|x| x.checked_add(size));
-    if stride < size || end.is_none_or(|e| e > view.length()) {
-        return Err(bad("data exceeds its buffer view"));
-    }
-    Ok(())
-}
-
-/// Check buffer URIs before `gltf` resolves them: percent-decoding must give UTF-8 (`gltf`
-/// panics otherwise).
-fn check_buffer_uris(doc: &gltf::Document) -> Result<()> {
-    for buf in doc.buffers() {
-        if let gltf::buffer::Source::Uri(uri) = buf.source()
-            && !uri.contains(':')
-            && percent_decode(uri).is_none()
-        {
-            return Err(malformed(KIND, format!("buffer URI \"{uri}\" is not valid UTF-8")));
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn percent_decode(s: &str) -> Option<String> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        let hex = |k: usize| b.get(k).and_then(|h| (*h as char).to_digit(16));
-        match (c, hex(i + 1), hex(i + 2)) {
-            (b'%', Some(h), Some(l)) => {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
+    craft_mesh::gltf::uri_decode_strict(s)
+}
+
+#[cfg(test)]
+mod uri_decode_tests {
+    use super::percent_decode;
+
+    #[test]
+    fn strict_shared_uri_decoder_preserves_reference_policy() {
+        assert_eq!(percent_decode("texture%20é%2B.png"), Some("texture é+.png".into()));
+        assert_eq!(percent_decode("a+b%GG%2"), Some("a+b%GG%2".into()));
+        assert_eq!(percent_decode("%252e%252e"), Some("%2e%2e".into()));
+        // Decoding does not replace the external-reference confinement checks.
+        assert_eq!(percent_decode("%2e%2e%2fsecret"), Some("../secret".into()));
+        assert_eq!(percent_decode("%00"), Some("\0".into()));
+        for uri in ["%FF", "%C0%AF", "%ED%A0%80", "%E2%82"] {
+            assert_eq!(percent_decode(uri), None, "{uri}");
         }
     }
-    String::from_utf8(out).ok()
 }

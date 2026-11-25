@@ -3,7 +3,7 @@
 //! maps from images and fill projection transforms, through engine commands.
 
 use serde_json::{Value, json};
-use texturecraft_engine::core::{Channel, EffectKind, Filter, LayerId, LayerKind, Projection};
+use texturecraft_engine::core::{Channel, Decal, EffectKind, Filter, LayerId, LayerKind, Projection, Projector, Source};
 use texturecraft_engine::geom::NO_TRI;
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_engine::geom::primitives;
@@ -59,11 +59,10 @@ fn filter_library_adds_every_filter_and_edits_its_parameters() {
         "gradientMap",
         "posterize",
         "clamp",
-        "slopeBlur",
+        "blurSlope",
         "matFinishGrind",
         "highPass",
         "edgeDetect",
-        "warpDirectional",
         "grayscale",
         "normalInvert",
         "bevel",
@@ -80,38 +79,51 @@ fn filter_library_adds_every_filter_and_edits_its_parameters() {
         let fid = f["id"].as_str().unwrap();
         let eid = id(execute(&mut s, "effect.add.filter", &json!({"layer": layer.0, "filter": fid, "target": "content"})).unwrap(), "effect");
         let (owner, e) = s.doc.project.effect(eid).unwrap();
+
         assert_eq!(owner, layer);
         assert_eq!(e.name, f["label"].as_str().unwrap(), "named after the shelf entry");
         assert!(s.doc.project.layer(layer).unwrap().content_effects.iter().any(|x| x.id == eid));
+
         execute(&mut s, "effect.remove", &json!({"effect": eid.0})).unwrap();
     }
-    // A gradient map recolors the content; effect.set edits it and inspect shows it.
-    let gm =
+
+    // A gradient map recolors the content; effect.set edits it and inspect shows it
+    let gradient_map =
         id(execute(&mut s, "effect.add.filter", &json!({"filter": "gradientMap", "target": "content", "colors": [[0, 0, 1], [0, 0, 1]]})).unwrap(), "effect");
     let blue = at(&mut s, Channel::BaseColor, 200.0, 200.0);
     assert!(blue[2] > 0.95 && blue[0] < 0.05, "{before:?} -> {blue:?}");
-    execute(&mut s, "effect.set", &json!({"effect": gm.0, "colors": ["#00ff00"]})).unwrap();
+
+    execute(&mut s, "effect.set", &json!({"effect": gradient_map.0, "colors": ["#00ff00"]})).unwrap();
+
     assert!(at(&mut s, Channel::BaseColor, 200.0, 200.0)[1] > 0.95);
-    assert!(execute(&mut s, "effect.set", &json!({"effect": gm.0, "colors": []})).is_err());
+    assert!(execute(&mut s, "effect.set", &json!({"effect": gradient_map.0, "colors": []})).is_err());
+
     let inspect = execute(&mut s, "project.inspect", &Value::Null).unwrap().to_string();
+
     assert!(inspect.contains("GradientMap"), "inspect shows filter parameters");
-    execute(&mut s, "effect.remove", &json!({"effect": gm.0})).unwrap();
-    // Posterize on the mask; its steps are clamped.
+
+    execute(&mut s, "effect.remove", &json!({"effect": gradient_map.0})).unwrap();
+
+    // Posterize on the mask; its steps are clamped
     let post = id(execute(&mut s, "effect.add.filter", &json!({"filter": "posterize", "levels": 3})).unwrap(), "effect");
     execute(&mut s, "effect.set", &json!({"effect": post.0, "levels": 500})).unwrap();
+
     assert!(s.doc.project.layer(layer).unwrap().mask.as_ref().is_some_and(|m| m.effects.iter().any(|e| e.id == post)));
-    assert!(matches!(s.doc.project.effect(post).unwrap().1.kind, EffectKind::Filter(Filter::Posterize { levels }) if levels == 64.0));
-    // Material finishes fill the content's roughness and height.
+    assert!(matches!(s.doc.project.effect(post).unwrap().1.kind, EffectKind::Filter(Filter::Posterize { levels, .. }) if levels == 64.0));
+
+    // Material finishes also write roughness and height
     let fin = id(execute(&mut s, "effect.add.filter", &json!({"filter": "MatFinish Hammered"})).unwrap(), "effect");
+
     assert!(s.doc.project.layer(layer).unwrap().content_effects.iter().any(|e| e.id == fin));
     assert!(matches!(&s.doc.project.effect(fin).unwrap().1.kind, EffectKind::Material(f) if f.sources.contains_key(&Channel::Height)));
     assert!(execute(&mut s, "effect.add.filter", &json!({"filter": "nope"})).is_err());
-    // A directional blur, slope blur and warp composite without trouble on a sphere.
+
+    // Exercise neighbourhood filters on curved geometry
     for (fid, extra) in [
         ("blurDirectional", json!({"radius": 40, "angle": 45})),
-        ("slopeBlur", json!({"radius": 30})),
-        ("warp", json!({"intensity": 50})),
-        ("warpDirectional", json!({"intensity": 50, "angle": 30})),
+        ("blurSlope", json!({"intensity": 0.5, "divider": 1})),
+        ("warp", json!({"intensity": 0.05})),
+        ("warp", json!({"warpMode": "directional", "intensity": 0.05, "angle": 30})),
         ("highPass", json!({"radius": 20})),
         ("edgeDetect", json!({"width": 4})),
         ("bevel", json!({"width": 20})),
@@ -122,6 +134,7 @@ fn filter_library_adds_every_filter_and_edits_its_parameters() {
         p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         execute(&mut s, "effect.add.filter", &p).unwrap();
     }
+
     assert!(at(&mut s, Channel::BaseColor, 200.0, 200.0).iter().all(|v| v.is_finite()));
 }
 
@@ -171,37 +184,187 @@ fn solo_keeps_one_material_channel() {
 #[test]
 fn decals_project_an_image_from_a_frame_placed_on_the_surface() {
     let mut s = session();
-    // A red disc on a transparent background.
+
+    // A red disc on a transparent background
     let name = s
         .import_resource_bytes("logo.png", png(32, 32, |x, y| if (x as i32 - 16).pow(2) + (y as i32 - 16).pow(2) < 196 { [255, 0, 0, 255] } else { [0; 4] }))
         .unwrap();
+
     assert!(execute(&mut s, "layer.add.decal", &json!({"image": "missing.png"})).is_err());
     assert!(execute(&mut s, "layer.add.decal", &json!({"image": name, "x": 2, "y": 2})).is_err(), "off the mesh");
+
     let r = execute(&mut s, "layer.add.decal", &json!({"image": name, "x": 200, "y": 200, "size": 0.5})).unwrap();
     let layer = id(r.clone(), "layer");
+
     assert!((r["decal"]["size"][1].as_f64().unwrap() - 0.5).abs() < 1e-6);
     let LayerKind::Fill(f) = &s.doc.project.layer(layer).unwrap().kind else { panic!("a fill layer") };
-    assert!(matches!(f.projection, Projection::Decal(_)));
+    assert!(matches!(f.projection, Projection::Planar { placed: Some(_), .. }));
     assert!(red(at(&mut s, Channel::BaseColor, 200.0, 200.0)), "the decal shows where it was placed");
     assert!(!red(at(&mut s, Channel::BaseColor, 120.0, 200.0)), "and only there");
-    // The image's transparent corners leave the surface as it was.
+
+    // The image's transparent corners leave the surface as it was
     assert!(!red(at(&mut s, Channel::BaseColor, 200.0 + 30.0, 200.0 - 30.0)));
-    // Bigger, then moved along its plane, then re-placed with a click.
+
+    // Bigger, then moved along its plane, then re-placed with a click
     execute(&mut s, "layer.decal.set", &json!({"size": 1.2})).unwrap();
+
     assert!(red(at(&mut s, Channel::BaseColor, 160.0, 200.0)));
+
     execute(&mut s, "layer.decal.set", &json!({"size": 0.4, "offset": [0.6, 0.0], "rotation": 45})).unwrap();
+
     assert!(!red(at(&mut s, Channel::BaseColor, 200.0, 200.0)), "moved away");
+
     let r = execute(&mut s, "layer.decal.set", &json!({"x": 170, "y": 180})).unwrap();
+
     assert_eq!(r["decal"]["offset"], json!([0.0, 0.0]), "re-placing resets the offset");
     assert!(red(at(&mut s, Channel::BaseColor, 170.0, 180.0)));
+
     let inspect = execute(&mut s, "project.inspect", &Value::Null).unwrap().to_string();
-    assert!(inspect.contains("Decal projection") && inspect.contains("\"rotation\":45"), "inspect shows the decal");
-    // Not a decal; one undo step per edit.
+
+    assert!(inspect.contains("Planar projection") && inspect.contains("\"decal\"") && inspect.contains("\"rotation\":45"), "inspect shows the decal");
+
+    // Not a decal; one undo step per edit
     let plain = id(execute(&mut s, "layer.add.fill", &Value::Null).unwrap(), "layer");
+
     assert!(execute(&mut s, "layer.decal.set", &json!({"layer": plain.0, "size": 1})).is_err());
+
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
+
     assert!(!red(at(&mut s, Channel::BaseColor, 170.0, 180.0)));
+}
+
+/// The decal of mask fill effect `effect`
+fn effect_decal(s: &Session, effect: LayerId) -> Decal {
+    let EffectKind::Fill { projection: Projection::Planar { placed: Some(decal), .. }, .. } = &s.doc.project.effect(effect).unwrap().1.kind else {
+        panic!("a decal fill effect")
+    };
+
+    *decal
+}
+
+#[test]
+fn a_mask_fill_effects_decal_is_edited_like_a_layer_decal() {
+    let mut s = session();
+    let name = s.import_resource_bytes("logo.png", png(8, 8, |_, _| [255, 255, 255, 255])).unwrap();
+    let added = execute(&mut s, "layer.add.decal", &json!({"image": name, "channel": "mask", "x": 200, "y": 200, "size": 0.5})).unwrap();
+    let (layer, effect) = (id(added.clone(), "layer"), id(added, "maskEffect"));
+    let layer_decal = id(execute(&mut s, "layer.add.decal", &json!({"image": name, "x": 200, "y": 200, "size": 0.5})).unwrap(), "layer");
+    let before = effect_decal(&s, effect);
+    let steps = s.history_labels().len();
+
+    // Only the effect id, with no layer selected
+    s.selected.clear();
+
+    assert!(s.selected_layer().is_none());
+
+    let r = execute(&mut s, "layer.decal.set", &json!({"effect": effect.0, "size": [0.3, 0.2], "offset": [0.1, -0.05], "rotation": 30, "depth": 0.2})).unwrap();
+
+    assert_eq!(r["layer"], json!(layer.0), "the owning layer is reported");
+
+    let after = effect_decal(&s, effect);
+    assert_eq!((after.size, after.offset, after.rotation), ([0.3, 0.2], [0.1, -0.05], 30.0));
+    assert_eq!(after.center, before.center, "the other fields stay");
+    assert_eq!(s.history_labels().len(), steps + 1, "one undo step per edit");
+
+    // Re-placing with a click
+    execute(&mut s, "layer.decal.set", &json!({"effect": effect.0, "layer": layer.0, "x": 170, "y": 180})).unwrap();
+
+    assert_eq!(effect_decal(&s, effect).offset, [0.0, 0.0]);
+
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+
+    assert_eq!(effect_decal(&s, effect), before, "undo restores the effect's decal");
+
+    // The layer decal is untouched by all of it
+    let LayerKind::Fill(f) = &s.doc.project.layer(layer_decal).unwrap().kind else { panic!("a fill layer") };
+    assert!(matches!(&f.projection, Projection::Planar { placed: Some(d), .. } if d.size[1] == 0.5 && d.rotation == 0.0));
+
+    // Errors: unknown effect, an effect that is not a decal, an effect of another layer
+    assert!(execute(&mut s, "layer.decal.set", &json!({"effect": 999_999, "size": 1})).is_err());
+
+    execute(&mut s, "layer.select", &json!({"layer": layer.0})).unwrap();
+    let levels = id(execute(&mut s, "effect.add.filter", &json!({"layer": layer.0, "filter": "levels"})).unwrap(), "effect");
+
+    assert!(execute(&mut s, "layer.decal.set", &json!({"effect": levels.0, "size": 1})).is_err());
+    assert!(execute(&mut s, "layer.decal.set", &json!({"effect": effect.0, "layer": layer_decal.0, "size": 1})).is_err());
+    assert_eq!(effect_decal(&s, effect), before);
+
+    // A new image replaces the effect's source, not a layer channel
+    let other = s.import_resource_bytes("other.png", png(4, 4, |_, _| [0, 0, 0, 255])).unwrap();
+    execute(&mut s, "layer.decal.set", &json!({"effect": effect.0, "image": other})).unwrap();
+
+    assert!(matches!(&s.doc.project.effect(effect).unwrap().1.kind, EffectKind::Fill { source: Source::Image { name, .. }, .. } if *name == other));
+}
+
+#[test]
+fn decals_keep_the_image_aspect_and_flip_their_image() {
+    let mut s = session();
+
+    // Twice as wide as tall, left half red and right half blue
+    let name = s.import_resource_bytes("wide.png", png(8, 4, |x, _| if x < 4 { [255, 0, 0, 255] } else { [0, 0, 255, 255] })).unwrap();
+    let r = execute(&mut s, "layer.add.decal", &json!({"image": name, "x": 200, "y": 200, "size": 0.5})).unwrap();
+    let layer = id(r.clone(), "layer");
+
+    assert_eq!(r["decal"]["size"], json!([1.0, 0.5]), "a new decal follows its image");
+    assert!(r["decal"].get("flip").is_none(), "nothing flipped saves nothing extra");
+
+    let size = |s: &mut Session| {
+        let LayerKind::Fill(f) = &s.doc.project.layer(layer).unwrap().kind else { panic!("a fill layer") };
+        let Projection::Planar { placed: Some(d), .. } = &f.projection else { panic!("a decal") };
+        (d.size, d.flip)
+    };
+
+    // A pair of sides is taken as given, unless the proportions are kept: then the width wins
+    execute(&mut s, "layer.decal.set", &json!({"size": [0.6, 0.6]})).unwrap();
+
+    assert_eq!(size(&mut s).0, [0.6, 0.6]);
+
+    execute(&mut s, "layer.decal.set", &json!({"size": [0.8, 0.8], "keepProportions": true})).unwrap();
+
+    assert_eq!(size(&mut s).0, [0.8, 0.4], "the width sets the height by the image's aspect");
+
+    execute(&mut s, "layer.decal.set", &json!({"size": 0.2, "keepProportions": true})).unwrap();
+
+    assert_eq!(size(&mut s).0, [0.4, 0.2], "a height sets the width");
+
+    execute(&mut s, "layer.decal.set", &json!({"size": [0.6, 0.6]})).unwrap();
+    execute(&mut s, "layer.decal.set", &json!({"keepProportions": true})).unwrap();
+
+    assert_eq!(size(&mut s).0, [0.6, 0.3], "turning the lock on fits the height to the width");
+
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+
+    assert_eq!(size(&mut s).0, [0.6, 0.6], "one undo step");
+
+    // Flip U and V each on their own, kept by later edits, undone one step at a time
+    execute(&mut s, "layer.decal.set", &json!({"size": [1.0, 0.5]})).unwrap();
+
+    assert!(red(at(&mut s, Channel::BaseColor, 190.0, 200.0)) && !red(at(&mut s, Channel::BaseColor, 210.0, 200.0)));
+
+    let r = execute(&mut s, "layer.decal.set", &json!({"flipU": true})).unwrap();
+
+    assert_eq!(r["decal"]["flip"], json!([true, false]));
+    assert!(!red(at(&mut s, Channel::BaseColor, 190.0, 200.0)) && red(at(&mut s, Channel::BaseColor, 210.0, 200.0)), "Flip U mirrors the image in its frame");
+
+    execute(&mut s, "layer.decal.set", &json!({"flipV": true, "rotation": 10})).unwrap();
+
+    assert_eq!(size(&mut s).1, [true, true]);
+
+    execute(&mut s, "layer.decal.set", &json!({"flipU": false})).unwrap();
+
+    assert_eq!(size(&mut s).1, [false, true], "the other flip stays");
+
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+
+    assert_eq!(size(&mut s).1, [true, true]);
+
+    // A new image in the same call sets the aspect: a tall one (1:2)
+    let tall = s.import_resource_bytes("tall.png", png(4, 8, |_, _| [255, 0, 0, 255])).unwrap();
+    execute(&mut s, "layer.decal.set", &json!({"image": tall, "size": 0.4, "keepProportions": true})).unwrap();
+
+    assert_eq!(size(&mut s).0, [0.2, 0.4]);
 }
 
 #[test]
@@ -388,26 +551,36 @@ fn a_decal_image_fills_a_chosen_channel_or_a_mask() {
     let place = |channel: &str| json!({"image": name, "channel": channel, "x": 200, "y": 200, "size": 0.5});
 
     let rough = id(execute(&mut s, "layer.add.decal", &place("roughness")).unwrap(), "layer");
+
     assert_eq!(s.doc.project.layer(rough).unwrap().channels.keys().copied().collect::<Vec<_>>(), [Channel::Roughness]);
     assert!(at(&mut s, Channel::Roughness, 200.0, 200.0)[0] > 0.95, "the white image is full roughness under the decal");
     assert!(execute(&mut s, "layer.add.decal", &place("sparkle")).is_err(), "unknown channel");
+
     let missing = Channel::ALL.into_iter().find(|channel| !s.doc.project.texture_sets[0].has_channel(*channel)).unwrap();
+
     assert!(execute(&mut s, "layer.add.decal", &place(missing.id())).is_err(), "a channel the set lacks");
 
     let added = execute(&mut s, "layer.add.decal", &place("mask")).unwrap();
     let masked = id(added.clone(), "layer");
     let mask = s.doc.project.layer(masked).unwrap().mask.as_ref().unwrap();
-    assert!(matches!(mask.effects.as_slice(), [effect] if matches!(effect.kind, EffectKind::Fill { projection: Projection::Decal(_), .. })));
+
+    assert!(
+        matches!(mask.effects.as_slice(), [effect] if matches!(effect.kind, EffectKind::Fill { projection: Projection::Planar { placed: Some(_), .. }, .. }))
+    );
     assert_eq!(added["maskEffect"], json!(mask.effects[0].id.0));
+
     execute(&mut s, "layer.fill.set", &json!({"layer": masked.0, "channel": "baseColor", "color": [1.0, 0.0, 0.0]})).unwrap();
+
     assert!(red(at(&mut s, Channel::BaseColor, 200.0, 200.0)), "the mask shows the layer under the decal");
     assert!(!red(at(&mut s, Channel::BaseColor, 120.0, 200.0)), "and hides it elsewhere");
 
     let effect = &added["maskEffect"];
     execute(&mut s, "layer.decal.set", &json!({"effect": effect, "x": 150, "y": 200})).unwrap();
+
     assert!(red(at(&mut s, Channel::BaseColor, 150.0, 200.0)), "a mask decal moves like a decal layer");
     assert!(!red(at(&mut s, Channel::BaseColor, 230.0, 200.0)));
     assert!(execute(&mut s, "layer.decal.set", &json!({"effect": rough.0, "x": 150, "y": 200})).is_err(), "a layer id is not an effect");
+
     execute(&mut s, "layer.decal.set", &json!({"effect": effect, "layer": masked.0, "size": 0.4})).expect("an effect with its own layer");
     let mismatched = json!({"effect": effect, "layer": rough.0, "size": 0.4});
     assert!(execute(&mut s, "layer.decal.set", &mismatched).is_err(), "an effect with another layer is refused");
@@ -537,6 +710,23 @@ fn images_fill_mesh_map_slots() {
 }
 
 #[test]
+fn bent_normal_images_are_read_in_the_project_normal_format() {
+    use texturecraft_engine::core::BakedMap;
+    let mut s = session();
+    let image = s.import_resource_bytes("bent.png", png(2, 2, |_, _| [128, 64, 255, 255])).unwrap();
+    let sample = |s: &Session| s.baked(0).unwrap().sample(BakedMap::BentNormal, 50, 50, (100, 100)).unwrap();
+
+    execute(&mut s, "textureSet.meshMap.set", &json!({"map": "bentNormal", "image": image})).unwrap();
+    assert!((sample(&s)[1] - 64.0 / 255.0).abs() < 1e-3, "OpenGL: green as stored {:?}", sample(&s));
+
+    // A tangent-space map like the normal map: DirectX green flipped
+    execute(&mut s, "textureSet.settings", &json!({"normalFormat": "directX"})).unwrap();
+    execute(&mut s, "textureSet.meshMap.set", &json!({"map": "bentNormal", "image": image})).unwrap();
+    let v = sample(&s);
+    assert!((v[0] - 128.0 / 255.0).abs() < 1e-3 && (v[1] - (1.0 - 64.0 / 255.0)).abs() < 1e-3 && (v[2] - 1.0).abs() < 1e-3, "{v:?}");
+}
+
+#[test]
 fn fill_projection_edits_keep_what_they_do_not_change() {
     let mut s = session();
     let layer = id(execute(&mut s, "layer.add.fill", &json!({"color": [0.5, 0.2, 0.1]})).unwrap(), "layer");
@@ -550,16 +740,32 @@ fn fill_projection_edits_keep_what_they_do_not_change() {
     };
     set(&mut s, json!({"rotation": 390, "offset": [0.25, 0.5]})).unwrap();
     set(&mut s, json!({"scale": 2})).unwrap();
+
     assert_eq!(proj(&s), Projection::Uv { scale: [2.0, 2.0], rotation: 30.0, offset: [0.25, 0.5] }, "a scale keeps the rotation and offset");
+
     set(&mut s, json!({"projection": "uv", "scale": [2, 3], "offset": "far"})).unwrap();
+
     assert_eq!(proj(&s), Projection::Uv { scale: [2.0, 3.0], rotation: 30.0, offset: [0.25, 0.5] }, "the same kind keeps its fields; a bad offset is ignored");
+
     set(&mut s, json!({"projection": "triplanar", "offset": [1, 2, 3]})).unwrap();
     set(&mut s, json!({"sharpness": 100})).unwrap();
-    assert_eq!(proj(&s), Projection::Triplanar { scale: 1.0, sharpness: 64.0, offset: [1.0, 2.0, 3.0] }, "a new kind starts from its defaults");
+
+    assert_eq!(
+        proj(&s),
+        Projection::Triplanar { scale: 1.0, sharpness: 64.0, offset: [1.0, 2.0, 3.0], uv: Default::default(), projector: Default::default() },
+        "a new kind starts from its defaults"
+    );
+
     set(&mut s, json!({"projection": "planar", "axis": 7, "offset": [1e9, 0, 0]})).unwrap();
-    assert_eq!(proj(&s), Projection::Planar { scale: 1.0, axis: 2, offset: [1000.0, 0.0, 0.0] }, "hostile values are clamped");
+
+    assert_eq!(
+        proj(&s),
+        Projection::Planar { scale: 1.0, axis: 2, offset: [1000.0, 0.0, 0.0], uv: Default::default(), projector: Projector::depth_culled(), placed: None },
+        "hostile values are clamped"
+    );
     assert!(set(&mut s, json!({"projection": "hexagonal"})).is_err());
-    // The offset moves the pattern: a UV offset changes what the composite shows.
+
+    // The offset moves the pattern: a UV offset changes what the composite shows
     set(&mut s, json!({"projection": "uv", "scale": 1})).unwrap();
     execute(
         &mut s,
@@ -599,7 +805,8 @@ fn directx_normal_images_flip_green() {
     assert!(fill(&mut s, json!({"normalFormat": "sideways"})).is_err());
     assert!(fill(&mut s, json!({"image": name, "normalFormat": 1})).is_err(), "not a string");
     assert!(fill(&mut s, json!({"value": [0.5, 0.5, 1.0], "normalFormat": "directX"})).is_err(), "not an image");
-    // Marking an image on a channel that is off leaves it off.
+
+    // Marking an image on a channel that is off leaves it off
     fill(&mut s, json!({"enabled": false})).unwrap();
     fill(&mut s, json!({"normalFormat": "directX"})).unwrap();
     assert!(!s.doc.project.layer(layer).unwrap().channels.contains_key(&Channel::Normal));
@@ -608,4 +815,191 @@ fn directx_normal_images_flip_green() {
     assert!(fill(&mut s, json!({"normalFormat": "directX"})).is_err(), "no image on the channel");
     let old: texturecraft_engine::core::Source = serde_json::from_value(json!({"Image": {"name": "n"}})).unwrap();
     assert_eq!(old, texturecraft_engine::core::Source::image("n"));
+}
+
+/// Red texels of the cube's -X face (turned away from where the decals are placed) whose position satisfies `inside`
+fn red_on_minus_x(s: &mut Session, inside: impl Fn(f32, f32) -> bool) -> usize {
+    s.update();
+    let cache = &s.caches[0];
+    let (w, h) = cache.size;
+    (0..w * h)
+        .filter(|&i| {
+            let Some(surface) = cache.gbuf.surface(&s.mesh, i as usize) else { return false };
+            surface.nrm.x < -0.99 && inside(surface.pos.y, surface.pos.z) && red(cache.composite.value(Channel::BaseColor, i % w, i / w))
+        })
+        .count()
+}
+
+fn decal_of(s: &Session, layer: LayerId) -> texturecraft_engine::core::Decal {
+    let LayerKind::Fill(fill) = &s.doc.project.layer(layer).unwrap().kind else { panic!("a fill layer") };
+    let Projection::Planar { placed: Some(decal), .. } = fill.projection else { panic!("a decal") };
+    decal
+}
+
+#[test]
+fn a_decal_with_symmetry_also_covers_the_mirrored_side_and_follows_its_edits() {
+    use texturecraft_engine::core::{DecalFlip, DecalSymmetry};
+    let mut s = Session::new_project("t", primitives::cube(2.0), "builtin:cube", None, 256).unwrap();
+    let name = s.import_resource_bytes("logo.png", png(8, 8, |_, _| [255, 0, 0, 255])).unwrap();
+    let place = json!({"image": name, "position": [1.0, 0.0, 0.0], "normal": [1.0, 0.0, 0.0], "up": [0.0, 1.0, 0.0], "size": 0.6});
+    let layer = id(execute(&mut s, "layer.add.decal", &place).unwrap(), "layer");
+    assert_eq!(decal_of(&s, layer).symmetry, None, "no copy unless asked for");
+    assert_eq!(red_on_minus_x(&mut s, |_, _| true), 0);
+
+    assert!(execute(&mut s, "layer.decal.set", &json!({"symmetry": "w"})).is_err());
+    assert!(execute(&mut s, "layer.decal.set", &json!({"symmetryFlip": "up"})).is_err());
+    let depth = s.history_labels().len();
+    let r = execute(&mut s, "layer.decal.set", &json!({"symmetry": "x", "symmetryFlip": "u"})).unwrap();
+    assert_eq!(r["decal"]["symmetry"], json!({"axis": 0, "flip": "u"}));
+    assert_eq!(s.history_labels().len(), depth + 1, "one undo step");
+    let centered = red_on_minus_x(&mut s, |y, z| y.abs() < 0.2 && z.abs() < 0.2);
+    assert!(centered > 20, "the mirrored copy shows opposite the decal: {centered}");
+
+    // The copy follows the decal when it moves (offset along its up) and when it grows
+    execute(&mut s, "layer.decal.set", &json!({"offset": [0.0, 0.5]})).unwrap();
+    assert!(red_on_minus_x(&mut s, |y, _| y > 0.3) > 20, "moved up with the decal");
+    assert_eq!(red_on_minus_x(&mut s, |y, _| y.abs() < 0.1), 0, "and left the middle");
+    execute(&mut s, "layer.decal.set", &json!({"size": 1.6})).unwrap();
+    assert!(red_on_minus_x(&mut s, |y, _| y.abs() < 0.1) > 20, "bigger with the decal");
+    execute(&mut s, "layer.decal.set", &json!({"size": 0.6})).unwrap();
+
+    // A flip alone keeps the axis; off removes the copy
+    execute(&mut s, "layer.decal.set", &json!({"symmetryFlip": "v"})).unwrap();
+    assert_eq!(decal_of(&s, layer).symmetry, Some(DecalSymmetry { axis: 0, flip: DecalFlip::V, offset: 0.0 }));
+    execute(&mut s, "layer.decal.set", &json!({"symmetry": "z"})).unwrap();
+    assert_eq!(decal_of(&s, layer).symmetry, Some(DecalSymmetry { axis: 2, flip: DecalFlip::V, offset: 0.0 }), "a new axis keeps the flip");
+    execute(&mut s, "layer.decal.set", &json!({"symmetry": "x"})).unwrap();
+
+    // The mirror plane's position is kept across axis changes, stays within the mesh and is saved
+    let r = execute(&mut s, "layer.decal.set", &json!({"symmetryOffset": 0.5})).unwrap();
+    assert_eq!(r["decal"]["symmetry"]["offset"], json!(0.5));
+    assert_eq!(red_on_minus_x(&mut s, |_, _| true), 0, "a plane at x = 0.5 puts the copy out of reach of the -X face");
+    let r = execute(&mut s, "layer.decal.set", &json!({"symmetryOffset": 9.0})).unwrap();
+    assert_eq!(r["decal"]["symmetry"]["offset"], json!(1.0), "the cube is 2 wide: at most 1 from its center");
+    assert_eq!(r["decal"]["symmetry"]["axis"], json!(0), "the axis is kept");
+    execute(&mut s, "layer.decal.set", &json!({"symmetryOffset": 0.5})).unwrap();
+
+    // Saved with the project
+    let reopened = Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap();
+    assert_eq!(reopened.doc.project, s.doc.project);
+    assert_eq!(decal_of(&reopened, layer).symmetry, Some(DecalSymmetry { axis: 0, flip: DecalFlip::V, offset: 0.5 }));
+
+    // Ten edits since the copy was asked for: undoing them all leaves the decal as placed
+    for _ in 0..10 {
+        execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    }
+    assert_eq!(decal_of(&s, layer).symmetry, None);
+    assert_eq!(red_on_minus_x(&mut s, |_, _| true), 0);
+    execute(&mut s, "edit.redo", &Value::Null).unwrap();
+    assert!(red_on_minus_x(&mut s, |_, _| true) > 20, "redo brings the copy back");
+    execute(&mut s, "layer.decal.set", &json!({"symmetry": "off"})).unwrap();
+    assert_eq!(decal_of(&s, layer).symmetry, None);
+    assert_eq!(red_on_minus_x(&mut s, |_, _| true), 0, "off: the other side is bare again");
+
+    // A decal can be added with a copy right away
+    let both = execute(&mut s, "layer.add.decal", &json!({"image": name, "position": [0.0, 1.0, 0.0], "normal": [0.0, 1.0, 0.0], "symmetry": "y"})).unwrap();
+    assert_eq!(both["decal"]["symmetry"], json!({"axis": 1, "flip": "none"}), "no offset is written while it is 0");
+    let shifted = execute(
+        &mut s,
+        "layer.add.decal",
+        &json!({"image": name, "position": [0.0, 1.0, 0.0], "normal": [0.0, 1.0, 0.0], "symmetry": "y", "symmetryOffset": -0.4}),
+    )
+    .unwrap();
+    assert!((shifted["decal"]["symmetry"]["offset"].as_f64().unwrap() + 0.4).abs() < 1e-6);
+}
+
+/// A decal's up as the projection shows it: the stored up inside the surface plane.
+fn plane_up(decal: &Value) -> texturecraft_engine::geom::glam::Vec3 {
+    use texturecraft_engine::geom::glam::Vec3;
+    let v = |key: &str| Vec3::new(decal[key][0].as_f64().unwrap() as f32, decal[key][1].as_f64().unwrap() as f32, decal[key][2].as_f64().unwrap() as f32);
+    let normal = v("normal").normalize();
+    (v("up") - normal * normal.dot(v("up"))).normalize_or_zero()
+}
+
+#[test]
+fn a_decal_moved_onto_another_facing_surface_keeps_a_valid_frame_with_the_carried_up() {
+    use texturecraft_engine::geom::glam::Vec3;
+    let mut s = Session::new_project("t", primitives::cube(2.0), "builtin:cube", None, 256).unwrap();
+    s.viewport = Vec2::new(400.0, 400.0);
+    let name = s.import_resource_bytes("logo.png", png(8, 4, |_, _| [255, 0, 0, 255])).unwrap();
+
+    // On the +Z face, its up turned halfway between world X and Y, size and turn set by the user
+    let place = json!({"image": name, "position": [0.0, 0.0, 1.0], "normal": [0.0, 0.0, 1.0], "up": [1.0, 1.0, 0.0], "size": [0.6, 0.3], "rotation": 25});
+    let layer = id(execute(&mut s, "layer.add.decal", &place).unwrap(), "layer");
+
+    // Onto the +Y face: the up turns with the surface and follows the old up's direction in it
+    let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.2, 1.0, 0.1], "normal": [0.0, 1.0, 0.0]})).unwrap();
+    let up = plane_up(&r["decal"]);
+    assert!((up.length() - 1.0).abs() < 1e-4 && up.dot(Vec3::Y).abs() < 1e-4, "an up inside the +Y face: {up}");
+    assert!(up.x > 0.5, "the old up's X side stays on the X side: {up}");
+    assert_eq!(r["decal"]["rotation"], json!(25.0), "the user's turn stays");
+    assert_eq!(r["decal"]["size"], json!([0.6_f32, 0.3_f32]), "and the size");
+
+    // Straight up the face with the old up along the new normal: no degenerate frame, nothing arbitrary
+    let r =
+        execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.0, 0.0, 1.0], "normal": [0.0, 0.0, 1.0], "up": [0.0, 1.0, 0.0]})).unwrap();
+    assert_eq!(plane_up(&r["decal"]), Vec3::Y);
+    let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.0, 1.0, 0.0], "normal": [0.0, 1.0, 0.0]})).unwrap();
+    assert!((plane_up(&r["decal"]) - Vec3::NEG_Z).length() < 1e-4, "the up that pointed up the +Z face points away over the edge: {:?}", r["decal"]["up"]);
+
+    // Onto the opposite face there is no smallest turn: the frame is still valid and follows the camera rule
+    let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [0.0, -1.0, 0.0], "normal": [0.0, -1.0, 0.0]})).unwrap();
+    let up = plane_up(&r["decal"]);
+    assert!((up.length() - 1.0).abs() < 1e-4 && up.dot(Vec3::Y).abs() < 1e-4, "{up}");
+
+    // An explicit up still wins
+    let r =
+        execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": [1.0, 0.0, 0.0], "normal": [1.0, 0.0, 0.0], "up": [0.0, 0.0, 1.0]})).unwrap();
+    assert_eq!(plane_up(&r["decal"]), Vec3::Z);
+    let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "up": [0.0, 1.0, 0.0]})).unwrap();
+    assert_eq!(plane_up(&r["decal"]), Vec3::Y, "an up without a move too");
+}
+
+#[test]
+fn a_decal_dragged_over_the_sphere_never_flips_its_up_between_steps() {
+    use texturecraft_engine::geom::glam::Vec3;
+    let mut s = session();
+    let name = s.import_resource_bytes("logo.png", png(8, 8, |_, _| [255, 0, 0, 255])).unwrap();
+    let place = json!({"image": name, "position": [0.0, 0.0, 1.0], "normal": [0.0, 0.0, 1.0], "up": [0.0, 1.0, 0.0], "size": 0.3});
+    let layer = id(execute(&mut s, "layer.add.decal", &place).unwrap(), "layer");
+
+    // Over the pole (the old up lies along the normal there) and down the far side, in 5 degree steps
+    let mut last = Vec3::Y;
+    for step in 0..=72 {
+        let angle = (step as f32 * 5.0).to_radians();
+        let normal = [0.0, angle.sin(), angle.cos()];
+        let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "position": normal, "normal": normal, "merge": step > 0})).unwrap();
+        let up = plane_up(&r["decal"]);
+        assert!((up.length() - 1.0).abs() < 1e-4, "step {step}: no frame at {normal:?}");
+        assert!(up.dot(last) > 0.0, "step {step}: up turned from {last} to {up}");
+        last = up;
+    }
+
+    // The same drag through viewport points (what the 3D view sends), from the middle to the edge
+    for step in 0..25 {
+        let r = execute(&mut s, "layer.decal.set", &json!({"layer": layer.0, "x": 200.0 + step as f32 * 2.0, "y": 200.0 - step as f32 * 2.0, "merge": true}))
+            .unwrap();
+        let up = plane_up(&r["decal"]);
+        assert!((up.length() - 1.0).abs() < 1e-4 && up.dot(last) > 0.0, "viewport step {step}: {last} to {up}");
+        last = up;
+    }
+}
+
+#[test]
+fn a_saved_decal_with_an_out_of_range_axis_is_repaired_on_load_and_can_be_edited() {
+    let mut session = session();
+    let image = session.import_resource_bytes("decal.png", png(4, 4, |_, _| [255; 4])).unwrap();
+    let layer = id(execute(&mut session, "layer.add.decal", &json!({"image": image, "symmetry": "x"})).unwrap(), "layer");
+    let LayerKind::Fill(fill) = &mut session.doc.project.layer_mut(layer).unwrap().kind else { panic!("expected fill") };
+    let Projection::Planar { placed: Some(decal), .. } = &mut fill.projection else { panic!("expected decal") };
+    decal.symmetry.as_mut().unwrap().axis = u8::MAX;
+    let bytes = session.to_project_bytes().unwrap();
+
+    let mut loaded = Session::from_project_bytes(&bytes).unwrap();
+
+    assert_eq!(decal_of(&loaded, layer).symmetry.unwrap().axis, 2);
+
+    execute(&mut loaded, "layer.decal.set", &json!({"layer": layer.0, "rotation": 12})).unwrap();
+
+    assert_eq!(decal_of(&loaded, layer).symmetry.unwrap().axis, 2);
 }

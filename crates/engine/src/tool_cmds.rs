@@ -36,7 +36,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Brush settings",
             [],
             None,
-            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
+            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, alphaSizeX?: 5..100 and alphaSizeY?: 5..100 (percent of the stamp the alpha fills), alphaRoundness?: 0..100 (Round alpha only: 100 circle, 0 square), alphaContrast?: 1..8, alphaInvert?, backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), cloneAligned? (default true: the first stroke fixes the offset to the source for the following strokes; false: every stroke starts sampling at the source point), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
             always,
             brush
         ),
@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Tool material",
             [],
             None,
-            "{channel, color?|value?, enabled?, solo?: true (paint this channel only)} or {maskValue?: 0..1}",
+            "{channel, color?: ([r,g,b] linear or \"#rrggbb\" sRGB)|value?, enabled?, solo?: true (paint this channel only)} or {maskValue?: 0..1, maskImage?: image resource | null (paint its gray into masks; null = maskValue)} or {material: id or label of a simple material (see material.list, smart: false)} — the brush paints that material's pattern (colour, metallic, roughness, height…, fixed to the surface, its size following the brush size) in the channels that are on; no layer is added, smart materials are refused (add them with material.apply)",
             always,
             material
         ),
@@ -199,6 +199,19 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
         (settings.alpha_image, settings.alpha_library) = (None, Some(alpha.id.clone()));
     }
 
+    let alpha_params = &mut settings.alpha_params;
+    for (key, slot) in [("alphaSizeX", &mut alpha_params.size_x), ("alphaSizeY", &mut alpha_params.size_y), ("alphaRoundness", &mut alpha_params.roundness)] {
+        if let Some(value) = percent(key) {
+            *slot = value;
+        }
+    }
+    if let Some(value) = f32p(params, "alphaContrast") {
+        alpha_params.contrast = value;
+    }
+    if let Some(value) = boolp(params, "alphaInvert") {
+        alpha_params.invert = value;
+    }
+
     if let Some(value) = boolp(params, "backfaceCulling") {
         settings.backface_culling = value;
     }
@@ -258,6 +271,16 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
 
     session.tool.brush = settings.sanitized();
     session.tool.clone_from = clone_from;
+    if let Some(aligned) = boolp(params, "cloneAligned")
+        && aligned != session.tool.clone_aligned
+    {
+        session.tool.clone_aligned = aligned;
+
+        // A new mode starts without the offset of an earlier stroke
+        if let Some(source) = session.tool.clone_source.as_mut() {
+            source.offset = None;
+        }
+    }
     if let Some(value) = f32p(params, "smudgeStrength") {
         session.tool.smudge_strength = (value / 100.0).clamp(0.0, 1.0);
     }
@@ -277,11 +300,14 @@ pub(crate) fn brush_json(session: &Session) -> Value {
             (None, Some(id)) => json!({ "library": id }),
             (None, None) => json!(settings.alpha.label()),
         },
+        "alphaSizeX": settings.alpha_params.size_x * 100.0, "alphaSizeY": settings.alpha_params.size_y * 100.0,
+        "alphaRoundness": settings.alpha_params.roundness * 100.0, "alphaContrast": settings.alpha_params.contrast, "alphaInvert": settings.alpha_params.invert,
         "backfaceCulling": settings.backface_culling, "symmetry": [settings.symmetry.x, settings.symmetry.y, settings.symmetry.z],
         "radialSymmetry": { "copies": settings.symmetry.radial, "axis": (["x", "y", "z"].get(settings.symmetry.axis as usize)) },
         "symmetryOffset": settings.symmetry.offset, "symmetryOn": settings.symmetry.enabled, "symmetryAngleSpan": settings.symmetry.angle_span,
-        "smudgeStrength": session.tool.smudge_strength * 100.0, "particles": settings.particles,
+        "material": session.tool.material, "smudgeStrength": session.tool.smudge_strength * 100.0, "particles": settings.particles,
         "cloneSource": if session.tool.clone_from == CloneFrom::Layer { "layer" } else { "composite" },
+        "cloneAligned": session.tool.clone_aligned,
     })
 }
 
@@ -289,33 +315,73 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
     let channel = channel_param("tool.material", p, "channel")?;
     let color = color_param("tool.material", p, "color")?;
     let value = color_param("tool.material", p, "value")?;
-    if let Some(v) = f32p(p, "maskValue") {
-        s.tool.mask_value = v.clamp(0.0, 1.0);
+
+    // Every param is checked before the tool changes, so a refused call changes nothing
+    let mask_image = match p.get("maskImage") {
+        Some(Value::Null) => Some(None),
+        Some(name) => {
+            let name = name.as_str().ok_or_else(|| bad("tool.material", "maskImage must be an image resource name or null"))?;
+
+            // The brush reads the decoded image: a resource that is not one (an environment, a linked package) is refused
+            if !s.images.contains_key(name) {
+                return Err(bad("tool.material", format!("no image resource '{name}'")));
+            }
+
+            Some(Some(name.to_owned()))
+        }
+        None => None,
+    };
+    if let Some(id) = strp(p, "material") {
+        let values = crate::materials::brush_values(id).ok_or_else(|| {
+            bad("tool.material", format!("`{id}` is not a simple material (a brush paints plain values; add smart materials with material.apply)"))
+        })?;
+
+        // Reset omitted channels so values from the previous brush material do not persist
+        // Normal maps remain flat
+        for channel in Channel::ALL {
+            if channel.kind() == texturecraft_core::ChannelKind::NormalMap {
+                continue;
+            }
+
+            let value = values.iter().find(|(set, _)| *set == channel).map_or(channel.default_value(), |(_, value)| *value);
+            s.tool.values.insert(channel, value);
+        }
+        s.tool.material = Some(crate::materials::find(id).map_or_else(|| id.to_string(), |m| m.id.to_string()));
     }
-    if let Some(c) = channel {
-        if let Some(v) = color.or(value) {
-            let v = if c == Channel::Height { v.map(|x| x.clamp(-1.0, 1.0)) } else { v.map(|x| x.clamp(0.0, 1.0)) };
-            s.tool.values.insert(c, v);
-            s.tool.enabled.insert(c);
+    if let Some(mask_value) = f32p(p, "maskValue") {
+        s.tool.mask_value = mask_value.clamp(0.0, 1.0);
+    }
+    if let Some(mask_image) = mask_image {
+        s.tool.mask_image = mask_image;
+    }
+    if let Some(channel) = channel {
+        if let Some(picked) = color.or(value) {
+            let picked =
+                if channel == Channel::Height { picked.map(|component| component.clamp(-1.0, 1.0)) } else { picked.map(|component| component.clamp(0.0, 1.0)) };
+            s.tool.values.insert(channel, picked);
+            s.tool.enabled.insert(channel);
+            s.tool.material = None;
         }
         match boolp(p, "enabled") {
             Some(true) => {
-                s.tool.enabled.insert(c);
+                s.tool.enabled.insert(channel);
             }
             Some(false) => {
-                s.tool.enabled.remove(&c);
+                s.tool.enabled.remove(&channel);
             }
             None => {}
         }
         if boolp(p, "solo") == Some(true) {
-            s.tool.enabled = std::iter::once(c).collect();
+            s.tool.enabled = std::iter::once(channel).collect();
         }
     }
     s.revision = s.revision.wrapping_add(1);
     Ok(json!({
-        "values": s.tool.values.iter().map(|(c, v)| (c.id().to_string(), json!(v))).collect::<serde_json::Map<_, _>>(),
-        "enabled": s.tool.enabled.iter().map(|c| c.id()).collect::<Vec<_>>(),
+        "material": s.tool.material,
+        "values": s.tool.values.iter().map(|(channel, value)| (channel.id().to_string(), json!(value))).collect::<serde_json::Map<_, _>>(),
+        "enabled": s.tool.enabled.iter().map(|channel| channel.id()).collect::<Vec<_>>(),
         "maskValue": s.tool.mask_value,
+        "maskImage": s.tool.mask_image,
     }))
 }
 
@@ -345,7 +411,9 @@ fn swap_mask_value(session: &mut Session, _: &Value) -> Result<Value> {
 
 fn stencil(session: &mut Session, params: &Value) -> Result<Value> {
     if boolp(params, "clear") == Some(true) {
-        session.tool.stencil = None;
+        if let Some(cleared) = session.tool.stencil.take() {
+            session.tool.stencil_look = cleared.look();
+        }
         return Ok(Value::Null);
     }
 
@@ -355,19 +423,20 @@ fn stencil(session: &mut Session, params: &Value) -> Result<Value> {
         }
 
         let previous_stencil = session.tool.stencil.take();
-        let mut stencil_state = crate::session::StencilState::new(name);
+        let mut stencil_state = crate::session::StencilState::with_look(name, session.tool.stencil_look);
         if let Some(previous_stencil) = previous_stencil {
             stencil_state = crate::session::StencilState { image: name.to_string(), ..previous_stencil };
         }
         session.tool.stencil = Some(stencil_state);
     }
 
+    use crate::session::StencilLook;
     let stencil_state = session.tool.stencil.as_mut().ok_or_else(|| bad("tool.stencil", "no stencil: give `image`"))?;
     if let Some(center) = pair(params, "center").or_else(|| params.get("center").and_then(color_of).map(|color| [color[0], color[1]])) {
-        stencil_state.center = center.map(|value| value.clamp(-4.0, 4.0));
+        stencil_state.center = center.map(|value| value.clamp(-StencilLook::MAX_CENTER_OFFSET, StencilLook::MAX_CENTER_OFFSET));
     }
     if let Some(scale) = f32p(params, "scale") {
-        stencil_state.scale = scale.clamp(0.01, 10.0);
+        stencil_state.scale = scale.clamp(StencilLook::MIN_SCALE, StencilLook::MAX_SCALE);
     }
     if let Some(rotation) = f32p(params, "rotation") {
         stencil_state.rotation = rotation.rem_euclid(360.0);
@@ -384,12 +453,11 @@ fn stencil(session: &mut Session, params: &Value) -> Result<Value> {
 }
 
 /// A `[a, b]` param of two finite numbers.
-fn pair(p: &Value, key: &str) -> Option<[f32; 2]> {
-    let a = p.get(key)?.as_array()?;
-    let [x, y] = a.as_slice() else { return None };
-    let x = x.as_f64()? as f32;
-    let y = y.as_f64()? as f32;
-    (x.is_finite() && y.is_finite()).then_some([x, y])
+pub(crate) fn pair(params: &Value, key: &str) -> Option<[f32; 2]> {
+    let [x, y] = params.get(key)?.as_array()?.as_slice() else { return None };
+    let pair = [x.as_f64()? as f32, y.as_f64()? as f32];
+
+    pair.iter().all(|component| component.is_finite()).then_some(pair)
 }
 
 fn clone_source(s: &mut Session, p: &Value) -> Result<Value> {

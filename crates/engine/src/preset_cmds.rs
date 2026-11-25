@@ -23,13 +23,21 @@ pub struct UserPresets {
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("export.presets", "Export presets", [], None, "{} → [{name, maps, builtin}]", always, list),
-        cmd!("export.preset.get", "Get an export preset", [], None, "{name} → {name, maps: [{file, format, bit_depth, channels}]}", always, get),
+        cmd!(
+            "export.preset.get",
+            "Get an export preset",
+            [],
+            None,
+            "{name} → {name, maps: [{file, format, bit_depth, channels, inverted?: [dest, ...]}]}",
+            always,
+            get
+        ),
         cmd!(
             "export.preset.save",
             "Save a user export preset",
             [],
             None,
-            "{preset: {name, maps}, unique?: true = add \" 2\", \" 3\"… on a name clash instead of failing, rename?: name of the user preset this one replaces} → {name}",
+            "{preset: {name, maps (a map may list `inverted` destinations such as [\"R\"] to write 1 minus the value)}, unique?: true = add \" 2\", \" 3\"… on a name clash instead of failing, rename?: name of the user preset this one replaces} → {name}",
             always,
             save
         ),
@@ -282,7 +290,8 @@ mod tests {
         assert!((rough - 0.3).abs() < 0.01);
         let set = s.doc.project.texture_sets[0].name.clone();
         let dir = std::env::temp_dir().join(format!("tc_user_preset_export_{}", std::process::id()));
-        // By name and as an inline object: the same files.
+
+        // By name and as an inline object: the same files
         for preset in [json!("packed"), packed] {
             let _ = std::fs::remove_dir_all(&dir);
             let r = run(&mut s, "file.exportTextures", json!({"dir": dir.display().to_string(), "preset": preset, "ts": 0})).unwrap();

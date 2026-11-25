@@ -22,7 +22,7 @@ pub use bake_meshes::BakeMeshes;
 pub use bake_task::BakeTask;
 pub use high_poly_missed::{HIDDEN_HIGH_POLY_VERTEX, high_poly_missed};
 pub use merged_high::MergedHigh;
-pub use mesh_map_command::{install_gpu_tracer, meshes_json, settings_params};
+pub use mesh_map_command::{install_gpu_tracer, meshes_json, set_gpu_raytracing, settings_params};
 pub use model_patch::settings_patch;
 pub use streamed_bake::StreamedBake;
 pub use streamed_map::StreamedMap;

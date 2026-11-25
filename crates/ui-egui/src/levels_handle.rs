@@ -7,9 +7,6 @@ use crate::i18n::tr;
 /// Narrowest gap the handles and typed values leave between the low and high handle of a pair
 const MIN_HANDLE_GAP: f32 = 0.01;
 
-/// Gamma range of the handle and typed values: the engine's own, so the handle nearly reaches either input handle
-const GAMMA_RANGE: std::ops::RangeInclusive<f32> = 0.01..=10.0;
-
 /// One draggable value of a levels effect
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LevelsHandle {
@@ -75,7 +72,7 @@ impl LevelsHandle {
             LevelsHandle::InputHigh => (levels.in_low, false),
             LevelsHandle::OutputLow => (levels.out_high, levels.out_low <= levels.out_high),
             LevelsHandle::OutputHigh => (levels.out_low, levels.out_high < levels.out_low),
-            LevelsHandle::Gamma => return GAMMA_RANGE,
+            LevelsHandle::Gamma => return Levels::GAMMA_RANGE,
         };
 
         // Invalid project values must not become NaN clamp bounds
