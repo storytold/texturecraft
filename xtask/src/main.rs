@@ -145,30 +145,23 @@ fn cmd_wasm() -> Result<(), String> {
     if failed == 0 { Ok(()) } else { Err(format!("{failed} package(s) failed the wasm check")) }
 }
 
-/// The render crate's unit tests that compile the most GPU pipelines, as the test filter
-/// arguments of one process each on Linux (the first one names them); the rest of its unit tests
-/// run in one more process.
+/// The render crate's unit test modules that compile the most GPU pipelines, in groups tested in
+/// a process each on Linux (llvmpipe keeps what a process compiled: each group peaks under
+/// about 12 GB there); the rest of its unit tests run in one more process.
 const RENDER_TEST_GROUPS: &[&[&str]] = &[
-    &["gpu_composite::procedural_tests::"],
-    &["gpu_composite::fill_projection::"],
-    &["gpu_composite::stack::"],
-    &["gpu_composite::packages::"],
-    &["gpu_composite::lighting::"],
-    &["gpu_composite::point::"],
-    &["gpu_composite::brush::"],
-    &["gpu_composite::pipelines::"],
-    // Its Bilinear HQ image case alone peaks at 8.6 GB on llvmpipe
-    &["gpu_composite::udim::", "--skip", UDIM_IMAGE_TEST],
-    &[UDIM_IMAGE_TEST, "--exact"],
-    &["gpu_neighbourhood::gather::"],
-    &["gpu_neighbourhood::box_family::"],
-    &["gpu_neighbourhood::tests::"],
+    &["gpu_composite::procedural_tests::", "gpu_composite::fill_projection::", "gpu_composite::lighting::", "gpu_composite::point::", "gpu_composite::brush::"],
+    &[
+        "gpu_composite::stack::",
+        "gpu_composite::packages::",
+        "gpu_composite::pipelines::",
+        "gpu_neighbourhood::gather::",
+        "gpu_neighbourhood::box_family::",
+        "gpu_neighbourhood::tests::",
+    ],
+    &["gpu_composite::udim::"],
 ];
 
-/// The UV tile fill test with an image, tested in a process of its own.
-const UDIM_IMAGE_TEST: &str = "gpu_composite::udim::tests::image_fills_follow_each_uv_tile";
-
-/// `cargo test --workspace`. On Linux the render crate's unit tests run one module per process,
+/// `cargo test --workspace`. On Linux the render crate's unit tests run in a few processes,
 /// with two malloc arenas: they compile many GPU pipelines on Mesa (llvmpipe), which keeps what
 /// it compiled until the process ends, so one process for all of them outgrows a 16 GB runner,
 /// and the default per-thread arenas fragment that memory. A MALLOC_ARENA_MAX the caller set wins.
@@ -200,10 +193,10 @@ fn cmd_test() -> Result<(), String> {
     step(test(&["--workspace", "--exclude", RENDER], &[]));
     step(test(&["-p", RENDER, "--doc"], &[]));
     step(test(&["-p", RENDER, "--test", "*"], &[]));
-    for filter in RENDER_TEST_GROUPS {
-        step(test(&["-p", RENDER, "--lib"], filter));
+    for group in RENDER_TEST_GROUPS {
+        step(test(&["-p", RENDER, "--lib"], group));
     }
-    let rest: Vec<&str> = RENDER_TEST_GROUPS.iter().flat_map(|filter| ["--skip", filter[0]]).collect();
+    let rest: Vec<&str> = RENDER_TEST_GROUPS.iter().copied().flatten().flat_map(|module| ["--skip", module]).collect();
     step(test(&["-p", RENDER, "--lib"], &rest));
     if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
 }

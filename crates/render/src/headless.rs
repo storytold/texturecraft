@@ -15,26 +15,9 @@ impl Headless {
     /// Create a device on the default adapter with every limit it reports. Errors when no GPU
     /// (or software) adapter exists.
     pub fn new() -> Result<Headless, String> {
-        // The render crate's tests take turns (`for_tests`). On GL they share one device (and its
-        // compiled pipelines, `gpu_composite`): llvmpipe keeps what it compiled until the process
-        // ends. Other backends get a device per test, which the test's end destroys
+        // The render crate's tests take turns and share a software adapter's device (`for_tests`)
         #[cfg(all(test, not(target_arch = "wasm32")))]
-        {
-            let turn = serial::Turn::take();
-            type Shared = Option<(wgpu::Device, wgpu::Queue, String)>;
-            static SHARED: std::sync::OnceLock<Result<Shared, String>> = std::sync::OnceLock::new();
-            let shared = SHARED.get_or_init(|| {
-                let gpu = Self::with_limits(crate::device_limits)?;
-                Ok((gpu.device.adapter_info().backend == wgpu::Backend::Gl).then_some((gpu.device, gpu.queue, gpu.adapter_name)))
-            });
-            if let Some((device, queue, adapter_name)) = shared.clone()? {
-                let renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
-                return Ok(Headless { device, queue, renderer, adapter_name, _serial: Some(turn) });
-            }
-            let mut headless = Self::with_limits(crate::device_limits)?;
-            headless._serial = Some(turn);
-            return Ok(headless);
-        }
+        return Self::for_tests();
         #[allow(unreachable_code)]
         Self::with_limits(crate::device_limits)
     }
@@ -44,9 +27,19 @@ impl Headless {
     /// holds for long (llvmpipe on few cores), and the NVIDIA driver can deadlock when one test
     /// destroys its device while another records commands on its own. A thread that already
     /// holds a turn takes another at once.
+    ///
+    /// In the render crate's tests and with the `test-support` feature, the tests of a process
+    /// also share one device and its compiled pipelines on a software adapter (llvmpipe, lavapipe:
+    /// compiling dominates their time, and llvmpipe keeps what it compiled until the process ends).
+    /// A hardware adapter gives each test a device of its own, which its end destroys.
     pub fn for_tests() -> Result<Headless, String> {
         let turn = serial::Turn::take();
-        let mut headless = Self::new()?;
+        #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+        if let Some((device, queue, adapter_name)) = shared_test_device()? {
+            let renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+            return Ok(Headless { device, queue, renderer, adapter_name, _serial: Some(turn) });
+        }
+        let mut headless = Self::with_limits(crate::device_limits)?;
         headless._serial = Some(turn);
         Ok(headless)
     }
@@ -74,6 +67,40 @@ impl Headless {
         self.queue.submit([enc.finish()]);
         self.renderer.read_view(&self.device, &self.queue, frame.view_id)
     }
+}
+
+/// The device of [`shared_test_device`]
+#[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+static SHARED_TEST_DEVICE: std::sync::OnceLock<Result<Option<SharedTestDevice>, String>> = std::sync::OnceLock::new();
+
+/// A device, its queue and its adapter's name
+#[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+type SharedTestDevice = (wgpu::Device, wgpu::Queue, String);
+
+/// The device a process's tests share on a software adapter ([`Headless::for_tests`]); None on
+/// a hardware adapter
+#[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+fn shared_test_device() -> Result<Option<SharedTestDevice>, String> {
+    SHARED_TEST_DEVICE
+        .get_or_init(|| {
+            let gpu = Headless::with_limits(crate::device_limits)?;
+            let shares = shares_test_device(&gpu.device.adapter_info());
+            Ok(shares.then_some((gpu.device, gpu.queue, gpu.adapter_name)))
+        })
+        .clone()
+}
+
+/// Whether `device` is the one the tests of this process share
+#[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+pub(crate) fn is_shared_test_device(device: &wgpu::Device) -> bool {
+    SHARED_TEST_DEVICE.get().is_some_and(|shared| matches!(shared, Ok(Some((shared, ..))) if shared == device))
+}
+
+/// Whether tests share one device on this adapter: a software one (GL here is llvmpipe or a
+/// desktop driver behind EGL, which keeps its compiled programs as long, so GL always shares)
+#[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+pub(crate) fn shares_test_device(info: &wgpu::AdapterInfo) -> bool {
+    info.backend == wgpu::Backend::Gl || info.device_type == wgpu::DeviceType::Cpu
 }
 
 /// Turns of tests on the GPU ([`Headless::for_tests`]). A thread already holding a turn (a test

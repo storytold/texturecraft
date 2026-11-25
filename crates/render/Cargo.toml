@@ -8,6 +8,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Other crates' tests: `Headless::for_tests` shares one device and its compiled pipelines per
+# process on software adapters, as the render crate's own tests do
+test-support = []
+
 [dependencies]
 texturecraft-core = { workspace = true }
 texturecraft-texel = { workspace = true }

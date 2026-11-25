@@ -280,7 +280,8 @@ mod tests {
         let image = Source::Image { name: "Pattern".into(), normal_format: NormalFormat::default() };
         image_input.inputs.insert(texturecraft_core::ImageInput::CUSTOM_INPUT.id.into(), image);
         assert!(compile_effects(Some(image_input.clone()), Some(image_input.clone()), ContentsOffset::NONE).0.is_ok());
-        let (project, pixels, owner) = compare_stack_in(vec![image_input.clone()], (true, 0, false, vec![image_input], true));
+        // No layer below: the image read is the path under test
+        let (project, pixels, owner) = compare_stack_in(vec![image_input.clone()], (false, 0, false, vec![image_input], false));
         let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
         case.mask_owner = Some(owner);
         assert_matches_cpu(&mut gpu, &case, Tolerance::BILINEAR, "an image Custom Input");
@@ -363,16 +364,21 @@ mod tests {
         ImageStore::from([("Pattern".into(), Arc::new(ImageRes::new(4, 4, texels, false)))])
     }
 
-    /// An anchored mask inside a folder with Scale and Rotation whose folder an instance draws
-    /// again under another offset previews on the GPU the draw where the layer itself sits, as the
-    /// CPU's `mask_image` places it.
+    /// An anchored mask inside a folder with Scale and Rotation previews on the GPU through the
+    /// material program as the CPU's `mask_image` places it: drawn once, and with an instance
+    /// drawing the folder again under another offset, where the preview shows the draw at the
+    /// layer's own place.
     #[test]
     #[allow(clippy::unwrap_used)] // A project that does not build fails the test
-    fn an_anchored_mask_in_a_folder_drawn_twice_previews_its_own_draw() {
+    fn an_anchored_mask_inside_an_offset_folder_matches_the_cpu() {
         let Some(mut gpu) = headless() else { return };
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let (baked, images, pixels) = (BakedMaps::default(), pattern_images(), PixelStore::default());
         let (mut project, owner, folder_id) = anchored_mask_in_offset_folder();
+        let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+        case.mask_owner = Some(owner);
+        assert_matches_cpu(&mut gpu, &case, Tolerance::BILINEAR, "anchored mask in an offset folder");
+
         let channels = [Channel::BaseColor, Channel::Height];
         let around = project.alloc_id();
         let mut group = Layer::new(around, "Around", LayerKind::folder(), &channels);
@@ -388,20 +394,6 @@ mod tests {
         case.mask_owner = Some(owner);
 
         assert_matches_cpu(&mut gpu, &case, Tolerance::BILINEAR, "anchored mask in a folder drawn twice");
-    }
-
-    /// An anchored mask inside a folder with Scale and Rotation, drawn once, previews on the GPU
-    /// through the material program as the CPU's `mask_image` places it.
-    #[test]
-    fn an_anchored_mask_inside_an_offset_folder_matches_the_cpu() {
-        let Some(mut gpu) = headless() else { return };
-        let mesh = Arc::new(primitives::plane(1.0, 1));
-        let (baked, images, pixels) = (BakedMaps::default(), pattern_images(), PixelStore::default());
-        let (project, owner, _) = anchored_mask_in_offset_folder();
-
-        let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
-        case.mask_owner = Some(owner);
-        assert_matches_cpu(&mut gpu, &case, Tolerance::BILINEAR, "anchored mask in an offset folder");
     }
 
     /// A paint layer with colour, roughness and height painted in a block (so a filter's halo
@@ -628,15 +620,13 @@ mod tests {
         };
         let invert = effect(EffectKind::Filter(Filter::Invert));
 
-        let mut cases = Vec::new();
-        for op in [CompareOp::LesserThan, CompareOp::WithinTolerance, CompareOp::GreaterThan] {
-            for hardness in [0.6, 0.0, -2.0] {
-                cases.push(vec![compare(op, hardness, BlendMode::Normal, 1.0)]);
-            }
-            cases.push(vec![compare(op, 0.7, BlendMode::Multiply, 0.8)]);
-            cases.push(vec![compare(op, 0.7, BlendMode::Disable, 0.8)]);
-            cases.push(vec![invert.clone(), compare(op, 0.5, BlendMode::Screen, 0.9), invert.clone()]);
-        }
+        // Each comparison with each hardness kind (soft, hard, below zero) once, then blends
+        let ops = [CompareOp::LesserThan, CompareOp::WithinTolerance, CompareOp::GreaterThan];
+        let mut cases: Vec<Vec<Effect>> =
+            ops.into_iter().zip([0.6, 0.0, -2.0]).map(|(op, hardness)| vec![compare(op, hardness, BlendMode::Normal, 1.0)]).collect();
+        cases.push(vec![compare(CompareOp::LesserThan, 0.7, BlendMode::Multiply, 0.8)]);
+        cases.push(vec![compare(CompareOp::WithinTolerance, 0.7, BlendMode::Disable, 0.8)]);
+        cases.push(vec![invert.clone(), compare(CompareOp::GreaterThan, 0.5, BlendMode::Screen, 0.9), invert.clone()]);
         for effects in cases {
             let label = format!("{effects:?}");
             let (project, pixels, owner) = ramp_mask_layer(effects);
@@ -678,13 +668,13 @@ mod tests {
         };
         let invert = effect(EffectKind::Filter(Filter::Invert));
 
-        let mut cases = Vec::new();
-        for background in [SelectionBackground::Black, SelectionBackground::White, SelectionBackground::Gray, SelectionBackground::Transparent] {
-            cases.push(vec![selection(picked.clone(), 1.0, 1.0, background, BlendMode::Normal, 1.0)]);
-            cases.push(vec![selection(picked.clone(), 0.6, 0.5, background, BlendMode::Normal, 1.0)]);
-            cases.push(vec![selection(picked.clone(), 0.8, 0.2, background, BlendMode::Multiply, 0.75)]);
-            cases.push(vec![selection(Vec::new(), 0.7, 0.5, background, BlendMode::Normal, 1.0)]);
-        }
+        // Each background once: the background is a parameter of the one selection path
+        let mut cases = vec![
+            vec![selection(picked.clone(), 1.0, 1.0, SelectionBackground::Black, BlendMode::Normal, 1.0)],
+            vec![selection(picked.clone(), 0.6, 0.5, SelectionBackground::White, BlendMode::Normal, 1.0)],
+            vec![selection(picked.clone(), 0.8, 0.2, SelectionBackground::Gray, BlendMode::Multiply, 0.75)],
+            vec![selection(Vec::new(), 0.7, 0.5, SelectionBackground::Transparent, BlendMode::Normal, 1.0)],
+        ];
         cases.push(vec![selection(picked.clone(), 0.6, 0.5, SelectionBackground::Gray, BlendMode::Disable, 0.9)]);
         cases.push(vec![invert.clone(), selection(picked.clone(), 0.4, 0.3, SelectionBackground::Transparent, BlendMode::Screen, 0.9), invert]);
         for effects in cases {
@@ -910,15 +900,19 @@ mod tests {
     #[test]
     fn mask_comparisons_reading_layers_match_the_cpu() {
         let invert = effect(EffectKind::Filter(Filter::Invert));
-        let mut cases = Vec::new();
-        for channel in [Channel::BaseColor, Channel::Roughness, Channel::Height, Channel::Normal] {
-            for pair in SIDES {
-                cases.push(vec![compare_effect(CompareOp::GreaterThan, pair, channel, 0.6, BlendMode::Normal, 1.0)]);
-            }
-            for op in [CompareOp::LesserThan, CompareOp::WithinTolerance, CompareOp::GreaterThan] {
-                cases.push(vec![compare_effect(op, SIDES[1], channel, 1.0, BlendMode::Normal, 1.0)]);
-                cases.push(vec![compare_effect(op, SIDES[3], channel, 0.3, BlendMode::Multiply, 0.8)]);
-            }
+        // Each side pair, channel kind and comparison once: they are parameters of one compare path
+        let channels = [Channel::BaseColor, Channel::Roughness, Channel::Height, Channel::Normal];
+        let mut cases: Vec<Vec<Effect>> = SIDES
+            .iter()
+            .zip(channels)
+            .map(|(&pair, channel)| vec![compare_effect(CompareOp::GreaterThan, pair, channel, 0.6, BlendMode::Normal, 1.0)])
+            .collect();
+        let ops = [CompareOp::LesserThan, CompareOp::WithinTolerance, CompareOp::GreaterThan];
+        for (op, (hard, soft)) in
+            ops.into_iter().zip([(Channel::Height, Channel::BaseColor), (Channel::Normal, Channel::Roughness), (Channel::BaseColor, Channel::Height)])
+        {
+            cases.push(vec![compare_effect(op, SIDES[1], hard, 1.0, BlendMode::Normal, 1.0)]);
+            cases.push(vec![compare_effect(op, SIDES[3], soft, 0.3, BlendMode::Multiply, 0.8)]);
         }
         cases.push(vec![compare_effect(CompareOp::GreaterThan, SIDES[0], Channel::Roughness, 0.5, BlendMode::Disable, 0.7)]);
         cases.push(vec![invert.clone(), compare_effect(CompareOp::WithinTolerance, SIDES[1], Channel::Height, 0.4, BlendMode::Screen, 0.9), invert]);
@@ -1001,13 +995,13 @@ mod tests {
         };
         let invert = effect(EffectKind::Filter(Filter::Invert));
 
-        let mut cases = Vec::new();
-        for background in [SelectionBackground::Black, SelectionBackground::White, SelectionBackground::Gray, SelectionBackground::Transparent] {
-            cases.push(vec![selection("Ids", 1.0, 1.0, background, BlendMode::Normal, 1.0)]);
-            cases.push(vec![selection("Ids", 0.6, 0.3, background, BlendMode::Multiply, 0.75)]);
-            cases.push(vec![selection("Ids sRGB", 0.7, 0.4, background, BlendMode::Normal, 1.0)]);
-            cases.push(vec![selection("Missing", 0.8, 1.0, background, BlendMode::Normal, 1.0)]);
-        }
+        // Each background once: the background is a parameter of the one selection path
+        let mut cases = vec![
+            vec![selection("Ids", 1.0, 1.0, SelectionBackground::Black, BlendMode::Normal, 1.0)],
+            vec![selection("Ids", 0.6, 0.3, SelectionBackground::White, BlendMode::Multiply, 0.75)],
+            vec![selection("Ids sRGB", 0.7, 0.4, SelectionBackground::Gray, BlendMode::Normal, 1.0)],
+            vec![selection("Missing", 0.8, 1.0, SelectionBackground::Transparent, BlendMode::Normal, 1.0)],
+        ];
         cases.push(vec![selection("Ids", 0.6, 0.5, SelectionBackground::White, BlendMode::Disable, 0.8)]);
         cases.push(vec![invert.clone(), selection("Ids", 0.4, 0.5, SelectionBackground::Gray, BlendMode::Screen, 0.9), invert]);
         for effects in cases {

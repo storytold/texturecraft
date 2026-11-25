@@ -229,6 +229,26 @@ fn azimuth(y: f32, x: f32) -> f32 {
     if x == 0.0 && y == 0.0 { return 0.5; }
     return atan2(y, x) / 6.283185307 + 0.5;
 }
+
+// acos within about one ulp of Rust's f32 acos (Cephes acosf). A backend's own acos can be far
+// coarser (llvmpipe's is off by about 1e-5), which moves a nearest texel read across a texel edge
+fn polar_angle(cosine: f32) -> f32 {
+    let x = clamp(cosine, -1.0, 1.0);
+    if x > 0.5 {
+        return 2.0 * asin_small(sqrt(0.5 * (1.0 - x)));
+    }
+    if x < -0.5 {
+        return 3.141592654 - 2.0 * asin_small(sqrt(0.5 * (1.0 + x)));
+    }
+    return 1.570796327 - asin_small(x);
+}
+
+// asin of |x| <= 0.5 (Cephes asinf's polynomial)
+fn asin_small(x: f32) -> f32 {
+    let z = x * x;
+    let p = (((4.2163199048e-2 * z + 2.4181311049e-2) * z + 4.5470025998e-2) * z + 7.4953002686e-2) * z + 1.6666752422e-1;
+    return p * z * x + x;
+}
 fn triplanar_weights(normal: vec3<f32>, sharpness: f32) -> vec3<f32> {
     let axes = abs(normal);
     let strongest = max(axes.x, max(axes.y, axes.z));

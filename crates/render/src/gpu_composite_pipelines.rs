@@ -213,26 +213,16 @@ pub(super) struct CompositePipelines {
     variants: BTreeMap<Features, Variants>,
 }
 
-/// The pipelines a compositor uses: its own, or in the render crate's tests on GL one set per
-/// device for every compositor (llvmpipe keeps what it compiled until the process ends, so each
-/// test compiling the same variants again would add up). Other backends keep their own: a device
-/// kept here lives until the process ends, and the NVIDIA driver can crash at exit while one
-/// still compiles in the background.
+/// The pipelines a compositor uses: its own, or on the device tests share
+/// ([`crate::headless::Headless::for_tests`]) one set for every compositor, so a test does not
+/// compile the variants an earlier one compiled (llvmpipe keeps what it compiled until the
+/// process ends, and compiling dominates its tests' time).
 pub(super) fn shared(device: &wgpu::Device, supports_curvature: bool, supports_id: bool) -> Arc<Mutex<CompositePipelines>> {
-    #[cfg(all(test, not(target_arch = "wasm32")))]
-    if device.adapter_info().backend == wgpu::Backend::Gl {
-        static SHARED: Mutex<Vec<(wgpu::Device, Arc<Mutex<CompositePipelines>>)>> = Mutex::new(Vec::new());
-        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, pipelines)) = shared.iter().find(|(owner, _)| owner == device) {
-            return pipelines.clone();
-        }
-        let pipelines = Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)));
-        shared.push((device.clone(), pipelines.clone()));
-        return pipelines;
+    #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+    if crate::headless::is_shared_test_device(device) {
+        static SHARED: std::sync::OnceLock<Arc<Mutex<CompositePipelines>>> = std::sync::OnceLock::new();
+        return SHARED.get_or_init(|| Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)))).clone();
     }
-    #[cfg(not(all(test, not(target_arch = "wasm32"))))]
-    let _ = device;
-    #[allow(unreachable_code)]
     Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)))
 }
 
@@ -578,8 +568,10 @@ mod tests {
         }
     }
 
-    /// The same programs as compute pipelines on the adapter, as `CompositePipelines::get`
-    /// creates them (both group variants), and the neighbourhood pipelines.
+    /// The programs with every package in full and with every package as a stub as compute
+    /// pipelines on the adapter, as `CompositePipelines::get` creates them (both group variants),
+    /// and the neighbourhood pipelines. The variants with one package in full are checked by naga
+    /// above: on the adapter they only repeat these compiles.
     #[test]
     fn package_shaders_build_compute_pipelines_in_full_and_as_stubs() {
         let Some(gpu) = oracle::headless() else { return };
@@ -593,7 +585,8 @@ mod tests {
         // The program with every other feature too stays with the naga check above: Mesa's GL
         // compiler (llvmpipe) runs out of 28 GB on its prepare_filter pipeline, with the package
         // files as stubs too (a property of the base features, not of the packages).
-        for features in variants().into_iter().filter(|features| !features.generators) {
+        let one_package = |features: &Features| ShaderFlags::EACH.contains(&features.packages);
+        for features in variants().into_iter().filter(|features| !features.generators && !one_package(features)) {
             let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
             let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tc_gpu_composite_packages"),
