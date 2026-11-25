@@ -113,6 +113,7 @@ const ROW_PASS_WORK: u64 = 4;
 const COLUMN_PASS_WORK: u64 = 8;
 
 /// P4's own compute pipelines, created from the neighbourhood module.
+#[derive(Clone)]
 pub(super) struct Pipelines {
     prepare: wgpu::ComputePipeline,
     apply: wgpu::ComputePipeline,
@@ -865,7 +866,7 @@ mod tests {
     /// The fields after running the stage `filter` over `texels` as the compositor does.
     fn run_stage(gpu: &Headless, texels: &[([f32; 4], f32)], size: (u32, u32), filter: NeighbourhoodFilter) -> Vec<[u32; 5]> {
         let (scratch, region) = fields_on_gpu(gpu, texels, size);
-        let kernels = NeighbourhoodGpu::new(&gpu.device);
+        let kernels = NeighbourhoodGpu::for_device(&gpu.device);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         kernels.encode(&gpu.device, &mut encoder, &scratch, region, filter);
         read_fields(gpu, encoder, &scratch)
@@ -1070,7 +1071,7 @@ mod tests {
     fn run_passes(gpu: &Headless, texels: &[([f32; 4], f32)], size: (u32, u32), filter: NeighbourhoodFilter, passes: &[(&str, [usize; 3])]) -> Vec<[u32; 5]> {
         let (scratch, region) = fields_on_gpu(gpu, texels, size);
         let offsets = [region.original, region.blur[0], region.blur[1], region.output];
-        let kernels = NeighbourhoodGpu::new(&gpu.device);
+        let kernels = NeighbourhoodGpu::for_device(&gpu.device);
         let pipelines = &kernels.box_family;
         let texel_groups = [size.0.div_ceil(8), size.1.div_ceil(8)];
         let mut encoder = gpu.device.create_command_encoder(&Default::default());

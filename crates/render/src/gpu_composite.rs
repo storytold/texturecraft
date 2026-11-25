@@ -3288,7 +3288,7 @@ impl GpuCompositor {
             if tile_work == 0 {
                 band_rows = height.min(256);
             }
-            self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::new(device));
+            self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::for_device(device));
         }
         let (pipeline, prepare) = self.pipelines().get(device, &self.pipeline_layout, program, self.asynchronous).ok_or(GPU_PIPELINES_PENDING)?;
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;

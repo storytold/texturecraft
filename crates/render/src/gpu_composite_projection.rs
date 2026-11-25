@@ -1275,7 +1275,7 @@ mod tests {
             ("planar bilinear HQ", Projection::Planar { scale: 2.5, axis: 2, offset: [0.0; 3], uv, projector: culled, placed: None }, Sampling::default()),
         ];
         for (label, projection, sampling) in cases {
-            assert_fill_matches(&mut gpu, &sphere(), &projection, sampling, FLIPS, &format!("depth culled {label}"));
+            assert_fill_matches_material(&mut gpu, &sphere(), &projection, sampling, FLIPS, &format!("depth culled {label}"));
         }
     }
 

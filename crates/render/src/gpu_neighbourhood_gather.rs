@@ -152,6 +152,7 @@ const KUWAHARA_TENSOR_READS: u64 = 9 * 4;
 const KUWAHARA_SAMPLE_WORK: u64 = 3 * SAMPLE_WORK;
 
 /// P5's own compute pipelines, created from the neighbourhood module.
+#[derive(Clone)]
 pub(super) struct Pipelines {
     /// Anisotropic Kuwahara's structure tensor: each texel's ellipse frame.
     kuwahara_frame: wgpu::ComputePipeline,
