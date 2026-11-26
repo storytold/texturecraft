@@ -18,6 +18,10 @@ use crate::security::MAX_BATCH_STEPS;
 use crate::workspace::authorize_command;
 use crate::{AutomationError, BridgeClient, Headless, bad};
 
+mod export_map_params;
+
+pub use export_map_params::ExportMapParams;
+
 /// Where tools run.
 pub enum Backend {
     /// An in-process session.
@@ -152,12 +156,24 @@ pub struct ExportParams {
     /// File format override: png, jpg, tga, tif, exr, …
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
-    /// none | dilation | dilationDefault | infinite
+    /// Bit depth override (8, 16 or 32, depending on the format).
+    #[serde(default, rename = "bitDepth", skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u8>,
+    /// Apply ordered dithering to 8-bit outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dithering: Option<bool>,
+    /// none | dilation | dilationDefault | diffusion | infinite.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub padding: Option<String>,
+    /// Padding width in texels for dilation and diffusion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dilation: Option<u32>,
     /// Output size in pixels (power of two).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u32>,
+    /// Settings for individual maps in the selected template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maps: Option<Vec<ExportMapParams>>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]

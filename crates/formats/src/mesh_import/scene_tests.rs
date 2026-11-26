@@ -3,7 +3,7 @@
 
 use std::io::Write as _;
 
-use texturecraft_geom::glam::{Vec2, Vec3};
+use texturecraft_geom::glam::{Vec2, Vec3, Vec4};
 
 use super::tests::hammer;
 use super::*;
@@ -298,7 +298,46 @@ fn fbx_binary_32_and_64_bit_compressed_or_not() {
     }
 }
 
+/// [`scene`] with a per-polygon-vertex color layer: corner `i` gets `(i/8, 1 - i/8, 0.25, 1)`.
+fn colored_scene() -> Vec<N> {
+    let mut nodes = scene(false);
+    let objects = nodes.iter_mut().find(|node| node.name == "Objects").unwrap();
+    let geometry = objects.children.iter_mut().find(|node| node.name == "Geometry").unwrap();
+    let colors: Vec<f64> = (0..7).flat_map(|i| [i as f64 / 8.0, 1.0 - i as f64 / 8.0, 0.25, 1.0]).collect();
+    geometry.children.push(layer(
+        "LayerElementColor",
+        "ByPolygonVertex",
+        "IndexToDirect",
+        vec![n("Colors", vec![P::Doubles(colors)], vec![]), n("ColorIndex", vec![P::Ints((0..7).collect())], vec![])],
+    ));
+    nodes
+}
+
+#[test]
+fn fbx_vertex_colors_reach_the_mesh_and_high_polys() {
+    let nodes = colored_scene();
+    let expected: Vec<Vec4> = (0..7).map(|i| Vec4::new(i as f32 / 8.0, 1.0 - i as f32 / 8.0, 0.25, 1.0)).collect();
+    for (label, bytes) in [("binary", binary_fbx(&nodes, 7400, false)), ("ascii", ascii_fbx(&nodes).into_bytes())] {
+        let imported = import_mesh_bytes("colors.fbx", &bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(imported.mesh.colors, expected, "{label}: the color layer reaches the mesh");
+        let high = import_high_poly_bytes("colors.fbx", &bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(high.mesh.colors, expected, "{label}: and the high poly used for ID bakes");
+    }
+}
+
 /// [`scene`] with a diffuse color on Red and an embedded diffuse texture on Blue.
+#[test]
+fn fbx_camera_models_are_capped_during_import() {
+    let mut nodes = scene(false);
+    let objects = nodes.iter_mut().find(|node| node.name == "Objects").unwrap();
+    for id in 100..199 {
+        objects.children.push(n("Model", vec![P::L(id), P::S("Camera\\u{0}\\u{1}Model"), P::S("Camera")], vec![]));
+    }
+
+    let raw = fbx::read(&binary_fbx(&nodes, 7500, true)).unwrap();
+    assert_eq!(raw.cameras.len(), MAX_CAMERAS);
+}
+
 fn textured_scene(png: &[u8]) -> Vec<N> {
     let mut nodes = scene(false);
     let objects = nodes.iter_mut().find(|n| n.name == "Objects").unwrap();
@@ -336,6 +375,23 @@ fn fbx_diffuse_colors_and_embedded_textures_reach_high_polys() {
         check_fbx_scene(&import_mesh_bytes("textured.fbx", &bytes).unwrap().mesh, false);
     }
     hammer("x.fbx", &binary_fbx(&nodes, 7500, false));
+}
+
+#[test]
+fn fbx_retains_white_materials_and_colors_beside_textures() {
+    let mut nodes = textured_scene(&tiny_png());
+    let objects = nodes.iter_mut().find(|node| node.name == "Objects").unwrap();
+    let red = objects.children.iter_mut().find(|node| matches!(node.props.first(), Some(P::L(30)))).unwrap();
+    red.children = vec![props70(vec![prop("DiffuseColor", &[1.0, 1.0, 1.0])])];
+    let blue = objects.children.iter_mut().find(|node| matches!(node.props.first(), Some(P::L(31)))).unwrap();
+    blue.children.push(props70(vec![prop("DiffuseColor", &[0.1, 0.2, 0.3])]));
+
+    let imported = import_high_poly_bytes("colors.fbx", &binary_fbx(&nodes, 7500, true)).unwrap();
+    let white = imported.base_color[0].as_ref().unwrap();
+    let textured = imported.base_color[1].as_ref().unwrap();
+    assert_eq!(white.factor, texturecraft_geom::glam::Vec4::ONE);
+    assert_eq!(textured.factor, texturecraft_geom::glam::Vec4::new(0.1, 0.2, 0.3, 1.0));
+    assert_eq!(textured.texels.len(), 4);
 }
 
 /// [`textured_scene`] with Blue's texture kept as a file: `tex/wood.png` relative to the FBX, or
@@ -396,6 +452,24 @@ fn fbx_ascii_and_z_up() {
     check_fbx_camera(&im);
     check_fbx_scene(&import_mesh_bytes("z.fbx", ascii_fbx(&scene(true)).as_bytes()).unwrap().mesh, true);
     check_fbx_scene(&import_mesh_bytes("z.fbx", &binary_fbx(&scene(true), 7700, true)).unwrap().mesh, true);
+}
+
+#[test]
+fn fbx_duplicate_geometry_connections_do_not_duplicate_instances() {
+    let mut nodes = scene(false);
+    let connections = nodes.iter_mut().find(|node| node.name == "Connections").unwrap();
+    for _ in 0..50 {
+        connections.children.push(n("C", vec![P::S("OO"), P::L(10), P::L(21)], vec![]));
+    }
+    let imported = import_mesh_bytes("scene.fbx", ascii_fbx(&nodes).as_bytes()).unwrap();
+    assert_eq!(imported.report.triangles, 3);
+
+    let objects = nodes.iter_mut().find(|node| node.name == "Objects").unwrap();
+    objects.children.push(n("Model", vec![P::L(22), P::S("Other\u{0}\u{1}Model"), P::S("Mesh")], vec![]));
+    let connections = nodes.iter_mut().find(|node| node.name == "Connections").unwrap();
+    connections.children.push(n("C", vec![P::S("OO"), P::L(10), P::L(22)], vec![]));
+    let imported = import_mesh_bytes("scene.fbx", ascii_fbx(&nodes).as_bytes()).unwrap();
+    assert_eq!(imported.report.triangles, 6, "a different model must remain a distinct instance");
 }
 
 /// The scene of [`scene`] (Y up) as FBX 6.1 writes it: geometry inside the Model, objects named
@@ -572,25 +646,64 @@ fn fbx_old_versions_and_garbage_are_errors() {
     assert!(import_mesh_bytes("h.fbx", &huge).is_err());
 }
 
+// Keep these fixtures independently schedulable: one serial test took 24 minutes in
+// instrumented coverage. Splitting cases keeps every mutation and assertion intact.
 #[test]
-fn malformed_fbx_and_dae_never_panic() {
+fn malformed_fbx_and_dae_never_panic_binary_7400() {
     hammer("x.fbx", &binary_fbx(&scene(false), 7400, false));
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_binary_7500() {
     hammer("x.fbx", &binary_fbx(&scene(true), 7500, true));
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_ascii() {
     hammer("x.fbx", ascii_fbx(&scene(false)).as_bytes());
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_collada() {
     hammer("x.dae", DAE.as_bytes());
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_random_binary() {
+    random_scene_corruptions(0);
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_random_ascii() {
+    random_scene_corruptions(1);
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_random_collada() {
+    random_scene_corruptions(2);
+}
+
+fn random_scene_corruptions(selected_fixture: usize) {
     // Random multi-byte corruptions (a fixed LCG keeps failures reproducible).
     let mut seed = 0x2545_f491_4f6c_dd1du64;
     let mut next = move || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (seed >> 33) as usize
     };
-    for good in [binary_fbx(&scene(false), 7500, true), ascii_fbx(&scene(true)).into_bytes(), DAE.as_bytes().to_vec()] {
+    // Replay earlier mutations without parsing them so each fixture receives exactly
+    // its original LCG stream, not a fresh seed. Fixture sizes and all 1,500 cases
+    // per fixture stay unchanged; generating these bytes is cheap next to parsing.
+    let fixtures = [binary_fbx(&scene(false), 7500, true), ascii_fbx(&scene(true)).into_bytes(), DAE.as_bytes().to_vec()];
+    for (fixture, good) in fixtures.into_iter().enumerate().take(selected_fixture + 1) {
         let name = if good.starts_with(b"<?xml") { "r.dae" } else { "r.fbx" };
         for _ in 0..1500 {
             let mut b = good.clone();
             for _ in 0..1 + next() % 4 {
                 let i = next() % b.len();
                 b[i] = next() as u8;
+            }
+            if fixture != selected_fixture {
+                continue;
             }
             if let Err(e) = import_mesh_bytes(name, &b) {
                 assert!(!e.to_string().contains("parser failed"), "{name}: a parser panicked");
@@ -708,6 +821,50 @@ fn dae_polylist_z_up_units_and_node_transforms() {
     let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
     assert_eq!(cam.name, "Overview");
     assert!(!cam.ortho && near(cam.fov, 30.0) && near(cam.yaw, 0.0) && near(cam.pitch, 0.0), "{cam:?}");
+}
+
+#[test]
+fn dae_attribute_and_text_entities_are_decoded() {
+    let dae = DAE
+        .replace(r#"<node id="other">"#, r#"<node id="other" name="Tom &amp; Jerry &lt;&quot;&apos;&#65;&#x42;">"#)
+        .replace(r#"name="Red""#, r#"name="R&amp;D""#)
+        .replace(r#"<geometry id="quad""#, r#"<geometry id="q&amp;d""#)
+        .replace(r##"url="#quad""##, r##"url="#q&#38;d""##)
+        .replace("<yfov>30</yfov>", "<yfov>3&#48;</yfov>");
+    let r = import_mesh_bytes("scene.dae", dae.as_bytes()).unwrap();
+    let m = &r.mesh;
+    let parts: Vec<&str> = m.submeshes.iter().map(|s| s.name.as_str()).collect();
+    assert!(parts.contains(&"Tom & Jerry <\"'AB"), "{parts:?}");
+    assert_eq!(m.materials, vec!["R&D".to_string(), "Blue".to_string()]);
+    assert_eq!(m.triangle_count(), 2 + 1 + 2);
+    let [cam] = r.cameras.as_slice() else { panic!("{:?}", r.cameras) };
+    assert!((cam.fov - 30.0).abs() < 1e-3, "{cam:?}");
+}
+
+#[test]
+fn dae_empty_material_binding_stays_distinct_from_named_default() {
+    let dae = DAE.replace(r#"name="Red""#, r#"name="""#).replace(r#"name="Blue""#, r#"name="Default""#);
+    let m = import_mesh_bytes("scene.dae", dae.as_bytes()).unwrap().mesh;
+    assert_eq!(m.materials.len(), 2);
+    let material_for = |part: &str| m.submeshes.iter().find(|s| s.name == part).map(|s| m.materials[s.material].as_str());
+    assert_eq!(material_for("child"), Some(""));
+    assert_eq!(material_for("other"), Some("Default"));
+}
+
+#[test]
+fn dae_preserves_multiple_cameras_on_one_node() {
+    let dae = DAE
+        .replace(
+            r#"<camera id="lens"><optics><technique_common><perspective><yfov>30</yfov></perspective></technique_common></optics></camera>"#,
+            r#"<camera id="lens"><optics><technique_common><perspective><yfov>30</yfov></perspective></technique_common></optics></camera>
+    <camera id="lens2" name="Detail"><optics><technique_common><orthographic><ymag>2</ymag></orthographic></technique_common></optics></camera>"#,
+        )
+        .replace(r##"<instance_camera url="#lens"/>"##, r##"<instance_camera url="#lens"/><instance_camera url="#lens2"/>"##);
+    assert_ne!(dae, DAE);
+    let r = import_mesh_bytes("scene.dae", dae.as_bytes()).unwrap();
+    assert_eq!(r.cameras.len(), 2, "{:?}", r.cameras);
+    assert!(!r.cameras[0].ortho && (r.cameras[0].fov - 30.0).abs() < 1e-3);
+    assert!(r.cameras[1].ortho);
 }
 
 #[test]

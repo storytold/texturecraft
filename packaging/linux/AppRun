@@ -13,6 +13,9 @@ set -u
 
 APPDIR="$(dirname "$(readlink -f "$0")")"
 DESK_ID=ai.storyteller.texturecraft
+# package.sh rewrites this line for a Nightly AppImage, which starts the app with the Launcher's
+# private profile exactly as the deb, rpm, Arch, Flatpak and tarball launchers do.
+CHANNEL=stable
 
 integrate() {
   case "${TEXTURECRAFT_NO_DESKTOP_INTEGRATION:-}" in
@@ -69,4 +72,14 @@ integrate() {
 }
 
 integrate
+
+# The Launcher's own protocol, and a bare version query, pass through untouched: the first already
+# names its profile, and the second must answer without one.
+case "${1-}" in
+  --launch-profile | --profile-root | --version | -V) exec "$APPDIR/usr/bin/texturecraft" "$@" ;;
+esac
+if [ "$CHANNEL" = nightly-v1 ]; then
+  exec "$APPDIR/usr/bin/texturecraft" --launch-profile nightly-v1 \
+    --profile-root "${XDG_DATA_HOME:-${HOME:-}/.local/share}/TextureCraft-Nightly" -- "$@"
+fi
 exec "$APPDIR/usr/bin/texturecraft" "$@"

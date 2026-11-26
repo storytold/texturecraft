@@ -22,7 +22,7 @@ impl BrushPreset {
 }
 
 /// `brush` with the stroke of `from` (shape, flow, opacity, spacing, hardness, angle, path
-/// following, jitters and particles): what a preset sets.
+/// following, jitters, particles and the alpha's parameters): what a preset sets.
 pub fn with_stroke_of(brush: &BrushSettings, from: &BrushSettings) -> BrushSettings {
     BrushSettings {
         flow: from.flow,
@@ -38,6 +38,7 @@ pub fn with_stroke_of(brush: &BrushSettings, from: &BrushSettings) -> BrushSetti
         alpha: from.alpha,
         alpha_image: from.alpha_image.clone(),
         alpha_library: from.alpha_library.clone(),
+        alpha_params: from.alpha_params,
         particles: from.particles,
         ..brush.clone()
     }
@@ -178,6 +179,15 @@ pub const PRESETS: [BrushPreset; 18] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alpha_params::AlphaParams;
+
+    #[test]
+    fn a_saved_brush_brings_its_alpha_parameters_and_a_built_in_preset_resets_them() {
+        let params = AlphaParams { size_x: 0.5, invert: true, ..AlphaParams::default() };
+        let saved = BrushSettings { alpha_params: params, ..BrushSettings::default() };
+        assert_eq!(with_stroke_of(&BrushSettings::default(), &saved).alpha_params, params);
+        assert_eq!(PRESETS[0].applied(&saved).alpha_params, AlphaParams::default());
+    }
 
     #[test]
     fn presets_are_unique_valid_and_keep_the_setup() {
