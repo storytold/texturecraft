@@ -34,7 +34,7 @@ impl IdColorPick {
         let Some(pick) = app.picking_id_color.take() else { return };
 
         if app.session.view == ViewMode::MeshMap(BakedMap::Id) {
-            let image = app.session.view_image.as_deref().filter(|name| app.session.images.contains_key(*name));
+            let image = app.session.view_image.as_deref().filter(|name| app.session.images.contains_key(name));
             app.run("viewport.view", view_params(pick.previous_view, image));
         }
     }

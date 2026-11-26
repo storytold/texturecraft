@@ -7,6 +7,9 @@ use texturecraft_engine::{Session, execute};
 const OPENPBR: &str = "OpenPBR (separate maps)";
 const DEFAULT: &str = "Document channels + Normal + AO (No Alpha)";
 
+/// The preset lists every channel but the normal map and the ambient occlusion first, then the normal map
+const NORMAL_MAP: usize = texturecraft_engine::core::Channel::ALL.len() - 2;
+
 /// A scratch folder that is removed when it goes out of scope, so a failing test leaves nothing behind.
 struct Scratch(std::path::PathBuf);
 
@@ -172,7 +175,7 @@ fn per_map_overrides_of_the_template_do_not_reach_the_openpbr_maps() {
     let result = execute(
         &mut session,
         "file.exportTextures",
-        &json!({"dir": dir.display().to_string(), "preset": DEFAULT, "materialX": true, "maps": [{"map": 0, "enabled": false}, {"map": 19, "format": "tiff", "bitDepth": 16}]}),
+        &json!({"dir": dir.display().to_string(), "preset": DEFAULT, "materialX": true, "maps": [{"map": 0, "enabled": false}, {"map": NORMAL_MAP, "format": "tiff", "bitDepth": 16}]}),
     )
     .unwrap();
 

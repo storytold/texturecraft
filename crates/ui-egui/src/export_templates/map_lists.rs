@@ -61,7 +61,7 @@ pub static INPUT_MAPS: LazyLock<Vec<MapGroup>> = LazyLock::new(|| {
             n_("Geometry"),
             vec![channel(Channel::Opacity), channel(Channel::Height), channel(Channel::Normal), missing(n_("Tangent")), channel(Channel::AmbientOcclusion)],
         ),
-        (n_("Other"), vec![channel(Channel::Glossiness), channel(Channel::Specular)]),
+        (n_("Other"), [Channel::Glossiness, Channel::Specular].into_iter().chain(Channel::USER).map(channel).collect()),
     ]
 });
 

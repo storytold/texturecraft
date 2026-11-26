@@ -67,7 +67,7 @@ impl ShelfEntry {
             name: preset.name.clone(),
             index,
         });
-        let images = app.session.doc.resources.keys().filter(|name| app.session.images.contains_key(*name)).cloned().map(ShelfEntry::Image);
+        let images = app.session.doc.resources.keys().filter(|name| app.session.images.contains_key(name)).cloned().map(ShelfEntry::Image);
         built_in.chain(saved).chain(images).collect()
     }
 

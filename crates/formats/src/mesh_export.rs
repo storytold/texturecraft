@@ -294,7 +294,7 @@ fn named_glb_meshes(mesh: &Mesh, name: &str) -> Result<Vec<craft_mesh::Mesh>> {
         let mut corners = Vec::with_capacity(indices.len());
         for &index in indices {
             let source = index as usize;
-            let position = mesh.positions.get(source).ok_or_else(|| FormatError::Invalid("a mesh index is out of range".into()))?;
+            let position = mesh.positions.get(source).ok_or_else(|| FormatError::Invalid("a corner index is out of range".into()))?;
             let next = output.positions.len() as u32;
             let local = *vertices.entry(index).or_insert(next);
             if local == next {
