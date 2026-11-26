@@ -173,6 +173,11 @@ impl BakedView<'_> {
         }
     }
 
+    /// Whether the bake holds map `m`.
+    pub fn has(&self, m: BakedMap) -> bool {
+        self.maps.maps.contains_key(&m)
+    }
+
     pub fn scalar(&self, m: BakedMap, x: u32, y: u32) -> Option<f32> {
         self.sample(m, x, y).map(|v| v[0])
     }

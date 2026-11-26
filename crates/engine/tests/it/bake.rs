@@ -65,20 +65,88 @@ fn high_poly_meshes_drive_the_bake_and_round_trip() {
 
     // Save and reopen: meshes, cage and settings come back
     let reloaded = Session::from_project_bytes(&session.to_project_bytes().unwrap()).unwrap();
-    let names = |session: &Session| session.bake_meshes.high.iter().map(|h| (h.name.clone(), h.mesh.triangle_count())).collect::<Vec<_>>();
+    let names = |session: &Session| session.doc.bake_meshes.high.iter().map(|high| (high.name.clone(), high.mesh.triangle_count())).collect::<Vec<_>>();
     assert_eq!(names(&reloaded), names(&session));
-    assert_eq!(reloaded.bake_meshes.cage.as_ref().map(|c| c.name.as_str()), Some("cage.obj"));
+    assert_eq!(reloaded.doc.bake_meshes.cage.as_ref().map(|cage| cage.name.as_str()), Some("cage.obj"));
     assert_eq!(reloaded.doc.project.texture_sets[0].bake, session.doc.project.texture_sets[0].bake);
 
     execute(&mut session, "bake.highPoly.remove", &json!({ "name": "hp_high.obj" })).unwrap();
-    assert!(session.bake_meshes.high.is_empty());
+
+    assert!(session.doc.bake_meshes.high.is_empty());
     execute(&mut session, "bake.cage.clear", &Value::Null).unwrap();
-    assert!(session.bake_meshes.cage.is_none());
+
+    assert!(session.doc.bake_meshes.cage.is_none());
 
     // Without high polys the bake falls back to the low poly
     execute(&mut session, "bake.run", &json!({ "resolution": 128, "maps": ["opacity"] })).unwrap();
+
     assert!(session.doc.baked[&0].maps[&BakedMap::Opacity].iter().all(|v| *v == 1.0));
     let _ = std::fs::remove_dir_all(std::path::Path::new(&high).parent().unwrap());
+}
+
+#[test]
+fn high_poly_and_cage_edits_are_undo_steps() {
+    let mut session = plane_session();
+    execute(&mut session, "bake.settings", &json!({ "ts": "all", "useLowAsHigh": true })).unwrap();
+    let low = session.mesh.as_ref().clone();
+    let high_names = |session: &Session| session.doc.bake_meshes.high.iter().map(|high| high.name.clone()).collect::<Vec<_>>();
+    let merged_triangles = |session: &Session| session.doc.bake_meshes.merged_high().map(|merged| merged.mesh.triangle_count());
+
+    session.add_high_poly_bytes("part_high.obj", obj(&low, 0.002, f32::MAX, [1.0; 3]).into_bytes()).unwrap();
+
+    assert_eq!(session.undo_label(), Some("Add high poly mesh"));
+    assert!(!session.doc.project.texture_sets[0].bake.high_poly.use_low_as_high);
+
+    session.undo().unwrap();
+
+    assert!(high_names(&session).is_empty(), "undo takes the high poly out");
+    assert_eq!(merged_triangles(&session), None, "bakes no longer see it");
+    assert!(session.doc.project.texture_sets[0].bake.high_poly.use_low_as_high, "the setting the add changed comes back");
+
+    session.redo().unwrap();
+
+    assert_eq!(high_names(&session), ["part_high.obj"]);
+    assert_eq!(merged_triangles(&session), Some(low.triangle_count()));
+
+    execute(&mut session, "bake.highPoly.remove", &json!({ "index": 0 })).unwrap();
+    session.undo().unwrap();
+
+    assert_eq!(high_names(&session), ["part_high.obj"], "undo brings a removed high poly back");
+    execute(&mut session, "bake.highPoly.remove", &json!({ "all": true })).unwrap();
+    session.undo().unwrap();
+
+    assert_eq!(merged_triangles(&session), Some(low.triangle_count()));
+
+    session.set_cage_bytes("cage.obj", obj(&low, 0.05, f32::MAX, [1.0; 3]).into_bytes()).unwrap();
+    session.undo().unwrap();
+
+    assert!(session.doc.bake_meshes.cage.is_none(), "undo takes the cage out");
+    session.redo().unwrap();
+    execute(&mut session, "bake.cage.clear", &Value::Null).unwrap();
+    session.undo().unwrap();
+
+    assert_eq!(session.doc.bake_meshes.cage.as_ref().map(|cage| cage.name.as_str()), Some("cage.obj"), "undo brings a removed cage back");
+
+    let steps = session.history_labels().len();
+    execute(&mut session, "bake.highPoly.remove", &json!({ "all": true })).unwrap();
+    execute(&mut session, "bake.highPoly.remove", &json!({ "all": true })).unwrap();
+    execute(&mut session, "bake.cage.clear", &Value::Null).unwrap();
+    execute(&mut session, "bake.cage.clear", &Value::Null).unwrap();
+
+    assert_eq!(session.history_labels().len(), steps + 2, "removing nothing adds no step");
+}
+
+#[test]
+fn opening_a_project_with_bake_meshes_adds_no_undo_step() {
+    let mut session = plane_session();
+    let low = session.mesh.as_ref().clone();
+    session.add_high_poly_bytes("part_high.obj", obj(&low, 0.002, f32::MAX, [1.0; 3]).into_bytes()).unwrap();
+    session.set_cage_bytes("cage.obj", obj(&low, 0.05, f32::MAX, [1.0; 3]).into_bytes()).unwrap();
+
+    let reloaded = Session::from_project_bytes(&session.to_project_bytes().unwrap()).unwrap();
+    assert!(reloaded.doc.bake_meshes.cage.is_some() && reloaded.doc.bake_meshes.merged_high().is_some());
+    assert!(reloaded.history_labels().is_empty());
+    assert!(!reloaded.modified, "a project just opened has nothing to save");
 }
 
 #[test]
@@ -94,7 +162,7 @@ fn malformed_high_poly_input_errors_cleanly() {
     assert!(execute(&mut session, "bake.highPoly.add", &json!({ "path": "/definitely/missing.obj" })).is_err());
     assert!(execute(&mut session, "bake.highPoly.remove", &json!({ "index": 3 })).is_err());
     assert!(execute(&mut session, "bake.highPoly.remove", &Value::Null).is_err());
-    assert!(session.bake_meshes.high.is_empty() && session.bake_meshes.cage.is_none());
+    assert!(session.doc.bake_meshes.high.is_empty() && session.doc.bake_meshes.cage.is_none());
     assert_eq!(session.doc.project, before, "failed imports preserve project settings");
 }
 
@@ -373,6 +441,7 @@ fn opacity_samples_a_textured_gltf_high_poly() {
     let low = session.mesh.as_ref().clone();
     let png = quadrants_png();
     session.add_high_poly_bytes("painted.glb", textured_glb(&low, 0.002, &png)).unwrap();
+
     assert!(session.log.iter().any(|l| l.contains("1 base color textures")), "{:?}", session.log);
     execute(&mut session, "bake.run", &json!({ "resolution": 128, "maps": ["opacity"], "dilation": 0 })).unwrap();
     assert_opacity_quadrants(&session);
@@ -380,7 +449,7 @@ fn opacity_samples_a_textured_gltf_high_poly() {
 
     // The textures come back with the project
     let reloaded = Session::from_project_bytes(&session.to_project_bytes().unwrap()).unwrap();
-    assert_eq!(reloaded.bake_meshes.high[0].base_color, session.bake_meshes.high[0].base_color);
+    assert_eq!(reloaded.doc.bake_meshes.high[0].base_color, session.doc.bake_meshes.high[0].base_color);
 }
 
 /// USDZ opacity uses the UsdPreviewSurface texture alpha
@@ -441,15 +510,17 @@ fn opacity_samples_textures_next_to_a_high_poly() {
 
         // The project holds the folded file: the textures come back without the folder
         let reloaded = Session::from_project_bytes(&session.to_project_bytes().unwrap()).unwrap();
-        assert_eq!(reloaded.bake_meshes.high[0].base_color, session.bake_meshes.high[0].base_color, "{file}");
+        assert_eq!(reloaded.doc.bake_meshes.high[0].base_color, session.doc.bake_meshes.high[0].base_color, "{file}");
     }
 
     // A missing image is named in the log; the high poly still loads, untextured
     std::fs::remove_file(dir.join("tex/painted color.png")).unwrap();
     let mut session = plane_session();
     execute(&mut session, "bake.highPoly.add", &json!({ "path": dir.join("painted.gltf").display().to_string() })).unwrap();
+
     assert!(session.log.iter().any(|l| l.contains("tex/painted color.png was not found")), "{:?}", session.log);
     execute(&mut session, "bake.run", &json!({ "resolution": 128, "maps": ["opacity"], "dilation": 0 })).unwrap();
+
     assert!(session.doc.baked[&0].maps[&BakedMap::Opacity].iter().all(|opacity| *opacity == 1.0));
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -464,7 +535,8 @@ fn leaning_session(lean: bool) -> Session {
     }
     let high_text = obj(&mesh, 0.1, f32::MAX, [1.0; 3]);
     let mut s = Session::new_project("t", mesh, "builtin:plane", None, 256).unwrap();
-    // A folder of its own per call: tests run in parallel, and another one removes the shared folder.
+
+    // Tests run in parallel, so each call needs its own folder
     static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("texturecraft-lean-test-{}-{call}", std::process::id()));
@@ -472,7 +544,8 @@ fn leaning_session(lean: bool) -> Session {
     let high = dir.join("high.obj");
     std::fs::write(&high, high_text).unwrap();
     execute(&mut s, "bake.highPoly.add", &json!({ "path": high.display().to_string() })).unwrap();
-    // The mesh is parsed and kept on add, so the file can go.
+
+    // The imported mesh remains after its source file is removed
     let _ = std::fs::remove_dir_all(&dir);
     execute(
         &mut s,
@@ -489,10 +562,12 @@ fn the_skew_map_is_saved_with_the_project() {
     execute(&mut s, "bake.skew.set", &json!({ "value": 0.25 })).unwrap();
     let back = Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap();
     assert_eq!(back.doc.bake_paint, s.doc.bake_paint);
-    // No skew: none comes back.
+
+    // Clearing skew persists
     execute(&mut s, "bake.skew.clear", &Value::Null).unwrap();
     assert!(Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap().doc.bake_paint.is_empty());
-    // A map with a non-finite value is skipped with a log line, and the project still opens.
+
+    // Invalid saved skew is skipped without preventing project load
     let mut pf = s.project_file();
     pf.bake_paint.insert((0, texturecraft_core::BakePaintTarget::Skew), texturecraft_formats::BakePaintData { width: 1, height: 1, values: vec![f32::NAN] });
     let opened = Session::from_project_file(pf).unwrap();
@@ -505,26 +580,45 @@ fn the_skew_map_is_saved_with_the_project() {
 }
 
 #[test]
+fn the_skew_map_steers_only_a_distance_cage_with_averaged_normals() {
+    let mut s = leaning_session(false);
+    execute(&mut s, "bake.skew.set", &json!({ "value": 0.25 })).unwrap();
+    assert!(s.bake_task(0).unwrap().skew.is_some());
+
+    s.doc.project.texture_sets[0].bake.cage.average_normals = false;
+    assert!(s.bake_task(0).unwrap().skew.is_none(), "without averaged normals the skew map is left out");
+    s.doc.project.texture_sets[0].bake.cage.average_normals = true;
+    let cage = obj(&s.mesh.clone(), 0.05, f32::MAX, [1.0; 3]);
+    s.set_cage_bytes("cage.obj", cage.into_bytes()).unwrap();
+    s.doc.project.texture_sets[0].bake.cage.kind = texturecraft_core::CageType::CustomFile;
+    assert!(s.bake_task(0).unwrap().skew.is_none(), "a cage file sets the rays itself");
+}
+
+#[test]
 fn painting_skew_widens_a_map_and_bad_strokes_change_nothing() {
     let mut s = leaning_session(true);
-    // Painting with no map makes a black one at `size` and puts the dab in it.
+
+    // The first stroke creates a black map at the requested size
     let r = execute(&mut s, "bake.skew.paint", &json!({ "points": [[0.5, 0.5]], "radius": 0.1, "size": 64 })).unwrap();
     assert_eq!(r["skew"]["width"], 64);
     let map = s.doc.bake_paint.get(&(0, texturecraft_core::BakePaintTarget::Skew)).cloned().unwrap();
     assert!(map.values.iter().any(|v| *v > 0.99) && map.values.contains(&0.0));
     let rev = s.revision;
-    // Erasing with value 0 brings it back down; the size stays.
+
+    // Erasing retains the map size
     execute(&mut s, "bake.skew.paint", &json!({ "points": [[0.5, 0.5]], "radius": 0.2, "value": 0.0, "hardness": 1.0 })).unwrap();
     let after = s.doc.bake_paint.get(&(0, texturecraft_core::BakePaintTarget::Skew)).cloned().unwrap();
     assert_eq!(after.width, 64);
     assert!(after.values.iter().all(|v| *v < 0.01) && s.revision > rev);
-    // A constant map is widened, keeping its value where nothing is painted.
+
+    // Resizing preserves untouched constant values
     execute(&mut s, "bake.skew.set", &json!({ "value": 0.5 })).unwrap();
     execute(&mut s, "bake.skew.paint", &json!({ "points": [[0.1, 0.1]], "radius": 0.05, "size": 32 })).unwrap();
     let wide = s.doc.bake_paint.get(&(0, texturecraft_core::BakePaintTarget::Skew)).cloned().unwrap();
     assert_eq!(wide.width, 32);
     assert!((wide.values[wide.values.len() / 2] - 0.5).abs() < 1e-5, "{}", wide.values[wide.values.len() / 2]);
-    // Hostile input is an error and leaves the map alone.
+
+    // Invalid strokes leave the map unchanged
     let before = s.doc.bake_paint.get(&(0, texturecraft_core::BakePaintTarget::Skew)).cloned();
     for bad in [
         json!({}),
@@ -541,7 +635,8 @@ fn painting_skew_widens_a_map_and_bad_strokes_change_nothing() {
         assert!(execute(&mut s, "bake.skew.paint", &bad).is_err(), "{bad}");
     }
     assert_eq!(s.doc.bake_paint.get(&(0, texturecraft_core::BakePaintTarget::Skew)).cloned(), before);
-    // And the painted map is saved with the project.
+
+    // Painted skew survives a project round trip
     let back = Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap();
     assert_eq!(back.doc.bake_paint, s.doc.bake_paint);
 }
@@ -611,4 +706,59 @@ fn a_failed_multi_set_bake_restores_settings_pixels_and_history() {
     assert_eq!(session.doc.project, original.project);
     assert_eq!(session.doc.baked, original.baked);
     assert_eq!(session.history_labels(), history);
+}
+
+#[test]
+fn obj_submesh_id_separates_objects_with_the_same_name_and_material() {
+    use texturecraft_engine::{core::IdColorSource, formats::import_mesh_bytes};
+    let file = b"o Part\nusemtl Shared\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 0.45 0\nvt 0 1\nf 1/1 2/2 3/3\no Part\nusemtl Shared\nv 2 0 0\nv 3 0 0\nv 2 1 0\nvt 0.5 0\nvt 0.95 0\nvt 0.5 1\nf 4/4 5/5 6/6";
+    let mesh = import_mesh_bytes("parts.obj", file).unwrap().mesh;
+    assert_eq!(mesh.materials.len(), 1);
+    assert_eq!(mesh.submeshes.len(), 2);
+    let mut session = Session::new_project("parts", mesh, "parts.obj", None, 128).unwrap();
+    session.doc.project.texture_sets[0].bake.maps.id.parameters.source = IdColorSource::Submesh;
+    execute(&mut session, "bake.run", &json!({"resolution":128,"maps":["id"],"dilation":0})).unwrap();
+    let map = &session.doc.baked[&0].maps[&BakedMap::Id];
+    let pixel = |x: usize| &map[(100 * 128 + x) * 3..(100 * 128 + x) * 3 + 3];
+    assert_ne!(pixel(10), pixel(74));
+}
+
+/// `file.changeMesh` swaps the mesh under a baked project: the high poly and the skew map stay,
+/// the project counts as changed, and image resources are decoded in the new session.
+#[test]
+fn changing_the_mesh_keeps_the_bake_setup_and_marks_the_project_changed() {
+    let mut s = plane_session();
+    let plane = s.mesh.as_ref().clone();
+    let high = temp_file("change_high.obj", &obj(&plane, 0.002, f32::MAX, [1.0; 3]));
+    execute(&mut s, "bake.highPoly.add", &json!({ "path": high })).unwrap();
+    execute(&mut s, "bake.skew.set", &json!({ "value": 1.0 })).unwrap();
+
+    // A single-pixel image resource
+    let png = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08,
+        0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x00,
+        0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    s.import_resource_bytes("dot.png", png.to_vec()).unwrap();
+    s.modified = false;
+    let mesh_id = s.mesh_id;
+
+    let mut low = String::new();
+    for p in &plane.positions {
+        low += &format!("v {} {} {}\n", p.x, p.y, p.z);
+    }
+    for uv in &plane.uvs {
+        low += &format!("vt {} {}\n", uv.x, 1.0 - uv.y);
+    }
+    for t in plane.indices.as_chunks::<3>().0 {
+        low += &format!("f {a}/{a} {b}/{b} {c}/{c}\n", a = t[0] + 1, b = t[1] + 1, c = t[2] + 1);
+    }
+    let low = temp_file("change_low.obj", &low);
+    execute(&mut s, "file.changeMesh", &json!({ "path": low })).unwrap();
+
+    assert_ne!(s.mesh_id, mesh_id, "the session is on a new mesh");
+    assert_eq!(s.doc.bake_meshes.high.len(), 1, "the high poly stays");
+    assert!(s.doc.bake_paint.keys().any(|(_, target)| *target == texturecraft_engine::core::BakePaintTarget::Skew), "the skew map stays");
+    assert!(s.modified, "the project differs from the saved one");
+    assert_eq!(s.images.len(), 1, "image resources are decoded in the new session");
 }

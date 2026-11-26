@@ -113,6 +113,7 @@ fn imported_mesh_maps_display_and_export_the_entire_overridden_tile() {
             format: FileFormat::Png,
             bit_depth: 8,
             channels: vec![(Dest::L, SourceRef::Baked { map, component: 0 })],
+            inverted: Vec::new(),
         }],
     });
     let files = session.export_files(&[0], &options).unwrap();
@@ -126,5 +127,10 @@ fn imported_mesh_maps_display_and_export_the_entire_overridden_tile() {
     execute(&mut session, "mask.add.black", &json!({"layer": layer.0})).unwrap();
     execute(&mut session, "effect.add.generator", &json!({"layer": layer.0, "generator": "ambientOcclusion"})).unwrap();
     let mask = session.mask_at(layer, &[(376, 120), (266, 10)]).unwrap();
-    assert_eq!(mask, vec![1.0, 0.0], "generators sample the whole bake through the working layout");
+    let expected = [240.0 / 255.0, 20.0 / 255.0];
+    assert_eq!(mask.len(), expected.len(), "one value per requested texel");
+    assert!(
+        mask.iter().zip(expected).all(|(value, expected)| (value - expected).abs() < 0.001),
+        "generators sample the whole bake through the working layout: {mask:?}"
+    );
 }

@@ -1,7 +1,7 @@
 use super::{MergedHigh, StreamedBake, StreamedMap};
 use crate::{EngineError, Result};
 use std::sync::Arc;
-use texturecraft_bake::{BakeOutput, BakePaintMap, BakeRequest, HighPoly, Progress, bake_tiles, tracing::Tracer};
+use texturecraft_bake::{BakeOutput, BakePaintMap, BakePasses, BakeRequest, HighPoly, Progress, bake_tiles, tracing::Tracer};
 use texturecraft_compose::BakedMaps;
 use texturecraft_core::{BakeSettings, BakedMap};
 use texturecraft_geom::{Bvh, Mesh};
@@ -46,13 +46,13 @@ impl BakeTask {
         let total = maps.len();
         let mut combined: Option<StreamedBake> = None;
 
+        let mut passes = BakePasses::new(self.request());
         for (index, map) in maps.iter().copied().enumerate() {
-            let mut settings = self.settings.clone();
-            settings.maps.select([map]);
-            let mut output = self.run_with(&settings, progress)?;
+            let mut output = passes.bake_map(map, progress, &self.excluded_tiles, self.tracer.as_deref()).map_err(bake_error)?;
+            super::preserve_tiles::restore(&mut output, &self.previous_maps, &self.excluded_tiles, self.tiles)?;
             let Some(data) = output.maps.remove(&map) else { continue };
             if combined.is_none() {
-                // Retain unchecked maps once, using the full selection rather than this one-map pass.
+                // Restore unchecked maps once from the full selection
                 super::preserve_tiles::restore_unchecked(&mut output, &self.previous_maps, &self.excluded_tiles, &maps)?;
             }
 
@@ -86,32 +86,32 @@ impl BakeTask {
     }
 
     pub fn run(&self, progress: &Progress) -> Result<BakeOutput> {
-        let mut output = self.run_with(&self.settings, progress)?;
+        let mut output = bake_tiles(&self.request(), progress, &self.excluded_tiles, self.tracer.as_deref()).map_err(bake_error)?;
+        super::preserve_tiles::restore(&mut output, &self.previous_maps, &self.excluded_tiles, self.tiles)?;
         super::preserve_tiles::restore_unchecked(&mut output, &self.previous_maps, &self.excluded_tiles, &[])?;
         Ok(output)
     }
 
-    fn run_with(&self, settings: &BakeSettings, progress: &Progress) -> Result<BakeOutput> {
+    fn request(&self) -> BakeRequest<'_> {
         let high =
             self.high.as_ref().map(|source| HighPoly { file_ids: &source.file_ids, mesh: &source.mesh, bvh: &source.bvh, base_color: &source.base_color });
-        let request = BakeRequest {
+        BakeRequest {
             low_base_color: &self.low_base_color,
             mesh: &self.mesh,
             bvh: &self.bvh,
             material: self.material,
-            settings,
+            settings: &self.settings,
             high,
             cage: self.cage.as_deref(),
             skew: self.skew.as_deref(),
             cage_paint: self.cage_paint.as_deref(),
             tiles: self.tiles,
-        };
-
-        let mut output = bake_tiles(&request, progress, &self.excluded_tiles, self.tracer.as_deref())
-            .map_err(|error| EngineError::Other(format!("bake failed: {error}")))?;
-        super::preserve_tiles::restore(&mut output, &self.previous_maps, &self.excluded_tiles, self.tiles)?;
-        Ok(output)
+        }
     }
+}
+
+fn bake_error(error: texturecraft_bake::BakeError) -> EngineError {
+    EngineError::Other(format!("bake failed: {error}"))
 }
 
 #[cfg(test)]
@@ -123,6 +123,42 @@ mod tests {
 
     const PREVIOUS_MAPS: [BakedMap; 3] = [BakedMap::Normal, BakedMap::AmbientOcclusion, BakedMap::Height];
     const SELECTED_MAPS: [BakedMap; 2] = [BakedMap::AmbientOcclusion, BakedMap::Height];
+
+    #[test]
+    fn preview_resamples_only_the_displayed_map_for_excluded_tiles() {
+        const PREVIOUS_WIDTH: u32 = 256;
+        const PREVIEW_TILE_PIXELS: u32 = 64;
+        const PREVIOUS_OPACITY: f32 = 0.25;
+        let mut session = Session::new_project("Preview", primitives::udim_plane(), "builtin:udim_plane", None, 128).unwrap();
+        execute(&mut session, "bake.tile.set", &json!({"tile": 1002, "enabled": false})).unwrap();
+        let selected = BakedMap::Opacity;
+        session.doc.baked.insert(
+            0,
+            BakedMaps {
+                resolution: PREVIOUS_WIDTH,
+                maps: [selected, BakedMap::WorldNormal, BakedMap::Normal, BakedMap::Height, BakedMap::Position, BakedMap::AmbientOcclusion]
+                    .into_iter()
+                    .map(|map| (map, Arc::new(vec![PREVIOUS_OPACITY; PREVIOUS_WIDTH as usize * (PREVIOUS_WIDTH as usize / 2) * map.components()])))
+                    .collect(),
+            },
+        );
+
+        let mut task = session.bake_map_preview_task(0, selected).unwrap();
+        task.settings.common.resolution = texturecraft_core::BakeResolution::from_pixels(PREVIEW_TILE_PIXELS).unwrap();
+        task.settings.common.dilation = 0;
+        task.tracer = None;
+        super::super::preserve_tiles::take_retained_allocations();
+        let output = task.run(&Progress::new()).unwrap();
+
+        let retained_maps = super::super::preserve_tiles::take_retained_allocations();
+        let other_output_bytes =
+            output.maps.iter().filter(|(map, _)| **map != selected).map(|(_, pixels)| std::mem::size_of_val(pixels.as_slice())).sum::<usize>();
+        eprintln!("atlas={}x{} retained_maps={retained_maps:?} other_output_bytes={other_output_bytes}", output.resolution, output.height);
+        let row = &output.maps[&selected][..output.resolution as usize];
+        assert!(row[..PREVIEW_TILE_PIXELS as usize].iter().any(|&opacity| opacity > PREVIOUS_OPACITY), "the included tile bakes");
+        assert!(row[PREVIEW_TILE_PIXELS as usize..].iter().all(|&opacity| opacity == PREVIOUS_OPACITY), "the excluded tile keeps its previous pixels");
+        assert!(retained_maps.is_empty(), "the preview never allocates buffers for maps it will discard");
+    }
 
     fn partial_task(selected: &[BakedMap], resized: bool, excluded: bool) -> BakeTask {
         let mut session = Session::new_project("Partial bake", primitives::udim_plane(), "builtin:udim_plane", None, 128).unwrap();

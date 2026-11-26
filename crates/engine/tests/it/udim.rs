@@ -114,13 +114,27 @@ fn projects_round_trip_and_meshes_export_their_own_uvs() {
     assert_eq!(red_per_tile(&back), red);
     // OBJ export keeps the mesh's UDIM UVs; the working mesh is in atlas space.
     assert!(s.mesh.uvs.iter().all(|uv| (0.0..=1.0).contains(&uv.x)));
-    let obj = String::from_utf8(s.mesh_obj_bytes()).unwrap();
+    let obj = String::from_utf8(s.mesh_obj_bytes().unwrap()).unwrap();
     let max_u = obj.lines().filter_map(|l| l.strip_prefix("vt ")).filter_map(|l| l.split_whitespace().next()?.parse::<f32>().ok()).fold(0.0f32, f32::max);
     assert!((max_u - 2.0).abs() < 1e-4, "{max_u}");
     // With its MTL: the same UVs, and no maps for the UV-tiled set (one image cannot hold them).
     let (with_mtl, files) = s.mesh_obj_with_mtl("plane").unwrap();
-    assert!(String::from_utf8(with_mtl).unwrap().ends_with(obj.split_once("\no ").unwrap().1));
+    let body = obj.strip_prefix("o ").or_else(|| obj.split_once("\no ").map(|(_, rest)| rest)).unwrap();
+    assert!(String::from_utf8(with_mtl).unwrap().ends_with(body));
     assert_eq!(files.len(), 1, "the MTL alone");
+
+    // GLB export embeds the UDIM tile atlas and reopens with UVs in [0, 1] atlas space.
+    let dir = std::env::temp_dir().join(format!("tc_udim_glb_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let glb_reply = execute(&mut s, "file.exportMesh", &json!({ "path": dir.join("plane.glb"), "format": "glb" })).unwrap();
+    let glb_bytes = std::fs::read(glb_reply["path"].as_str().unwrap()).unwrap();
+    let back = texturecraft_formats::import_mesh_bytes("plane.glb", &glb_bytes).unwrap();
+    assert_eq!(back.mesh.triangle_count(), s.mesh.triangle_count());
+    assert_eq!(back.mesh.materials, s.mesh.materials);
+    assert!(back.mesh.uvs.iter().all(|uv| (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y)));
+    assert!(glb_bytes.windows(9).filter(|w| *w == b"image/png").count() >= 3);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

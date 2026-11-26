@@ -2,8 +2,7 @@ use super::{BakeMesh, MergedHigh};
 use std::sync::{Arc, OnceLock};
 use texturecraft_geom::{Bvh, Mesh};
 
-/// The high-definition meshes and the cage. Like the low-poly mesh they are not part of the
-/// undo history.
+/// The high-definition meshes and the cage; undo and redo restore them with the document
 #[derive(Clone, Debug, Default)]
 pub struct BakeMeshes {
     pub(crate) low_base_color: OnceLock<std::result::Result<super::MaterialColors, String>>,

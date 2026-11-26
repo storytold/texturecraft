@@ -10,7 +10,10 @@ use texturecraft_ui_egui::state::Unsaved;
 fn harness(modified: bool) -> Harness<'static, TextureCraftApp> {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     session.modified = modified;
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     h
 }
@@ -102,7 +105,7 @@ fn closing_the_project_with_changes_asks_first() {
     assert_eq!(name(&h), "Edited", "the project stays until answered");
     h.get_by_label("Don't save").click();
     h.run_steps(2);
-    assert_ne!(name(&h), "Edited", "Don't save closes the project");
+    assert!(!h.state().session.project_open, "Don't save closes the project");
     assert!(h.state().ui.windows.unsaved.is_none() && !h.state().session.modified);
 }
 

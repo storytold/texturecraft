@@ -2,6 +2,8 @@
 
 use texturecraft_engine::{Session, geom::glam::Vec2};
 
+pub use crate::surface_paint_point::SurfacePaintPoint;
+
 /// A line anchor scoped to its project, UV layout and texture set
 #[derive(Clone, Copy, Debug)]
 pub struct UvPaintPoint {

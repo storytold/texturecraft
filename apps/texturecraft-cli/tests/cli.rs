@@ -1,12 +1,23 @@
 //! Drives the `texturecraft-cli` binary.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::Value;
 
+// Nextest 0.9.130+ remaps this variable when an archive is extracted on another
+// runner. Cargo's compile-time path still supports ordinary `cargo test`.
+fn cli_binary() -> OsString {
+    cli_binary_path(std::env::var_os("CARGO_BIN_EXE_texturecraft-cli"))
+}
+
+fn cli_binary_path(runner_path: Option<OsString>) -> OsString {
+    runner_path.unwrap_or_else(|| env!("CARGO_BIN_EXE_texturecraft-cli").into())
+}
+
 fn cli(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_texturecraft-cli")).args(args).output().unwrap()
+    Command::new(cli_binary()).args(args).output().unwrap()
 }
 
 fn ok(args: &[&str]) -> String {
@@ -85,6 +96,38 @@ fn new_info_run_bake_export_batch() {
 }
 
 #[test]
+fn batch_rejects_non_string_paths() {
+    let directory = tmp("batch-paths");
+    let script = directory.join("script.json");
+    let unexpected_project = directory.join("unexpected.tcraft");
+    let invalid_open = serde_json::json!({"steps": [], "open": false, "save": p(&unexpected_project)});
+    let invalid_save = serde_json::json!({
+        "open": "builtin:cube",
+        "save": [p(&unexpected_project)],
+        "steps": [{"id": "file.saveCopy", "params": {"path": p(&unexpected_project)}}]
+    });
+
+    for (body, field) in [(invalid_open, "open"), (invalid_save, "save")] {
+        std::fs::write(&script, body.to_string()).unwrap();
+        let output = cli(&["batch", p(&script)]);
+
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{field}: {error}");
+        assert!(error.contains(&format!("`{field}` field must be a string")), "{error}");
+        assert!(output.stdout.is_empty());
+        assert!(!unexpected_project.exists());
+    }
+
+    std::fs::write(&script, r#"{"steps":[],"open":null,"save":null}"#).unwrap();
+    let reply = json(&["batch", p(&script)]);
+
+    assert_eq!(reply["completed"], 0);
+    assert!(reply["failed"].is_null());
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
 fn info_on_a_mesh_reports_uvs() {
     let d = tmp("mesh");
     let obj = d.join("quad.obj");
@@ -101,7 +144,7 @@ fn info_on_a_mesh_reports_uvs() {
 fn serve_takes_the_automation_root_spelling_too() {
     use std::io::Write as _;
     let d = tmp("automation-root");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_texturecraft-cli"))
+    let mut child = Command::new(cli_binary())
         .args(["serve", "--automation-write-root", p(&d)])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

@@ -9,7 +9,10 @@ use texturecraft_ui_egui::TextureCraftApp;
 /// The sample project in the default split layout at 1600 x 960 with the polygon fill tool
 fn polygon_fill_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().session.tool.tool = Tool::PolygonFill;
     harness.run_steps(4);
     harness
@@ -59,10 +62,12 @@ fn a_box_drag_in_the_3d_view_is_one_fill_over_more_than_a_click() {
     let center = clicked.state().viewport_rect.center();
     let before = history(&clicked).len();
     click(&mut clicked, center);
+
     assert_eq!(history(&clicked).len(), before + 1, "a click fills one triangle");
 
     let mut boxed = polygon_fill_app();
     drag(&mut boxed, center - vec2(120.0, 120.0), center + vec2(120.0, 120.0));
+
     assert_eq!(history(&boxed).len(), before + 1);
     assert_eq!(history(&boxed).last().map(String::as_str), Some("Polygon fill"));
     assert!(
@@ -81,6 +86,7 @@ fn a_box_drag_in_the_2d_view_is_one_fill() {
     let before = history(&harness).len();
 
     drag(&mut harness, center - vec2(80.0, 20.0), center + vec2(80.0, 20.0));
+
     assert_eq!(history(&harness).len(), before + 1);
     assert_eq!(history(&harness).last().map(String::as_str), Some("Polygon fill"));
 }
@@ -100,11 +106,32 @@ fn a_new_press_after_release_does_not_resume_the_previous_box() {
         .events
         .extend([Event::PointerMoved(point), Event::PointerButton { pos: point, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }]);
     harness.run_steps(1);
+
     assert_eq!(painted_tiles(&harness), tiles_after_drag, "a press alone must not refill the old rectangle");
 
     harness.event(Event::PointerButton { pos: point, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
     harness.run_steps(1);
+
     assert_eq!(history(&harness).len(), history_after_drag.len() + 1, "only the new click records a step");
+}
+
+#[test]
+fn the_symmetry_toggle_is_offered_for_polygon_fill_and_a_symmetric_click_is_one_step() {
+    use egui_kittest::kittest::Queryable;
+
+    let mut harness = polygon_fill_app();
+    harness.get_by_label("Symmetry settings");
+    harness.get_by_label("Symmetry").click();
+    harness.run_steps(2);
+
+    assert!(harness.state().session.tool.brush.symmetry.any(), "the toggle turns mirroring on for the fill");
+
+    let center = harness.state().viewport_rect.center();
+    let before = history(&harness).len();
+    click(&mut harness, center);
+
+    assert_eq!(history(&harness).len(), before + 1, "the fill and its mirror copies are one undo step");
+    assert_eq!(history(&harness).last().map(String::as_str), Some("Polygon fill"));
 }
 
 #[test]
@@ -114,7 +141,11 @@ fn polygon_fill_snapshots() {
 
     std::fs::create_dir_all(&directory).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(vec2(1600.0, 960.0)).wgpu().build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(vec2(1600.0, 960.0))
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     let adapter = harness.state().render_state.as_ref().unwrap().adapter.get_info();
     eprintln!("Offscreen adapter: {} ({:?}), driver {} {}", adapter.name, adapter.backend, adapter.driver, adapter.driver_info);
     harness.state_mut().session.tool.tool = Tool::PolygonFill;

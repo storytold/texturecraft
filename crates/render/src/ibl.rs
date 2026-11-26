@@ -8,6 +8,7 @@
 use std::f32::consts::{PI, TAU};
 
 use rayon::prelude::*;
+use texturecraft_compose::environment_sky;
 use texturecraft_geom::glam::{Vec2, Vec3};
 
 /// An equirect HDR image (linear RGB).
@@ -18,85 +19,8 @@ pub struct EnvImage {
     pub data: Vec<[f32; 3]>,
 }
 
+pub use texturecraft_compose::environment_sky::{dir_of, radiance, sh_basis, uv_of};
 pub use texturecraft_core::project::ENVIRONMENTS;
-
-pub fn dir_of(u: f32, v: f32) -> Vec3 {
-    let (theta, phi) = (v * PI, u * TAU);
-    Vec3::new(theta.sin() * phi.cos(), theta.cos(), theta.sin() * phi.sin())
-}
-
-pub fn uv_of(d: Vec3) -> Vec2 {
-    let phi = d.z.atan2(d.x);
-    Vec2::new((phi / TAU).rem_euclid(1.0), d.y.clamp(-1.0, 1.0).acos() / PI)
-}
-
-/// A soft rectangular light: azimuth/elevation center (degrees), half sizes (degrees).
-struct SoftBox {
-    az: f32,
-    el: f32,
-    hw: f32,
-    hh: f32,
-    color: Vec3,
-}
-
-impl SoftBox {
-    fn eval(&self, d: Vec3) -> Vec3 {
-        let el = d.y.clamp(-1.0, 1.0).asin().to_degrees();
-        let az = d.z.atan2(d.x).to_degrees();
-        let daz = ((az - self.az + 540.0).rem_euclid(360.0)) - 180.0;
-        let (x, y) = (daz.abs() / self.hw, (el - self.el).abs() / self.hh);
-        let e = |t: f32| 1.0 - smooth((t - 0.8) / 0.4);
-        self.color * e(x) * e(y)
-    }
-}
-
-fn smooth(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn sky(d: Vec3, zenith: Vec3, horizon: Vec3, ground: Vec3) -> Vec3 {
-    if d.y >= 0.0 { horizon.lerp(zenith, d.y.powf(0.6)) } else { horizon.lerp(ground, (-d.y).powf(0.25)) }
-}
-
-fn radiance(name: &str, d: Vec3) -> Vec3 {
-    match name {
-        "Studio Contrast" => {
-            let base = sky(d, Vec3::splat(0.04), Vec3::splat(0.03), Vec3::splat(0.01));
-            base + SoftBox { az: 35.0, el: 30.0, hw: 22.0, hh: 18.0, color: Vec3::new(14.0, 13.2, 12.0) }.eval(d)
-                + SoftBox { az: -150.0, el: 40.0, hw: 6.0, hh: 30.0, color: Vec3::new(4.0, 4.4, 5.0) }.eval(d)
-        }
-        "Overcast" => {
-            let base = sky(d, Vec3::new(1.2, 1.25, 1.35), Vec3::new(0.95, 0.95, 0.95), Vec3::new(0.18, 0.2, 0.15));
-            base + SoftBox { az: 60.0, el: 55.0, hw: 40.0, hh: 25.0, color: Vec3::splat(0.6) }.eval(d)
-        }
-        "Sunset" => {
-            let base = sky(d, Vec3::new(0.15, 0.25, 0.55), Vec3::new(1.4, 0.65, 0.3), Vec3::new(0.08, 0.06, 0.05));
-            let sun_dir = dir_of(0.12, 0.47);
-            let sun = smooth((d.dot(sun_dir) - 0.9985) / 0.0012) * 120.0;
-            base + Vec3::new(1.0, 0.6, 0.3) * sun
-        }
-        "Warehouse" => {
-            let mut c = sky(d, Vec3::splat(0.25), Vec3::splat(0.18), Vec3::splat(0.06));
-            for k in 0..6 {
-                c += SoftBox { az: -150.0 + k as f32 * 60.0, el: 50.0, hw: 6.0, hh: 3.0, color: Vec3::new(9.0, 8.5, 7.5) }.eval(d);
-            }
-            c + SoftBox { az: 90.0, el: 5.0, hw: 30.0, hh: 12.0, color: Vec3::new(1.6, 1.8, 2.2) }.eval(d)
-        }
-        "Night" => {
-            let base = sky(d, Vec3::new(0.01, 0.015, 0.04), Vec3::new(0.03, 0.03, 0.06), Vec3::splat(0.005));
-            base + SoftBox { az: 20.0, el: 15.0, hw: 10.0, hh: 10.0, color: Vec3::new(0.4, 1.6, 4.0) }.eval(d)
-                + SoftBox { az: -110.0, el: 10.0, hw: 12.0, hh: 8.0, color: Vec3::new(4.0, 0.8, 1.6) }.eval(d)
-        }
-        // "Studio Soft" (default)
-        _ => {
-            let base = sky(d, Vec3::new(0.5, 0.52, 0.56), Vec3::new(0.32, 0.32, 0.33), Vec3::new(0.08, 0.075, 0.07));
-            base + SoftBox { az: 40.0, el: 35.0, hw: 28.0, hh: 20.0, color: Vec3::new(5.5, 5.2, 4.8) }.eval(d)
-                + SoftBox { az: -125.0, el: 20.0, hw: 35.0, hh: 22.0, color: Vec3::new(1.1, 1.25, 1.5) }.eval(d)
-                + SoftBox { az: 175.0, el: 55.0, hw: 8.0, hh: 25.0, color: Vec3::new(3.0, 3.0, 3.0) }.eval(d)
-        }
-    }
-}
 
 /// Render a built-in environment (unknown names give the default studio).
 pub fn environment(name: &str, width: u32) -> EnvImage {
@@ -132,16 +56,12 @@ impl EnvImage {
 
     /// Box-downsample by 2.
     pub fn half(&self) -> EnvImage {
-        let (w, h) = ((self.width / 2).max(1), (self.height / 2).max(1));
-        let mut data = vec![[0.0f32; 3]; (w * h) as usize];
-        data.par_chunks_mut(w as usize).enumerate().for_each(|(y, row)| {
-            for (x, px) in row.iter_mut().enumerate() {
-                let (sx, sy) = (x as i64 * 2, y as i64 * 2);
-                let s = (self.get(sx, sy) + self.get(sx + 1, sy) + self.get(sx, sy + 1) + self.get(sx + 1, sy + 1)) * 0.25;
-                *px = s.to_array();
-            }
-        });
-        EnvImage { width: w, height: h, data }
+        Self::half_from(self.width, self.height, |x, y| self.get(i64::from(x), i64::from(y)))
+    }
+
+    fn half_from(width: u32, height: u32, texel: impl Fn(u32, u32) -> Vec3 + Sync) -> Self {
+        let (width, height, data) = environment_sky::half(width, height, texel);
+        Self { width, height, data: data.into_iter().map(|rgb| rgb.to_array()).collect() }
     }
 
     /// An imported equirect image (`rgba` row-major, top row first, sRGB-encoded when `srgb`) as
@@ -149,19 +69,32 @@ impl EnvImage {
     /// range, and images larger than [`MAX_IMPORT_WIDTH`] are box-downsampled. None when the
     /// pixel count does not match the size.
     pub fn from_rgba(width: u32, height: u32, rgba: &[[f32; 4]], srgb: bool) -> Option<EnvImage> {
-        if width == 0 || height == 0 || rgba.len() as u64 != width as u64 * height as u64 {
+        Self::from_pixels(width, height, rgba, srgb)
+    }
+
+    /// An equirectangular linear RGB image with the same radiance and size limits as an RGBA import.
+    pub fn from_linear_rgb(width: u32, height: u32, rgb: &[[f32; 3]]) -> Option<EnvImage> {
+        Self::from_pixels(width, height, rgb, false)
+    }
+
+    fn from_pixels<const COMPONENTS: usize>(width: u32, height: u32, pixels: &[[f32; COMPONENTS]], srgb: bool) -> Option<EnvImage> {
+        if width == 0 || height == 0 || pixels.len() as u64 != u64::from(width) * u64::from(height) {
             return None;
         }
-        let lin = |v: f32| {
-            let v = if v.is_finite() { v.clamp(0.0, 65_000.0) } else { 0.0 };
-            if srgb { texturecraft_texel::srgb_to_linear(v.min(1.0)) } else { v }
+
+        let linear_rgb = |pixel: &[f32; COMPONENTS]| std::array::from_fn(|component| environment_sky::environment_linear(pixel[component], srgb));
+        let mut img = if width > MAX_IMPORT_WIDTH || height > MAX_IMPORT_WIDTH {
+            // Linearize only the texels that contribute to the first reduced level
+            Self::half_from(width, height, |x, y| Vec3::from(linear_rgb(&pixels[y as usize * width as usize + x as usize])))
+        } else {
+            Self { width, height, data: pixels.par_iter().map(linear_rgb).collect() }
         };
-        let data = rgba.par_iter().map(|p| [lin(p[0]), lin(p[1]), lin(p[2])]).collect();
-        let mut img = EnvImage { width, height, data };
+
         while img.width > MAX_IMPORT_WIDTH || img.height > MAX_IMPORT_WIDTH {
             img = img.half();
         }
-        // The mip chain needs at least 4×2 texels at its last level.
+
+        // The mip chain needs at least 4×2 texels at its last level
         if img.width < 128 || img.height < 64 {
             let (w, h) = (img.width.max(128), img.height.max(64));
             let data = (0..w * h).map(|i| img.sample(dir_of(((i % w) as f32 + 0.5) / w as f32, ((i / w) as f32 + 0.5) / h as f32)).to_array()).collect();
@@ -238,48 +171,9 @@ pub fn prefilter(env: &EnvImage, levels: u32) -> Vec<EnvImage> {
     out
 }
 
-/// Diffuse irradiance as 9 SH coefficients (already convolved with the cosine lobe and divided
-/// by π, so `Σ c·Y(n)` times albedo is the diffuse radiance).
+/// Diffuse irradiance as 9 SH coefficients, convolved with the cosine lobe and divided by π, so `Σ c·Y(n)` times albedo is the diffuse radiance
 pub fn sh9(env: &EnvImage) -> [[f32; 3]; 9] {
-    let mut src = env.clone();
-    while src.width > 128 {
-        src = src.half();
-    }
-    let (w, h) = (src.width, src.height);
-    let mut c = [Vec3::ZERO; 9];
-    for y in 0..h {
-        let theta = PI * (y as f32 + 0.5) / h as f32;
-        let dw = (TAU / w as f32) * (PI / h as f32) * theta.sin();
-        for x in 0..w {
-            let d = dir_of((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
-            // No firefly clamp: the projection integrates, so a bright sun lights diffuse fully.
-            let l = src.get(x as i64, y as i64) * dw;
-            for (k, ylm) in sh_basis(d).iter().enumerate() {
-                c[k] += l * *ylm;
-            }
-        }
-    }
-    let a = [PI, 2.0 * PI / 3.0, 2.0 * PI / 3.0, 2.0 * PI / 3.0, PI / 4.0, PI / 4.0, PI / 4.0, PI / 4.0, PI / 4.0];
-    let mut out = [[0.0; 3]; 9];
-    for k in 0..9 {
-        out[k] = (c[k] * a[k] / PI).to_array();
-    }
-    out
-}
-
-pub fn sh_basis(d: Vec3) -> [f32; 9] {
-    let (x, y, z) = (d.x, d.y, d.z);
-    [
-        0.282_095,
-        0.488_603 * y,
-        0.488_603 * z,
-        0.488_603 * x,
-        1.092_548 * x * y,
-        1.092_548 * y * z,
-        0.315_392 * (3.0 * z * z - 1.0),
-        1.092_548 * x * z,
-        0.546_274 * (x * x - y * y),
-    ]
+    environment_sky::sh9_averaged(env.width, env.height, |x, y| env.get(x as i64, y as i64))
 }
 
 #[cfg(test)]

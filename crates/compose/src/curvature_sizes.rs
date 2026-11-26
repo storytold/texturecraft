@@ -4,13 +4,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use rayon::prelude::*;
-use texturecraft_core::{BakedMap, BlockScales, CurvatureDetail};
+use texturecraft_core::{BakedMap, BlockScales};
 use texturecraft_texel::dilate::{DilationMap, NONE};
 
 use crate::curvature_size_level::{CurvatureSizeLevel, DEVIATION_SCALE};
 use crate::eval::{BLUR_BOX_PASSES, Inputs, blur};
 
-/// The curvature map padded past its UV islands and blurred at each size of [`CurvatureDetail::SIZES`] after the first.
+/// The blur radius of each level in texels at 2K: the detail sizes of [`texturecraft_core::CurvatureDetail::SIZES`] after the first, then wider ones the wear generators' edges smoothness reaches
+pub const LEVEL_RADII: [f32; 8] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
+
+/// The curvature map padded past its UV islands and blurred at each radius of [`LEVEL_RADII`]
 pub struct CurvatureSizes {
     /// One per blurred size, built once a generator gives that size a weight above 0.
     pub levels: Vec<Option<Arc<CurvatureSizeLevel>>>,
@@ -31,7 +34,11 @@ const CACHE_MAPS: usize = 16;
 impl CurvatureSizes {
     /// The sizes of the texture set `inp` composites, holding at least those `needed` marks (one flag per blurred size); None without a baked curvature map or a needed size.
     pub fn of(inp: &Inputs, needed: &[bool]) -> Option<Arc<CurvatureSizes>> {
-        let curvature = inp.baked.maps.get(&BakedMap::Curvature)?;
+        CurvatureSizes::of_map(inp, inp.baked.maps.get(&BakedMap::Curvature)?, needed)
+    }
+
+    /// The sizes of `curvature`, a map in the baked curvature map's layout (the baked map or one derived from it)
+    pub fn of_map(inp: &Inputs, curvature: &Arc<Vec<f32>>, needed: &[bool]) -> Option<Arc<CurvatureSizes>> {
         let (width, height) = (inp.baked.resolution, inp.baked.height(BakedMap::Curvature));
         if !needed.contains(&true) || width == 0 || height == 0 {
             return None;
@@ -70,14 +77,14 @@ impl CurvatureSizes {
             padding.src.par_iter().map(|&source| if source == NONE { 0.0 } else { curvature.get(source as usize).copied().unwrap_or(0.5) - 0.5 }).collect();
         let (block_width, block_height) = (block.0.max(1).min(width), block.1.max(1).min(height));
 
-        let levels = CurvatureDetail::SIZES
+        let levels = LEVEL_RADII
             .iter()
-            .skip(1)
             .enumerate()
             .map(|(level, size)| {
                 if let Some(existing) = built.and_then(|sizes| sizes.levels.get(level)).and_then(Option::clone) {
                     return Some(existing);
                 }
+
                 if !needed.get(level).copied().unwrap_or(false) {
                     return None;
                 }
@@ -85,6 +92,7 @@ impl CurvatureSizes {
                 // Sizes are texels at 2K; a blur this wide holds nothing finer than half its radius, so it is stored that much coarser
                 let radius = (size * block_width as f32 / 2048.0).round().max(1.0) as u32;
                 let mut step = (radius / 2).max(1).next_power_of_two();
+
                 // A coarse cell must not average curvature from different UV tiles
                 while !block_width.is_multiple_of(step) || !block_height.is_multiple_of(step) {
                     step /= 2;
@@ -125,8 +133,8 @@ fn store(curvature: &Arc<Vec<f32>>, key: CacheKey, scales: &BlockScales, sizes: 
         sizes
     };
 
-    // One layout per curvature map, with the most recently used map at the end
-    cache.retain(|(source, ..)| source.strong_count() > 0 && !std::ptr::eq(source.as_ptr(), Arc::as_ptr(curvature)));
+    // Keep layout variants so thumbnails and the viewport reuse their own levels
+    cache.retain(|entry| entry.0.strong_count() > 0 && !is_entry_for(entry, curvature, key, scales));
     let sizes = Arc::new(sizes);
     cache.push((Arc::downgrade(curvature), key, scales.clone(), sizes.clone()));
     trim_cache(&mut cache, CACHE_BYTES);
@@ -247,6 +255,8 @@ fn coarsen(data: &[f32], (width, height): (u32, u32), step: u32, block: (u32, u3
 
 #[cfg(test)]
 mod tests {
+    use texturecraft_core::CurvatureDetail;
+
     use super::*;
 
     #[test]
@@ -338,6 +348,7 @@ mod tests {
 
     #[test]
     fn unused_maps_are_evicted_even_while_undo_keeps_the_sources_alive() {
+        let _guard = CACHE_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let sources: Vec<_> = (0..=CACHE_MAPS).map(|_| Arc::new(vec![0.5; 16])).collect();
         let scales = BlockScales::default();
         let key = ((4, 4), (4, 4), (4, 4));
@@ -408,18 +419,46 @@ mod tests {
         }
     }
 
+    // Cache lifecycle tests must not evict each other's entries in parallel
+    static CACHE_TESTS: Mutex<()> = Mutex::new(());
+
     #[test]
-    fn a_new_layout_replaces_the_sizes_of_the_old_one() {
+    fn alternating_layouts_reuse_their_cached_sizes() {
+        let _guard = CACHE_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let curvature = Arc::new(vec![0.5; 16]);
         let scales = BlockScales::default();
-        let entries_for_curvature = || {
-            let cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.iter().filter(|(source, ..)| std::ptr::eq(source.as_ptr(), Arc::as_ptr(&curvature))).count()
-        };
+        let viewport_key = ((4, 4), (4, 4), (4, 4));
+        let thumbnail_key = ((4, 4), (4, 4), (2, 2));
+        let viewport = store(&curvature, viewport_key, &scales, CurvatureSizes { levels: Vec::new() });
+        let thumbnail = store(&curvature, thumbnail_key, &scales, CurvatureSizes { levels: Vec::new() });
 
-        store(&curvature, ((4, 4), (4, 4), (4, 4)), &scales, CurvatureSizes { levels: Vec::new() });
-        store(&curvature, ((4, 4), (2, 2), (8, 8)), &scales, CurvatureSizes { levels: Vec::new() });
-        assert_eq!(entries_for_curvature(), 1, "only the latest layout of a curvature map stays cached");
+        assert!(Arc::ptr_eq(&cached(&curvature, viewport_key, &scales).unwrap(), &viewport), "a thumbnail must not evict the viewport layout");
+        assert!(Arc::ptr_eq(&cached(&curvature, thumbnail_key, &scales).unwrap(), &thumbnail), "both layouts stay reusable");
+        let mut set = texturecraft_core::TextureSet::new("Tiles", 0, 4);
+        set.uv_tiles = vec![1001, 1002];
+        set.tile_resolutions.insert(1002, 2);
+        let scaled = set.block_scales();
+        assert_ne!(scaled, scales);
+        assert!(cached(&curvature, viewport_key, &scaled).is_none(), "different tile scales cannot read the unscaled result");
+        let scaled_sizes = store(&curvature, viewport_key, &scaled, CurvatureSizes { levels: Vec::new() });
+        assert!(Arc::ptr_eq(&cached(&curvature, viewport_key, &scaled).unwrap(), &scaled_sizes));
+        assert!(Arc::ptr_eq(&cached(&curvature, viewport_key, &scales).unwrap(), &viewport), "scale variants also coexist");
+        let replacement = store(&curvature, viewport_key, &scales, CurvatureSizes { levels: Vec::new() });
+        assert!(Arc::ptr_eq(&cached(&curvature, viewport_key, &scales).unwrap(), &replacement));
+        assert!(Arc::ptr_eq(&cached(&curvature, thumbnail_key, &scales).unwrap(), &thumbnail), "updating one layout keeps the other");
+    }
+
+    #[test]
+    fn layout_variants_obey_the_entry_limit() {
+        let _guard = CACHE_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let curvature = Arc::new(vec![0.5; 16]);
+        let scales = BlockScales::default();
+        let key = |size| ((4, 4), (4, 4), (size, size));
+        for size in 1..=CACHE_MAPS as u32 + 1 {
+            store(&curvature, key(size), &scales, CurvatureSizes { levels: Vec::new() });
+        }
+        assert!(cached(&curvature, key(1), &scales).is_none(), "layout variants cannot grow without bound");
+        assert!(cached(&curvature, key(CACHE_MAPS as u32 + 1), &scales).is_some(), "the newest layout stays cached");
     }
 
     #[test]
@@ -443,5 +482,10 @@ mod tests {
                 assert!(Arc::ptr_eq(built, earlier), "sizes already built are kept, not rebuilt");
             }
         }
+    }
+
+    #[test]
+    fn the_first_levels_are_the_detail_sizes() {
+        assert_eq!(LEVEL_RADII[..CurvatureDetail::BLURRED_SIZES], CurvatureDetail::SIZES[1..]);
     }
 }

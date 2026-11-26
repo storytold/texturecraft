@@ -51,6 +51,8 @@ struct Head {
 struct PostRaw {
     size: [u32; 4],
     display: [f32; 4],
+    back_top: [f32; 4],
+    back_bottom: [f32; 4],
 }
 
 struct Geometry {
@@ -92,6 +94,7 @@ struct SceneConst {
     eps: f32,
     sigma: Vec3,
     rotation: f32,
+    env_camera: bool,
     heights: Vec<f32>,
     ior: f32,
     /// Focus depth (0: the orbit target) and lens radius in world units (0: pinhole).
@@ -113,6 +116,11 @@ pub struct GpuTracer {
     env: Option<EnvGpu>,
     materials: Option<Materials>,
     acc: Option<Accum>,
+    /// Keep the preceding size so motion/full-resolution switches can reuse allocations.
+    spare_acc: Option<Accum>,
+    /// How many sets of accumulation buffers were allocated (for tests).
+    #[cfg(test)]
+    acc_allocations: u32,
     scene: Option<SceneConst>,
     bind: Option<wgpu::BindGroup>,
     samples: u32,
@@ -309,6 +317,9 @@ impl GpuTracer {
             env: None,
             materials: None,
             acc: None,
+            spare_acc: None,
+            #[cfg(test)]
+            acc_allocations: 0,
             scene: None,
             bind: None,
             samples: 0,
@@ -323,6 +334,7 @@ impl GpuTracer {
     /// Free the scene and accumulation memory, keeping the compiled pipelines.
     pub fn release(&mut self) {
         (self.geometry, self.env, self.materials, self.acc, self.scene, self.bind) = (None, None, None, None, None, None);
+        self.spare_acc = None;
         self.samples = 0;
     }
 
@@ -340,6 +352,7 @@ impl GpuTracer {
             if bvh_depth(&nodes).is_none_or(|d| d >= STACK) {
                 return Err("the mesh's BVH is too deep for GPU traversal".into());
             }
+
             let (data, verts) = geometry_data(&scene.mesh, &scene.bvh, &scene.tri_set);
             let (nodes, tris) = data;
             for (what, b) in [("BVH", nodes.len()), ("triangle list", tris.len()), ("vertex list", verts.len())] {
@@ -402,6 +415,7 @@ impl GpuTracer {
             eps: scene.eps,
             sigma: scene.scatter_sigma,
             rotation: scene.env_rotation,
+            env_camera: scene.env_camera,
             heights: scene.sets.iter().map(|s| s.height_strength).collect(),
             ior: scene.ior,
             lens: scene.lens.map_or([0.0; 2], |[focus, aperture]| [focus, aperture.max(0.0) * scene.radius]),
@@ -498,24 +512,42 @@ impl GpuTracer {
         Ok(true)
     }
 
-    /// Start over at `width × height` (the accumulation buffers are cleared or reallocated).
+    /// Start over at `width × height`, keeping the active render intact if allocation fails.
     pub fn reset(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) -> Result<(), String> {
-        let (w, h) = (width.clamp(1, 8192), height.clamp(1, 8192));
-        self.samples = 0;
-        if let Some(a) = self.acc.as_ref().filter(|a| (a.width, a.height) == (w, h)) {
-            for b in &a.acc {
-                encoder.clear_buffer(b, 0, None);
+        let (width, height) = (width.clamp(1, 8192), height.clamp(1, 8192));
+        let bytes = u64::from(width) * u64::from(height) * 16;
+        let limits = device.limits();
+
+        // Reject unsupported sizes before invalidating the displayed render
+        if bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
+            return Err(format!("a {width}×{height} render exceeds this GPU's buffer limit"));
+        }
+
+        if let Some(accumulation) = self.acc.as_ref().filter(|accumulation| (accumulation.width, accumulation.height) == (width, height)) {
+            for buffer in &accumulation.acc {
+                encoder.clear_buffer(buffer, 0, None);
             }
+
+            self.samples = 0;
             return Ok(());
         }
-        self.acc = None;
-        self.bind = None;
-        let bytes = u64::from(w) * u64::from(h) * 16;
-        let limits = device.limits();
-        if bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
-            return Err(format!("a {w}×{h} render exceeds this GPU's buffer limit"));
+
+        // Reused buffers must not retain samples from the previous view
+        if let Some(spare) = self.spare_acc.take_if(|accumulation| (accumulation.width, accumulation.height) == (width, height)) {
+            for buffer in spare.acc.iter().chain(&spare.illum) {
+                encoder.clear_buffer(buffer, 0, None);
+            }
+
+            self.spare_acc = self.acc.replace(spare);
+            self.bind = None;
+            self.samples = 0;
+            return Ok(());
         }
-        let buf = |label| {
+
+        // Retire the obsolete spare before allocating, but keep the active render until success
+        self.spare_acc = None;
+
+        let create_buffer = |label| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: bytes,
@@ -523,12 +555,20 @@ impl GpuTracer {
                 mapped_at_creation: false,
             })
         };
-        self.acc = Some(scoped(device, "GPU path tracing: accumulation buffers", || Accum {
-            width: w,
-            height: h,
-            acc: ["tc_acc_hit", "tc_acc_albedo", "tc_acc_normal", "tc_acc_env"].map(buf),
-            illum: ["tc_illum_a", "tc_illum_b"].map(buf),
-        })?);
+        let accumulation = scoped(device, "GPU path tracing: accumulation buffers", || Accum {
+            width,
+            height,
+            acc: ["tc_acc_hit", "tc_acc_albedo", "tc_acc_normal", "tc_acc_env"].map(create_buffer),
+            illum: ["tc_illum_a", "tc_illum_b"].map(create_buffer),
+        })?;
+        self.spare_acc = self.acc.replace(accumulation);
+        self.bind = None;
+        self.samples = 0;
+        #[cfg(test)]
+        {
+            self.acc_allocations += 1;
+        }
+
         Ok(())
     }
 
@@ -560,7 +600,7 @@ impl GpuTracer {
         });
         let (w, h) = (acc.width, acc.height);
         let inv_vp = cam.view_proj(w as f32 / h as f32).inverse();
-        let (sin, cos) = sc.rotation.sin_cos();
+        let (sin, cos) = (sc.rotation + if sc.env_camera { crate::renderer::camera_yaw(cam) } else { 0.0 }).sin_cos();
         let head = Head {
             inv_vp: inv_vp.to_cols_array(),
             forward: cam.forward().extend(sc.eps).to_array(),
@@ -602,14 +642,21 @@ impl GpuTracer {
         let disp = [display.exposure, flag(display.aces), display.env_opacity, flag(display.denoise)];
         let mut bytes = vec![0u8; self.post_stride as usize * STEPS.len()];
         for (i, step) in STEPS.iter().enumerate() {
-            let raw = PostRaw { size: [acc.width, acc.height, self.samples, *step], display: disp };
+            let [t, b] = display.background;
+            let raw = PostRaw {
+                size: [acc.width, acc.height, self.samples, *step],
+                display: disp,
+                back_top: [t[0], t[1], t[2], 0.0],
+                back_bottom: [b[0], b[1], b[2], 0.0],
+            };
             if let Some(slot) = bytes.get_mut(i * self.post_stride as usize..).and_then(|s| s.get_mut(..size_of::<PostRaw>())) {
                 slot.copy_from_slice(bytemuck::bytes_of(&raw));
             }
         }
         queue.write_buffer(&self.post, 0, &bytes);
         let post = wgpu::BufferBinding { buffer: &self.post, offset: 0, size: wgpu::BufferSize::new(size_of::<PostRaw>() as u64) };
-        // a: illum[0] → illum[1], b: illum[1] → illum[0].
+
+        // a: illum[0] → illum[1], b: illum[1] → illum[0]
         let group = |src: &wgpu::Buffer, dst: &wgpu::Buffer| {
             let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(post.clone()) }];
             entries.extend(acc.acc.iter().zip(1..).map(|(b, binding)| wgpu::BindGroupEntry { binding, resource: b.as_entire_binding() }));
@@ -628,7 +675,7 @@ impl GpuTracer {
             cpass.dispatch_workgroups(groups.0, groups.1, 1);
         };
         if display.denoise {
-            // The five steps alternate b, a, b, a, b, leaving the result in illum[0].
+            // The five steps alternate b, a, b, a, b, leaving the result in illum[0]
             run(&self.init_pipe, &a, 0);
             for slot in 1..STEPS.len() {
                 run(&self.step_pipe, if slot % 2 == 1 { &b } else { &a }, slot);
@@ -800,28 +847,92 @@ mod tests {
 
     /// The radiance accumulation, read back.
     fn accumulation(h: &Headless, t: &GpuTracer) -> Vec<[f32; 4]> {
-        let acc = t.acc.as_ref().unwrap();
-        let bytes = acc.width as u64 * acc.height as u64 * 16;
-        let staging = h.device.create_buffer(&wgpu::BufferDescriptor {
+        read_buffer(h, &t.acc.as_ref().unwrap().acc[0])
+    }
+
+    /// Read a completed buffer to check its contents across resets and reuse.
+    fn read_buffer(headless: &Headless, buffer: &wgpu::Buffer) -> Vec<[f32; 4]> {
+        let bytes = buffer.size();
+        let staging = headless.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: bytes,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut enc = h.device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(&acc.acc[0], 0, &staging, 0, bytes);
-        h.queue.submit([enc.finish()]);
+        let mut encoder = headless.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, bytes);
+        headless.queue.submit([encoder.finish()]);
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        h.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        headless.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+
         bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec()
+    }
+
+    /// Two cached sizes reuse cleared buffers, and leaving Rendering mode releases both.
+    #[test]
+    fn switching_between_two_sizes_reuses_the_accumulation_buffers() {
+        let Some((headless, mut tracer)) = gpu() else { return };
+
+        for (width, height) in [(64, 48), (32, 24), (64, 48), (32, 24), (64, 48)] {
+            let mut encoder = headless.device.create_command_encoder(&Default::default());
+            tracer.reset(&headless.device, &mut encoder, width, height).unwrap();
+            headless.queue.submit([encoder.finish()]);
+
+            let accumulation = tracer.acc.as_ref().unwrap();
+            assert_eq!((accumulation.width, accumulation.height), (width, height));
+            assert_eq!(tracer.samples(), 0);
+            for buffer in accumulation.acc.iter().chain(&accumulation.illum) {
+                assert!(read_buffer(&headless, buffer).iter().all(|pixel| *pixel == [0.0; 4]), "reused buffers must be cleared");
+
+                // Leave nonzero contents to detect stale pixels on the next reuse
+                let pixels = vec![[1.0f32; 4]; (width * height) as usize];
+                headless.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&pixels));
+            }
+            tracer.samples = 7;
+        }
+
+        assert_eq!(tracer.acc_allocations, 2, "two sizes, two allocations, however often it switches");
+        let mut encoder = headless.device.create_command_encoder(&Default::default());
+        tracer.reset(&headless.device, &mut encoder, 16, 16).unwrap();
+        headless.queue.submit([encoder.finish()]);
+        assert_eq!(tracer.acc_allocations, 3, "a third size allocates (and drops the oldest set)");
+
+        tracer.release();
+        assert!(tracer.acc.is_none() && tracer.spare_acc.is_none(), "leaving Rendering mode frees both sizes");
+    }
+
+    /// Rejecting an oversized render preserves the image and lets tracing continue.
+    #[test]
+    fn failed_reset_retains_the_active_render() {
+        let Some((mut headless, mut tracer)) = gpu() else { return };
+        let scene = sphere_scene(&mut headless, crate::ibl::environment("Studio Soft", 32), &WHITE);
+        let camera = camera();
+        let settings = TraceSettings::default();
+        let display = TraceDisplay::from_display(&Default::default());
+        tracer.render(&headless.device, &headless.queue, &headless.renderer, &scene, &camera, &settings, &display, [32, 24], 2).unwrap();
+        let before = accumulation(&headless, &tracer);
+
+        let mut encoder = headless.device.create_command_encoder(&Default::default());
+        let error = tracer.reset(&headless.device, &mut encoder, 8192, 8192).unwrap_err();
+
+        assert!(error.contains("exceeds this GPU's buffer limit"));
+        assert!(tracer.acc.is_some(), "a rejected resize must keep the active buffers");
+        assert!(tracer.bind.is_some(), "a rejected resize must keep the active bindings");
+        assert_eq!(tracer.samples(), 2, "a rejected resize must keep the accumulated samples");
+        assert_eq!(accumulation(&headless, &tracer), before);
+        assert!(tracer.pass(&headless.device, &headless.queue, &mut encoder, &camera, &settings, 1));
+        let output = GpuTracer::output_texture(&headless.device, 32, 24);
+        assert!(tracer.resolve(&headless.device, &headless.queue, &mut encoder, &display, &output.create_view(&Default::default())));
+        headless.queue.submit([encoder.finish()]);
+        assert!(crate::readback::Readback::blocking(&headless.device, &headless.queue, &output).is_some());
+        assert_eq!(tracer.samples(), 3);
     }
 
     const WHITE: [(Channel, [f32; 3]); 3] = [(Channel::BaseColor, [1.0; 3]), (Channel::Metallic, [0.0; 3]), (Channel::Roughness, [0.5; 3])];
 
     #[test]
     fn white_furnace_on_the_gpu_stays_bounded_and_finite() {
-        // White spheres in a uniform white environment reflect at most what arrives: at half
-        // exposure the environment shows as 0.5 and the spheres between 0.25 and 0.5.
+        // Half exposure puts the white environment at 0.5 and bounds the spheres below it
         use Channel::*;
         let Some((mut h, mut t)) = gpu() else { return };
         let everything = [(CoatWeight, [1.0; 3]), (SheenWeight, [1.0; 3]), (AnisotropyLevel, [1.0; 3]), (ScatterWeight, [1.0; 3])];
@@ -829,7 +940,7 @@ mod tests {
             let values: Vec<_> = WHITE.iter().chain(extra).copied().collect();
             let env = EnvImage { width: 8, height: 4, data: vec![[1.0; 3]; 32] };
             let scene = sphere_scene(&mut h, env, &values);
-            let d = TraceDisplay { exposure: 0.5, aces: false, env_opacity: 1.0, denoise: false };
+            let d = TraceDisplay { exposure: 0.5, aces: false, env_opacity: 1.0, denoise: false, background: crate::DEFAULT_BACKGROUND };
             let (w, _, px) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &TraceSettings { bounces: 8 }, &d, [64, 48], 256).unwrap();
             assert!(accumulation(&h, &t).iter().all(|v| v.iter().all(|c| c.is_finite())), "{name}: no NaN or infinity");
             let at = |x: u32, y: u32| texturecraft_texel::srgb_to_linear(px[((y * w + x) * 4 + 1) as usize] as f32 / 255.0);
@@ -859,7 +970,7 @@ mod tests {
         for (name, values, lens) in [("every lobe", &values[..], None), ("glass under a thin lens", &glass[..], Some([3.2, 0.2]))] {
             let mut scene = sphere_scene(&mut h, crate::ibl::environment("Studio Contrast", 256), values);
             (scene.lens, scene.ior) = (lens, 1.45);
-            let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false };
+            let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false, background: crate::DEFAULT_BACKGROUND };
             let settings = TraceSettings { bounces: 6 };
             let (_, _, gpu) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &settings, &d, [48, 36], 1024).unwrap();
             let mut cpu = Tracer::new(48, 36);
@@ -872,8 +983,7 @@ mod tests {
 
     #[test]
     fn gpu_reads_full_size_channels_beside_placeholders() {
-        // Base color stays at its default (a 1×1 placeholder texture) while roughness varies
-        // across the surface (a full-size texture): the tracer must still read every texel of it.
+        // A 1×1 base-color placeholder must not limit sampling of the full-size roughness map
         use Channel::*;
         let Some((mut h, mut t)) = gpu() else { return };
         let mut composite = Composite::new(&[Roughness, Metallic], 64);
@@ -897,7 +1007,7 @@ mod tests {
         let bvh = Arc::new(Bvh::new(&mesh));
         let env = crate::ibl::environment("Studio Contrast", 256);
         let scene = TraceScene::new(mesh, bvh, vec![TraceSet { material: 0, composite, height_strength: 0.0 }], Arc::new(env), 0.0);
-        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false };
+        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false, background: crate::DEFAULT_BACKGROUND };
         let settings = TraceSettings { bounces: 4 };
         let (_, _, gpu) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &settings, &d, [48, 36], 1024).unwrap();
         let mut cpu = Tracer::new(48, 36);
@@ -941,7 +1051,8 @@ mod tests {
         let mut cam = OrbitCamera::default();
         cam.frame(lo, hi);
         let scene = TraceScene::new(mesh.clone(), Arc::new(Bvh::new(&mesh)), Vec::new(), Arc::new(crate::ibl::environment("Studio Soft", 1024)), 0.0);
-        let (settings, d) = (TraceSettings::default(), TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: true });
+        let (settings, d) =
+            (TraceSettings::default(), TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: true, background: crate::DEFAULT_BACKGROUND });
         let run = |t: &mut GpuTracer, n| t.render(&h.device, &h.queue, &h.renderer, &scene, &cam, &settings, &d, [1920, 1080], n).unwrap();
         run(&mut t, 8);
         let t0 = std::time::Instant::now();

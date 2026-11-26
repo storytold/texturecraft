@@ -3,18 +3,16 @@
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 
+use texturecraft_compose::MaskGray;
 use texturecraft_geom::glam::Vec2;
-use texturecraft_geom::{Mesh, NO_TRI};
+use texturecraft_geom::triangle_partition::CORNER_GRID_STEPS;
+use texturecraft_geom::{Mesh, NO_TRI, TrianglePartition};
 use texturecraft_paint::{EyeDepth, fill_triangles, screen_point};
 
 use crate::fill_mode::FillMode;
 use crate::polygon_fill_drag::PolygonFillDrag;
 use crate::session::Session;
-use crate::triangle_partition::TrianglePartition;
 use crate::{EngineError, Result};
-
-/// Corners closer than one step of this grid (per unit of position or UV) count as the same corner
-const CORNER_GRID_STEPS: f32 = 1e5;
 
 impl Session {
     /// Fill the triangle / polygon / UV island / connected mesh under viewport pixel `screen`
@@ -104,6 +102,10 @@ impl Session {
 
         drag.last_box = Some((low, high));
         let selected = self.box_selection(low, high);
+        let selected = match self.polygon_fill_drag.as_ref() {
+            Some(drag) => self.with_symmetry_copies(&drag.fill_groups, selected),
+            None => selected,
+        };
         self.show_box_fill(selected)
     }
 
@@ -173,20 +175,21 @@ impl Session {
         match self.tool.fill_mode {
             FillMode::Triangle => TrianglePartition::new(&self.mesh, material, |_, _| Vec::<u32>::new()),
             FillMode::Polygon => TrianglePartition::new(&self.mesh, material, polygon_edges),
-            FillMode::UvIsland => TrianglePartition::new(&self.mesh, material, uv_edges),
+            FillMode::UvIsland => TrianglePartition::uv_islands(&self.mesh, material),
             FillMode::Mesh => TrianglePartition::new(&self.mesh, material, position_edges),
         }
     }
 
-    /// Fill the fill-mode group holding `triangle` (one undo step)
+    /// Fill the fill-mode group holding `triangle` and its symmetry copies (one undo step)
     fn fill_group_of(&mut self, triangle: u32) -> Result<usize> {
         let ts = self.ts();
         let groups = self.fill_partition(self.fill_material()?);
         let triangles: BTreeSet<u32> = groups.group(triangle).unwrap_or_default().iter().copied().collect();
+        let triangles = self.with_symmetry_copies(&groups, triangles);
 
         let (gbuf, mut canvas) = self.fill_canvas(ts)?;
         fill_triangles(&mut canvas, &gbuf, &triangles);
-        self.commit_fill("Polygon fill", ts, &canvas)?;
+        self.commit_fill("Polygon fill", ts, &canvas, &MaskGray::Value(self.tool.mask_value))?;
         Ok(triangles.len())
     }
 
@@ -257,7 +260,7 @@ impl Session {
         } else {
             self.fill_canvas(ts).and_then(|(gbuf, mut canvas)| {
                 fill_triangles(&mut canvas, &gbuf, &selected);
-                self.paint_fill(ts, &canvas)
+                self.paint_fill(ts, &canvas, &MaskGray::Value(self.tool.mask_value))
             })
         };
         self.invalidate_changed(&previous);
@@ -292,12 +295,6 @@ fn pixel_span(low: f32, high: f32, count: u32) -> std::ops::Range<usize> {
     first..end.max(first)
 }
 
-/// Texture coordinates of `triangle`'s corners
-fn uv_corners(mesh: &Mesh, triangle: usize) -> Option<[Vec2; 3]> {
-    let [first, second, third] = mesh.tri(triangle)?;
-    Some([*mesh.uvs.get(first)?, *mesh.uvs.get(second)?, *mesh.uvs.get(third)?])
-}
-
 /// The polygon diagonals of `triangle`: edges the importer added to split a polygon
 fn polygon_edges(mesh: &Mesh, triangle: usize) -> Vec<(u32, u32)> {
     let hidden = mesh.diagonals.get(triangle).copied().unwrap_or(0);
@@ -310,14 +307,6 @@ fn polygon_edges(mesh: &Mesh, triangle: usize) -> Vec<(u32, u32)> {
             (from.min(to), from.max(to))
         })
         .collect()
-}
-
-/// `triangle`'s edges in UV space: imports often split vertices along hard edges where the UVs run on, so vertex indices alone break islands apart
-fn uv_edges(mesh: &Mesh, triangle: usize) -> Vec<([i64; 2], [i64; 2])> {
-    let corner = |uv: Vec2| (uv * CORNER_GRID_STEPS).round().to_array().map(|step| step as i64);
-    let Some([first, second, third]) = uv_corners(mesh, triangle).map(|uvs| uvs.map(corner)) else { return Vec::new() };
-
-    [(first, second), (second, third), (third, first)].map(|(from, to)| (from.min(to), from.max(to))).to_vec()
 }
 
 /// `triangle`'s edges by position: UV seams and hard edges split vertices but leave the geometry connected

@@ -2,7 +2,7 @@
 //! frame-budgeted compositor, through engine commands.
 
 use serde_json::{Value, json};
-use texturecraft_engine::core::{Channel, LayerId, LayerKind};
+use texturecraft_engine::core::{Channel, Fill, LayerId, LayerKind, Source};
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_engine::geom::primitives;
 use texturecraft_engine::{Session, execute};
@@ -204,6 +204,52 @@ fn edits_invalidate_only_the_sets_they_change() {
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     assert!(!s.caches[0].dirty.is_empty() && s.caches[1].dirty.is_empty());
     assert!((rough(&mut s, 0) - 0.4).abs() < 1e-3);
+}
+
+#[test]
+fn importing_images_invalidates_only_sets_with_newly_resolved_references() {
+    use std::sync::Arc;
+
+    let mut session = session();
+    let referenced_layer = session.doc.project.texture_sets[1].stack[0];
+    session
+        .edit("Reference missing image", |session| {
+            let mut fill = Fill::default();
+            fill.sources.insert(Channel::BaseColor, Source::image("later.png"));
+            session.doc.project.layer_mut(referenced_layer).unwrap().kind = LayerKind::Fill(fill);
+            Ok(())
+        })
+        .unwrap();
+    session.update();
+
+    let mut image_bytes = Vec::new();
+    let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+    image.write_to(&mut std::io::Cursor::new(&mut image_bytes), image::ImageFormat::Png).unwrap();
+    session.import_resource_bytes("later.png", image_bytes.clone()).unwrap();
+    assert!(session.caches[0].dirty.is_empty(), "unrelated set stays clean");
+    assert!(!session.caches[1].dirty.is_empty(), "newly resolved image invalidates its set");
+    session.update();
+    let (x, y) = covered(&session, 1);
+    assert!(session.caches[1].composite.value(Channel::BaseColor, x, y)[0] > 0.9);
+    let imported_image = Arc::downgrade(&session.images["later.png"]);
+
+    session.undo().unwrap();
+    assert!(!session.caches[0].dirty.is_empty(), "resource removal retains broad invalidation");
+    assert!(!session.caches[1].dirty.is_empty());
+    assert!(imported_image.upgrade().is_none(), "undo releases the decoded image even while encoded bytes remain in history");
+    session.update();
+    session.redo().unwrap();
+    assert!(session.caches[0].dirty.is_empty());
+    assert!(!session.caches[1].dirty.is_empty());
+    assert!(!imported_image.ptr_eq(&Arc::downgrade(&session.images["later.png"])), "redo decodes a new image allocation");
+    session.update();
+
+    session.import_resource_bytes("unused.png", image_bytes).unwrap();
+    assert!(session.caches.iter().all(|cache| cache.dirty.is_empty()), "unused image leaves every set clean");
+
+    let resolved_image = Arc::downgrade(&session.images["later.png"]);
+    session.sync_images();
+    assert!(resolved_image.ptr_eq(&Arc::downgrade(&session.images["later.png"])), "sync reuses already decoded images");
 }
 
 #[test]

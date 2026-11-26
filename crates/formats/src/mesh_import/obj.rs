@@ -1,9 +1,8 @@
-//! Wavefront OBJ (via `tobj`): polygons fan-triangulated, one vertex per unique v/vt/vn.
-
+//! Wavefront OBJ through the shared bounded mesh reader.
+use super::{MAX_VERTICES, RawMesh, check_vertices};
+use crate::{FormatError, Result, malformed};
+use std::collections::HashMap;
 use texturecraft_geom::glam::{Vec2, Vec3, Vec4};
-
-use super::{RawMesh, check_triangles, check_vertices};
-use crate::{Result, malformed};
 
 const KIND: &str = "OBJ";
 
@@ -12,95 +11,104 @@ pub(crate) fn read(bytes: &[u8]) -> Result<RawMesh> {
 }
 
 fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
-    let text = String::from_utf8_lossy(bytes);
-
-    // A synthetic library lets tobj assign usemtl names without reading external MTL files
-    let mut names: Vec<&str> = Vec::new();
-    for line in text.lines().map(str::trim) {
-        if line.split_whitespace().next() == Some("usemtl")
-            && let Some((_, name)) = line.split_once(' ')
-            && !name.trim().is_empty()
-            && !names.contains(&name.trim())
-        {
-            names.push(name.trim());
-        }
-    }
-
-    let library: String = names.iter().map(|name| format!("newmtl {name}\n")).collect();
-    let source = format!("mtllib texturecraft-usemtl.mtl\n{text}");
-
-    // Polygons stay whole so the wireframe can show them; `RawMesh::polygon` triangulates
-    let options = tobj::LoadOptions { single_index: true, triangulate: false, ignore_points: true, ignore_lines: true };
-    let (models, materials) =
-        tobj::load_obj_buf(&mut source.as_bytes(), &options, |_| tobj::load_mtl_buf(&mut library.as_bytes())).map_err(|e| malformed(KIND, e))?;
-    let materials = materials.unwrap_or_default();
-
+    let limits = craft_mesh::Limits {
+        max_vertices: MAX_VERTICES,
+        max_triangles: texturecraft_geom::MAX_TRIANGLES,
+        max_face_corners: MAX_VERTICES,
+        max_meshes: MAX_VERTICES,
+        max_parts: MAX_VERTICES,
+        max_materials: MAX_VERTICES,
+        max_data_bytes: super::MAX_MESH_FILE_BYTES as usize,
+        ..Default::default()
+    };
+    let options = craft_mesh::obj::ReadOptions { strict: true, preserve_runs: true, ignore_material_libraries: true, groups_as_objects: true };
+    let scene = craft_mesh::obj::read_with_options(bytes, &limits, &mut craft_mesh::no_external, &options).map_err(|e| match e {
+        craft_mesh::Error::TooLarge(s) => FormatError::TooLarge(s),
+        e => FormatError::Invalid(e.to_string()),
+    })?;
+    let any_uvs = scene.meshes.iter().flat_map(|mesh| mesh.parts.iter()).flat_map(|part| part.corners.iter()).any(|c| c.uv != craft_mesh::NONE);
+    let any_colors = scene.meshes.iter().any(|mesh| !mesh.colors.is_empty());
     let mut raw = RawMesh::default();
-    let (mut normals, mut uvs, mut colors) = (Some(Vec::new()), Some(Vec::new()), Vec::new());
-    let mut partial_uvs = false;
-    for model in &models {
-        let mesh = &model.mesh;
-        let vertex_count = mesh.positions.len() / 3;
-        check_vertices(raw.positions.len().saturating_add(vertex_count))?;
-
-        // Corners per face; without arities every face is a triangle
-        let arities: Vec<usize> =
-            if mesh.face_arities.is_empty() { vec![3; mesh.indices.len() / 3] } else { mesh.face_arities.iter().map(|a| *a as usize).collect() };
-        check_triangles(raw.triangle_count(), arities.iter().map(|a| a.saturating_sub(2)).sum())?;
-        let base = raw.positions.len() as u32;
-        raw.positions.extend(mesh.positions.as_chunks::<3>().0.iter().map(|p| Vec3::new(p[0], p[1], p[2])));
-        if mesh.normals.len() == vertex_count * 3 {
-            if let Some(v) = &mut normals {
-                v.extend(mesh.normals.as_chunks::<3>().0.iter().map(|p| Vec3::new(p[0], p[1], p[2])));
-            }
-        } else {
-            normals = None;
-        }
-        if mesh.texcoords.len() == vertex_count * 2 {
-            if let Some(v) = &mut uvs {
-                // OBJ UVs have their origin bottom-left
-                v.extend(mesh.texcoords.as_chunks::<2>().0.iter().map(|t| Vec2::new(t[0], 1.0 - t[1])));
-            }
-        } else {
-            partial_uvs |= vertex_count > 0 && !mesh.indices.is_empty();
-            uvs = None;
-        }
-
-        // `v x y z r g b`: objects without colors are white
-        match mesh.vertex_color.len() == vertex_count * 3 {
-            true => colors.extend(mesh.vertex_color.as_chunks::<3>().0.iter().map(|c| Vec4::new(c[0], c[1], c[2], 1.0))),
-            false => colors.extend(std::iter::repeat_n(Vec4::ONE, vertex_count)),
-        }
-
-        let name = match mesh.material_id {
-            Some(id) => materials.get(id).map(|mat| mat.name.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| format!("Material_{id}")),
-            None => "Default".to_string(),
-        };
-        if let Some(i) = mesh.indices.iter().find(|i| **i as usize >= vertex_count) {
-            return Err(malformed(KIND, format!("face index {i} out of range")));
-        }
-
-        // tobj names models without `o`/`g` "unnamed_object"; an empty name takes the file stem
-        let part = if model.name == "unnamed_object" { "" } else { model.name.as_str() };
-        let (mut rest, mut corners) = (mesh.indices.as_slice(), Vec::new());
-        for arity in arities {
-            let Some((face, tail)) = rest.split_at_checked(arity) else { break };
-            rest = tail;
-            corners.clear();
-            corners.extend(face.iter().map(|i| base + i));
-            if arity >= 3 {
-                raw.polygon(&name, part, &corners);
+    let (mut normals, mut uvs, mut colors) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut missing_normals, mut missing_uvs) = (false, false);
+    for (mesh_id, mesh) in scene.meshes.iter().enumerate() {
+        // The shared reader preserves declarations as meshes, even when their names match
+        let declaration = mesh_id.to_string();
+        for part in &mesh.parts {
+            let material = part.material.and_then(|i| scene.materials.get(i)).map_or("Default", |m| m.name.as_str());
+            // OBJ model/material runs have independent v/vt/vn deduplication.
+            let mut ids = HashMap::new();
+            for face in part.faces() {
+                let mut polygon = Vec::with_capacity(face.len());
+                for corner in face {
+                    let id = if let Some(id) = ids.get(corner) {
+                        *id
+                    } else {
+                        let position = mesh.positions.get(corner.position as usize).ok_or_else(|| malformed(KIND, "position index out of range"))?;
+                        check_vertices(raw.positions.len().saturating_add(1))?;
+                        // Bound both the output pools and the per-run corner map before growth.
+                        let staging = raw
+                            .positions
+                            .len()
+                            .checked_add(1)
+                            .and_then(|n| n.checked_mul(64))
+                            .and_then(|n| ids.len().checked_add(1).and_then(|m| m.checked_mul(48)).and_then(|m| n.checked_add(m)));
+                        if staging.is_none_or(|n| n > limits.max_data_bytes) {
+                            return Err(FormatError::TooLarge("OBJ mesh exceeds the memory limit".into()));
+                        }
+                        let id = u32::try_from(raw.positions.len()).map_err(|_| FormatError::TooLarge("OBJ vertex count".into()))?;
+                        raw.positions.push(Vec3::new(position[0] as f32, position[1] as f32, position[2] as f32));
+                        let normal = mesh.normals.get(corner.normal as usize).map(|n| Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32));
+                        missing_normals |= normal.is_none();
+                        normals.push(normal.unwrap_or_default());
+                        if any_uvs {
+                            let uv = mesh.uv_sets.first().and_then(|set| set.get(corner.uv as usize)).map(|v| Vec2::new(v[0], v[1]));
+                            missing_uvs |= uv.is_none();
+                            uvs.push(uv.unwrap_or_default());
+                        }
+                        if any_colors {
+                            colors.push(mesh.colors.get(corner.position as usize).copied().map(Vec4::from_array).unwrap_or(Vec4::ONE));
+                        }
+                        ids.insert(*corner, id);
+                        id
+                    };
+                    polygon.push(id);
+                }
+                raw.polygon(material, &declaration, &polygon);
             }
         }
     }
-
-    if partial_uvs && models.iter().any(|model| !model.mesh.texcoords.is_empty()) {
-        raw.warnings.push("some objects have no UVs; the whole mesh was unwrapped automatically".into());
+    // Restore display names only after grouping by declaration and material
+    for (_, name, _) in &mut raw.groups {
+        if let Some(mesh) = name.parse::<usize>().ok().and_then(|id| scene.meshes.get(id)) {
+            *name = mesh.name.clone();
+        }
     }
-
-    raw.normals = normals;
-    raw.uvs = uvs;
-    raw.colors = models.iter().any(|model| !model.mesh.vertex_color.is_empty()).then_some(colors);
-
+    if missing_uvs {
+        raw.warnings.push("some objects have no UVs; default UVs were assigned".into());
+    }
+    raw.normals = (!missing_normals).then_some(normals);
+    raw.uvs = any_uvs.then_some(uvs);
+    raw.colors = any_colors.then_some(colors);
     Ok(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore = "release benchmark for declaration-heavy OBJ input"]
+    fn declaration_import_benchmark() {
+        for count in [10_000, 50_000] {
+            let mut source = String::from("v 0 0 0\nv 1 0 0\nv 0 1 0\n");
+            for _ in 0..count {
+                source.push_str("o repeated\nf 1 2 3\n");
+            }
+            let start = std::time::Instant::now();
+            let raw = super::read(source.as_bytes()).unwrap();
+            println!("{count} declarations: {:?}", start.elapsed());
+            assert_eq!(raw.groups.len(), count);
+            assert_eq!(raw.triangle_count(), count);
+            assert!(raw.groups.iter().all(|(_, name, tris)| name == "repeated" && tris.len() == 3));
+        }
+    }
 }
