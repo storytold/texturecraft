@@ -245,13 +245,18 @@ fn wall_expectation(d: f32, h: f32, distribution: RayDistribution) -> (f32, Vec3
     }
 }
 
+/// The tangent frame (T, B, N) of the occlusion scenes' floors: their u grows along +x and their
+/// v along +z (glTF, v down), so "up the image" is −z, and they face +y.
+const FLOOR_FRAME: (Vec3, Vec3, Vec3) = (Vec3::X, Vec3::NEG_Z, Vec3::Y);
+
 /// Mean measured and expected AO, and the angle between the measured and expected bent normals
 /// (both averaged over the group), for a group of texels.
 fn compare_occlusion(output: &BakeOutput, group: &[&Texel], expected: impl Fn(&Surface) -> (f32, Vec3)) -> (f32, f32, f32, f32) {
     let count = group.len() as f32;
     let measured_ao = group.iter().map(|t| scalar(output, BakedMap::AmbientOcclusion, t.index)).sum::<f32>() / count;
     let expected_ao = group.iter().map(|t| t.mean(|s| expected(s).0)).sum::<f32>() / count;
-    let measured_bent = group.iter().map(|t| unpack(vector(output, BakedMap::BentNormal, t.index))).sum::<Vec3>();
+    // Bent normals bake in tangent space, like the normal map
+    let measured_bent = group.iter().map(|t| to_world(FLOOR_FRAME, unpack(vector(output, BakedMap::BentNormal, t.index)))).sum::<Vec3>();
     let expected_bent = group.iter().map(|t| t.mean_vector(|s| expected(s).1.normalize())).sum::<Vec3>();
     // The smallest mean open direction in the group bounds the bent-normal noise
     let moment = group.iter().flat_map(|t| t.surfaces.iter().map(|s| expected(s).1.length())).fold(f32::INFINITY, f32::min);

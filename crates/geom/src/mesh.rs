@@ -7,6 +7,9 @@ use crate::{GeomError, Result};
 /// An edge by the bits of its two end positions, the lower one first
 type EdgePositions = ([u32; 3], [u32; 3]);
 
+/// Normals closer than about one degree are the same normal: the edge between them is smooth
+const SAME_NORMAL_MIN_COSINE: f32 = 0.9998;
+
 /// A contiguous index range drawn with one material.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubMesh {
@@ -48,6 +51,11 @@ pub struct Mesh {
     pub diagonals: Vec<u8>,
 }
 
+/// [`Mesh::diagonals`] marks of the two fan triangles of a quad: the first has the diagonal as
+/// its edge 2 (last corner back to the first), the second as its edge 0.
+const QUAD_FIRST_MARK: u8 = 0b100;
+const QUAD_SECOND_MARK: u8 = 0b001;
+
 /// Hard cap on mesh size accepted from files (triangles).
 pub const MAX_TRIANGLES: usize = 20_000_000;
 
@@ -68,6 +76,19 @@ impl Mesh {
         self.positions.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), p| (lo.min(*p), hi.max(*p)))
     }
 
+    /// Axis-aligned bounds of the triangles drawn with `material` (None when none are).
+    pub fn bounds_of_material(&self, material: usize) -> Option<(Vec3, Vec3)> {
+        let mut bounds: Option<(Vec3, Vec3)> = None;
+        for triangle in self.triangles_of(material) {
+            let Some(corners) = self.tri(triangle) else { continue };
+            for corner in corners {
+                let Some(position) = self.positions.get(corner) else { continue };
+                bounds = Some(bounds.map_or((*position, *position), |(lo, hi)| (lo.min(*position), hi.max(*position))));
+            }
+        }
+        bounds
+    }
+
     /// Bounding-sphere radius around the bounds center (at least a small epsilon).
     pub fn radius(&self) -> f32 {
         let (lo, hi) = self.bounds();
@@ -85,36 +106,37 @@ impl Mesh {
     /// split it from its twin), per material in `0..materials.len().max(1)`.
     pub fn wire_edges(&self) -> Vec<Vec<(u32, u32)>> {
         (0..self.materials.len().max(1))
-            .map(|m| {
-                // Edge → (real in some triangle, triangles using it), in first-seen order.
+            .map(|material| {
+                // Keep first-seen edge order while counting its triangle uses
                 let mut edges: Vec<((u32, u32), bool, u8)> = Vec::new();
-                let mut at: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
-                for t in self.triangles_of(m) {
-                    let Some(v) = self.indices.get(t * 3..t * 3 + 3) else { continue };
-                    let hidden = self.diagonals.get(t).copied().unwrap_or(0);
-                    for (i, (a, b)) in [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])].into_iter().enumerate() {
-                        let key = (a.min(b), a.max(b));
-                        let real = hidden >> i & 1 == 0;
-                        let e = *at.entry(key).or_insert_with(|| {
+                let mut edge_indices: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
+                for triangle in self.triangles_of(material) {
+                    let Some(vertices) = self.indices.get(triangle * 3..triangle * 3 + 3) else { continue };
+                    let hidden = self.diagonals.get(triangle).copied().unwrap_or(0);
+                    for (side, (from, to)) in [(vertices[0], vertices[1]), (vertices[1], vertices[2]), (vertices[2], vertices[0])].into_iter().enumerate() {
+                        let key = (from.min(to), from.max(to));
+                        let is_polygon_edge = hidden >> side & 1 == 0;
+                        let edge_index = *edge_indices.entry(key).or_insert_with(|| {
                             edges.push((key, false, 0));
                             edges.len() - 1
                         });
-                        if let Some((_, r, n)) = edges.get_mut(e) {
-                            *r |= real;
-                            *n = n.saturating_add(1);
+                        if let Some((_, edge_is_polygon_side, triangle_count)) = edges.get_mut(edge_index) {
+                            *edge_is_polygon_side |= is_polygon_edge;
+                            *triangle_count = triangle_count.saturating_add(1);
                         }
                     }
                 }
-                edges.into_iter().filter(|(_, real, n)| *real || *n == 1).map(|(k, ..)| k).collect()
+                edges.into_iter().filter(|(_, is_polygon_edge, triangle_count)| *is_polygon_edge || *triangle_count == 1).map(|(edge, ..)| edge).collect()
             })
             .collect()
     }
 
-    /// Edges where the UV layout splits: two triangles meet there in 3D but not in UV space, per material in `0..materials.len().max(1)`
-    pub fn uv_seam_edges(&self) -> Vec<Vec<(u32, u32)>> {
+    /// Hard edges the UV layout does not split, which bake visible lines into the normal map: two triangles meet there with different normals but the same UVs, per material in `0..materials.len().max(1)`
+    pub fn missing_seam_edges(&self) -> Vec<Vec<(u32, u32)>> {
         // Signed zero denotes the same position on either side of an imported seam
         let bits = |position: Vec3| position.to_array().map(|coordinate| if coordinate == 0.0 { 0 } else { coordinate.to_bits() });
         let mut seams = vec![Vec::new(); self.materials.len().max(1)];
+
         // Match across materials before grouping the lines for texture-set visibility
         let mut sides: std::collections::HashMap<EdgePositions, Vec<(u32, u32, usize)>> = std::collections::HashMap::new();
         for material in 0..seams.len() {
@@ -132,10 +154,19 @@ impl Mesh {
         }
 
         let uv = |index: u32| self.uvs.get(index as usize).copied();
+
+        // Imported normals need not be unit length; two missing normals agree
+        let direction = |index: u32| self.normals.get(index as usize).map_or(Vec3::ZERO, |normal| normal.normalize_or_zero());
+        let same_normal = |a: u32, b: u32| {
+            let (a, b) = (direction(a), direction(b));
+            a == b || a.dot(b) >= SAME_NORMAL_MIN_COSINE
+        };
         for pairs in sides.into_values() {
             let Some(&(first_from, first_to, _)) = pairs.first() else { continue };
 
-            if pairs.iter().any(|&(from, to, _)| (uv(from), uv(to)) != (uv(first_from), uv(first_to))) {
+            let uv_split = pairs.iter().any(|&(from, to, _)| (uv(from), uv(to)) != (uv(first_from), uv(first_to)));
+            let hard = pairs.iter().any(|&(from, to, _)| !same_normal(from, first_from) || !same_normal(to, first_to));
+            if hard && !uv_split {
                 for (from, to, material) in pairs {
                     if let Some(edges) = seams.get_mut(material) {
                         edges.push((from.min(to), from.max(to)));
@@ -214,7 +245,68 @@ impl Mesh {
         self.normals = normals.into_iter().map(|v| v.try_normalize().unwrap_or(Vec3::Y)).collect();
     }
 
-    /// MikkTSpace tangents (falls back to per-triangle tangents if generation fails).
+    /// The faces MikkTSpace sees: each importer quad (a fan pair marked in [`Mesh::diagonals`])
+    /// as one four-corner face, like Blender hands it over, and every other triangle as a
+    /// triangle. Polygons with more than four corners stay fan triangles. The vertex and index
+    /// buffers are untouched; only tangent generation looks at the quads.
+    fn tangent_faces(&self) -> Vec<TangentFace> {
+        let triangles = self.indices.len() / 3;
+        // An empty face table keeps the original constant-space triangle adapter.
+        // Do not allocate a per-triangle table unless a valid quad needs one.
+        if !self.diagonals.contains(&QUAD_FIRST_MARK) || !(0..triangles).any(|t| self.quad_at(t).is_some()) {
+            return Vec::new();
+        }
+        let mut faces = Vec::with_capacity(triangles);
+        let mut t = 0;
+        while t < triangles {
+            if let Some(corners) = self.quad_at(t) {
+                faces.push(TangentFace { corners: [corners[0], corners[1], corners[2], corners[3]], count: 4 });
+                t += 2;
+                continue;
+            }
+            let c = |k: usize| self.indices.get(t * 3 + k).copied().unwrap_or(0);
+            faces.push(TangentFace { corners: [c(0), c(1), c(2), 0], count: 3 });
+            t += 1;
+        }
+        faces
+    }
+
+    /// The four corners of the quad whose fan triangles are `t` and `t + 1`, or `None` when they
+    /// are not an intact quad: the marks must be exactly the shared diagonal (a fan of more
+    /// corners marks more edges), the triangles must share the fan's first corner and the
+    /// diagonal's end, the four vertices must differ, have finite UVs and make two triangles of
+    /// positive area (anything else keeps its triangles, which MikkTSpace already survives).
+    fn quad_at(&self, t: usize) -> Option<[u32; 4]> {
+        if self.diagonals.get(t).copied()? != QUAD_FIRST_MARK || self.diagonals.get(t + 1).copied()? != QUAD_SECOND_MARK {
+            return None;
+        }
+        let a = self.indices.get(t * 3..t * 3 + 3)?;
+        let b = self.indices.get(t * 3 + 3..t * 3 + 6)?;
+        if a[0] != b[0] || a[2] != b[1] {
+            return None;
+        }
+        let corners = [a[0], a[1], a[2], b[2]];
+        if (1..4).any(|i| corners[..i].contains(&corners[i])) {
+            return None;
+        }
+        let point = |c: usize| self.positions.get(corners[c] as usize).copied();
+        let (p0, p1, p2, p3) = (point(0)?, point(1)?, point(2)?, point(3)?);
+        let points = [p0, p1, p2, p3];
+        // Distinct corner indices can still share one position (a seam); MikkTSpace compares
+        // positions exactly and underflows when every triangle of a folded quad is dropped.
+        if (1..4).any(|i| points[..i].contains(&points[i])) {
+            return None;
+        }
+        let area = |p: Vec3, q: Vec3, r: Vec3| (q - p).cross(r - p).length_squared() > 0.0;
+        if area(p0, p1, p2) && area(p0, p2, p3) && corners.iter().all(|&c| self.uvs.get(c as usize).is_some_and(|uv| uv.is_finite())) {
+            Some(corners)
+        } else {
+            None
+        }
+    }
+
+    /// MikkTSpace tangents (falls back to per-triangle tangents if generation fails). Quads the
+    /// importer split ([`Mesh::diagonals`]) are tangent-generated as quads, as Blender does.
     pub fn compute_tangents(&mut self) {
         self.tangents = vec![Vec4::new(1.0, 0.0, 0.0, 1.0); self.positions.len()];
         if self.normals.len() != self.positions.len() {
@@ -224,10 +316,14 @@ impl Mesh {
             self.uvs = vec![Vec2::ZERO; self.positions.len()];
         }
         // mikktspace crashes (out-of-bounds) when every triangle is degenerate; skip it then.
-        let usable = !crate::unwrap::all_triangles_degenerate(self);
-        let mut g = Mikk { mesh: self };
-        if !usable || !mikktspace::generate_tangents(&mut g) {
+        if crate::unwrap::all_triangles_degenerate(self) {
             self.simple_tangents();
+        } else {
+            let faces = self.tangent_faces();
+            let mut g = Mikk { mesh: self, faces };
+            if !mikktspace::generate_tangents(&mut g) {
+                self.simple_tangents();
+            }
         }
         for (t, n) in self.tangents.iter_mut().zip(&self.normals) {
             // Orthonormalize against the normal; repair degenerate results.
@@ -271,6 +367,26 @@ impl Mesh {
                 uv.is_finite().then(|| (uv.x.floor() as i32, uv.y.floor() as i32))
             })
             .collect()
+    }
+
+    /// Mesh units one UV unit covers on material `m`'s triangles: sqrt(surface area / UV area), None without UV area
+    pub fn uv_density(&self, m: usize) -> Option<f32> {
+        let (mut surface_area, mut uv_area) = (0.0_f32, 0.0_f32);
+        for [a, b, c] in self.triangles_of(m).filter_map(|t| self.tri(t)) {
+            let (Some(pa), Some(pb), Some(pc)) = (self.positions.get(a), self.positions.get(b), self.positions.get(c)) else { continue };
+            let (Some(ua), Some(ub), Some(uc)) = (self.uvs.get(a), self.uvs.get(b), self.uvs.get(c)) else { continue };
+
+            surface_area += (*pb - *pa).cross(*pc - *pa).length() * 0.5;
+            uv_area += (*ub - *ua).perp_dot(*uc - *ua).abs() * 0.5;
+        }
+
+        if !(uv_area > 0.0 && uv_area.is_finite() && surface_area.is_finite()) {
+            return None;
+        }
+
+        // The area ratio can exceed f32 even when its square root fits
+        let density = (f64::from(surface_area) / f64::from(uv_area)).sqrt() as f32;
+        density.is_finite().then_some(density)
     }
 
     /// Remap the UVs of material `m`'s triangles with `f`. Vertices they share with other
@@ -402,22 +518,34 @@ impl Mesh {
     }
 }
 
+/// One MikkTSpace face: a triangle or a quad, as vertex indices.
+struct TangentFace {
+    corners: [u32; 4],
+    /// 3 or 4 corners in use.
+    count: usize,
+}
+
 struct Mikk<'a> {
     mesh: &'a mut Mesh,
+    faces: Vec<TangentFace>,
 }
 
 impl Mikk<'_> {
     fn vi(&self, face: usize, vert: usize) -> usize {
-        self.mesh.indices.get(face * 3 + vert).copied().unwrap_or(0) as usize
+        if self.faces.is_empty() {
+            self.mesh.indices.get(face * 3 + vert).copied().unwrap_or(0) as usize
+        } else {
+            self.faces.get(face).and_then(|f| f.corners.get(vert)).copied().unwrap_or(0) as usize
+        }
     }
 }
 
 impl mikktspace::Geometry for Mikk<'_> {
     fn num_faces(&self) -> usize {
-        self.mesh.indices.len() / 3
+        if self.faces.is_empty() { self.mesh.indices.len() / 3 } else { self.faces.len() }
     }
-    fn num_vertices_of_face(&self, _face: usize) -> usize {
-        3
+    fn num_vertices_of_face(&self, face: usize) -> usize {
+        self.faces.get(face).map_or(3, |f| f.count)
     }
     fn position(&self, face: usize, vert: usize) -> [f32; 3] {
         self.mesh.positions.get(self.vi(face, vert)).copied().unwrap_or_default().to_array()
@@ -442,6 +570,19 @@ impl mikktspace::Geometry for Mikk<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmarked_and_invalid_quad_meshes_need_no_face_table() {
+        let mut mesh = quad();
+        assert_eq!(mesh.tangent_faces().capacity(), 0);
+        mesh.diagonals = vec![QUAD_FIRST_MARK, QUAD_SECOND_MARK];
+        assert_eq!(mesh.tangent_faces().len(), 1);
+        mesh.positions.fill(Vec3::ZERO);
+        mesh.normals.fill(Vec3::X);
+        assert_eq!(mesh.tangent_faces().capacity(), 0);
+        mesh.compute_tangents();
+        assert!(mesh.tangents.iter().all(|t| t.is_finite() && t.truncate().dot(Vec3::X).abs() < 1e-6));
+    }
 
     fn quad() -> Mesh {
         Mesh::from_parts(
@@ -468,70 +609,253 @@ mod tests {
     }
 
     #[test]
+    fn bounds_of_a_material_cover_only_its_triangles() {
+        let m = quad();
+        assert_eq!(m.bounds_of_material(0), Some((Vec3::ZERO, Vec3::new(1.0, 1.0, 0.0))));
+        assert_eq!(m.bounds_of_material(1), None);
+    }
+
+    #[test]
+    fn uv_density_is_mesh_units_per_uv_unit() {
+        assert_eq!(quad().uv_density(0), Some(1.0));
+
+        let plane = crate::primitives::plane(3.0, 4).uv_density(0).unwrap();
+
+        assert!((plane - 3.0).abs() < 1e-4, "{plane}");
+        assert_eq!(quad().uv_density(1), None, "no triangles of that material");
+    }
+
+    #[test]
+    fn a_small_positive_uv_area_still_has_a_density() {
+        let mut mesh = quad();
+        let original = mesh.uv_density(0).unwrap();
+        let scale = 0.0001;
+        mesh.uvs.iter_mut().for_each(|uv| *uv *= scale);
+
+        let density = mesh.uv_density(0).unwrap();
+
+        assert!((density * scale - original).abs() < 1e-5);
+        mesh.uvs.fill(Vec2::ZERO);
+        assert!(mesh.uv_density(0).is_none());
+    }
+
+    #[test]
     fn wire_edges_leave_out_polygon_diagonals() {
         let mut m = quad();
         assert_eq!(m.wire_edges(), vec![vec![(0, 1), (1, 2), (0, 2), (2, 3), (0, 3)]], "triangles show every edge");
-        // Edge 2 of (0, 1, 2) and edge 0 of (0, 2, 3) split the quad.
+
+        // Hide the quad's shared diagonal
         m.diagonals = vec![0b100, 0b001];
         assert_eq!(m.wire_edges(), vec![vec![(0, 1), (1, 2), (2, 3), (0, 3)]]);
-        // A diagonal whose twin a seam split off (vertex 4 copies vertex 0) stays.
+
+        // Keep the diagonal when a seam splits its twin
         let mut seam = m.clone();
         seam.indices[3] = 4;
         assert_eq!(seam.wire_edges()[0].len(), 6);
-        // Appending keeps each side's diagonals on its own triangles.
+
+        // Appending preserves each side's own diagonals
         let mut a = Mesh::from_parts(m.positions.clone(), None, m.uvs.clone(), vec![0, 1, 2], "A").unwrap();
         a.append(&m);
         assert_eq!(a.diagonals, vec![0, 0b100, 0b001]);
         assert_eq!(crate::primitives::plane(1.0, 2).wire_edges()[0].len(), 12, "a 2×2 grid of quads has 12 edges");
     }
 
-    #[test]
-    fn uv_seams_are_where_the_uv_layout_splits() {
-        let mesh = quad();
-        assert_eq!(mesh.uv_seam_edges(), vec![Vec::<(u32, u32)>::new()], "one UV island has no seam");
-
-        // Vertex 4 copies vertex 0's position with another UV: the diagonal (0, 2) / (4, 2) is cut
-        let mut seam = mesh.clone();
-        seam.positions.push(seam.positions[0]);
-        seam.normals.push(seam.normals[0]);
-        seam.tangents.push(seam.tangents[0]);
-        seam.uvs.push(Vec2::new(0.9, 0.9));
-        seam.indices[3] = 4;
-        assert_eq!(seam.uv_seam_edges(), vec![vec![(0, 2), (2, 4)]]);
-
-        // The same split with the same UV is a hard edge, not a seam
-        let mut hard = seam.clone();
-        hard.uvs[4] = hard.uvs[0];
-        assert_eq!(hard.uv_seam_edges(), vec![Vec::<(u32, u32)>::new()]);
-    }
-
-    #[test]
-    fn uv_seams_join_positions_with_opposite_signed_zero() {
-        let mut mesh = quad();
-        mesh.positions.push(Vec3::new(-0.0, 0.0, 0.0));
-        mesh.normals.push(mesh.normals[0]);
-        mesh.tangents.push(mesh.tangents[0]);
-        mesh.uvs.push(Vec2::new(0.9, 0.9));
-        mesh.indices[3] = 4;
-        assert_eq!(mesh.positions[0], mesh.positions[4]);
-        assert_eq!(mesh.uv_seam_edges(), vec![vec![(0, 2), (2, 4)]]);
-    }
-
-    #[test]
-    fn uv_seams_between_materials_belong_to_both_materials() {
+    /// `quad` with vertex 4 a copy of vertex 0 at `uv` with `normal`, used by the second triangle: the diagonal (0, 2) / (4, 2) has two sides
+    fn split_quad(uv: Vec2, normal: Vec3) -> Mesh {
         let mut mesh = quad();
         mesh.positions.push(mesh.positions[0]);
-        mesh.normals.push(mesh.normals[0]);
+        mesh.normals.push(normal);
         mesh.tangents.push(mesh.tangents[0]);
-        mesh.uvs.push(Vec2::new(0.9, 0.9));
+        mesh.uvs.push(uv);
         mesh.indices[3] = 4;
+        mesh
+    }
+
+    #[test]
+    fn missing_seams_are_hard_edges_the_uv_layout_does_not_split() {
+        let none = vec![Vec::<(u32, u32)>::new()];
+        assert_eq!(quad().missing_seam_edges(), none, "a smooth quad has no hard edge");
+
+        let shared_uv = quad().uvs[0];
+        let smooth_split = split_quad(shared_uv, Vec3::Z);
+        assert_eq!(smooth_split.missing_seam_edges(), none, "the same normal on both sides is a smooth edge");
+
+        let hard = split_quad(shared_uv, Vec3::new(1.0, 0.0, 1.0).normalize());
+        assert_eq!(hard.missing_seam_edges(), vec![vec![(0, 2), (2, 4)]], "a hard edge inside one UV island");
+
+        let seamed = split_quad(Vec2::new(0.9, 0.9), hard.normals[4]);
+        assert_eq!(seamed.missing_seam_edges(), none, "a hard edge on a UV seam is fine");
+
+        let mut short_normals = quad();
+        short_normals.normals.iter_mut().for_each(|normal| *normal *= 0.5);
+        assert_eq!(short_normals.missing_seam_edges(), none, "normals shorter than unit length point the same way");
+        assert_eq!(split_quad(shared_uv, Vec3::Z * 0.5).missing_seam_edges(), none, "normals of different lengths point the same way");
+
+        let mut no_normals = quad();
+        no_normals.normals.fill(Vec3::ZERO);
+        assert_eq!(no_normals.missing_seam_edges(), none, "two missing normals agree");
+    }
+
+    #[test]
+    fn missing_seams_join_positions_with_opposite_signed_zero() {
+        let mut mesh = split_quad(quad().uvs[0], Vec3::X);
+        mesh.positions[4] = Vec3::new(-0.0, 0.0, 0.0);
+        assert_eq!(mesh.positions[0], mesh.positions[4]);
+        assert_eq!(mesh.missing_seam_edges(), vec![vec![(0, 2), (2, 4)]]);
+    }
+
+    #[test]
+    fn missing_seams_between_materials_belong_to_both_materials() {
+        let mut mesh = split_quad(quad().uvs[0], Vec3::X);
         mesh.materials.push("second".into());
         mesh.submeshes[0].count = 3;
         mesh.submeshes.push(SubMesh { name: "second".into(), material: 1, start: 3, count: 3 });
 
-        assert_eq!(mesh.uv_seam_edges(), vec![vec![(0, 2)], vec![(2, 4)]]);
-        mesh.uvs[4] = mesh.uvs[0];
-        assert_eq!(mesh.uv_seam_edges(), vec![Vec::<(u32, u32)>::new(); 2], "a material boundary alone is not a UV seam");
+        assert_eq!(mesh.missing_seam_edges(), vec![vec![(0, 2)], vec![(2, 4)]]);
+        mesh.normals[4] = mesh.normals[0];
+        assert_eq!(mesh.missing_seam_edges(), vec![Vec::<(u32, u32)>::new(); 2], "a material boundary alone is not a hard edge");
+    }
+
+    /// MikkTSpace run directly on one quad, the way Blender hands it over (the reference the
+    /// triangle-corner results are held to).
+    struct QuadRef<'a> {
+        mesh: &'a Mesh,
+        out: [Vec4; 4],
+    }
+
+    impl mikktspace::Geometry for QuadRef<'_> {
+        fn num_faces(&self) -> usize {
+            1
+        }
+        fn num_vertices_of_face(&self, _face: usize) -> usize {
+            4
+        }
+        fn position(&self, _face: usize, vert: usize) -> [f32; 3] {
+            self.mesh.positions[vert].to_array()
+        }
+        fn normal(&self, _face: usize, vert: usize) -> [f32; 3] {
+            self.mesh.normals[vert].to_array()
+        }
+        fn tex_coord(&self, _face: usize, vert: usize) -> [f32; 2] {
+            [self.mesh.uvs[vert].x, 1.0 - self.mesh.uvs[vert].y]
+        }
+        fn set_tangent_encoded(&mut self, tangent: [f32; 4], _face: usize, vert: usize) {
+            self.out[vert] = Vec4::from_array(tangent);
+        }
+    }
+
+    /// A non-planar quad with a trapezoid UV layout, split as the importer does (two fan
+    /// triangles, the diagonal marked), tangents computed.
+    fn warped_quad() -> Mesh {
+        let mut m = Mesh::from_parts(
+            vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 0.6), Vec3::new(0.0, 1.0, 0.0)],
+            None,
+            vec![Vec2::new(0.0, 0.9), Vec2::new(1.0, 1.0), Vec2::new(0.9, 0.0), Vec2::new(0.3, 0.2)],
+            vec![0, 1, 2, 0, 2, 3],
+            "Default",
+        )
+        .unwrap();
+        m.diagonals = vec![0b100, 0b001];
+        m.compute_tangents();
+        m
+    }
+
+    /// Largest angle in degrees between the tangents of `a` and `b`, and whether any sign differs.
+    fn tangent_gap(a: &[Vec4], b: &[Vec4]) -> (f32, bool) {
+        let angle = a.iter().zip(b).map(|(x, y)| x.truncate().dot(y.truncate()).clamp(-1.0, 1.0).acos().to_degrees()).fold(0.0, f32::max);
+        (angle, a.iter().zip(b).any(|(x, y)| x.w != y.w))
+    }
+
+    #[test]
+    fn warped_quad_tangents_match_quad_mikktspace() {
+        let m = warped_quad();
+        let mut reference = QuadRef { mesh: &m, out: [Vec4::ZERO; 4] };
+        assert!(mikktspace::generate_tangents(&mut reference));
+        let n = m.normals.clone();
+        let reference: Vec<Vec4> = reference
+            .out
+            .iter()
+            .zip(&n)
+            .map(|(t, n)| {
+                let v = t.truncate();
+                (v - *n * n.dot(v)).normalize().extend(t.w)
+            })
+            .collect();
+        let (angle, sign) = tangent_gap(&m.tangents, &reference);
+        assert!(angle < 0.01 && !sign, "tangents differ from quad MikkTSpace by {angle} degrees (sign differs: {sign})");
+
+        // Without the polygon marks the mesh is two triangles, whose tangents are another frame.
+        let mut tris = m.clone();
+        tris.diagonals.clear();
+        tris.compute_tangents();
+        assert!(tangent_gap(&tris.tangents, &reference).0 > 0.5, "the quad and the triangle frames must differ for this test to mean anything");
+    }
+
+    #[test]
+    fn planar_quad_tangents_do_not_change() {
+        let mut m = quad();
+        let before = m.tangents.clone();
+        m.diagonals = vec![0b100, 0b001];
+        m.compute_tangents();
+        let (angle, flipped) = tangent_gap(&m.tangents, &before);
+        assert!(angle < 1e-3 && !flipped, "angle {angle}, flipped {flipped}");
+    }
+
+    #[test]
+    fn folded_quad_sharing_a_position_does_not_crash_mikktspace() {
+        // Corner 3 reuses corner 1's position with its own UV (a 4-line OBJ makes this). With
+        // only this quad in the mesh every MikkTSpace triangle used to be dropped and it crashed.
+        let mut m = Mesh::from_parts(
+            vec![Vec3::ZERO, Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::X],
+            Some(vec![Vec3::Z; 4]),
+            vec![Vec2::new(0.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, 0.0), Vec2::new(0.5, 0.5)],
+            vec![0, 1, 2, 0, 2, 3],
+            "Default",
+        )
+        .unwrap();
+        m.diagonals = vec![0b100, 0b001];
+        m.compute_tangents();
+        assert!(m.tangents.iter().all(|t| t.is_finite()), "{:?}", m.tangents);
+    }
+
+    #[test]
+    fn hostile_quads_keep_triangle_tangents_and_do_not_panic() {
+        // A repeated corner, a non-finite UV and a collapsed quad: no panic, tangents stay finite.
+        for edit in 0..3 {
+            let mut m = warped_quad();
+            match edit {
+                0 => m.indices = vec![0, 1, 1, 0, 1, 3],
+                1 => m.uvs[2] = Vec2::new(f32::NAN, 0.0),
+                _ => m.positions = vec![Vec3::ZERO; 4],
+            }
+            m.compute_tangents();
+            assert!(m.tangents.iter().all(|t| t.is_finite()), "edit {edit}: {:?}", m.tangents);
+        }
+        // Diagonal marks on triangles that are not a fan pair are ignored.
+        let mut m = warped_quad();
+        m.diagonals = vec![0b100, 0b100];
+        m.compute_tangents();
+        let mut plain = warped_quad();
+        plain.diagonals.clear();
+        plain.compute_tangents();
+        assert_eq!(m.tangents, plain.tangents);
+    }
+
+    #[test]
+    fn polygons_beyond_four_corners_stay_triangles() {
+        // A fan of three triangles (a pentagon) marks 0b100, 0b101, 0b001: no quad is found.
+        let mut m = Mesh::from_parts(
+            vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.3, 1.0, 0.4), Vec3::new(0.5, 1.5, 0.0), Vec3::new(-0.3, 1.0, 0.0)],
+            Some(vec![Vec3::Z; 5]),
+            vec![Vec2::new(0.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(0.8, 0.0), Vec2::new(0.5, 0.0), Vec2::new(0.2, 0.0)],
+            vec![0, 1, 2, 0, 2, 3, 0, 3, 4],
+            "Default",
+        )
+        .unwrap();
+        let before = m.tangents.clone();
+        m.diagonals = vec![0b100, 0b101, 0b001];
+        m.compute_tangents();
+        assert_eq!(m.tangents, before);
     }
 
     #[test]

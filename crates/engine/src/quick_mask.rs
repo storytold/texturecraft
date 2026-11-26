@@ -35,44 +35,53 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit quick mask",
             ["Viewport"],
             Some("U"),
-            "{editing?: bool} — toggles when omitted; editing enables the mask",
-            always,
+            "{editing?: bool} — toggles when omitted; needs the quick mask enabled",
+            mask_enabled,
             edit
         ),
-        cmd!("viewport.quickMask.invert", "Invert quick mask", ["Viewport"], Some("Ctrl+Shift+I"), "{}", always, invert),
+        cmd!("viewport.quickMask.invert", "Invert quick mask", ["Viewport"], Some("Ctrl+Shift+I"), "{}", mask_enabled, invert),
     ]
 }
 
-fn state(s: &Session) -> Value {
-    let q = &s.quick_mask;
+fn mask_enabled(session: &Session) -> std::result::Result<(), String> {
+    if session.quick_mask.enabled { Ok(()) } else { Err("enable the quick mask first".into()) }
+}
+
+fn state(session: &Session) -> Value {
+    let mask = &session.quick_mask;
     json!({
-        "enabled": q.enabled, "editing": q.editing, "inverted": q.inverted,
-        "paintedTiles": q.masks.get(&s.ts()).map(TileImage::allocated_count).unwrap_or(0),
+        "enabled": mask.enabled, "editing": mask.editing, "inverted": mask.inverted,
+        "paintedTiles": mask.masks.get(&session.ts()).map(TileImage::allocated_count).unwrap_or(0),
     })
 }
 
-fn changed(s: &mut Session) -> Result<Value> {
-    s.quick_mask.revision = s.quick_mask.revision.wrapping_add(1);
-    s.revision = s.revision.wrapping_add(1);
-    Ok(state(s))
+fn changed(session: &mut Session) -> Result<Value> {
+    session.quick_mask.revision = session.quick_mask.revision.wrapping_add(1);
+    session.revision = session.revision.wrapping_add(1);
+    Ok(state(session))
 }
 
-fn enable(s: &mut Session, p: &Value) -> Result<Value> {
-    s.quick_mask.enabled = boolp(p, "enabled").unwrap_or(!s.quick_mask.enabled);
-    changed(s)
+fn enable(session: &mut Session, params: &Value) -> Result<Value> {
+    let enabled = boolp(params, "enabled").unwrap_or(!session.quick_mask.enabled);
+    if !enabled && session.quick_mask.editing {
+        session.cancel_stroke();
+        session.quick_mask.editing = false;
+    }
+
+    session.quick_mask.enabled = enabled;
+    changed(session)
 }
 
-fn edit(s: &mut Session, p: &Value) -> Result<Value> {
-    s.cancel_stroke();
-    let q = &mut s.quick_mask;
-    q.editing = boolp(p, "editing").unwrap_or(!q.editing);
-    q.enabled |= q.editing;
-    changed(s)
+fn edit(session: &mut Session, params: &Value) -> Result<Value> {
+    session.cancel_stroke();
+    let quick_mask = &mut session.quick_mask;
+    quick_mask.editing = boolp(params, "editing").unwrap_or(!quick_mask.editing);
+    changed(session)
 }
 
-fn invert(s: &mut Session, _: &Value) -> Result<Value> {
-    s.quick_mask.inverted = !s.quick_mask.inverted;
-    changed(s)
+fn invert(session: &mut Session, _: &Value) -> Result<Value> {
+    session.quick_mask.inverted = !session.quick_mask.inverted;
+    changed(session)
 }
 
 impl Session {

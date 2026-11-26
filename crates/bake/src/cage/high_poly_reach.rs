@@ -75,7 +75,7 @@ impl HighPolyReach {
 }
 
 /// Each vertex's mesh-name key, from the first triangle that uses it
-fn vertex_keys(mesh: &Mesh, triangle_keys: &[u32]) -> Vec<u32> {
+pub(super) fn vertex_keys(mesh: &Mesh, triangle_keys: &[u32]) -> Vec<u32> {
     let mut keys = vec![ANY; mesh.positions.len()];
     for (corners, &triangle_key) in mesh.indices.as_chunks::<3>().0.iter().zip(triangle_keys) {
         for &corner in corners {

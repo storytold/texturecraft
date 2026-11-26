@@ -86,6 +86,29 @@ async fn inspect(c: &Conn) -> Value {
     tool(c, "session_inspect", json!({})).await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn textures_export_accepts_per_map_settings() {
+    let dir = tmp("map-options");
+    let (client, server) = connect(workspace(&dir)).await;
+
+    let result = tool(
+        &client,
+        "textures_export",
+        json!({"dir": "textures", "preset": "glTF PBR Metal Roughness", "maps": [
+            {"map": 0, "format": "pgm", "bitDepth": 16},
+            {"map": 1, "enabled": false}
+        ]}),
+    )
+    .await;
+
+    let files = result["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{result}");
+    let graymap = files.iter().filter_map(Value::as_str).find(|path| path.ends_with(".pgm")).unwrap();
+    assert!(std::fs::read(dir.join(graymap)).unwrap().starts_with(b"P5\n128 128\n65535\n"));
+    shutdown(client, server).await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn top(s: &Value) -> &Value {
     &s["layers"][0]
 }
@@ -430,13 +453,15 @@ async fn mesh_files_export_bake_and_reimport_in_the_workspace() {
     assert!(!textures.is_empty() && textures.iter().all(|t| base.join(t.as_str().unwrap()).is_file()), "{usda}");
     assert_eq!(tool(&c, "mesh_export", json!({"path": "out/cube.glb"})).await["path"], "out/cube.glb");
     assert!(base.join("out/cube.usda").is_file() && base.join("out/cube.glb").is_file());
-    // The loose usda arrives packaged with its textures.
+
+    // The loose usda arrives packaged with its textures
     let high = tool(&c, "bake_mesh_add", json!({"path": "out/cube.usda"})).await;
     assert_eq!(high["name"], "cube.usdz", "{high}");
     let cage = tool(&c, "bake_mesh_add", json!({"path": "out/cube.glb", "cage": true})).await;
     assert_eq!(cage["meshes"]["cage"]["name"], "cube.glb", "{cage}");
     assert_eq!(inspect(&c).await["bakeMeshes"]["highPoly"][0]["name"], "cube.usdz");
-    // A built-in mesh has no file to re-read; a file does.
+
+    // A built-in mesh has no file to re-read; a file does
     assert!(tool_err(&c, "mesh_reimport", json!({})).await.contains("built-in"));
     tool(&c, "mesh_reimport", json!({"path": "out/cube.glb", "preserveStrokes": true})).await;
     assert_eq!(inspect(&c).await["mesh"]["source"], "mesh.glb");

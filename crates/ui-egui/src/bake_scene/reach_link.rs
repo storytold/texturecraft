@@ -2,7 +2,6 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use texturecraft_engine::Session;
 use texturecraft_engine::bake::{HighPolyReach, high_poly_missed};
-use texturecraft_engine::core::HighPolySettings;
 
 use super::cage_shell_key::CageShellKey;
 use crate::gpu::SceneSync;
@@ -13,8 +12,8 @@ type ShownDistances = (Vec<(f32, f32)>, Option<usize>);
 /// The red on the high poly: each texture set's ray reach, worked out on a worker thread, and the distances the GPU's colors show
 #[derive(Default)]
 pub(super) struct ReachLink {
-    /// Each set's ray inputs and high-poly settings (backfaces, name matching), and the id of the high poly, the reach was started for
-    keys: Vec<Option<(CageShellKey, HighPolySettings)>>,
+    /// Each set's ray inputs, and the id of the high poly, the reach was started for
+    keys: Vec<Option<CageShellKey>>,
     high_id: u64,
     job: Option<Receiver<Vec<Option<HighPolyReach>>>>,
     reach: Vec<Option<HighPolyReach>>,
@@ -23,6 +22,11 @@ pub(super) struct ReachLink {
 }
 
 impl ReachLink {
+    pub(super) fn reset_for_mesh(&mut self) {
+        // Keep at most one worker across project switches and discard its obsolete result
+        *self = Self { job: self.job.take(), ..Default::default() };
+    }
+
     /// Whether a reach is being worked out (the view must keep drawing to pick it up)
     pub(super) fn busy(&self) -> bool {
         self.job.is_some()
@@ -39,7 +43,9 @@ impl ReachLink {
 
         match job.try_recv() {
             Ok(reach) => {
-                self.reach = reach;
+                if !self.keys.is_empty() {
+                    self.reach = reach;
+                }
                 self.shown = None;
                 self.job = None;
             }
@@ -56,15 +62,12 @@ impl ReachLink {
         }
 
         let set_count = session.doc.project.texture_sets.len();
-        let keys: Vec<Option<(CageShellKey, HighPolySettings)>> = session
-            .doc
-            .project
-            .texture_sets
-            .iter()
-            .enumerate()
-            .map(|(texture_set, set)| Some((CageShellKey::of(session, texture_set)?, set.bake.high_poly.clone())))
-            .collect();
+        let keys: Vec<Option<CageShellKey>> = (0..set_count).map(|texture_set| CageShellKey::of(session, texture_set)).collect();
+
         if keys != self.keys || high_id != self.high_id {
+            // The GPU keeps displayed colors; stale CPU arrays need not overlap the rebuild
+            self.reach.clear();
+
             let inputs: Vec<_> = (0..set_count).map(|texture_set| session.bake_cage_inputs(texture_set).ok().flatten()).collect();
             self.job = Some(crate::spawn_worker("texturecraft-bake-reach", move || {
                 inputs.iter().map(|inputs| inputs.as_ref().and_then(|inputs| inputs.high_poly_reach().ok())).collect()
@@ -83,7 +86,7 @@ impl ReachLink {
             return;
         }
 
-        let Some(vertex_count) = session.bake_meshes.merged_high().map(|high| high.mesh.positions.len()) else { return };
+        let Some(vertex_count) = session.doc.bake_meshes.merged_high().map(|high| high.mesh.positions.len()) else { return };
 
         out.bake_high_missed = Some((self.high_id, high_poly_missed(&self.reach, &shown.0, only_set, vertex_count)));
         self.shown = Some(shown);
@@ -100,7 +103,45 @@ mod tests {
     use texturecraft_engine::geom::primitives;
 
     #[test]
+    fn switching_projects_waits_for_old_work_and_discards_its_result() {
+        let (sender, receiver) = mpsc::channel();
+        let mut link = ReachLink { job: Some(receiver), ..Default::default() };
+
+        link.reset_for_mesh();
+
+        assert!(link.busy(), "a project switch must keep the single running worker");
+        sender.send(vec![Some(HighPolyReach::default())]).unwrap();
+        link.poll();
+
+        assert!(!link.busy());
+        assert!(link.reach.is_empty(), "a hidden scene must release the previous project's result");
+    }
+
+    #[test]
+    fn rebuilding_reach_releases_previous_vertex_arrays_before_starting_work() {
+        const PREVIOUS_SET_COUNT: usize = 2;
+        const PREVIOUS_VERTEX_COUNT: usize = 64;
+
+        let mut session = Session::new_project("Reach", primitives::plane(1.0, 1), "plane", None, 128).unwrap();
+        session.add_high_poly_bytes("high.obj", b"v 0 0.1 0\nv 0.1 0.1 0\nv 0 0.1 0.1\nf 1 2 3\n".to_vec()).unwrap();
+        let mut link = ReachLink {
+            reach: (0..PREVIOUS_SET_COUNT).map(|_| Some(HighPolyReach { vertices: vec![None; PREVIOUS_VERTEX_COUNT], ..Default::default() })).collect(),
+            ..Default::default()
+        };
+        let mut out = SceneSync::default();
+
+        link.sync(&session, 1, None, &mut out);
+
+        let retained_slots: usize = link.reach.iter().flatten().map(|reach| reach.vertices.capacity()).sum();
+        assert_eq!(retained_slots, 0, "obsolete CPU arrays must not overlap their replacements");
+        assert!(out.bake_high_missed.is_none(), "the GPU keeps its displayed colors until the replacement arrives");
+    }
+
+    #[test]
     fn input_changes_wait_for_the_running_reach_then_use_the_latest_inputs() {
+        const WAIT_FRAMES: usize = 2000;
+        const WAIT_FRAME_PAUSE: Duration = Duration::from_millis(5);
+
         let mut session = Session::new_project("Reach", primitives::plane(1.0, 1), "plane", None, 128).unwrap();
         session.add_high_poly_bytes("high.obj", b"v 0 0.1 0\nv 0.1 0.1 0\nv 0 0.1 0.1\nf 1 2 3\n".to_vec()).unwrap();
         let (sender, receiver) = mpsc::channel();
@@ -113,6 +154,7 @@ mod tests {
             link.sync(&session, 2, None, &mut out);
             assert!(out.bake_high_missed.is_none());
         }
+
         assert!(sender.send(Vec::new()).is_ok(), "input changes must keep the running job's receiver");
         link.poll();
 
@@ -123,18 +165,20 @@ mod tests {
         assert!(link.busy());
         assert!(out.bake_high_missed.is_none());
 
-        for _ in 0..2000 {
+        for _ in 0..WAIT_FRAMES {
             link.poll();
             if !link.busy() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5));
+
+            std::thread::sleep(WAIT_FRAME_PAUSE);
         }
+
         assert!(!link.busy(), "the latest reach must finish");
         link.sync(&session, 2, None, &mut out);
         let (high_id, missed) = out.bake_high_missed.unwrap();
         assert_eq!(high_id, 2);
-        assert_eq!(missed, vec![0.0; session.bake_meshes.merged_high().unwrap().mesh.positions.len()]);
+        assert_eq!(missed, vec![0.0; session.doc.bake_meshes.merged_high().unwrap().mesh.positions.len()]);
         assert!(link.reach[0].is_none(), "the latest setting bakes without a high poly");
     }
 }

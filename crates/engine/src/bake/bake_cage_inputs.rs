@@ -23,6 +23,16 @@ impl BakeCageInputs {
         CageShell::new(&self.request())
     }
 
+    /// Whether this set uses the session's shared low mesh
+    pub fn uses_mesh(&self, mesh: &Arc<Mesh>) -> bool {
+        Arc::ptr_eq(&self.mesh, mesh)
+    }
+
+    /// Build a cage from edges shared across sets using the same low mesh
+    pub fn cage_shell_with_edges(&self, wire_edges: &[Vec<(u32, u32)>], missing_seam_edges: &[Vec<(u32, u32)>]) -> Result<CageShell, BakeError> {
+        CageShell::new_with_edges(&self.request(), wire_edges, missing_seam_edges)
+    }
+
     /// Where each high-poly vertex sits relative to the bake's transfer rays
     pub fn high_poly_reach(&self) -> Result<HighPolyReach, BakeError> {
         HighPolyReach::new(&self.request())

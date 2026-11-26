@@ -4,6 +4,7 @@
 
 use serde_json::{Value, json};
 use texturecraft_core::{BlendMode, Channel, NormalFormat};
+use texturecraft_geom::glam::Vec3;
 
 use crate::{EngineError, Result, Session};
 
@@ -21,6 +22,63 @@ pub struct CommandSpec {
     pub params: &'static str,
     pub enabled: Enabled,
     pub run: Run,
+}
+
+impl CommandSpec {
+    /// Whether a keyboard shortcut can run this command: it acts with no parameters at all, or
+    /// every parameter in its first `params` form is optional (`name?`) and none of them is one
+    /// of several alternatives. Left out: commands that need a path, name or similar, commands
+    /// that only return data or do nothing without parameters, and the ones that replace the
+    /// open project (the menu asks to save first).
+    pub fn bindable(&self) -> bool {
+        const NOT_FROM_A_KEY: [&str; 13] = [
+            "project.inspect",
+            "project.templates",
+            "project.new",
+            "tool.state",
+            "text.fonts",
+            "export.presets",
+            "edit.history",
+            "camera.get",
+            "textureSet.parts",
+            "bake.settings",
+            "bake.preview",
+            "camera.set",
+            "textureSet.settings",
+        ];
+        const NOTHING_WITHOUT_PARAMS: [&str; 4] = ["layer.blend", "tool.stencil", "tool.fillSelection", "tool.path"];
+        !(self.id.ends_with(".list") || NOT_FROM_A_KEY.contains(&self.id) || NOTHING_WITHOUT_PARAMS.contains(&self.id)) && params_all_optional(self.params)
+    }
+}
+
+/// Whether the first `{...}` group of a `params` text has only optional entries.
+fn params_all_optional(params: &str) -> bool {
+    let Some(body) = params.trim_start().strip_prefix('{') else { return false };
+    let Some(end) = body.find('}') else { return false };
+
+    // `{a?} | {b}`: other forms exist, and the first one alone may not do anything
+    if body[end + 1..].trim_start().starts_with('|') {
+        return false;
+    }
+
+    let (mut depth, mut start) = (0i32, 0);
+    let mut entries = Vec::new();
+    for (i, c) in body[..end].char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                entries.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    entries.push(&body[start..end]);
+    entries.iter().filter(|entry| !entry.trim().is_empty()).all(|entry| {
+        // `index? | name?` asks for one of the two, so it is not optional as a whole
+        !entry.contains(" | ") && entry.trim().split([':', ' ', '(']).next().is_some_and(|key| key.ends_with('?'))
+    })
 }
 
 pub(crate) fn always(_: &Session) -> std::result::Result<(), String> {
@@ -53,16 +111,25 @@ pub fn command_specs() -> &'static [CommandSpec] {
         let mut v = Vec::new();
         v.extend(crate::view_cmds::edit_specs());
         v.extend(crate::layer_cmds::specs());
+        v.extend(crate::fill_material_cmds::specs());
+        v.extend(crate::fill_reset_cmds::specs());
+        v.extend(crate::folder_cmds::specs());
         v.extend(crate::layer_ops::specs());
         v.extend(crate::instance_cmds::specs());
         v.extend(crate::mask_cmds::specs());
+        v.extend(crate::generator_pick::specs());
+        v.extend(crate::mask_export::specs());
+        v.extend(crate::add_mask_cmds::specs());
         v.extend(crate::color_selection_cmds::specs());
         v.extend(crate::effect_clipboard::specs());
+        v.extend(crate::effect_blending_cmds::specs());
         v.extend(crate::tool_cmds::specs());
         v.extend(crate::brush_preset_cmds::specs());
         v.extend(crate::path_tool::specs());
         v.extend(crate::view_cmds::specs());
+        v.extend(crate::solo::specs());
         v.extend(crate::camera_cmds::specs());
+        v.extend(crate::swatch_cmds::specs());
         v.extend(crate::quick_mask::specs());
         v.extend(crate::set_cmds::specs());
         v.extend(crate::meshmap_cmds::specs());
@@ -73,6 +140,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::bake::specs());
         v.extend(crate::bake_preview::specs());
         v.extend(crate::materialx_cmds::specs());
+        v.extend(crate::pbr_cmds::specs());
         v.extend(crate::file_cmds::specs());
         v.extend(crate::preset_cmds::specs());
         v.extend(crate::resource_cmds::specs());
@@ -81,9 +149,44 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::smart_masks::specs());
         v.extend(crate::filter_lib::specs());
         v.extend(crate::decal_cmds::specs());
+        v.extend(crate::warp_cmds::specs());
         v.extend(crate::text_cmds::specs());
         v
     })
+}
+
+/// Commands that run in the empty state (no project open): they open or create a project, or
+/// only read the libraries and the user's presets, or only move the camera (`viewport.frame`, enabled on the reference app's blank screen).
+fn works_without_project(id: &str) -> bool {
+    matches!(
+        id,
+        "file.open"
+            | "file.new"
+            | "project.new"
+            | "project.sample"
+            | "project.inspect"
+            | "viewport.frame"
+            | "project.templates"
+            | "export.presets"
+            | "export.preset.get"
+            | "export.preset.save"
+            | "export.preset.remove"
+            | "brush.preset.list"
+            | "alpha.list"
+            | "filter.list"
+            | "material.list"
+            | "mask.smart.list"
+            | "text.fonts"
+    )
+}
+
+/// Whether `spec` can run on `s`: no project open refuses everything but [`works_without_project`]
+pub fn check_enabled(spec: &CommandSpec, s: &Session) -> std::result::Result<(), String> {
+    if !s.project_open && !works_without_project(spec.id) {
+        return Err("no project is open".into());
+    }
+
+    (spec.enabled)(s)
 }
 
 pub fn find(id: &str) -> Option<&'static CommandSpec> {
@@ -94,7 +197,7 @@ pub fn find(id: &str) -> Option<&'static CommandSpec> {
 /// `merge: true` its edits continue the previous undo step of the same label (drags).
 pub fn execute(s: &mut Session, id: &str, params: &Value) -> Result<Value> {
     let spec = find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
-    (spec.enabled)(s).map_err(|why| EngineError::Disabled { cmd: id.to_string(), why })?;
+    check_enabled(spec, s).map_err(|why| EngineError::Disabled { cmd: id.to_string(), why })?;
     let outer = std::mem::replace(&mut s.merge_edits, boolp(params, "merge").unwrap_or(false));
     let result = (spec.run)(s, params);
     s.merge_edits = outer;
@@ -114,7 +217,7 @@ pub fn list(s: &Session, filter: Option<&str>) -> Value {
                 "menu": c.menu,
                 "shortcut": c.shortcut,
                 "params": c.params,
-                "enabled": (c.enabled)(s).is_ok(),
+                "enabled": check_enabled(c, s).is_ok(),
             })
         })
         .collect();
@@ -133,6 +236,14 @@ pub(crate) fn f32p(p: &Value, key: &str) -> Option<f32> {
 
 pub(crate) fn u64p(p: &Value, key: &str) -> Option<u64> {
     p.get(key).and_then(|v| v.as_u64().or_else(|| v.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f.round() as u64)))
+}
+
+/// A `[x, y, z]` param of finite numbers
+pub(crate) fn vec3(params: &Value, key: &str) -> Option<Vec3> {
+    let [x, y, z] = params.get(key)?.as_array()?.as_slice() else { return None };
+    let vector = Vec3::new(x.as_f64()? as f32, y.as_f64()? as f32, z.as_f64()? as f32);
+
+    vector.is_finite().then_some(vector)
 }
 
 pub(crate) fn boolp(p: &Value, key: &str) -> Option<bool> {
@@ -186,26 +297,165 @@ pub(crate) fn blend_param(cmd: &str, p: &Value, key: &str) -> Result<Option<Blen
 }
 
 /// A color: `[r, g, b]` (linear 0..1) or `"#rrggbb"` (sRGB hex, converted to linear).
-pub(crate) fn color_param(p: &Value, key: &str) -> Option<[f32; 3]> {
-    color_of(p.get(key)?)
+pub(crate) fn color_param(cmd: &str, p: &Value, key: &str) -> Result<Option<[f32; 3]>> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => color_of(v).map(Some).ok_or_else(|| bad(cmd, format!("`{key}` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)"))),
+    }
 }
 
 /// A color value (see [`color_param`]).
 pub(crate) fn color_of(v: &Value) -> Option<[f32; 3]> {
     match v {
         Value::Array(a) if a.len() >= 3 => {
-            let v: Vec<f32> = a.iter().take(3).map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
-            if v.iter().all(|x| x.is_finite()) { Some([v[0], v[1], v[2]]) } else { None }
+            let mut out = [0.0f32; 3];
+            for (i, x) in a.iter().take(3).enumerate() {
+                let f = x.as_f64()? as f32;
+                if !f.is_finite() {
+                    return None;
+                }
+                out[i] = f;
+            }
+            Some(out)
         }
         Value::Number(n) => n.as_f64().map(|v| [v as f32; 3]).filter(|v| v[0].is_finite()),
         Value::String(s) => {
             let s = s.trim_start_matches('#');
-            if s.len() != 6 {
+            if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return None;
             }
             let c = |i: usize| u8::from_str_radix(s.get(i..i + 2)?, 16).ok().map(|v| texturecraft_texel::srgb_to_linear(v as f32 / 255.0));
             Some([c(0)?, c(2)?, c(4)?])
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_commands_a_key_can_run_are_bindable() {
+        let bindable = |id: &str| find(id).unwrap_or_else(|| panic!("{id} is gone")).bindable();
+        for id in [
+            "layer.add.paint",
+            "layer.add.fill",
+            "layer.add.group",
+            "mask.invert",
+            "mask.clear",
+            "layer.visible",
+            "effect.add.paint",
+            "file.save",
+            "tool.paint",
+            "camera.add",
+            "effect.duplicate",
+            "effect.paste",
+        ] {
+            assert!(bindable(id), "{id} needs no parameters");
+        }
+        for id in [
+            "file.saveCopy",
+            "textureSet.select",
+            "layer.rename",
+            "tool.select",
+            "layer.select",
+            "viewport.focusAt",
+            "tool.stroke",
+            "mask.smart.apply",
+            "bake.skew.set",
+            "textureSet.resolution",
+            "effect.move",
+            "camera.remove",
+            "bake.highPoly.remove",
+        ] {
+            assert!(!bindable(id), "{id} needs a parameter");
+        }
+        for id in ["layer.move", "layer.list", "project.inspect", "edit.history", "export.presets", "tool.state", "project.new", "camera.set", "layer.blend"] {
+            assert!(!bindable(id), "{id} is a query or has several forms");
+        }
+    }
+
+    #[test]
+    fn params_texts_are_read_by_their_required_entries() {
+        for ok in ["{}", "{layer?}", "{enabled?: bool} \u{2014} toggles when omitted", "{effect?: the selected effect}"] {
+            assert!(params_all_optional(ok), "{ok}");
+        }
+        for no in [
+            "{path}",
+            "{layer?, name}",
+            "{x, y (viewport pixels), viewport?: [w, h]}",
+            "{a?} | {b}",
+            "{index? | name?}",
+            "{ts?, value?: 0..1 | path: image}",
+            "no braces",
+        ] {
+            assert!(!params_all_optional(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn color_param_accepts_valid_forms() {
+        let p = json!({
+            "hex": "#336699",
+            "hex_plain": "336699",
+            "rgb": [0.2, 0.4, 0.6],
+            "grey": 0.5,
+        });
+        assert!(color_param("cmd", &p, "hex").unwrap().is_some());
+        assert!(color_param("cmd", &p, "hex_plain").unwrap().is_some());
+        assert_eq!(color_param("cmd", &p, "rgb").unwrap(), Some([0.2, 0.4, 0.6]));
+        assert_eq!(color_param("cmd", &p, "grey").unwrap(), Some([0.5, 0.5, 0.5]));
+        assert_eq!(color_param("cmd", &p, "missing").unwrap(), None);
+        assert_eq!(color_param("cmd", &json!({"c": null}), "c").unwrap(), None);
+    }
+
+    #[test]
+    fn color_param_rejects_invalid_forms() {
+        let bad_cases = [
+            ("#fff", "`color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)"),
+            ("red", "`color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)"),
+            ("#12345", "`color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)"),
+            ("#gggggg", "`color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)"),
+        ];
+        for (input, expected_err) in bad_cases {
+            let p = json!({ "color": input });
+            let err = color_param("test.cmd", &p, "color").unwrap_err();
+            assert_eq!(err.to_string(), format!("`test.cmd`: {expected_err}"));
+        }
+
+        let bad_array = json!({ "color": ["a", "b", "c"] });
+        assert!(color_param("test.cmd", &bad_array, "color").is_err());
+
+        let short_array = json!({ "color": [0.5, 0.5] });
+        assert!(color_param("test.cmd", &short_array, "color").is_err());
+
+        let overflow_array = json!({ "color": [1e40, 0.0, 0.0] });
+        assert!(color_param("test.cmd", &overflow_array, "color").is_err());
+
+        let overflow_scalar = json!({ "color": 1e40 });
+        assert!(color_param("test.cmd", &overflow_scalar, "color").is_err());
+    }
+
+    #[test]
+    fn hex_color_rejects_signs_and_non_hex() {
+        assert_eq!(color_of(&json!("#+f+f+f")), None);
+        assert_eq!(color_of(&json!("#-00000")), None);
+        assert_eq!(color_of(&json!("#GGGGGG")), None);
+        assert!(color_of(&json!("#ff8000")).is_some());
+    }
+
+    #[test]
+    fn no_bindable_command_asks_for_a_parameter() {
+        // Effect commands need a selected effect, which this session lacks
+        for spec in command_specs().iter().filter(|c| c.bindable() && c.shortcut.is_none() && !c.id.starts_with("effect.")) {
+            let mut session = crate::sample_session(texturecraft_core::MIN_RESOLUTION, 16).unwrap();
+            if (spec.enabled)(&session).is_ok()
+                && let Err(err) = execute(&mut session, spec.id, &Value::Null)
+            {
+                let text = err.to_string();
+                assert!(!text.contains("required") && !text.contains("give "), "{} asks for a parameter: {text}", spec.id);
+            }
+        }
     }
 }

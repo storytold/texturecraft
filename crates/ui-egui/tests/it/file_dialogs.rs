@@ -13,7 +13,10 @@ use texturecraft_ui_egui::state::Unsaved;
 fn harness(modified: bool) -> Harness<'static, TextureCraftApp> {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     session.modified = modified;
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     h
 }
@@ -25,6 +28,16 @@ fn answer(h: &mut Harness<'_, TextureCraftApp>, answer_with: impl FnMut(&Request
 fn invoke(h: &mut Harness<'_, TextureCraftApp>, id: &str) {
     let ctx = h.ctx.clone();
     texturecraft_ui_egui::menus::invoke(h.state_mut(), &ctx, id);
+}
+
+/// The file dialog behind a menu item; Export Mesh's comes after its options prompt, whose Export asks for it this way
+fn ask_file_of(h: &mut Harness<'_, TextureCraftApp>, id: &str) {
+    if id == "file.exportMesh" {
+        let ctx = h.ctx.clone();
+        assert!(texturecraft_ui_egui::windows::file_action(h.state_mut(), &ctx, id));
+    } else {
+        invoke(h, id);
+    }
 }
 
 /// A path in a new temporary folder.
@@ -63,6 +76,30 @@ fn a_canceled_dialog_changes_nothing() {
     assert_eq!(h.state().session.doc.project.name, name);
     assert!(h.state().toasts.is_empty());
     assert_eq!(h.state().file_dialogs.pending(), 0);
+}
+
+#[test]
+fn the_sample_picker_asks_to_save_only_after_a_path_is_chosen() {
+    let samples = super::temp_dir::TempDir::new("sample-picker");
+    let mut h = harness(true);
+    let samples_folder = samples.join("Samples");
+    std::fs::create_dir(&samples_folder).unwrap();
+    std::fs::write(samples_folder.join("Material Ball.tcraft"), b"stand-in").unwrap();
+    h.state_mut().samples_folder = samples_folder;
+    answer(&mut h, |_| Answer::Cancelled);
+    invoke(&mut h, "project.sample");
+    assert_eq!(h.state().file_dialogs.pending(), 1);
+    h.run_steps(3);
+    assert!(h.state().ui.windows.unsaved.is_none());
+    assert!(h.state().session.modified);
+
+    let path = PathBuf::from("chosen.tcraft");
+    let selected = path.clone();
+    answer(&mut h, move |_| Answer::Paths(vec![selected.clone()]));
+    invoke(&mut h, "project.sample");
+    h.run_steps(3);
+    assert_eq!(h.state().ui.windows.unsaved, Some(Unsaved::Open(path.display().to_string())));
+    assert!(h.state().session.modified);
 }
 
 #[test]
@@ -146,8 +183,8 @@ fn answered_after_the_project_changed(ask: impl FnOnce(&mut Harness<'_, TextureC
 #[test]
 fn every_project_dialog_does_nothing_for_a_replaced_project() {
     let file = temp_file("replaced-actions", "chosen.obj");
-    for id in ["material.load", "resource.import", "file.importMaterialX", "file.exportMesh", "file.reimportMesh"] {
-        let h = answered_after_the_project_changed(|h| invoke(h, id), &file);
+    for id in ["material.load", "file.importMaterialX", "file.exportMesh", "file.reimportMesh"] {
+        let h = answered_after_the_project_changed(|h| ask_file_of(h, id), &file);
         assert!(h.state().toasts.iter().any(|t| t.error && t.text.starts_with(PROJECT_CHANGED)), "{id}");
         assert!(!file.exists(), "{id} wrote nothing");
     }

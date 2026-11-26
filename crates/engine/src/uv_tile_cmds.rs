@@ -56,6 +56,7 @@ fn tile_resolution(session: &mut Session, params: &Value) -> Result<Value> {
     }
 
     session.cancel_stroke();
+    let mut warnings = crate::SessionLog::new();
     let size = session.edit("UV tile resolution", |session| {
         let texture_set = session.doc.project.texture_set_mut(texture_set_index)?;
         let previous = texture_set.clone();
@@ -67,10 +68,11 @@ fn tile_resolution(session: &mut Session, params: &Value) -> Result<Value> {
         check_size(texture_set)?;
         let size = texture_set.size();
         if previous.tile_resolution(tile) != resolution {
-            relayout(&mut session.doc, texture_set_index, &previous, &mut session.log)?;
+            relayout(&mut session.doc, texture_set_index, &previous, &mut warnings)?;
         }
         Ok(size)
     })?;
+    session.log.append(warnings);
     Ok(json!({ "ts": texture_set_index, "tile": tile, "resolution": resolution, "size": size }))
 }
 
@@ -80,7 +82,7 @@ fn uv_tiles(session: &mut Session, params: &Value) -> Result<Value> {
     let enabled = boolp(params, "enabled").ok_or_else(|| bad(COMMAND, "`enabled` (true or false) is required"))?;
     let texture_set = session.doc.project.texture_set(texture_set_index)?;
     let tiles = if enabled {
-        detect_uv_tiles(&session.source, texture_set.material, Some(true), &mut Vec::new())
+        detect_uv_tiles(&session.source, texture_set.material, Some(true), &mut crate::log::SessionLog::new())
             .map_err(|error| bad(COMMAND, format!("texture set \"{}\": {error}", texture_set.name)))?
     } else {
         Vec::new()
@@ -92,6 +94,7 @@ fn uv_tiles(session: &mut Session, params: &Value) -> Result<Value> {
     // Leaving UV tile mode keeps tile 1001, the area a classic set paints
     let dropped: Vec<u32> = texture_set.uv_tiles.iter().copied().filter(|tile| !enabled && *tile != 1001).collect();
     session.cancel_stroke();
+    let mut warnings = crate::SessionLog::new();
     session.edit(if enabled { "Use UV tiles" } else { "Stop using UV tiles" }, |session| {
         let texture_set = session.doc.project.texture_set_mut(texture_set_index)?;
         let previous = texture_set.clone();
@@ -99,8 +102,9 @@ fn uv_tiles(session: &mut Session, params: &Value) -> Result<Value> {
         texture_set.bake_excluded_tiles.retain(|tile| tiles.contains(tile));
         texture_set.uv_tiles = tiles.clone();
         check_size(texture_set)?;
-        relayout(&mut session.doc, texture_set_index, &previous, &mut session.log)
+        relayout(&mut session.doc, texture_set_index, &previous, &mut warnings)
     })?;
+    session.log.append(warnings);
     Ok(json!({ "ts": texture_set_index, "uvTiles": tiles, "dropped": dropped }))
 }
 
@@ -128,7 +132,7 @@ fn from_layout(set: &TextureSet, a: [f32; 2]) -> Option<[f32; 2]> {
 }
 
 /// Move painted images into the working layout and baked maps only when the tile grid changes
-pub(crate) fn relayout(doc: &mut Document, ts: usize, old: &TextureSet, log: &mut Vec<String>) -> Result<()> {
+pub(crate) fn relayout(doc: &mut Document, ts: usize, old: &TextureSet, log: &mut crate::log::SessionLog) -> Result<()> {
     let new = doc.project.texture_set(ts)?.clone();
     let map = |uv: [f32; 2]| from_layout(&new, uv).and_then(|mesh_uv| to_layout(old, mesh_uv));
     let (old_size, new_size) = (old.size(), new.size());
@@ -155,7 +159,7 @@ pub(crate) fn relayout(doc: &mut Document, ts: usize, old: &TextureSet, log: &mu
             None => {
                 doc.baked.remove(&ts);
                 doc.project.texture_set_mut(ts)?.baked.clear();
-                log.push(format!("Texture set \"{}\": the baked mesh maps no longer fit; bake them again", new.name));
+                log.warn("Project", format!("Texture set \"{}\": the baked mesh maps no longer fit; bake them again", new.name));
             }
         }
     }
