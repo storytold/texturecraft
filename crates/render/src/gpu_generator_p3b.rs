@@ -275,3 +275,93 @@ mod tests {
         assert_matches_cpu(&mut gpu, &case, Tolerance::TRANSCENDENTAL, "Dripping Rust");
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod bench {
+    #![allow(clippy::unwrap_used)] // A benchmark: a fixture that does not build fails it
+
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
+    use texturecraft_core::{
+        BorderDistanceParameters, Channel, DrippingRustParameters, Effect, EffectKind, Fill, Generator, KindControls, Layer, LayerKind, Mask, MaskBackground,
+        Project, Source, TextureSet,
+    };
+    use texturecraft_geom::{UvGBuffer, primitives};
+
+    use super::super::CompositeProgram;
+    use super::super::oracle::headless;
+
+    /// Each whole-map field built afresh on a 2K plane filling its UV tile (the distance
+    /// transform's worst case), and on the CPU for comparison. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_whole_map_fields() {
+        let Some(mut gpu) = headless() else { return };
+        const SIDE: u32 = 2048;
+        const RUNS: u32 = 3;
+        let mesh = Arc::new(primitives::plane(1.0, 8));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIDE, SIDE));
+        let baked = BakedMaps::default();
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIDE, SIDE), 0)], 1);
+        let controls = |run: u32| {
+            let step = run as f32 * 0.01;
+            [
+                ("Border Distance", KindControls::BorderDistance(BorderDistanceParameters { distance: 0.5 + step, smoothness: 0.5, ..Default::default() })),
+                ("Dripping Rust", KindControls::DrippingRust(DrippingRustParameters { drips_intensity: 0.5 + step, ..Default::default() })),
+            ]
+        };
+        for index in 0..2 {
+            let mut gpu_ms = 0.0;
+            let mut cpu_ms = 0.0;
+            for run in 0..=RUNS {
+                let (label, control) = controls(run)[index].clone();
+                let mut project = Project::new("Bench", "builtin:plane");
+                project.texture_sets.push(TextureSet::new("Plane", 0, SIDE));
+                let owner = project.alloc_id();
+                let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.8; 3]))]), ..Default::default() };
+                let mut layer = Layer::new(owner, "Masked", LayerKind::Fill(fill), &[Channel::BaseColor]);
+                let mut mask = Mask::new(MaskBackground::Black);
+                let generator = Generator { controls: Some(Box::new(control.clone())), ..Generator::new(control.kind()) };
+                mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
+                layer.mask = Some(mask);
+                project.insert_layer(0, layer, None, false).unwrap();
+                let pixels = PixelStore::default();
+                let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
+                program.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
+                program.set_tile_images(&ImageStore::default());
+
+                let started = std::time::Instant::now();
+                gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+                gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+                let gpu_elapsed = started.elapsed().as_secs_f64() * 1000.0;
+
+                let set = &project.texture_sets[0];
+                let inputs = texturecraft_compose::Inputs {
+                    project: &project,
+                    ts: 0,
+                    mesh: &mesh,
+                    gbuf: &gbuf,
+                    pixels: &pixels,
+                    baked: &baked,
+                    block_scales: set.block_scales(),
+                    preview: None,
+                    images: &ImageStore::default(),
+                    bounds: mesh.bounds(),
+                };
+                let started = std::time::Instant::now();
+                let _ = texturecraft_compose::mask_values(&inputs, owner, &[(0, 0)]);
+                let cpu_elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                // The first run compiles the pipelines
+                if run > 0 {
+                    gpu_ms += gpu_elapsed;
+                    cpu_ms += cpu_elapsed;
+                }
+                if run == RUNS {
+                    println!("{label}: GPU {:.1} ms, CPU (one tile, field included) {:.1} ms", gpu_ms / f64::from(RUNS), cpu_ms / f64::from(RUNS));
+                }
+            }
+        }
+    }
+}
