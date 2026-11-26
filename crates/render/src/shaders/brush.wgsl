@@ -148,14 +148,16 @@ fn tip_texel(p: vec2<i32>, side: i32, mip: u32) -> f32 {
 }
 
 fn library_alpha(local: vec2<f32>, radius: f32) -> f32 {
-    let base = f32(textureDimensions(tip, 0).x);
+    let base_size = textureDimensions(tip, 0).x;
+    let base = f32(base_size);
     let diameter = radius * 2.0 * min(params.shape.x, params.shape.y);
     var mip = 0u;
     if diameter <= base {
         let requested = floor(log2(base / max(diameter, 1.0)));
         mip = u32(clamp(requested, 0.0, f32(textureNumLevels(tip) - 1u)));
     }
-    let side = i32(textureDimensions(tip, mip).x);
+    // Each level halves the square tip; lavapipe (Mesa 25.2) can report level 0's size for a level in some lanes
+    let side = i32(max(base_size >> mip, 1u));
     let p = (local * vec2(0.5, -0.5) + 0.5) * f32(side) - 0.5;
     if any(p <= vec2(-1.0)) || any(p >= vec2(f32(side))) { return 0.0; }
     // The weights from the same floor as the texels: llvmpipe may fuse the multiply-add for one of
