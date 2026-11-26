@@ -43,7 +43,8 @@ degenerate are refused (MikkTSpace crashes on them).
 ### Mesh export (`mesh_export`)
 
 ```rust
-pub fn obj_bytes(mesh: &Mesh, name: &str) -> Vec<u8>;
+pub fn obj_bytes(mesh: &Mesh, name: &str) -> Result<Vec<u8>>;
+pub fn obj_with_mtl(mesh: &Mesh, name: &str, stem: &str, textures: &[Vec<ExportedFile>]) -> Result<(Vec<u8>, NamedFiles)>;
 pub fn glb_bytes(mesh: &Mesh, name: &str, textures: &[GlbTextures]) -> Result<Vec<u8>>;
 pub fn glb_export_options() -> ExportOptions;                     // render GlbTextures with these
 pub struct GlbTextures { pub base_color, pub orm, pub normal, pub emissive: Option<Vec<u8>> }  // PNG
@@ -51,7 +52,13 @@ pub fn usd_bytes(mesh: &Mesh, name: &str, textures: &[Vec<ExportedFile>], format
 pub fn usd_export_options() -> ExportOptions;                     // render each material's textures with these
 pub enum UsdFormat { Usda, Usdc, Usdz }
 pub struct UsdExport { pub bytes: Vec<u8>, pub textures: Vec<(String, Vec<u8>)> }  // textures: usda/usdc only
+pub fn usd_texture_bindings(set: &TextureSet, opts: &ExportOptions, project_normal: NormalFormat, files: &[PlannedFile]) -> Vec<UsdTextureBinding>;  // which UsdPreviewSurface input reads which output of which exported file
+pub fn usd_layer_with_textures(mesh: &Mesh, name: &str, bindings: &[Vec<UsdTextureBinding>]) -> Result<Vec<u8>>;  // binary `.usd` (Crate) only; material m reads bindings[m] as ./<file>
+pub struct UsdTextureBinding { /* opaque */ }
 ```
+
+OBJ export propagates shared writer validation and limit errors rather than returning empty bytes.
+An unsuccessful OBJ export returns no material library or texture files.
 
 USD: one `Mesh` prim (vertex normals and `primvars:st`, `subdivisionScheme = "none"`), one
 `materialBind` GeomSubset per material when there are several, and a UsdPreviewSurface material
@@ -61,6 +68,11 @@ emissive maps dropped, and both clear coat maps when the coat is black). Meters,
 `.usdc` is a Crate 0.8.0 file; `.usdz` is that layer first plus the PNGs, stored uncompressed at
 64-byte aligned offsets; `.usda` / `.usdc` reference `<name>_<material>_<slot>.png` next to the
 layer.
+`usd_layer_with_textures` writes the same scene as a binary `.usd` (Crate) whose materials read texture files the
+caller already wrote (the Export textures window's USD asset): `usd_texture_bindings` binds base
+color, roughness, metallic, normal (scale/bias for the file's green convention), emissive color,
+opacity, clear coat and clear coat roughness by what each map of the template holds, each reading
+the `rgb`, `r`, `g`, `b` or `a` output of its file; one texture shader per file, so packed maps work.
 
 GLB: one primitive per submesh, one metallic-roughness material per mesh material with its
 textures embedded in the binary chunk (base color sRGB, `alphaMode: BLEND` when it has alpha;
@@ -78,34 +90,44 @@ pub fn preset_from_json(json: &str) -> Result<ExportPreset>;
 pub fn preset_to_json(preset: &ExportPreset) -> Result<String>;
 ```
 
-- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)> }`
+- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)>, inverted: Vec<Dest> }`
   (serde JSON, so presets can be user files).
 - `Dest`: `R G B A` or `L` (gray; `L` + `A` = gray + alpha).
 - `SourceRef`: `Channel { channel, component }` (`Normal` = the **final** normal in the export
   normal format), `Virtual { map, component }` (`NormalOpenGl`, `NormalDirectX`, `Glossiness` =
   1 − roughness, `AoMixed` = baked AO × AO channel, `F0` = 0.08 × specular level),
   `Baked { map, component }`, `Constant(f32)`.
-- `ExportOptions { preset, format_override, bit_depth_override, padding, size, normal_format }`;
-  `Padding::{None, Dilation(n), DilationDefault(n), Infinite}`; `size` must be a power of two
+- `ExportOptions::new(preset)` accepts format and bit-depth overrides, per-map settings in
+  `maps`, dithering, padding, size and normal format.
+  `Padding::{None, Dilation(n), DilationDefault(n), DilationDiffusion(n), Infinite}`; `size` must be a power of two
   (box filter down, bilinear up).
 - File templates: `$project`, `$mesh`, `$textureSet`, `$channel`, `$colorSpace`; names are
   sanitized to `[A-Za-z0-9_.-]` (reserved device names get a `_` prefix); case-insensitive
   collisions get `_2`, `_3`, … plus a warning.
 - A map is written only when one of its sources has data in the texture set (channel present,
   map baked, …); alpha from a missing channel is dropped.
-- Formats: PNG 8/16, JPEG 8 (q 95), TGA 8, TIFF 8/16, BMP 8, WebP 8 (lossless), EXR 16f/32f
-  (`Y`, `YA`, `RGB`, `RGBA`, ZIP), HDR 32f. Color maps are sRGB in 8/16-bit and linear in float
-  formats; data maps are linear; height is stored as `h · 0.5 + 0.5`.
+- Formats: PNG 8/16, JPEG 8 (q 95), JNG 8 (JPEG colour, deflate alpha), PGM 8/16 (gray; colour
+  becomes luminance), TGA 8, TIFF 8/16/32f, BMP 8, WebP 8 (lossless), PSD 8/16 (merged image, no
+  layers; alpha is an extra alpha channel, not transparency), EXR 16f/32f (`Y`, `YA`, `RGB`, `RGBA`, ZIP), HDR 32f. 8-bit files can be dithered
+  (`ExportOptions::dither`, an 8×8 ordered pattern). When `ExportOptions::color_space` is unset,
+  color maps default to sRGB in integer files and linear Rec.709 in float files. An explicit
+  override can select another supported space. PGM writes sRGB or linear Rec.709 luminance and
+  falls back to linear Rec.709 when an ACES space is requested. Data maps are linear, and height
+  is stored as `h · 0.5 + 0.5`.
 - Final normal: Sobel normal from the height channel (strength = `height_strength`; with 1, a
   height change of 1 over 1/16 of the texture width tilts 45°; `+Y` up the image), combined with
   the normal channel, then with the baked normal map, by Reoriented Normal Mapping. DirectX
   flips green.
 
-Built-in presets:
+File names may hold folders: `/` separates folder names inside the output directory (each one
+sanitized; a backslash, `..`, a leading `/` and empty folder names are refused), and the folders
+are created when the files are written.
+
+Built-in presets (each one lists the public specification its packing follows in `src/presets.rs`):
 
 | Preset | Files (`$mesh_$textureSet_…`) |
 |---|---|
-| Document channels + Normal + AO | one per document channel (`$channel`), plus `normal` and `ambientOcclusion` (mixed) |
+| Document channels + Normal + AO (No Alpha) | one per document channel (`$channel`), plus `normal` and `ambientOcclusion` (mixed) |
 | glTF PBR Metal Roughness | `BaseColor` (sRGB, A = opacity), `OcclusionRoughnessMetallic`, `Normal` (OpenGL), `Emissive` (if present) |
 | Unreal Engine (Packed) | `BaseColor`, `OcclusionRoughnessMetallic`, `Normal` (DirectX) |
 | Unity HDRP (Mask Map) | `BaseMap`, `MaskMap` (R metal, G AO, B detail = 0, A smoothness), `Normal` (OpenGL) |
@@ -113,6 +135,8 @@ Built-in presets:
 | Blender (Principled BSDF) | `BaseColor`, `Metallic`, `Roughness`, `Normal` (OpenGL), `Height` (16-bit), `Emission`, `Specular` |
 | Godot 4 (ORM) | `albedo` (A = opacity), `orm` (R AO, G roughness, B metal), `normal` (OpenGL), `emission` |
 | OpenPBR (separate maps) | one map per OpenPBR Surface input the set has: `base_color`, `base_metalness`, `specular_roughness`, `specular_roughness_anisotropy`, `coat_weight`, `coat_roughness`, `fuzz_weight`, `fuzz_color`, `fuzz_roughness`, `transmission_weight`, `subsurface_weight`, `emission_color`, `geometry_opacity`, `geometry_normal` (OpenGL), `height` (16-bit) |
+| Unity URP Lit (Metallic Smoothness) | `BaseMap`, `MetallicMap` (R metal, A smoothness), `NormalMap` (OpenGL), `OcclusionMap`, `EmissionMap` |
+| USD Preview Surface (separate maps) | one map per UsdPreviewSurface input the set has, named like it: `diffuseColor`, `emissiveColor`, `metallic`, `roughness`, `normal` (OpenGL), `occlusion`, `opacity`, `clearcoat`, `clearcoatRoughness` |
 | Separate maps | one file per channel, gray where scalar, height 16-bit |
 | Mesh maps | every baked map (`$channel` = map id), 16-bit |
 
@@ -121,13 +145,16 @@ Built-in presets:
 ```rust
 pub struct ProjectFile {
     pub project: Project, pub pixels: PixelStore, pub baked: BTreeMap<usize, BakedMaps>,
-    pub mesh: Option<(String /* ext */, Vec<u8>)>, pub thumbnail: Option<Vec<u8>>,
+    pub mesh: Option<(String /* ext */, Vec<u8>)>, pub mesh_uvs: Option<Vec<Vec2>>,
+    pub thumbnail: Option<Vec<u8>>,
     pub warnings: Vec<String>, // Import warnings, never saved
 }
 pub fn save_project_bytes(pf: &ProjectFile) -> Result<Vec<u8>>;
 pub fn load_project_bytes(bytes: &[u8]) -> Result<ProjectFile>;
 pub fn save_project(path: &Path, pf: &ProjectFile) -> Result<()>;   // native, atomic
 pub fn load_project(path: &Path) -> Result<ProjectFile>;            // native
+pub fn set_project_open_limit_gib(limit_gib: u32);                 // subsequent loads, minimum 1 GiB
+pub fn project_open_limit_gib() -> u32;
 ```
 
 `.tcraft` layout (zip, deflate):
@@ -136,19 +163,51 @@ pub fn load_project(path: &Path) -> Result<ProjectFile>;            // native
 |---|---|
 | `project.json` | serde JSON of `Project` |
 | `mesh.<ext>` | the original mesh file bytes (absent for `builtin:<id>` meshes) |
+| `uv_layout.bin` | generated UVs for an explicitly rebuilt mesh (format 4) |
 | `pixels/layer_<id>_<channelId>.bin` | painted layer (or content paint effect) channel |
 | `pixels/mask_<id>.bin` | painted mask effect |
 | `baked/<ts>_<mapId>.bin` | baked mesh map of texture set `<ts>` |
 | `thumbnail.png` | optional, stored |
 
-`.bin`: header `TCTX`, version, width, height, components, tile count (u32 LE each), then per
+Paint and bake `.bin` entries use a `TCTX` header with version, width, height, components and tile
+count (u32 LE each), then per
 allocated 64×64 tile `tx`, `ty` (u32 LE) and the raw `u16` LE components (sparse, lossless).
 Baked maps: the same header with 0 tiles, then `width × height × components` f32 LE.
 
+Project format version 2 stores baked maps in uniform UV tile blocks, independent of working
+tile-resolution overrides. Older projects load their stored bake pixels as-is, without converting
+the old layout; their appearance may change until rebaked. Painted layers and cage/skew correction
+maps retain their working atlas layout.
+
+Project format version 3 stores baked bent normal maps in tangent space (OpenGL green, like the
+normal map). Version 2 and older files held them in world space: loading drops those maps, keeps
+the bake settings and warns that the Bent Normals map needs a re-bake.
+
+Project format version 4 saves rebuilt mesh UVs so reopening can use the same layout. The
+`uv_layout.bin` entry starts with `TCUV`, followed by the layout version and corner count (u32 LE).
+Each triangle corner has one little-endian f32 pair in imported index order.
+
 Loading runs `Project::validate`, refuses a newer `format_version` (`FormatError::NewerVersion`),
 checks every tile against its texture set's resolution and component count, rejects repeated or
-out-of-range tiles and trailing data, drops pixels of layers that are in no stack, and caps the
-total decompressed size at 8 GiB.
+out-of-range tiles and trailing data, and drops pixels of layers that are in no stack. Total
+decompressed project data is limited to 8 GiB by default. Settings › Project › Max project size on
+open changes this limit, in GiB, independently of the save CPU and RAM preferences. Each load keeps
+the limit it started with; individual resource, mesh, image and entry-count limits still apply.
+The limit counts file data, including binary headers and tile coordinates, rather than peak process
+memory. Saves and autosaves are not refused by this open limit; raise it to reopen a larger project.
+
+Opening checks the sum of all declared ZIP payload sizes before decompression, including unknown
+entries, and checks actual reads against the same limit independently. Overlapping ZIP entries are
+rejected. ZIP indexing is restricted to the final 32 MiB with a 64 MiB read allowance before the
+100,000-entry limit can be checked. Baked-map dimensions must agree with the entry size; float data
+is read in bounded chunks with fallible allocation. Nested archives are not recursively extracted
+by the project reader. Subsequent image and mesh decoding has separate format-specific limits;
+the project-open limit is not a combined budget for those decoded assets or the application's heap.
+
+Native saves compress entries in parallel within the configured CPU allowance and an estimated
+in-flight byte budget. Stored resources and entries larger than that budget stream directly into
+the destination without a whole-entry temporary buffer. The save RAM percentage is an estimate,
+excluding compressor, allocator and project-snapshot overhead; it is not a peak process memory cap.
 
 Unreadable bake settings fall back to defaults field by field while readable settings and project
 content are retained. Legacy baked-map filenames remain readable; unsupported baked-map types are

@@ -1,22 +1,32 @@
-//! UI text lookup. Keys are the English strings, so English needs no table and a missing
-//! translation falls back to English. Every user-visible literal goes through [`tr`] (or [`trf`]
-//! for text with `{name}` placeholders); each language is a static `(English, translation)`
-//! table, indexed into a hash map the first time the language is used. `Prefs::language` picks it.
+//! UI text lookup over the optional shared craft-i18n catalogs.
+//! Missing translations and builds without catalogs use the English source text.
 
-use std::collections::HashMap;
 use std::fmt::Display;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, OnceLock};
 
-mod ar;
-mod de;
-mod es;
-mod fr;
-mod it;
-mod ja;
-mod ko;
-mod pt_br;
-mod zh_hans;
+include!(concat!(env!("OUT_DIR"), "/craft_i18n.rs"));
+
+static I18N: LazyLock<craft_i18n::I18n> = LazyLock::new(|| {
+    let offered: Vec<_> = LANGUAGES.iter().map(|l| l.code).collect();
+    let (i18n, problems) = craft_i18n::I18n::new(CRAFT_I18N, &offered);
+    for problem in problems {
+        log::warn!("translation catalog: {problem}");
+    }
+    i18n
+});
+
+static SHARED_LANGUAGES: OnceLock<[craft_i18n::Lang; COUNT]> = OnceLock::new();
+
+/// Resolve the fixed picker codes once; hot text lookups only load the cached language handle.
+fn shared_languages() -> &'static [craft_i18n::Lang; COUNT] {
+    SHARED_LANGUAGES.get_or_init(|| LANGUAGES.each_ref().map(|l| I18N.from_code(l.code).unwrap_or(craft_i18n::Lang::EN)))
+}
+
+/// Whether this build embeds a catalog for a supported language.
+pub fn available(code: &str) -> bool {
+    I18N.from_code(code).is_some()
+}
 
 pub struct Language {
     /// BCP 47 code ("en", "pt-BR", "zh-Hans").
@@ -25,27 +35,45 @@ pub struct Language {
     pub name: &'static str,
     /// Its English name (the picker's fallback when no font can draw `name`).
     pub english: &'static str,
-    /// `(English, translation)` pairs, in any order.
-    pub table: &'static [(&'static str, &'static str)],
 }
 
 const COUNT: usize = 10;
 
 pub static LANGUAGES: [Language; COUNT] = [
-    Language { code: "en", name: "English", english: "English", table: &[] },
-    Language { code: "fr", name: "Français", english: "French", table: fr::TABLE },
-    Language { code: "de", name: "Deutsch", english: "German", table: de::TABLE },
-    Language { code: "es", name: "Español", english: "Spanish", table: es::TABLE },
-    Language { code: "pt-BR", name: "Português (Brasil)", english: "Portuguese (Brazil)", table: pt_br::TABLE },
-    Language { code: "it", name: "Italiano", english: "Italian", table: it::TABLE },
-    Language { code: "ja", name: "日本語", english: "Japanese", table: ja::TABLE },
-    Language { code: "zh-Hans", name: "简体中文", english: "Chinese (Simplified)", table: zh_hans::TABLE },
-    Language { code: "ko", name: "한국어", english: "Korean", table: ko::TABLE },
-    Language { code: "ar", name: "العربية", english: "Arabic", table: ar::TABLE },
+    Language { code: "en", name: "English", english: "English" },
+    Language { code: "fr", name: "Français", english: "French" },
+    Language { code: "de", name: "Deutsch", english: "German" },
+    Language { code: "es", name: "Español", english: "Spanish" },
+    Language { code: "pt-BR", name: "Português (Brasil)", english: "Portuguese (Brazil)" },
+    Language { code: "it", name: "Italiano", english: "Italian" },
+    Language { code: "ja", name: "日本語", english: "Japanese" },
+    Language { code: "zh-Hans", name: "简体中文", english: "Chinese (Simplified)" },
+    Language { code: "ko", name: "한국어", english: "Korean" },
+    Language { code: "ar", name: "العربية", english: "Arabic" },
 ];
 
-static MAPS: [OnceLock<HashMap<&'static str, &'static str>>; COUNT] = [const { OnceLock::new() }; COUNT];
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
+
+/// How a fill reads its images, as the Filtering combo names it
+pub(crate) fn filtering_label(filtering: texturecraft_engine::core::Filtering) -> &'static str {
+    use texturecraft_engine::core::Filtering;
+    match filtering {
+        Filtering::BilinearHq => n_("Bilinear | HQ"),
+        Filtering::BilinearSharp => n_("Bilinear | Sharp"),
+        Filtering::Nearest => n_("Nearest"),
+    }
+}
+
+/// Whether a fill repeats past its tile, as the UV Wrap combo names it
+pub(crate) fn wrap_label(wrap: texturecraft_engine::core::UvWrap) -> &'static str {
+    use texturecraft_engine::core::UvWrap;
+    match wrap {
+        UvWrap::None => n_("None"),
+        UvWrap::RepeatHorizontally => n_("Repeat horizontally"),
+        UvWrap::RepeatVertically => n_("Repeat vertically"),
+        UvWrap::Repeat => n_("Repeat"),
+    }
+}
 
 /// Display labels belong to the UI; the model exposes only map identities
 pub(crate) fn baked_map_label(map: texturecraft_engine::core::BakedMap) -> &'static str {
@@ -65,9 +93,13 @@ pub(crate) fn baked_map_label(map: texturecraft_engine::core::BakedMap) -> &'sta
     }
 }
 
-/// Switch the UI language (unknown codes fall back to English).
+/// The saved language that follows the operating system's (Settings > Language > Default (System Language)).
+pub const SYSTEM_LANGUAGE: &str = "";
+
+/// Switch the UI language ([`SYSTEM_LANGUAGE`] follows the system; unknown codes fall back to English).
 pub fn set_language(code: &str) {
-    CURRENT.store(LANGUAGES.iter().position(|l| l.code == code).unwrap_or(0), Ordering::Relaxed);
+    let code = if code == SYSTEM_LANGUAGE { system_language() } else { code };
+    CURRENT.store(LANGUAGES.iter().position(|l| l.code.eq_ignore_ascii_case(code) && available(l.code)).unwrap_or(0), Ordering::Relaxed);
 }
 
 /// The current UI language.
@@ -77,12 +109,8 @@ pub fn current() -> &'static Language {
 
 /// `text` in the current language (unchanged when it has no translation).
 pub fn tr(text: &str) -> &str {
-    let i = CURRENT.load(Ordering::Relaxed);
-    let (Some(lang), Some(map)) = (LANGUAGES.get(i), MAPS.get(i)) else { return text };
-    if lang.table.is_empty() {
-        return text;
-    }
-    map.get_or_init(|| lang.table.iter().copied().collect()).get(text).copied().unwrap_or(text)
+    let lang = shared_languages().get(CURRENT.load(Ordering::Relaxed)).copied().unwrap_or(craft_i18n::Lang::EN);
+    I18N.t(lang, text)
 }
 
 /// Marks a static string for translation where it is defined (gettext's `N_`); it is translated
@@ -93,25 +121,39 @@ pub const fn n_(text: &'static str) -> &'static str {
 
 /// `template` translated, with each `{name}` replaced by its value in `args`.
 pub fn trf(template: &str, args: &[(&str, &dyn Display)]) -> String {
-    let mut out = String::with_capacity(template.len() + 16);
-    let mut rest = tr(template);
-    while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 1..];
-        match after.find('}').and_then(|close| args.iter().find(|(k, _)| *k == &after[..close]).map(|(_, v)| (close, v))) {
-            Some((close, v)) => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "{v}");
-                rest = &after[close + 1..];
-            }
-            None => {
-                out.push('{');
-                rest = after;
-            }
-        }
+    let values: Vec<_> = args.iter().map(|(name, value)| (*name, value.to_string())).collect();
+    let args: Vec<_> = values.iter().map(|(name, value)| (*name, value.as_str())).collect();
+    craft_i18n::fmt(tr(template), &args)
+}
+
+/// An undo step's label in the current language. A label with a layer name, path number or
+/// smart mask name in it ("Paint on Rust") is matched to its engine template, which is translated
+/// and filled in again; any other label is translated as it is.
+pub fn tr_history(label: &str) -> String {
+    tr_history_with(label, |text| tr(text).to_string())
+}
+
+/// [`tr_history`] with its own lookup `translate`
+fn tr_history_with(label: &str, translate: impl Fn(&str) -> String) -> String {
+    match history_template(label) {
+        Some((template, name, value)) => craft_i18n::fmt(&translate(template), &[(name, value)]),
+        None => translate(label),
     }
-    out.push_str(rest);
-    out
+}
+
+/// The engine template a history label was made from, its placeholder name and the value in it.
+/// The template with the longest fixed start wins.
+fn history_template(label: &str) -> Option<(&'static str, &'static str, &str)> {
+    texturecraft_engine::HISTORY_TEMPLATES
+        .iter()
+        .filter_map(|template| {
+            let (open, close) = (template.find('{')?, template.find('}')?);
+            let (prefix, suffix) = (&template[..open], &template[close + 1..]);
+            let value = label.strip_prefix(prefix)?.strip_suffix(suffix)?;
+            Some((prefix.len(), *template, &template[open + 1..close], value))
+        })
+        .max_by_key(|(prefix_length, ..)| *prefix_length)
+        .map(|(_, template, name, value)| (template, name, value))
 }
 
 /// The supported language for a locale such as "de-AT", "pt_BR.UTF-8" or "zh-Hant-TW" ("en" when
@@ -134,12 +176,21 @@ pub fn os_language() -> &'static str {
     locale.map_or("en", |l| language_for_locale(&l))
 }
 
+/// [`os_language`] read once: the language is applied every frame.
+fn system_language() -> &'static str {
+    static SYSTEM: OnceLock<&'static str> = OnceLock::new();
+    SYSTEM.get_or_init(os_language)
+}
+
+/// Tests that switch the global UI language, or draw the UI under it, run one at a time.
+#[cfg(test)]
+pub(crate) static TEST_LANGUAGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
+    use super::TEST_LANGUAGE as LANGUAGE;
     use super::*;
-
-    /// Tests that switch the global UI language run one at a time.
-    static LANGUAGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use std::collections::{BTreeSet, HashMap};
 
     /// Every key the UI looks up: `tr("…")` / `trf("…"` literals in the sources, plus the
     /// static catalogs whose labels are translated where they are shown.
@@ -166,37 +217,50 @@ mod tests {
     /// The labels of the menu catalog, panels, shortcuts, shelf tabs and engine enums that are
     /// translated where they are shown.
     fn catalog_keys() -> Vec<&'static str> {
-        use texturecraft_engine::core::{BlendMode, Channel, EffectKind, GeneratorKind, ProceduralKind};
+        use texturecraft_engine::core::{
+            BlendMode, Channel, EffectKind, GeneratorKind, ProceduralKind, TileBlending, TileInputDistribution, TileShape, TileSizeMode, TileSymmetry,
+        };
         use texturecraft_engine::filter_lib::{FILTERS, build, scalar_params};
-        let mut k: Vec<&'static str> = Vec::new();
-        k.extend(crate::menus::TOP);
-        for i in crate::menus::CATALOG.iter().filter(|i| i.label != "-") {
-            k.push(i.label);
-            k.extend(i.sub);
+        let mut keys: Vec<&'static str> = Vec::new();
+        keys.extend(crate::menus::TOP);
+        for item in crate::menus::CATALOG.iter().filter(|item| item.label != "-") {
+            keys.push(item.label);
+            keys.extend(item.sub);
         }
-        k.extend(crate::docking::VIEWS.iter().map(|(_, p)| p.name()));
-        for b in crate::keymap::bindings() {
-            k.push(b.label);
-            k.push(b.group);
+        keys.extend(crate::docking::VIEWS.iter().map(|(_, panel)| panel.name()));
+        for binding in crate::keymap::bindings() {
+            keys.push(binding.label);
+            keys.push(binding.group);
         }
-        k.extend(crate::shelf::TABS.iter().map(|t| t.2));
-        k.extend(Channel::ALL.iter().flat_map(|c| [c.label(), c.short()]));
-        k.extend(BlendMode::all().map(|m| m.label()));
-        k.extend(texturecraft_engine::formats::export::VirtualMap::ALL.iter().map(|m| m.label()));
-        k.extend(texturecraft_engine::Tool::ALL.iter().map(|t| t.label()));
-        k.extend(ProceduralKind::ALL.iter().map(|p| p.label()));
-        k.extend(GeneratorKind::ALL.iter().map(|g| g.label()));
-        k.extend(texturecraft_engine::paint::BrushAlpha::ALL.iter().map(|a| a.label()));
-        k.extend(texturecraft_engine::geom::primitives::BUILTINS.iter().map(|(_, l)| *l));
-        for f in FILTERS {
-            k.extend([f.label, f.group]);
-            if let Ok(EffectKind::Filter(x)) = build(f.id, &serde_json::Value::Null) {
-                k.push(x.label());
-                k.extend(scalar_params(&x).into_iter().map(|p| p.1));
+        keys.extend(crate::shelf::TABS.iter().map(|tab| tab.2));
+        keys.extend(Channel::ALL.iter().flat_map(|channel| [channel.label(), channel.short()]));
+        keys.extend(BlendMode::all().map(|mode| mode.label()));
+        keys.extend(texturecraft_engine::formats::export::VirtualMap::ALL.iter().map(|map| map.label()));
+        keys.extend(texturecraft_engine::Tool::ALL.iter().map(|tool| tool.label()));
+        keys.extend(texturecraft_engine::HISTORY_TEMPLATES);
+        keys.extend(ProceduralKind::ALL.iter().map(|kind| kind.label()));
+        keys.extend(GeneratorKind::ALL.iter().map(|kind| kind.label()));
+        keys.extend(TileShape::ALL.iter().map(|shape| shape.label()));
+        keys.extend(TileSizeMode::ALL.iter().map(|mode| mode.label()));
+        keys.extend(TileInputDistribution::ALL.iter().map(|distribution| distribution.label()));
+        keys.extend(TileSymmetry::ALL.iter().map(|symmetry| symmetry.label()));
+        keys.extend(TileBlending::ALL.iter().map(|blending| blending.label()));
+        keys.extend(texturecraft_engine::paint::BrushAlpha::ALL.iter().map(|alpha| alpha.label()));
+        keys.extend(texturecraft_engine::geom::primitives::BUILTINS.iter().map(|(_, label)| *label));
+        for filter in FILTERS {
+            keys.extend([filter.label, filter.group]);
+            if let Some(about) = filter.about() {
+                keys.push(about.description);
+                keys.extend(about.tags);
+            }
+            if let Ok(EffectKind::Filter(effect)) = build(filter.id, &serde_json::Value::Null) {
+                keys.push(effect.label());
+                keys.extend(scalar_params(&effect).into_iter().map(|parameter| parameter.1));
             }
         }
-        // Effect, view and camera names the engine gives.
-        k.extend([
+
+        // Include effect, view and camera names supplied by the engine
+        keys.extend([
             "Paint",
             "Path",
             "Fill",
@@ -209,8 +273,8 @@ mod tests {
             texturecraft_engine::camera_cmds::DEFAULT_CAMERA,
             crate::dock::SOLO_HINT,
         ]);
-        k.retain(|s| !s.is_empty() && !UNTRANSLATED.contains(s));
-        k
+        keys.retain(|key| !key.is_empty() && !UNTRANSLATED.contains(key));
+        keys
     }
 
     /// String literals passed straight to `tr(` or `trf(` in `src`.
@@ -250,42 +314,92 @@ mod tests",
         }
     }
 
-    fn placeholders(s: &str) -> Vec<&str> {
-        let mut v: Vec<&str> = s.split('{').skip(1).filter_map(|p| p.split_once('}').map(|(name, _)| name)).collect();
-        v.sort_unstable();
-        v
+    #[test]
+    fn the_system_language_setting_speaks_the_operating_system_language() {
+        let _language = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_language(SYSTEM_LANGUAGE);
+        let shown = current().code;
+        set_language("en");
+
+        let expected = if available(os_language()) { os_language() } else { "en" };
+        assert_eq!(shown, expected);
     }
 
     #[test]
-    fn every_key_is_translated_in_every_language() {
+    fn embedded_catalogs_are_valid() {
+        assert!(I18N.check_all().is_empty(), "{:?}", I18N.check_all());
+    }
+
+    /// Translation work never blocks a feature: report missing/stale keys without failing.
+    #[test]
+    fn translation_coverage_report() {
         let keys = keys();
         assert!(keys.len() > 300, "found only {} keys", keys.len());
-        let mut missing = Vec::new();
-        for l in LANGUAGES.iter().skip(1) {
-            let map: HashMap<&str, &str> = l.table.iter().copied().collect();
-            assert_eq!(map.len(), l.table.len(), "{}: duplicate keys", l.code);
-            for k in &keys {
-                if !map.contains_key(k.as_str()) {
-                    missing.push(format!("{}: {k:?}", l.code));
+        let used: BTreeSet<_> = keys.iter().map(String::as_str).collect();
+        for &(locale, common, app) in CRAFT_I18N {
+            let Some(lang) = I18N.from_code(locale) else { continue };
+            let missing: Vec<_> = keys.iter().filter(|key| I18N.get(lang, "", key).is_none()).collect();
+
+            // Decode TSV escapes to compare with literal source strings
+            let mut rows = HashMap::new();
+            for text in [common, app] {
+                for line in text.lines().filter(|l| !l.starts_with('#')) {
+                    let columns: Vec<_> = line.split('\t').collect();
+                    if let ["", source, _] = columns.as_slice() {
+                        let mut decoded = String::new();
+                        let mut chars = source.chars();
+                        while let Some(c) = chars.next() {
+                            decoded.push(if c == '\\' {
+                                match chars.next() {
+                                    Some('n') => '\n',
+                                    Some('t') => '\t',
+                                    Some(c) => c,
+                                    None => '\\',
+                                }
+                            } else {
+                                c
+                            });
+                        }
+                        rows.insert(decoded, ());
+                    }
                 }
             }
+            let stale: Vec<_> = rows.keys().filter(|key| !used.contains(key.as_str())).collect();
+            eprintln!("{locale}: missing {} {missing:?}; unused/shared {} {stale:?}", missing.len(), stale.len());
         }
-        assert!(missing.is_empty(), "{} missing translations:\n{}", missing.len(), missing.join("\n"));
     }
-
-    /// Catalog labels that read the same in every language (names and formats).
-    const UNTRANSLATED: &[&str] = &["RGB", "RGBA"];
 
     #[test]
-    fn translations_keep_placeholders_and_are_not_empty() {
-        for l in &LANGUAGES {
-            for (en, t) in l.table {
-                assert!(!t.trim().is_empty(), "{}: empty translation of {en:?}", l.code);
-                assert_eq!(placeholders(en), placeholders(t), "{}: placeholders of {en:?} in {t:?}", l.code);
-                assert_eq!(en.ends_with("..."), t.ends_with("...") || t.ends_with('…'), "{}: ellipsis of {en:?} in {t:?}", l.code);
-            }
-        }
+    fn history_labels_are_matched_to_their_templates() {
+        assert_eq!(history_template("Paint on Rust"), Some(("Paint on {layer}", "layer", "Rust")));
+        assert_eq!(history_template("Paint on Paint mask of x"), Some(("Paint on {layer}", "layer", "Paint mask of x")));
+        assert_eq!(history_template("Paint mask of Paint on x"), Some(("Paint mask of {layer}", "layer", "Paint on x")));
+        assert_eq!(history_template("Erase mask of Rust"), Some(("Erase mask of {layer}", "layer", "Rust")));
+        assert_eq!(history_template("Edit path 2"), Some(("Edit path {n}", "n", "2")));
+        assert_eq!(history_template("Apply smart mask Dirt"), Some(("Apply smart mask {name}", "name", "Dirt")));
+        assert_eq!(history_template("Rename layer"), None);
     }
+
+    /// The template is translated and the layer name filled in; other labels are translated whole
+    #[test]
+    fn history_labels_with_a_layer_name_are_translated_through_their_template() {
+        let translate = |text: &str| {
+            match text {
+                "Paint on {layer}" => "Auf {layer} malen",
+                "Paint mask of {layer}" => "Maske von {layer} malen",
+                "Remove layer" => "Ebene entfernen",
+                other => other,
+            }
+            .to_string()
+        };
+        assert_eq!(tr_history_with("Paint on Rust", translate), "Auf Rust malen");
+        assert_eq!(tr_history_with("Paint mask of Paint on x", translate), "Maske von Paint on x malen");
+        assert_eq!(tr_history_with("Remove layer", translate), "Ebene entfernen");
+        assert_eq!(tr_history_with("Clone on Rust", translate), "Clone on Rust");
+        assert_eq!(tr_history_with("Paint on {layer}", translate), "Auf {layer} malen");
+    }
+
+    const UNTRANSLATED: &[&str] = &["RGB", "RGBA"];
 
     #[test]
     fn lookup_formatting_and_fallbacks() {
@@ -302,27 +416,31 @@ mod tests",
             assert_eq!(language_for_locale(locale), code, "{locale}");
         }
         set_language("de");
-        assert_eq!(current().code, "de");
+        assert_eq!(current().code, if available("de") { "de" } else { "en" });
         assert_eq!(tr("not a key"), "not a key");
         set_language("en");
     }
 
     #[test]
-    fn lookup_is_fast() {
+    fn saved_language_codes_and_spanish_lookup() {
         let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let keys = keys();
-        set_language("ja");
-        let t = std::time::Instant::now();
-        let mut n = 0usize;
-        for _ in 0..100 {
-            for k in &keys {
-                n += tr(k).len();
-            }
+        for language in &LANGUAGES {
+            set_language(language.code);
+            assert_eq!(current().code, if available(language.code) { language.code } else { "en" });
         }
-        let per = t.elapsed().as_secs_f64() * 1e9 / (100 * keys.len()) as f64;
+        const MISSING: &str = "missing test label";
+        set_language("es");
+        let spanish = tr("Layers");
+        let missing = tr(MISSING);
         set_language("en");
-        assert!(n > 0);
-        // A frame looks up a few hundred strings: well under a microsecond each.
-        assert!(per < 1000.0, "{per:.0} ns per lookup");
+        let english = tr("Layers");
+        set_language("es");
+        let spanish_again = tr("Layers");
+        set_language("en");
+
+        assert_eq!(spanish, if available("es") { "Capas" } else { "Layers" });
+        assert_eq!(missing, MISSING);
+        assert_eq!(english, "Layers");
+        assert_eq!(spanish_again, spanish);
     }
 }

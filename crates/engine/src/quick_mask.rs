@@ -35,44 +35,53 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit quick mask",
             ["Viewport"],
             Some("U"),
-            "{editing?: bool} — toggles when omitted; editing enables the mask",
-            always,
+            "{editing?: bool} — toggles when omitted; needs the quick mask enabled",
+            mask_enabled,
             edit
         ),
-        cmd!("viewport.quickMask.invert", "Invert quick mask", ["Viewport"], Some("Ctrl+Shift+I"), "{}", always, invert),
+        cmd!("viewport.quickMask.invert", "Invert quick mask", ["Viewport"], Some("Ctrl+Shift+I"), "{}", mask_enabled, invert),
     ]
 }
 
-fn state(s: &Session) -> Value {
-    let q = &s.quick_mask;
+fn mask_enabled(session: &Session) -> std::result::Result<(), String> {
+    if session.quick_mask.enabled { Ok(()) } else { Err("enable the quick mask first".into()) }
+}
+
+fn state(session: &Session) -> Value {
+    let mask = &session.quick_mask;
     json!({
-        "enabled": q.enabled, "editing": q.editing, "inverted": q.inverted,
-        "paintedTiles": q.masks.get(&s.ts()).map(TileImage::allocated_count).unwrap_or(0),
+        "enabled": mask.enabled, "editing": mask.editing, "inverted": mask.inverted,
+        "paintedTiles": mask.masks.get(&session.ts()).map(TileImage::allocated_count).unwrap_or(0),
     })
 }
 
-fn changed(s: &mut Session) -> Result<Value> {
-    s.quick_mask.revision = s.quick_mask.revision.wrapping_add(1);
-    s.revision = s.revision.wrapping_add(1);
-    Ok(state(s))
+fn changed(session: &mut Session) -> Result<Value> {
+    session.quick_mask.revision = session.quick_mask.revision.wrapping_add(1);
+    session.revision = session.revision.wrapping_add(1);
+    Ok(state(session))
 }
 
-fn enable(s: &mut Session, p: &Value) -> Result<Value> {
-    s.quick_mask.enabled = boolp(p, "enabled").unwrap_or(!s.quick_mask.enabled);
-    changed(s)
+fn enable(session: &mut Session, params: &Value) -> Result<Value> {
+    let enabled = boolp(params, "enabled").unwrap_or(!session.quick_mask.enabled);
+    if !enabled && session.quick_mask.editing {
+        session.cancel_stroke();
+        session.quick_mask.editing = false;
+    }
+
+    session.quick_mask.enabled = enabled;
+    changed(session)
 }
 
-fn edit(s: &mut Session, p: &Value) -> Result<Value> {
-    s.cancel_stroke();
-    let q = &mut s.quick_mask;
-    q.editing = boolp(p, "editing").unwrap_or(!q.editing);
-    q.enabled |= q.editing;
-    changed(s)
+fn edit(session: &mut Session, params: &Value) -> Result<Value> {
+    session.cancel_stroke();
+    let quick_mask = &mut session.quick_mask;
+    quick_mask.editing = boolp(params, "editing").unwrap_or(!quick_mask.editing);
+    changed(session)
 }
 
-fn invert(s: &mut Session, _: &Value) -> Result<Value> {
-    s.quick_mask.inverted = !s.quick_mask.inverted;
-    changed(s)
+fn invert(session: &mut Session, _: &Value) -> Result<Value> {
+    session.quick_mask.inverted = !session.quick_mask.inverted;
+    changed(session)
 }
 
 impl Session {
@@ -105,34 +114,37 @@ impl Session {
     /// Includes the stroke in progress.
     pub fn quick_mask_rgba(&self, ts: usize, size: u32) -> Option<Vec<u8>> {
         let cache = self.caches.get(ts)?;
-        let (w, h) = cache.size;
-        let size = size.clamp(1, w.max(h));
+        let (width, height) = cache.size;
+        let size = size.clamp(1, width.max(height));
         let mask = self.quick_mask_image(ts, cache.size);
         let live = self.stroke.as_ref().filter(|s| s.ts == ts && s.target.is_none()).map(|s| (&s.canvas.alpha, s.stroke.settings.opacity, s.erase));
         let base = cache.composite.channels.get(&Channel::BaseColor);
-        let lut = srgb_lut();
+        let srgb = srgb_lut();
         let inverted = self.quick_mask.inverted;
         let mut out = vec![255u8; size as usize * size as usize * 4];
+
         out.par_chunks_mut(size as usize * 4).enumerate().for_each(|(y, row)| {
-            let ty = (y as u64 * u64::from(h) / u64::from(size)) as u32;
-            for (x, px) in row.chunks_exact_mut(4).enumerate() {
-                let tx = (x as u64 * u64::from(w) / u64::from(size)) as u32;
-                let mut m = from_u16(mask.get(tx, ty)[0]);
+            let ty = (y as u64 * u64::from(height) / u64::from(size)) as u32;
+            for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let tx = (x as u64 * u64::from(width) / u64::from(size)) as u32;
+                let mut coverage = from_u16(mask.get(tx, ty)[0]);
                 if let Some((alpha, opacity, erase)) = live {
-                    let a = from_u16(alpha.get(tx, ty)[0]) * opacity;
-                    m = if erase { m * (1.0 - a) } else { a + m * (1.0 - a) };
+                    let stroke_coverage = from_u16(alpha.get(tx, ty)[0]) * opacity;
+                    coverage = if erase { coverage * (1.0 - stroke_coverage) } else { stroke_coverage + coverage * (1.0 - stroke_coverage) };
                 }
-                let blocked = if inverted { m } else { 1.0 - m };
+
+                let blocked = if inverted { coverage } else { 1.0 - coverage };
                 let raw = base.map(|b| b.get(tx, ty)).unwrap_or([32768; 4]);
-                let t = 0.55 * blocked;
+                let tint_amount = 0.55 * blocked;
                 for (k, tint) in [0.9, 0.1, 0.15].into_iter().enumerate() {
-                    let c = f32::from(lut.get(usize::from(raw[k] >> 4)).copied().unwrap_or(0)) / 255.0;
-                    if let Some(slot) = px.get_mut(k) {
-                        *slot = ((c + (tint - c) * t).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    let color = f32::from(srgb.get(usize::from(raw[k] >> 4)).copied().unwrap_or(0)) / 255.0;
+                    if let Some(slot) = pixel.get_mut(k) {
+                        *slot = ((color + (tint - color) * tint_amount).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                     }
                 }
             }
         });
+
         Some(out)
     }
 }

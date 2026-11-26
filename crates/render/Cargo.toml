@@ -13,14 +13,15 @@ texturecraft-core = { workspace = true }
 texturecraft-texel = { workspace = true }
 texturecraft-geom = { workspace = true }
 texturecraft-compose = { workspace = true }
-texturecraft-bake = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
 half = { workspace = true }
 log = { workspace = true }
 rayon = { workspace = true }
+serde = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+texturecraft-bake = { workspace = true }
 pollster = "0.4"
 
 # The browser's WebGPU resolves error scopes later: their results are awaited on the page.

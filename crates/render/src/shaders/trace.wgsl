@@ -254,6 +254,10 @@ fn rnm(base: vec3<f32>, detail: vec3<f32>) -> vec3<f32> {
     return normalize_or(t * dot(t, u) - u * t.z, vec3<f32>(0.0, 0.0, 1.0));
 }
 
+// Roughness floors keep specular lobes finite
+const SPECULAR_ROUGHNESS_FLOOR: f32 = 0.045;
+const SHEEN_ROUGHNESS_FLOOR: f32 = 0.07;
+
 fn surface(hit: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
     let p0 = tri_p(hit.idx, 0u);
     let p1 = tri_p(hit.idx, 1u);
@@ -272,9 +276,11 @@ fn surface(hit: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
     if (!front) {
         geo = -geo;
     }
+
     if (dot(n_geo, geo) < 0.0) {
         n_geo = -n_geo;
     }
+
     let a0 = verts[ix.x * 2u + 1u];
     let a1 = verts[ix.y * 2u + 1u];
     let a2 = verts[ix.z * 2u + 1u];
@@ -291,7 +297,8 @@ fn surface(hit: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
     let extra = textureLoad(t_extra, texel(layer, 7u, uv, 0, 0), layer, 0);
 
     let info = P.sets[layer];
-    // A UV tile smaller than its atlas block: Extra alpha holds 32 × log2(1 / its share), as in mesh.wgsl.
+
+    // Extra alpha stores 32 × log2(1 / UV tile scale)
     let k = info.w * info.x / 16.0 * exp2(-extra.a * 255.0 / 32.0);
     var n_height = vec3<f32>(0.0, 0.0, 1.0);
     if (k != 0.0) {
@@ -299,9 +306,9 @@ fn surface(hit: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
         let hy = textureLoad(t_height, texel(layer, 3u, uv, 0, 1), layer, 0).r - textureLoad(t_height, texel(layer, 3u, uv, 0, -1), layer, 0).r;
         n_height = normalize_or(vec3<f32>(-hx * 0.5 * k, hy * 0.5 * k, 1.0), vec3<f32>(0.0, 0.0, 1.0));
     }
-    // 8-bit normals centred on 128, so the flat normal (128, 128, 255) is exactly +z (with
-    // `× 2 − 1` it would lean 0.3°, shifting every reflection).
-    let detail = normalize_or((nrm_t.rgb * 255.0 - 128.0) / 127.0, vec3<f32>(0.0, 0.0, 1.0));
+
+    // The signed normal in half floats, as in mesh.wgsl (flat is exactly +z)
+    let detail = normalize_or(clamp(nrm_t.rgb, vec3<f32>(-1.0), vec3<f32>(1.0)), vec3<f32>(0.0, 0.0, 1.0));
     let n_ts = rnm(n_height, detail);
     let tt = normalize_or(tw - n_geo * dot(n_geo, tw), onb_t(n_geo));
     let b = cross(n_geo, tt) * tsign;
@@ -309,6 +316,7 @@ fn surface(hit: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
     if (dot(n, -d) <= 0.0) {
         n = n_geo;
     }
+
     let angle = clamp(lobes.a, 0.0, 1.0) * PI;
     let turned = tt * cos(angle) + b * sin(angle);
     let tangent = normalize_or(turned - n * dot(n, turned), onb_t(n));
@@ -326,11 +334,13 @@ fn surface(hit: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
         diffuse = base * (1.0 - metallic);
         f0 = mix(vec3<f32>(0.08 * level), base, metallic);
     }
-    // The coat normal packs x and y as 128 + 127·n (flat: exactly 0); z is rebuilt.
+
+    // The coat normal packs x and y around 128 so flat stays exact
     let coat_base = select(geo, n_geo, dot(n_geo, -d) > 0.0);
     let cxy = (extra.xy * 255.0 - 128.0) / 127.0;
     let c = normalize_or(vec3<f32>(cxy, sqrt(max(1.0 - dot(cxy, cxy), 0.0))), vec3<f32>(0.0, 0.0, 1.0));
     let coat_turned = normalize_or(tt * c.x + b * c.y + coat_base * c.z, coat_base);
+
     var s: Surface;
     s.pos = o + d * hit.t;
     s.geo = geo;
@@ -338,15 +348,15 @@ fn surface(hit: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
     s.tangent = tangent;
     s.diffuse = diffuse;
     s.f0 = f0;
-    s.roughness = clamp(orm.g, 0.045, 1.0);
+    s.roughness = clamp(orm.g, SPECULAR_ROUGHNESS_FLOOR, 1.0);
     s.emissive = emi.rgb;
     s.opacity = clamp(base_t.a, 0.0, 1.0);
     s.anisotropy = clamp(lobes.b, 0.0, 1.0);
     s.coat = clamp(lobes.r, 0.0, 1.0);
-    s.coat_roughness = max(clamp(lobes.g, 0.0, 1.0), 0.045);
+    s.coat_roughness = max(clamp(lobes.g, 0.0, 1.0), SPECULAR_ROUGHNESS_FLOOR);
     s.coat_n = select(coat_base, coat_turned, dot(coat_turned, -d) > 0.0);
     s.sheen = clamp(sheen_t.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * clamp(sheen_t.a, 0.0, 1.0);
-    s.sheen_roughness = max(clamp(nrm_t.a, 0.0, 1.0), 0.07);
+    s.sheen_roughness = max(clamp(nrm_t.a, 0.0, 1.0), SHEEN_ROUGHNESS_FLOOR);
     s.scatter = clamp(emi.a, 0.0, 1.0);
     s.transmission = clamp(extra.b, 0.0, 1.0) * (1.0 - metallic);
     s.base = clamp(base, vec3<f32>(0.0), vec3<f32>(1.0));
