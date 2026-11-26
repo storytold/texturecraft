@@ -231,7 +231,9 @@ fn distance_rows(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 // The distance to the nearest uncovered texel of the block: the least squared row distance plus
-// the squared rows between, the block's top and bottom edges counting as uncovered
+// the squared rows between, the block's top and bottom edges counting as uncovered. values[0].x is
+// the squared reach the generators read: a texel farther away gets that reach instead, which every
+// reader takes like any farther distance, and the search ends there
 @compute @workgroup_size(WORKGROUP, WORKGROUP)
 fn distance_columns(@builtin(global_invocation_id) id: vec3<u32>) {
     let pixel = id.xy;
@@ -240,7 +242,7 @@ fn distance_columns(@builtin(global_invocation_id) id: vec3<u32>) {
     let row = line.x;
     let top = line.y;
     let rows = line.z;
-    var best = read_first(pixel);
+    var best = min(read_first(pixel), params.values[0].x);
     for (var rows_away = 1u; f32(rows_away * rows_away) < best; rows_away++) {
         let squared = f32(rows_away * rows_away);
         if rows_away > row { best = min(best, f32((row + 1u) * (row + 1u))); } else {
@@ -267,24 +269,118 @@ fn border_gradient(@builtin(global_invocation_id) id: vec3<u32>) {
     store_value(pixel, value);
 }
 
-// One box pass of its block's radius along the block's rows (words.y 0) or columns (1), reading
-// black past the block's edges (blur_blocks, box_line)
-@compute @workgroup_size(WORKGROUP, WORKGROUP)
-fn box_pass(@builtin(global_invocation_id) id: vec3<u32>) {
-    let pixel = id.xy;
-    if !in_size(pixel) { return; }
-    let blocks = (size().x + block().x - 1u) / block().x;
-    let radius = i32(block_radii[(pixel.y / block().y) * blocks + pixel.x / block().x]);
-    let along_columns = params.words.y != 0u;
-    let line = block_line(pixel, along_columns);
-    let at = i32(line.x);
-    let start = line.y;
-    let line_length = i32(line.z);
-    var sum = 0.0;
-    for (var offset = max(at - radius, 0); offset <= min(at + radius, line_length - 1); offset++) {
-        sum += read_first(along(pixel, along_columns, start + u32(offset)));
+// The CPU's fixed-point scale for box blurs (eval.rs FIX): values become integers of 2^-24
+const BOX_FIX: f32 = 16777216.0;
+
+// A signed 64-bit integer as (low, high) words, two's complement: the CPU sums box windows in i64
+fn wide_add(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let low = a.x + b.x;
+    return vec2(low, a.y + b.y + select(0u, 1u, low < a.x));
+}
+
+fn wide_negate(a: vec2<u32>) -> vec2<u32> {
+    return wide_add(~a, vec2(1u, 0u));
+}
+
+fn wide_from(value: i32) -> vec2<u32> {
+    return vec2(bitcast<u32>(value), select(0u, 0xffffffffu, value < 0));
+}
+
+// `value` / `divisor` for a non-negative `value` whose quotient fits 32 bits and a divisor below
+// 2^16, sixteen bits at a time
+fn wide_divide(value: vec2<u32>, divisor: u32) -> u32 {
+    var remainder = value.y % divisor;
+    let upper = (remainder << 16u) | (value.x >> 16u);
+    let upper_quotient = upper / divisor;
+    remainder = upper % divisor;
+    let lower = (remainder << 16u) | (value.x & 0xffffu);
+    return (upper_quotient << 16u) | (lower / divisor);
+}
+
+// The CPU's window mean (box_line): (2 sum + n) divided by 2n, rounded towards negative infinity
+fn box_mean(sum: vec2<u32>, taps: u32) -> i32 {
+    let numerator = wide_add(wide_add(sum, sum), vec2(taps, 0u));
+    let divisor = 2u * taps;
+    if (numerator.y & 0x80000000u) == 0u {
+        return bitcast<i32>(wide_divide(numerator, divisor));
     }
-    store_value(pixel, sum / f32(2 * radius + 1));
+    let magnitude = wide_add(wide_negate(numerator), vec2(divisor - 1u, 0u));
+    return -bitcast<i32>(wide_divide(magnitude, divisor));
+}
+
+// A value in fixed point as the CPU rounds it (f64::round, half away from zero); `value` × 2^24 is exact
+fn box_fixed(value: f32) -> i32 {
+    let scaled = value * BOX_FIX;
+    let whole = trunc(scaled);
+    let rounded = whole + select(0.0, sign(scaled), abs(scaled - whole) >= 0.5);
+    return i32(rounded);
+}
+
+// The texel at `position` along line `line` of a box pass, along rows or columns
+fn box_texel(along_columns: bool, line: u32, position: u32) -> vec2<u32> {
+    return select(vec2(position, line), vec2(line, position), along_columns);
+}
+
+// A box pass's input texel as the CPU's fixed-point integer: the first pass converts, later passes
+// read the integers the pass before stored (exact in f32 for magnitudes up to 2^24)
+fn box_read(along_columns: bool, line: u32, position: u32) -> vec2<u32> {
+    let value = read_first(box_texel(along_columns, line, position));
+    return wide_from(select(i32(value), box_fixed(value), params.words.z != 0u));
+}
+
+// Texels one box-pass invocation writes along its line: enough work to keep the running sum, small
+// enough to keep the GPU busy (BOX_CHUNK in gpu_generator_p3b_fields_gpu.rs)
+const BOX_CHUNK: u32 = 64u;
+
+// One box pass of its block's radius along the block's rows (words.y 0) or columns (1), reading
+// black past the block's edges, exactly as the CPU's fixed-point blur_blocks. One invocation per
+// chunk of a line within a block: it sums its first window, then keeps a running i64 sum, so a
+// texel costs two reads whatever the radius, and integer sums make the chunks exact.
+// words.z marks the first of the six passes (it converts to fixed point), words.w the last (it
+// converts back); a block of radius 0 the CPU leaves as it is
+@compute @workgroup_size(64)
+fn box_pass(@builtin(global_invocation_id) id: vec3<u32>) {
+    let along_columns = params.words.y != 0u;
+    let blocks = (size() + block() - 1u) / block();
+    let segments = select(blocks.x, blocks.y, along_columns);
+    let lines = select(size().y, size().x, along_columns);
+    let block_length = select(block().x, block().y, along_columns);
+    let chunks = (block_length + BOX_CHUNK - 1u) / BOX_CHUNK;
+    // Neighbouring invocations take neighbouring lines, so their reads lie side by side
+    if id.x >= lines * segments * chunks { return; }
+    let line = id.x % lines;
+    let segment = (id.x / lines) % segments;
+    let start = segment * block_length;
+    let length = i32(min(block_length, select(size().x, size().y, along_columns) - start));
+    let first = i32((id.x / (lines * segments)) * BOX_CHUNK);
+    if first >= length { return; }
+    let last = min(first + i32(BOX_CHUNK), length);
+    let block_index = select(vec2(segment, line / block().y), vec2(line / block().x, segment), along_columns);
+    let radius = i32(block_radii[block_index.y * blocks.x + block_index.x]);
+    if radius == 0 {
+        for (var at = first; at < last; at++) {
+            let texel = box_texel(along_columns, line, start + u32(at));
+            store_value(texel, read_first(texel));
+        }
+        return;
+    }
+
+    let taps = u32(2 * radius + 1);
+    var sum = vec2(0u);
+    for (var offset = max(first - radius, 0); offset <= min(first + radius, length - 1); offset++) {
+        sum = wide_add(sum, box_read(along_columns, line, start + u32(offset)));
+    }
+    for (var at = first; at < last; at++) {
+        let mean = box_mean(sum, taps);
+        let value = select(f32(mean), f32(mean) / BOX_FIX, params.words.w != 0u);
+        store_value(box_texel(along_columns, line, start + u32(at)), value);
+        if at + radius + 1 < length {
+            sum = wide_add(sum, box_read(along_columns, line, start + u32(at + radius + 1)));
+        }
+        if at - radius >= 0 {
+            sum = wide_add(sum, wide_negate(box_read(along_columns, line, start + u32(at - radius))));
+        }
+    }
 }
 
 // `first` where the texel is covered, else 0 (values[0].y 1: also clamped to 0..1)

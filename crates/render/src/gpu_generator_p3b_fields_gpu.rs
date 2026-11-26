@@ -19,6 +19,11 @@ use crate::gpu_trace::{entry, storage};
 
 const WORKGROUP: u32 = 8;
 const LINE_WORKGROUP: u32 = 64;
+/// Texels one box-pass invocation writes along its line (BOX_CHUNK in generator_p3b.wgsl)
+const BOX_CHUNK: u32 = 64;
+/// Texels the distance search goes past the farthest reach a request reads, and the farthest it searches at all
+const DISTANCE_REACH_MARGIN: f32 = 2.0;
+const MAX_DISTANCE_REACH: f32 = 65536.0;
 /// The box passes per axis of a blur (compose's `BLUR_BOX_PASSES`)
 const BOX_PASSES: usize = 3;
 /// Scratch planes a Dripping Rust field needs: its values, the blurred sums, the cover, the blurred cover and a blur's middle pass
@@ -174,6 +179,38 @@ impl Pass<'_> {
         (self.base.size[0].div_ceil(WORKGROUP), self.base.size[1].div_ceil(WORKGROUP))
     }
 
+    /// Workgroups of one box-pass invocation per [`BOX_CHUNK`] texels of a line within a block, along rows or along columns
+    fn lines(&self, along_columns: bool) -> (u32, u32) {
+        let [width, height, block_width, block_height] = self.base.size;
+        let (lines, segments, block_length) =
+            if along_columns { (width, height.div_ceil(block_height), block_height) } else { (height, width.div_ceil(block_width), block_width) };
+        ((lines * segments * block_length.div_ceil(BOX_CHUNK)).div_ceil(LINE_WORKGROUP), 1)
+    }
+
+    /// The farthest any request reads the distances, in working texels, squared: UV Border
+    /// Distance's reach and UV Checker's border (with its texel footprint) at the largest tile
+    fn distance_reach_squared(&self, requests: &[FieldRequest]) -> f32 {
+        let [width, height, block_width, block_height] = self.base.size;
+        let largest_tile = (0..height.div_ceil(block_height))
+            .flat_map(|row| (0..width.div_ceil(block_width)).map(move |column| (column * block_width, row * block_height)))
+            .map(|(left, top)| block_width as f32 * self.scale_at(left, top))
+            .fold(block_width as f32, f32::max);
+        let reach = requests
+            .iter()
+            .map(|request| match &request.controls {
+                KindControls::BorderDistance(border) => border.distance * recipe::REACH_PER_DISTANCE * largest_tile,
+                KindControls::UvChecker(checker) => {
+                    checker.border_width * recipe::BORDER_TEXELS_PER_WIDTH_2K * largest_tile / recipe::REFERENCE_TILE_TEXELS + 1.0
+                }
+                _ => 0.0,
+            })
+            .fold(0.0, f32::max);
+
+        // A texel past the reach reads as just beyond it
+        let reach = (reach.ceil() + DISTANCE_REACH_MARGIN).min(MAX_DISTANCE_REACH);
+        reach * reach
+    }
+
     /// The UV tile scale of the block holding working texel (`x`, `y`) (BlockScales::at)
     fn scale_at(&self, x: u32, y: u32) -> f32 {
         let (scales, side, columns) = self.scales;
@@ -258,9 +295,10 @@ impl Pass<'_> {
         let mut read = source;
         for pass in 0..2 * BOX_PASSES {
             let axis = u32::from(pass >= BOX_PASSES);
-            let params = FieldParams { words: [0, axis, 0, 0], ..self.base };
+            // The first pass turns values into the CPU's fixed point, the last turns them back
+            let params = FieldParams { words: [0, axis, u32::from(pass == 0), u32::from(pass == 2 * BOX_PASSES - 1)], ..self.base };
             let written = if pass % 2 == 0 { middle } else { target };
-            self.run_with_radii(encoder, &self.kernels.box_pass, &params, ([Some(read), None, None], islands, radii), written, self.texels());
+            self.run_with_radii(encoder, &self.kernels.box_pass, &params, ([Some(read), None, None], islands, radii), written, self.lines(axis != 0));
             read = written;
         }
     }
@@ -472,7 +510,9 @@ impl GeneratorFieldsGpu {
                 let table = island_table(device, &plan.requests[0], 0);
                 let blocks = size.0.div_ceil(block.0);
                 pass.run(&mut encoder, &kernels.distance_rows, &base, ([None, None, None], &table), &rows, ((size.1 * blocks).div_ceil(LINE_WORKGROUP), 1));
-                pass.run(&mut encoder, &kernels.distance_columns, &base, ([Some(&rows), None, None], &table), &distances, pass.texels());
+                let reach =
+                    FieldParams { values: [[pass.distance_reach_squared(&plan.requests), 0.0, 0.0, 0.0], [0.0; 4], [0.0; 4], [0.0; 4], [0.0; 4]], ..base };
+                pass.run(&mut encoder, &kernels.distance_columns, &reach, ([Some(&rows), None, None], &table), &distances, pass.texels());
                 distances
             });
             for (layer, request) in plan.requests.iter().enumerate() {
