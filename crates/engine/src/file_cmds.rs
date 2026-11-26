@@ -91,7 +91,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export Mesh...",
             ["File"],
             None,
-            "{path: .obj, .glb, .usda, .usdc or .usdz file, format?: obj|glb|usda|usdc|usdz (default: from the extension, else obj); obj writes its .mtl and textures, usda/usdc their textures, next to the file} → {path, textures?}",
+            "{path: .obj, .glb, .usda, .usdc or .usdz file, format?: obj|glb|gltf|glft|usda|usdc|usdz (default: from the extension, else obj; .gltf/.glft and format gltf/glft write a .glb, replacing that suffix), overwrite?: bool (required when the rewritten destination already exists); obj writes its .mtl and textures, usda/usdc their textures, next to the file} → {path, textures?}",
             always,
             export_mesh
         ),
@@ -1170,6 +1170,10 @@ fn write_materialx(
 fn export_mesh(s: &mut Session, p: &Value) -> Result<Value> {
     let path = native::path_param(p, "path", "file.exportMesh")?;
     let out = s.mesh_export(path, strp(p, "format"))?;
+    let overwrite = crate::commands::boolp(p, "overwrite").unwrap_or(false);
+    if out.path != path && std::fs::symlink_metadata(&out.path).is_ok() && !overwrite {
+        return Err(bad("file.exportMesh", format!("{} already exists", out.path)));
+    }
     let dir = std::path::Path::new(&out.path).parent().unwrap_or(std::path::Path::new(""));
     let texture_paths: Vec<std::path::PathBuf> = out.textures.iter().map(|(name, _)| dir.join(name)).collect();
     let main_path = std::path::PathBuf::from(&out.path);
@@ -1185,7 +1189,7 @@ fn export_mesh(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The mesh formats `file.exportMesh` writes.
-pub const MESH_EXPORT_FORMATS: [&str; 5] = ["obj", "glb", "usda", "usdc", "usdz"];
+pub const MESH_EXPORT_FORMATS: [&str; 6] = ["obj", "glb", "gltf", "usda", "usdc", "usdz"];
 
 /// A mesh export: the mesh file's path (with its extension) and bytes, and (obj, usda, usdc) the
 /// files it references (textures, an OBJ's MTL), by file name, to write next to it.
@@ -1203,16 +1207,25 @@ impl MeshExport {
 }
 
 impl Session {
-    /// The working mesh as a file for `path`, in `format` (obj, glb, usda, usdc, usdz; default:
-    /// from the extension, else OBJ). The extension is appended when it doesn't match.
+    /// The working mesh as a file for `path`, in `format` (obj, glb, gltf, usda, usdc, usdz;
+    /// default: from the extension, else OBJ). `.gltf` and `.glft`, and format `gltf`, write a `.glb`
+    /// by replacing that suffix; otherwise the format extension is appended when it doesn't match.
     pub fn mesh_export(&mut self, path: &str, format: Option<&str>) -> Result<MeshExport> {
         let ext = match format {
+            Some("gltf" | "glft") => "glb".to_string(),
             Some(f) if MESH_EXPORT_FORMATS.contains(&f) => f.to_string(),
             Some(other) => return Err(bad("file.exportMesh", format!("unknown mesh format `{other}` ({})", MESH_EXPORT_FORMATS.join(", ")))),
+            None if ext_of(path) == "gltf" || ext_of(path) == "glft" => "glb".to_string(),
             None if MESH_EXPORT_FORMATS.contains(&ext_of(path).as_str()) => ext_of(path),
             None => "obj".into(),
         };
-        let path = if ext_of(path) == ext { path.to_string() } else { format!("{path}.{ext}") };
+        let path = if ext_of(path) == ext {
+            path.to_string()
+        } else if (ext_of(path) == "gltf" || ext_of(path) == "glft") && ext == "glb" {
+            std::path::Path::new(path).with_extension("glb").display().to_string()
+        } else {
+            format!("{path}.{ext}")
+        };
         let (bytes, textures) = match (ext.as_str(), texturecraft_formats::UsdFormat::from_ext(&ext)) {
             ("glb", _) => (self.mesh_glb_bytes()?, Vec::new()),
             (_, Some(format)) => {
@@ -1375,7 +1388,11 @@ f 1/1 2/2 3/3
     #[test]
     fn export_mesh_writes_obj_by_default_and_textured_glb() {
         let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
-        let dir = std::env::temp_dir().join(format!("tc_export_mesh_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "tc_export_mesh_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let base = dir.join("ball").display().to_string();
         let obj = crate::execute(&mut s, "file.exportMesh", &json!({ "path": base })).unwrap();
@@ -1408,6 +1425,22 @@ f 1/1 2/2 3/3
         let reopened = Session::from_mesh_bytes("ball.glb", &bytes, 128, "ball").unwrap();
         assert_eq!(reopened.mesh.triangle_count(), s.mesh.triangle_count());
         assert_eq!(reopened.mesh.materials, s.mesh.materials);
+
+        // Refuses to overwrite an existing rewritten destination unless confirmed, and writes fresh ones.
+        assert!(crate::execute(&mut s, "file.exportMesh", &json!({ "path": dir.join("ball.gltf").display().to_string() })).is_err());
+        assert_eq!(std::fs::read(dir.join("ball.glb")).unwrap(), bytes);
+        let gltf = crate::execute(&mut s, "file.exportMesh", &json!({ "path": dir.join("ball_gltf.gltf").display().to_string() })).unwrap();
+        assert!(gltf["path"].as_str().unwrap().ends_with("ball_gltf.glb"));
+        assert!(std::fs::read(dir.join("ball_gltf.glb")).unwrap().starts_with(b"glTF"));
+        let typo = crate::execute(&mut s, "file.exportMesh", &json!({ "path": dir.join("typed.glft") })).unwrap();
+        assert_eq!(typo["path"], dir.join("typed.glb").to_string_lossy().as_ref());
+        assert!(std::fs::read(dir.join("typed.glb")).unwrap().starts_with(b"glTF"));
+        assert!(!dir.join("typed.glft.obj").exists());
+        let gltf_fmt = crate::execute(&mut s, "file.exportMesh", &json!({ "path": dir.join("ball_fmt").display().to_string(), "format": "gltf" })).unwrap();
+        assert!(gltf_fmt["path"].as_str().unwrap().ends_with("ball_fmt.glb"));
+        assert!(std::path::Path::new(gltf_fmt["path"].as_str().unwrap()).is_file());
+        let overwrite = crate::execute(&mut s, "file.exportMesh", &json!({ "path": dir.join("ball.gltf").display().to_string(), "overwrite": true })).unwrap();
+        assert!(overwrite["path"].as_str().unwrap().ends_with("ball.glb"));
         assert!(crate::execute(&mut s, "file.exportMesh", &json!({ "path": base, "format": "fbx" })).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

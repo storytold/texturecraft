@@ -326,6 +326,52 @@ fn export_mesh(app: &mut TextureCraftApp, ctx: &egui::Context) {
     app.ui.windows.export_mesh = open;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn mesh_export_filter(ext: &str) -> (&'static str, &'static [&'static str]) {
+    match ext {
+        "glb" => (tr("glTF binary with textures"), &["glb", "gltf", "glft"]),
+        "usdz" => (tr("USDZ with textures"), &["usdz"]),
+        "usda" => (tr("USD text, textures alongside"), &["usda"]),
+        "usdc" => (tr("USD binary, textures alongside"), &["usdc"]),
+        _ => (tr("Wavefront OBJ with MTL, textures alongside"), &["obj"]),
+    }
+}
+
+/// Preserve the chosen format for an extensionless name; let an explicit supported suffix take precedence
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn ask_mesh_export(app: &mut TextureCraftApp, format: Option<&'static str>) {
+    let stem = texturecraft_engine::formats::export::sanitize_file_stem(&app.session.doc.project.name);
+    let name = format!("{stem}.{}", format.unwrap_or("obj"));
+    let available = ["obj", "glb", "usdz", "usda", "usdc"];
+    let mut dialog = FileDialog::save();
+    for ext in available.into_iter().filter(|ext| format.is_none_or(|picked| picked == *ext)) {
+        let (label, extensions) = mesh_export_filter(ext);
+        dialog = dialog.filter(label, extensions);
+    }
+
+    app.ask_file(dialog.file_name(name), Bound::Project, move |app, paths| {
+        let Some(path) = paths.first() else {
+            return;
+        };
+
+        let explicit = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|ext| ext == "glft" || texturecraft_engine::file_cmds::MESH_EXPORT_FORMATS.contains(&ext.as_str()));
+        let mut params = json!({"path": path.display().to_string()});
+        if let Some(format) = format.filter(|_| !explicit) {
+            params["format"] = json!(format);
+        }
+
+        // If an extension rewrite points at a different existing file, the engine refuses and app.run shows the error
+        if let Some(result) = app.run("file.exportMesh", params) {
+            let saved_path = result["path"].as_str().unwrap_or_default();
+            app.toast(trf("Exported mesh to {path}", &[("path", &saved_path)]), false);
+        }
+    });
+}
+
 fn about(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let tk = Tokens::get(ctx);
     let mut open = app.ui.windows.about;
@@ -621,22 +667,7 @@ pub fn file_action(app: &mut TextureCraftApp, _ctx: &egui::Context, id: &str) ->
             true
         }
         "file.exportMesh" => {
-            let name = format!("{}.obj", texturecraft_engine::formats::export::sanitize_file_stem(&app.session.doc.project.name));
-            let dialog = FileDialog::save()
-                .filter(tr("Wavefront OBJ with MTL, textures alongside"), &["obj"])
-                .filter(tr("glTF binary with textures"), &["glb"])
-                .filter(tr("USDZ with textures"), &["usdz"])
-                .filter(tr("USD text, textures alongside"), &["usda"])
-                .filter(tr("USD binary, textures alongside"), &["usdc"])
-                .file_name(name);
-            app.ask_file(dialog, Bound::Project, |app, paths| {
-                if let Some(path) = paths.first()
-                    && let Some(result) = app.run("file.exportMesh", json!({"path": path.display().to_string()}))
-                {
-                    let saved_path = result["path"].as_str().unwrap_or_default();
-                    app.toast(trf("Exported mesh to {path}", &[("path", &saved_path)]), false);
-                }
-            });
+            ask_mesh_export(app, None);
             true
         }
         "file.reimportMesh" => {

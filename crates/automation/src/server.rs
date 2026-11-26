@@ -135,12 +135,15 @@ pub struct ReimportParams {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MeshExportParams {
-    /// Output file relative to the write root; the format's extension is appended if missing.
+    /// Output file relative to the write root; a .gltf/.glft suffix is replaced when exporting GLB.
     pub path: String,
     /// obj (MTL and textures written next to it), glb (textures embedded), usda, usdc (textures
     /// written next to it) or usdz (textures packaged); default: from the extension, else obj.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    /// Overwrite an existing destination even if rewritten (e.g. .gltf targeting an existing .glb).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]

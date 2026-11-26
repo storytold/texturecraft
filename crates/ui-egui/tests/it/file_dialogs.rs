@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use egui::{ViewportCommand, ViewportEvent, ViewportId};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_engine::Session;
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::file_dialogs::{Answer, Request};
@@ -363,4 +363,67 @@ fn a_save_elsewhere_does_not_answer_the_prompt() {
     assert!(!h.state().session.modified);
     assert!(!sends(&mut h, 3, &ViewportCommand::Close), "only the prompt's own Save goes on");
     assert_eq!(h.state().ui.windows.unsaved, Some(Unsaved::Quit));
+}
+
+#[test]
+fn ui_export_mesh_preserves_selected_format_and_honors_explicit_extension() {
+    let dir = temp_file("export-mesh-ui", "chosen").parent().unwrap().to_path_buf();
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut h = harness(false);
+    h.state_mut().ui.prefs.language = "en".into();
+    h.run_steps(3);
+    let press_export = |h: &Harness<'_, TextureCraftApp>| {
+        // The rail also has an Export button; the options prompt sits to its left
+        h.get_all_by_role(egui::Role::Button)
+            .filter(|button| button.accesskit_node().label().as_deref() == Some("Export"))
+            .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+            .expect("Export in the options prompt")
+            .click();
+    };
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let store = seen.clone();
+    let extensionless = dir.join("mesh");
+    answer(&mut h, move |request| {
+        *store.borrow_mut() = Some(request.clone());
+        Answer::Paths(vec![extensionless.clone()])
+    });
+
+    invoke(&mut h, "file.exportMesh");
+    h.run_steps(2);
+    assert_eq!(h.state().ui.windows.mesh_export_options, Some(h.state().session.project_id));
+    assert!(seen.borrow().is_none(), "the options prompt precedes the file chooser");
+    let file_type = h.get_by_role_and_label(egui::Role::ComboBox, "File type");
+    assert_eq!(file_type.value().as_deref(), Some("Wavefront OBJ (.obj)"));
+    file_type.click();
+    h.run_steps(2);
+    h.get_by_label("glTF binary (.glb)").click();
+    h.run_steps(2);
+    assert!(seen.borrow().is_none(), "format choice alone does not open the native picker");
+    press_export(&h);
+    h.run_steps(3);
+
+    let Some(Request::File(dialog)) = seen.borrow().clone() else { panic!("no file dialog was asked for") };
+    assert!(dialog.file_name.is_some_and(|name| name.ends_with(".glb")));
+    assert_eq!(dialog.filters.first().map(|filter| filter.extensions.clone()), Some(vec!["glb".to_string(), "gltf".to_string(), "glft".to_string()]));
+    assert!(std::fs::read(dir.join("mesh.glb")).unwrap().starts_with(b"glTF"));
+    assert!(!dir.join("mesh.obj").exists());
+
+    let explicit_obj = dir.join("custom.obj");
+    let reply_explicit = explicit_obj.clone();
+    answer(&mut h, move |_| Answer::Paths(vec![reply_explicit.clone()]));
+    invoke(&mut h, "file.exportMesh");
+    h.run_steps(2);
+    let file_type = h.get_by_role_and_label(egui::Role::ComboBox, "File type");
+    assert_eq!(file_type.value().as_deref(), Some("Wavefront OBJ (.obj)"));
+    file_type.click();
+    h.run_steps(2);
+    h.get_by_label("glTF binary (.glb)").click();
+    h.run_steps(2);
+    press_export(&h);
+    h.run_steps(3);
+
+    assert!(explicit_obj.is_file(), "explicit .obj extension takes precedence over pre-selected GLB");
+    assert!(!dir.join("custom.glb").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

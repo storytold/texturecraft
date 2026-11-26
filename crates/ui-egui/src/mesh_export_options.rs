@@ -3,6 +3,8 @@
 use egui::Ui;
 
 use crate::TextureCraftApp;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::i18n::n_;
 use crate::i18n::tr;
 use crate::theme::Tokens;
 use crate::unavailable;
@@ -22,12 +24,32 @@ const INFO_TOOLTIP_WIDTH: f32 = 250.0;
 /// Gap between the two option groups, as in the reference
 const GROUP_GAP: f32 = 25.0;
 
+/// Native export types; the default preserves the original OBJ export path
+#[cfg(not(target_arch = "wasm32"))]
+const FILE_TYPES: [(&str, &str); 5] = [
+    ("obj", n_("Wavefront OBJ (.obj)")),
+    ("glb", n_("glTF binary (.glb)")),
+    ("usdz", n_("USDZ (.usdz)")),
+    ("usda", n_("USD text (.usda)")),
+    ("usdc", n_("USD binary (.usdc)")),
+];
+
 /// The prompt, while File > Export Mesh waits on it
 pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    #[cfg(not(target_arch = "wasm32"))]
+    let format_memory = egui::Id::unique("mesh_export_format");
     if app.ui.windows.mesh_export_options != Some(app.session.project_id) {
         app.ui.windows.mesh_export_options = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        ctx.data_mut(|data| data.remove::<(u64, &'static str)>(format_memory));
         return;
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut format = ctx
+        .data(|data| data.get_temp::<(u64, &'static str)>(format_memory))
+        .filter(|(project, _)| *project == app.session.project_id)
+        .map_or(FILE_TYPES[0].0, |(_, format)| format);
 
     let mut open = true;
     let (mut export, mut cancel) = (false, false);
@@ -58,6 +80,16 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
         );
         ui.add_space(8.0);
 
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let label = FILE_TYPES.iter().find(|(candidate, _)| *candidate == format).map_or(FILE_TYPES[0].1, |(_, label)| *label);
+            egui::ComboBox::from_label(tr("File type")).selected_text(tr(label)).show_ui(ui, |ui| {
+                for (candidate, label) in FILE_TYPES {
+                    ui.selectable_value(&mut format, candidate, tr(label));
+                }
+            });
+        }
+
         // One row keeps the window to its contents; a bare right-to-left layout fills the screen height
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -68,8 +100,20 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
         });
     });
 
+    #[cfg(not(target_arch = "wasm32"))]
+    ctx.data_mut(|data| {
+        if export || cancel || !open {
+            data.remove::<(u64, &'static str)>(format_memory);
+        } else {
+            data.insert_temp(format_memory, (app.session.project_id, format));
+        }
+    });
+
     if export {
         app.ui.windows.mesh_export_options = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::windows::ask_mesh_export(app, Some(format));
+        #[cfg(target_arch = "wasm32")]
         crate::windows::file_action(app, ctx, "file.exportMesh");
     } else if cancel || !open {
         app.ui.windows.mesh_export_options = None;
