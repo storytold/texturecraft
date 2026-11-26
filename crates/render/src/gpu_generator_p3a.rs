@@ -118,13 +118,8 @@ pub(super) fn generator_operation(generator: &Generator, inputs: &mut Procedural
         _ => return None,
     };
 
-    // Inputs read through the same source as the CPU's `Texel::source` with the default sampling;
-    // an anchor or a pattern as an input stays on the CPU
+    // Inputs read through the same source as the CPU's `Texel::source` with the default sampling
     if let Some(source) = input {
-        if !matches!(source, Source::Uniform(_) | Source::Image { .. }) {
-            return None;
-        }
-
         let mut source_op = source_operation(Some(source), &Projection::default(), Sampling::default(), [0.0; 3], ChannelKind::NormalMap, inputs)?;
         bind_tile_source(&mut source_op, Some(source), patterns);
         inputs.generator_sources.push(source_op);
@@ -174,8 +169,8 @@ mod tests {
     use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
     use texturecraft_core::{
         AxisBlend, AxisLayer, BakedMap, BlendMode, Channel, DistanceParameters, Effect, EffectKind, Fill, Generator, GeneratorGrayscale, GeneratorKind,
-        GrayscaleConversionParameters, KindControls, Layer, LayerId, LayerKind, LinearGradientParameters, Mask, MaskBackground, OutputResolution, Project,
-        SectionParameters, Source, TextureSet,
+        GrayscaleConversionParameters, KindControls, Layer, LayerId, LayerKind, LinearGradientParameters, Mask, MaskBackground, OutputResolution, Procedural,
+        ProceduralKind, Project, SectionParameters, Source, TextureSet,
     };
     use texturecraft_geom::glam::Vec3;
     use texturecraft_geom::{Mesh, primitives};
@@ -223,18 +218,34 @@ mod tests {
         ])
     }
 
-    /// A white layer over a black one, masked by `generator` blended `blend` at `opacity` over a
-    /// gray background fill: the project and the masked layer
+    /// The anchor point on the layer below, recording its clouds
+    const BELOW_ANCHOR: LayerId = LayerId(950);
+
+    /// Clouds between 0.1 and 0.9
+    fn clouds() -> Source {
+        let pattern = Procedural { scale: 3.7, seed: 19, ..Procedural::new(ProceduralKind::Clouds) };
+        Source::Procedural { pattern, low: [0.1; 3], high: [0.9; 3], ramp: Vec::new() }
+    }
+
+    /// The colour [`BELOW_ANCHOR`] recorded, as an input
+    fn below_anchor() -> Source {
+        Source::Anchor { anchor: BELOW_ANCHOR, channel: Channel::BaseColor, ramp: Vec::new() }
+    }
+
+    /// A white layer over clouds with an anchor point, masked by `generator` blended `blend` at
+    /// `opacity` over a gray background fill: the project and the masked layer
     fn generator_project(generator: Generator, blend: BlendMode, opacity: f32) -> (Project, LayerId) {
         let channels = [Channel::BaseColor];
         let mut project = Project::new("P3a generators", "builtin:sphere");
         project.texture_sets.push(TextureSet::new("Set", 0, SIZE));
-        let fill = |color: f32| LayerKind::Fill(Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([color; 3]))]), ..Fill::default() });
+        let fill = |source: Source| LayerKind::Fill(Fill { sources: BTreeMap::from([(Channel::BaseColor, source)]), ..Fill::default() });
         let below = project.alloc_id();
-        assert!(project.insert_layer(0, Layer::new(below, "Below", fill(0.0), &channels), None, false).is_ok());
+        let mut below = Layer::new(below, "Below", fill(clouds()), &channels);
+        below.content_effects.push(Effect::new(BELOW_ANCHOR, EffectKind::Anchor));
+        assert!(project.insert_layer(0, below, None, false).is_ok());
 
         let owner = project.alloc_id();
-        let mut layer = Layer::new(owner, "Masked", fill(1.0), &channels);
+        let mut layer = Layer::new(owner, "Masked", fill(Source::Uniform([1.0; 3])), &channels);
         let mut mask = Mask::new(MaskBackground::Black);
         let under = EffectKind::Fill { source: Source::Uniform([0.4; 3]), projection: Default::default(), sampling: Default::default() };
         mask.effects.push(Effect::new(project.alloc_id(), under));
@@ -290,6 +301,10 @@ mod tests {
         let mut position_input = with_controls(GeneratorKind::ThreeDDistance, KindControls::Distance(distance));
         position_input.inputs.insert(BakedMap::Position, Source::image("position"));
         let hard = DistanceParameters { contrast: 1.0, ..distance };
+        let mut anchored = with_controls(GeneratorKind::ThreeDLinearGradient, KindControls::LinearGradient(gradient));
+        anchored.inputs.insert(BakedMap::Position, below_anchor());
+        let mut patterned = with_controls(GeneratorKind::ThreeDDistance, KindControls::Distance(distance));
+        patterned.inputs.insert(BakedMap::Position, clouds());
         let cases = [
             ("distance, inverted with an offset", (inverted, BlendMode::Normal, 1.0), Tolerance::POINT),
             (
@@ -299,6 +314,8 @@ mod tests {
             ),
             ("gradient at half resolution", (reduced, BlendMode::Normal, 1.0), Tolerance::NEIGHBOURHOOD),
             ("distance from a Position image", (position_input, BlendMode::Normal, 1.0), Tolerance::BILINEAR),
+            ("gradient from an anchor point", (anchored, BlendMode::Normal, 1.0), Tolerance::POINT),
+            ("distance from a pattern", (patterned, BlendMode::Normal, 1.0), Tolerance::POINT),
             (
                 "distance as a hard step",
                 (with_controls(GeneratorKind::ThreeDDistance, KindControls::Distance(hard)), BlendMode::Normal, 1.0),
@@ -337,6 +354,11 @@ mod tests {
         cases.push(("image not loaded".into(), GrayscaleConversionParameters { source: Some(Source::image("absent")), ..Default::default() }));
         cases.push(("empty slot".into(), GrayscaleConversionParameters { balance: 0.2, ..Default::default() }));
         cases.push((
+            "anchor slot".into(),
+            GrayscaleConversionParameters { source: Some(below_anchor()), grayscale: GeneratorGrayscale::Luma, ..Default::default() },
+        ));
+        cases.push(("pattern slot".into(), GrayscaleConversionParameters { source: Some(clouds()), contrast: 0.3, ..Default::default() }));
+        cases.push((
             "uniform slot".into(),
             GrayscaleConversionParameters { source: Some(Source::Uniform([0.2, 0.7, 0.4])), grayscale: GeneratorGrayscale::Max, ..Default::default() },
         ));
@@ -362,30 +384,33 @@ mod tests {
         let world_normal = BakedMaps { resolution: SIZE, maps: BTreeMap::from([(BakedMap::WorldNormal, Arc::new(stored))]) };
         let mut replaced = generator(sections[1]);
         replaced.inputs.insert(BakedMap::WorldNormal, Source::Uniform([0.3, 0.8, 0.55]));
+        let mut anchored = generator(sections[0]);
+        anchored.inputs.insert(BakedMap::WorldNormal, below_anchor());
+        let mut patterned = generator(sections[1]);
+        patterned.inputs.insert(BakedMap::WorldNormal, clouds());
         let cases = [
             ("surface normals", generator(sections[0]), BakedMaps::default()),
             ("surface normals, other blends", generator(sections[1]), BakedMaps::default()),
             ("baked World Normal", generator(sections[0]), world_normal),
             ("replaced input", replaced, BakedMaps::default()),
+            ("anchor point input", anchored, BakedMaps::default()),
+            ("pattern input", patterned, BakedMaps::default()),
         ];
         for (label, generator, baked) in cases {
             assert_generator_matches(&mut gpu, &mesh, &baked, (generator, BlendMode::Normal, 1.0), Tolerance::POINT, label);
         }
     }
 
-    /// What the CPU computes ahead of a kind's own controls, a World Space Normals section the
-    /// GPU does not adjust yet and an anchor as an input keep the generator on the CPU
+    /// What the CPU computes ahead of a kind's own controls and a World Space Normals section the
+    /// GPU does not adjust yet keep the generator on the CPU
     #[test]
     fn controls_the_gpu_does_not_evaluate_compose_on_the_cpu() {
         let distance = Generator::new(GeneratorKind::ThreeDDistance);
         let section = SectionParameters::defaults(GeneratorKind::Position);
-        let mut anchored = distance.clone();
-        anchored.inputs.insert(BakedMap::Position, Source::Anchor { anchor: LayerId(1), channel: Channel::Height, ramp: Vec::new() });
         let contrasted = SectionParameters { contrast: 0.3, ..neutral_section([AxisLayer { invert: false, blend: AxisBlend::Add, weight: 1.0 }; 3]) };
         let declined = [
             ("wear", Generator { wear: texturecraft_core::WearParameters::defaults(GeneratorKind::EdgeWear), ..distance.clone() }),
             ("section", Generator { section, ..distance.clone() }),
-            ("anchor input", anchored),
             ("section contrast", Generator { section: Some(contrasted), ..Generator::new(GeneratorKind::WorldSpaceNormals) }),
         ];
         for (label, generator) in declined {
