@@ -7,9 +7,6 @@ use texturecraft_engine::{StackTarget, ViewMode};
 use crate::TextureCraftApp;
 use crate::state::Mode;
 
-/// Height in points of the eyedropper drawn as the pointer while picking
-const EYEDROPPER_SIZE: f32 = 20.0;
-
 /// A color selection waiting for a click, and the view to return to once it comes
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IdColorPick {
@@ -37,7 +34,8 @@ impl IdColorPick {
         let Some(pick) = app.picking_id_color.take() else { return };
 
         if app.session.view == ViewMode::MeshMap(BakedMap::Id) {
-            app.run("viewport.view", view_params(pick.previous_view));
+            let image = app.session.view_image.as_deref().filter(|name| app.session.images.contains_key(*name));
+            app.run("viewport.view", view_params(pick.previous_view, image));
         }
     }
 
@@ -56,18 +54,7 @@ impl IdColorPick {
 
     /// An eyedropper in place of the pointer while it is over `rect`, its tip on the hotspot
     pub fn draw_cursor(ui: &egui::Ui, rect: egui::Rect) {
-        let Some(pointer) = ui.ctx().pointer_hover_pos().filter(|pointer| rect.contains(*pointer)) else { return };
-
-        ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-
-        // The glyph's tip is its bottom-left corner; a dark outline keeps it readable on any ID color
-        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("id_color_pick_cursor")));
-        let font = egui::FontId::proportional(EYEDROPPER_SIZE);
-        let glyph = egui_phosphor::regular::EYEDROPPER;
-        for offset in [egui::vec2(-1.0, 0.0), egui::vec2(1.0, 0.0), egui::vec2(0.0, -1.0), egui::vec2(0.0, 1.0)] {
-            painter.text(pointer + offset, egui::Align2::LEFT_BOTTOM, glyph, font.clone(), egui::Color32::from_black_alpha(220));
-        }
-        painter.text(pointer, egui::Align2::LEFT_BOTTOM, glyph, font, egui::Color32::WHITE);
+        crate::screen_pick::paint_cursor(ui.ctx(), Some(rect), None);
     }
 
     /// Ends pick mode once its effect is no longer selected or painting mode is left
@@ -80,13 +67,15 @@ impl IdColorPick {
     }
 }
 
-/// The `viewport.view` params that show `view`
-fn view_params(view: ViewMode) -> Value {
+/// The `viewport.view` params that show `view` (`image`: the resource of the "Other..." view)
+fn view_params(view: ViewMode, image: Option<&str>) -> Value {
     match view {
         ViewMode::Material => json!({"mode": "material"}),
         ViewMode::Channel(channel) => json!({"mode": channel.id()}),
         ViewMode::MeshMap(map) => json!({"mode": format!("map:{}", map.id())}),
         ViewMode::UvChecker => json!({"mode": "uvChecker"}),
+        ViewMode::NormalHeightMesh => json!({"mode": "normalHeightMesh"}),
+        ViewMode::Image => image.map_or_else(|| json!({"mode": "material"}), |name| json!({"mode": "image", "image": name})),
         ViewMode::Mask(layer) => json!({"mode": "mask", "layer": layer.0}),
     }
 }

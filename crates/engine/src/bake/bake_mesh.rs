@@ -6,6 +6,8 @@ use texturecraft_geom::{BaseColor, Mesh};
 #[derive(Clone, Debug)]
 pub struct BakeMesh {
     pub name: String,
+    /// The folder the file was read from, when it was picked from disk this session (projects don't keep it)
+    pub folder: Option<String>,
     pub bytes: Arc<Vec<u8>>,
     pub mesh: Arc<Mesh>,
     pub base_color: Vec<Option<Arc<BaseColor>>>,

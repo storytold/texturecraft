@@ -5,6 +5,7 @@ use egui_kittest::Harness;
 use serde_json::json;
 use texturecraft_engine::core::Channel;
 use texturecraft_engine::geom::glam::Vec2;
+use texturecraft_engine::{StackTarget, core::LayerId};
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::state::ViewLayout;
 
@@ -29,7 +30,10 @@ const BESIDE_LINE_IN_RADII: f32 = 3.0;
 /// The sample project with only the 2D view, at 1600 x 960
 fn uv_view_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.layout = ViewLayout::Only2D;
     harness.run_steps(4);
     harness
@@ -180,6 +184,42 @@ fn a_stroke_cancelled_with_escape_leaves_the_line_start_where_it_was() {
 }
 
 #[test]
+fn a_forced_2d_completion_moves_the_next_line_start() {
+    let mut harness = uv_view_app();
+    click(&mut harness, FIRST_CLICK, false);
+
+    harness.hover_at(CANCELLED_DRAG_FROM);
+    harness.run_steps(1);
+    harness.event(Event::PointerButton { pos: CANCELLED_DRAG_FROM, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    harness.run_steps(1);
+    harness.hover_at(CANCELLED_DRAG_TO);
+    harness.run_steps(2);
+    assert!(harness.state().session.stroke_active(), "the 2D drag is still active");
+
+    harness.state_mut().session.target = StackTarget::Effect(LayerId(u64::MAX));
+    harness.run_steps(1);
+    assert!(!harness.state().session.stroke_active(), "the unavailable tool finishes the drag");
+    harness.state_mut().session.target = StackTarget::Content;
+    harness.event(Event::PointerButton { pos: CANCELLED_DRAG_TO, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    harness.run_steps(2);
+
+    let (before_line, width) = alpha(&harness);
+    click(&mut harness, SECOND_CLICK, true);
+    let (after_line, _) = alpha(&harness);
+    let line = added(&before_line, &after_line);
+
+    let dab_centre = |point| {
+        let mut reference = uv_view_app();
+        let (blank, width) = alpha(&reference);
+        click(&mut reference, point, false);
+        let (painted, _) = alpha(&reference);
+        centre(&added(&blank, &painted), width)
+    };
+    let expected_middle = (dab_centre(CANCELLED_DRAG_TO) + dab_centre(SECOND_CLICK)) * 0.5;
+    assert!(painted_at(&line, width, expected_middle), "Shift+click starts at the forced completion endpoint");
+}
+
+#[test]
 fn a_new_project_does_not_reuse_the_previous_projects_line_start() {
     let mut harness = uv_view_app();
     click(&mut harness, FIRST_CLICK, false);
@@ -212,11 +252,16 @@ fn shift_line_snapshots() {
     let output_dir = std::path::PathBuf::from(std::env::var_os("TC_UI_SNAPSHOTS").expect("set TC_UI_SNAPSHOTS to the output directory"));
     std::fs::create_dir_all(&output_dir).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|context| {
-        let adapter = &context.wgpu_render_state.as_ref().expect("wgpu render state").adapter;
-        eprintln!("Shift-line snapshot adapter: {:?}", adapter.get_info());
-        TextureCraftApp::new(context, session)
-    });
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| {
+            let adapter = &context.wgpu_render_state.as_ref().expect("wgpu render state").adapter;
+            eprintln!("Shift-line snapshot adapter: {:?}", adapter.get_info());
+            TextureCraftApp::new(context, session)
+        });
     harness.state_mut().ui.layout = ViewLayout::Only2D;
     harness.run_steps(4);
     click(&mut harness, FIRST_CLICK, false);

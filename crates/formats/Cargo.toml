@@ -9,15 +9,24 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+craft-usd.workspace = true
+# ICC v2 serialization prerequisite: craft-libs#1735; app colour policy stays local.
+craft-cms-icc-v2 = { package = "craft-cms", version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "8fa4db64a9bb943520259ea95331a303ba788f21" }
+craft-materialx = { workspace = true }
+craft-mesh = { workspace = true }
+craft-mcmat = { workspace = true }
+craft-tcraft = { workspace = true }
+craft-zip = { workspace = true }
 texturecraft-core = { workspace = true }
 texturecraft-texel = { workspace = true }
 texturecraft-geom = { workspace = true }
 texturecraft-compose = { workspace = true }
 image = { workspace = true }
-gltf = { workspace = true }
-tobj = { workspace = true }
+png = "0.18"
+bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
+craft-image-codecs = { workspace = true }
+craft-psd = { git = "https://github.com/storytold/craft-libs", rev = "8fa4db64a9bb943520259ea95331a303ba788f21" }
 flate2 = { workspace = true }
-lz4_flex = { workspace = true }
 half = { workspace = true }
 quick-xml = { workspace = true }
 zip = { workspace = true }
@@ -27,3 +36,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }
 base64 = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cap-std = { workspace = true }
+sysinfo = { workspace = true }
+
+[dev-dependencies]
+gltf = { workspace = true }

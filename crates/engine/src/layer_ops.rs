@@ -62,50 +62,85 @@ pub(crate) fn copy_tree(src: &Document, id: LayerId, s: &mut Document, ts: usize
     if depth > texturecraft_core::project::MAX_DEPTH {
         return Err(EngineError::Other("layer groups nested too deeply".into()));
     }
+
     let size = s.project.texture_set(ts)?.size();
     let channels = s.project.texture_set(ts)?.channel_list();
-    let layer = src.project.layer(id)?.clone();
+    let layer = src.project.layer(id)?;
     let new = s.project.alloc_id();
     let mut copy = layer.clone();
     copy.id = new;
-    // Channels the target set doesn't have are dropped; ones it has but the source didn't
-    // stay disabled.
-    copy.channels.retain(|c, _| channels.contains(c));
-    for e in copy.mask.iter_mut().flat_map(|m| m.effects.iter_mut()).chain(copy.content_effects.iter_mut()) {
-        let old = e.id;
-        e.id = s.project.alloc_id();
-        if let Some(img) = src.pixels.masks.get(&old) {
-            s.pixels.masks.insert(e.id, fit(img, size, &[0, 0]));
+
+    // Channels absent from the target set stay disabled
+    copy.channels.retain(|channel, _| channels.contains(channel));
+    for effect in copy.mask.iter_mut().flat_map(|mask| &mut mask.effects).chain(&mut copy.content_effects) {
+        let old = effect.id;
+        effect.id = s.project.alloc_id();
+        if let Some(image) = src.pixels.masks.get(&old) {
+            s.pixels.masks.insert(effect.id, fit(image, size, &[0, 0]));
         }
-        // Content paint effects keep per-channel pixels.
-        for c in channels.iter().copied() {
-            if let Some(img) = src.pixels.layer(old, c) {
-                s.pixels.layers.insert((e.id, c), fit(img, size, &empty_texel(c)));
+
+        for &channel in &channels {
+            if let Some(image) = src.pixels.layer(old, channel) {
+                s.pixels.layers.insert((effect.id, channel), fit(image, size, &empty_texel(channel)));
             }
         }
     }
-    let children = layer.children().to_vec();
-    if let LayerKind::Group { children: c, .. } = &mut copy.kind {
-        c.clear();
+
+    if let LayerKind::Group { children, .. } = &mut copy.kind {
+        children.clear();
     }
-    for c in Channel::ALL {
-        if let Some(img) = src.pixels.layer(id, c)
-            && channels.contains(&c)
-        {
-            s.pixels.layers.insert((new, c), fit(img, size, &empty_texel(c)));
+
+    for &channel in &channels {
+        if let Some(image) = src.pixels.layer(id, channel) {
+            s.pixels.layers.insert((new, channel), fit(image, size, &empty_texel(channel)));
         }
     }
+
     s.project.insert_layer(ts, copy, above, inside)?;
-    let mut below = None;
-    for c in children {
-        // Children keep their bottom → top order inside the new group.
-        let placed = match below {
-            None => copy_tree(src, c, s, ts, Some(new), true, depth + 1)?,
-            Some(b) => copy_tree(src, c, s, ts, Some(b), false, depth + 1)?,
-        };
-        below = Some(placed);
+    let mut previous = None;
+    for &child in layer.children() {
+        let placed = copy_tree(src, child, s, ts, previous.or(Some(new)), previous.is_none(), depth + 1)?;
+        previous = Some(placed);
     }
+
+    if matches!(&layer.kind, LayerKind::Group { randomized, .. } if !randomized.is_empty()) {
+        remap_seed_records(&src.project, &mut s.project, id, new)?;
+    }
+
     Ok(new)
+}
+
+/// Retarget saved seed resets to the layers and effects of the new folder.
+fn remap_seed_records(source: &texturecraft_core::Project, destination: &mut texturecraft_core::Project, original: LayerId, copy: LayerId) -> Result<()> {
+    let mut pairs = vec![(original, copy)];
+    let mut ids = std::collections::HashMap::new();
+    while let Some((original, copy)) = pairs.pop() {
+        let old = source.layer(original)?;
+        let new = destination.layer(copy)?;
+        ids.insert(original, copy);
+        pairs.extend(old.children().iter().copied().zip(new.children().iter().copied()));
+
+        fn effect_ids(layer: &texturecraft_core::Layer) -> impl Iterator<Item = LayerId> {
+            layer.content_effects.iter().chain(layer.mask.iter().flat_map(|mask| &mask.effects)).map(|effect| effect.id)
+        }
+
+        ids.extend(effect_ids(old).zip(effect_ids(new)));
+    }
+
+    if let LayerKind::Group { randomized, .. } = &mut destination.layer_mut(copy)?.kind {
+        randomized.retain_mut(|record| {
+            let Some(layer) = ids.get(&record.layer) else { return false };
+            record.layer = *layer;
+            if let Some((source, _)) = &mut record.target {
+                let Some(target) = ids.get(source) else { return false };
+                *source = *target;
+            }
+
+            true
+        });
+    }
+
+    Ok(())
 }
 
 fn copy(s: &mut Session, p: &Value) -> Result<Value> {
@@ -128,7 +163,7 @@ fn paste(s: &mut Session, _: &Value) -> Result<Value> {
         let sel = s.selected_layer();
         let inside = sel.and_then(|l| s.doc.project.layer(l).ok()).is_some_and(|l| l.is_group());
         let new = copy_tree(&src, id, &mut s.doc, ts, sel, inside, 0)?;
-        s.selected.insert(ts, new);
+        s.select_one(ts, new);
         s.target = StackTarget::Content;
         Ok(new)
     })?;
@@ -147,8 +182,8 @@ fn to_all_sets(s: &mut Session, p: &Value) -> Result<Value> {
             let new = if copy {
                 copy_tree(&src, id, &mut s.doc, ts, None, false, 0)?
             } else {
-                // On top of the set: clear its selection first.
-                s.selected.remove(&ts);
+                // On top of the set: clear its selection first
+                s.select_none(ts);
                 crate::instance_cmds::make_instance(s, id, ts)?
             };
             made.push(new.0);
