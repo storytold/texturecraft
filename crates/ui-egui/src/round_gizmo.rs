@@ -10,7 +10,7 @@ use texturecraft_engine::layer_cmds::signed_scale;
 use crate::TextureCraftApp;
 use crate::frame_gizmo::{
     ARROW, EDGE_ON_FACING, HANDLE_EDGE, MIN_HANDLE_REACH, MIN_SCREEN_SPAN, TURN_RING, arrow_distance, center_distance, dashed_outline, distance_to_segment,
-    handle_dot, move_handles, nearest, ring_open,
+    foreshortened_arrow, handle_dot, move_handles, nearest, ring_open, screen_plane_scale,
 };
 use crate::move_on_model::MoveOnModel;
 use crate::projection_gizmo::{Gizmo, dragging};
@@ -141,8 +141,9 @@ impl RoundGizmo {
         let center = self.center;
         let directions = self.directions();
         let reach = self.radius * STEP_PROBE_RADII;
+        let plane_scale = screen_plane_scale(app, rect, origin, center, reach);
         self.steps = directions.map(|direction| Some((project(app, rect, origin + direction * reach)? - center) / reach));
-        self.arrows = self.steps.map(|step| step.filter(|step| step.length() * reach > MIN_SCREEN_SPAN).map(|step| center + step.normalized() * ARROW));
+        self.arrows = self.steps.map(|step| foreshortened_arrow(center, step, reach, plane_scale, ARROW));
 
         let right = app.session.camera.forward().cross(Vec3::Y).try_normalize().unwrap_or(Vec3::X);
         let pixels = (project(app, rect, origin + right * reach)? - center).length() / reach;
@@ -1040,5 +1041,25 @@ pub(crate) mod tests {
         drag(&mut harness, dot, end_on.center + (dot - end_on.center) * 1.5, Modifiers::NONE);
         let (projector, _) = projector_and_offset(&projection(&harness, layer));
         assert!(projector.scale[0] > 1.2 && projector.scale[1] > 1.2 && projector.scale[2] == 1.0, "it scales across only: {:?}", projector.scale);
+    }
+
+    #[test]
+    fn projector_arrows_foreshorten_toward_the_camera() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut harness, _) = fill_app("spherical");
+        harness.state_mut().session.camera.yaw = 0.0;
+        harness.state_mut().session.camera.pitch = 0.0;
+        harness.run_steps(2);
+        let head_on = gizmo(&harness);
+
+        assert!(head_on.arrows[2].is_none(), "head-on Z arrow stays hidden: {:?}", head_on.arrows);
+        assert!(head_on.arrows[0].unwrap().distance(head_on.center) > ARROW * 0.9);
+
+        harness.state_mut().session.camera.yaw = 0.25;
+        harness.run_steps(2);
+        let tilted = gizmo(&harness);
+        let z_len = tilted.arrows[2].expect("tilted Z arrow shows").distance(tilted.center);
+        let y_len = tilted.arrows[1].unwrap().distance(tilted.center);
+        assert!(z_len < y_len * 0.4, "tilted arrow {z_len} should be shorter than in-plane {y_len}");
     }
 }
