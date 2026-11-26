@@ -338,7 +338,7 @@ pub(crate) fn ask_mesh_export(app: &mut TextureCraftApp, format: Option<&'static
         // If an extension rewrite points at a different existing file, the engine refuses and app.run shows the error
         if let Some(result) = app.run("file.exportMesh", params) {
             let saved_path = result["path"].as_str().unwrap_or_default();
-            app.toast(trf("Exported mesh to {path}", &[("path", saved_path)]), false);
+            app.toast(trf("Exported mesh to {path}", &[("path", &saved_path)]), false);
         }
     });
 }

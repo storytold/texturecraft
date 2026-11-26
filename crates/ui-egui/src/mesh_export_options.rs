@@ -37,7 +37,7 @@ const FILE_TYPES: [(&str, &str); 5] = [
 /// The prompt, while File > Export Mesh waits on it
 pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     #[cfg(not(target_arch = "wasm32"))]
-    let format_memory = egui::Id::new("mesh_export_format");
+    let format_memory = egui::Id::unique("mesh_export_format");
     if app.ui.windows.mesh_export_options != Some(app.session.project_id) {
         app.ui.windows.mesh_export_options = None;
         #[cfg(not(target_arch = "wasm32"))]
