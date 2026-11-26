@@ -2126,15 +2126,17 @@ pub(crate) mod tests {
             execute(&mut session, "mask.smart.apply", &json!({"name": mask.id, "layer": layer.0})).unwrap();
             check_mask(&mut session, mask.id, true);
         }
-        // A default generator on the earlier model (ThinAreas) composes on the GPU; the others start
-        // on the reference app's controls, which compose on the CPU
+        // A default generator on the earlier model (ThinAreas) composes on the GPU, as do the kinds
+        // P3a ports; the others start on the reference app's controls, which compose on the CPU
+        let p3a = [GeneratorKind::ThreeDDistance, GeneratorKind::ThreeDLinearGradient, GeneratorKind::GrayscaleConversion, GeneratorKind::WorldSpaceNormals];
         for generator in GeneratorKind::ALL {
             execute(&mut session, "mask.remove", &json!({"layer": layer.0})).unwrap();
             execute(&mut session, "mask.add.black", &json!({"layer": layer.0})).unwrap();
             let name = format!("{generator:?}");
             execute(&mut session, "effect.add.generator", &json!({"target": "mask", "layer": layer.0, "generator": name})).unwrap();
             let effects = &session.doc.project.layer(layer).unwrap().mask.as_ref().unwrap().effects;
-            let on_gpu = matches!(&effects.last().unwrap().kind, texturecraft_engine::core::EffectKind::Generator(added) if added.on_earlier_model());
+            let on_gpu = matches!(&effects.last().unwrap().kind, texturecraft_engine::core::EffectKind::Generator(added) if added.on_earlier_model())
+                || p3a.contains(&generator);
             check_mask(&mut session, &name, on_gpu);
         }
 

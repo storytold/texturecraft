@@ -50,6 +50,9 @@ mod point;
 mod stack;
 #[path = "gpu_composite_udim.rs"]
 mod udim;
+// GPU generators P3a: the kinds that read per-texel inputs alone
+#[path = "gpu_generator_p3a.rs"]
+mod generator_p3a;
 use groups::{BEGIN_GROUP, END_GROUP, GroupPlan, StackWork};
 use pipelines::CompositePipelines;
 
@@ -1644,6 +1647,8 @@ impl CompositeProgram {
             self.surface = Some((mesh.clone(), gbuf.clone()));
         }
         self.geometry.resolve(mesh);
+        // P3a: the mesh's bounds the 3D generators scale their position by
+        generator_p3a::bind_bounds(&mut self.operations, mesh);
         // Texels no triangle covers keep the channels' defaults, as the CPU leaves them
         let partly_covered = gbuf.tri.contains(&NO_TRI);
         if self.mask_preview || ((partly_covered || !self.filters.stages.is_empty() || !self.geometry.parts.is_empty()) && self.coverage.is_none()) {
@@ -2543,6 +2548,11 @@ fn source_operation(
 }
 
 fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
+    // P3a: 3D Distance, 3D Linear Gradient, Grayscale Conversion and World Space Normals
+    if generator_p3a::ports(generator.kind) {
+        return generator_p3a::generator_operation(generator, inputs, patterns);
+    }
+
     // The GPU has the earlier model alone: the wear, section, light and kind controls, a texture,
     // a grunge, Micro Details and the kinds without an earlier model compose on the CPU
     if !generator.on_earlier_model()
@@ -4731,7 +4741,8 @@ mod procedural_tests {
     }
 
     /// A generator on the earlier model composes on the GPU; one with the reference app's controls
-    /// (a new generator's), a kind without an earlier model or Micro Details composes on the CPU
+    /// (a new generator's), a kind without an earlier model or Micro Details composes on the CPU,
+    /// except the kinds P3a ports
     #[test]
     fn generators_beyond_the_earlier_model_compose_on_the_cpu() {
         use texturecraft_core::MicroDetails;
@@ -4742,6 +4753,9 @@ mod procedural_tests {
         assert!(gpu(&earlier));
         assert!(!gpu(&Generator::new(GeneratorKind::Dirt)), "the reference app's controls");
         assert!(!gpu(&oracle::earlier_generator(GeneratorKind::UvChecker)), "no earlier model");
+        for kind in [GeneratorKind::ThreeDDistance, GeneratorKind::ThreeDLinearGradient, GeneratorKind::GrayscaleConversion, GeneratorKind::WorldSpaceNormals] {
+            assert!(gpu(&Generator::new(kind)), "{kind:?} (P3a)");
+        }
         let micro = MicroDetails { enabled: true, ..MicroDetails::defaults(GeneratorKind::Curvature).unwrap() };
         let curvature = Generator { micro: Some(Box::new(micro)), ..oracle::earlier_generator(GeneratorKind::Curvature) };
         assert!(!gpu(&curvature), "Micro Details");
