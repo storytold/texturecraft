@@ -15,7 +15,10 @@ use texturecraft_core::{
 };
 use texturecraft_geom::Mesh;
 
-use super::{NeighbourhoodFilter, Operation, ProceduralInputs, TilePatterns, bind_tile_source, source_operation};
+use super::{FIRST_GENERATOR, NeighbourhoodFilter, Operation, ProceduralInputs, TilePatterns, bind_tile_source, source_operation};
+
+/// The opcode of the last kind with an earlier model; opcodes from FIRST_GENERATOR to it carry the controls
+const LAST_CONTROLS_OPCODE: u32 = FIRST_GENERATOR + 6;
 
 const WEAR: u32 = 1;
 const SECTION: u32 = 2;
@@ -136,13 +139,8 @@ fn stage(generator: &Generator, resolution: u32, inputs: &ProceduralInputs) -> O
     Some((late, blur, cell))
 }
 
-/// A replaced input the generator reads: the source, how the CPU reads it, and its role
-struct Input<'a> {
-    source: &'a Source,
-    sampling: Sampling,
-    channel: ChannelKind,
-    role: usize,
-}
+/// A replaced input the generator reads: the source, how the CPU reads it (sampling and channel kind), and its role
+type Input<'a> = (&'a Source, Sampling, ChannelKind, usize);
 
 /// The generator's replacement for `map`, read as the CPU reads it in `role`
 fn input(generator: &Generator, map: BakedMap, role: usize) -> Option<Input<'_>> {
@@ -152,7 +150,7 @@ fn input(generator: &Generator, map: BakedMap, role: usize) -> Option<Input<'_>>
         BakedMap::Curvature | BakedMap::AmbientOcclusion | BakedMap::Thickness => (Sampling::SAVED_BEFORE, ChannelKind::Scalar),
         _ => (Sampling::default(), ChannelKind::NormalMap),
     };
-    Some(Input { source, sampling, channel, role })
+    Some((source, sampling, channel, role))
 }
 
 /// Each input's source operation in a row of generator sources: the first's index plus one and the count
@@ -162,9 +160,9 @@ fn push_sources(sources: &[Input], inputs: &mut ProceduralInputs, patterns: &mut
     }
 
     let first = inputs.generator_sources.len() as u32 + 1;
-    for input in sources {
-        let mut op = source_operation(Some(input.source), &Projection::default(), input.sampling, [0.0; 3], input.channel, inputs)?;
-        bind_tile_source(&mut op, Some(input.source), patterns);
+    for &(source, sampling, channel, _) in sources {
+        let mut op = source_operation(Some(source), &Projection::default(), sampling, [0.0; 3], channel, inputs)?;
+        bind_tile_source(&mut op, Some(source), patterns);
         inputs.generator_sources.push(op);
     }
     Some((first, sources.len() as u32))
@@ -172,7 +170,7 @@ fn push_sources(sources: &[Input], inputs: &mut ProceduralInputs, patterns: &mut
 
 fn role_word<'a>(words: &mut [u32], sources: &mut Vec<Input<'a>>, input: Option<Input<'a>>) {
     if let Some(input) = input {
-        words[ROLES_WORD + input.role] = sources.len() as u32 + 1;
+        words[ROLES_WORD + input.3] = sources.len() as u32 + 1;
         sources.push(input);
     }
 }
@@ -315,7 +313,7 @@ pub(super) fn set_bounds(operations: &[Operation], ramp_words: &mut [u32], mesh:
     let center = (low + high) * 0.5;
     let radius = ((high - low).length() * 0.5).max(MIN_MESH_RADIUS);
     let bounds = [low.x, low.y, low.z, high.x, high.y, high.z, center.x, center.y, center.z, radius].map(f32::to_bits);
-    for op in operations.iter().filter(|op| (40..=46).contains(&op.ids[1]) && op.ext[0] != 0) {
+    for op in operations.iter().filter(|op| (FIRST_GENERATOR..=LAST_CONTROLS_OPCODE).contains(&op.ids[1]) && op.ext[0] != 0) {
         let Some(table) = (op.ext[0] as usize).checked_sub(super::LOOKUP_WORDS as usize) else { continue };
         let Some(&bounds_word) = ramp_words.get(table + BOUNDS_WORD) else { continue };
         if bounds_word == 0 {
@@ -439,6 +437,7 @@ mod tests {
                 wear(GeneratorKind::FiberGlassEdgeWear, |wear| (wear.ao_masking, wear.curvature_weight, wear.level) = (0.7, 1.0, 0.9)),
                 Tolerance::POINT,
             ),
+            ("Dirt", wear(GeneratorKind::Dirt, |wear| wear.level = 0.6), Tolerance::POINT),
             ("Dirt with replaced inputs and cells", replaced, Tolerance::NEIGHBOURHOOD),
         ];
 
