@@ -63,9 +63,8 @@ when it is not docked). Each opens a popup beside the bar with its title in capi
 button that turns it into a floating window, and *Close*. A floating rail panel has a *Dock* button
 that closes it back onto the bar; the float is saved with the UI state.
 
-- **Export:** SEND TO lists three targets and a Configure button, all greyed with "Not available
-  yet". The reference names other products there; TextureCraft says *Export to image editor*,
-  *Send to compositing app* and *Send to 3D staging app*. EXPORT has *Export Mesh...* (the
+- **Export:** the dock shows EXPORT only (the reference's SEND TO part has no counterpart here and
+  is left out, [#789](https://github.com/storytold/texturecraft/issues/789)). EXPORT has *Export Mesh...* (the
   *Mesh Export Options* prompt, then the file choice) and *Export Textures...* (the Export textures
   window: *Global settings* above the texture sets, *General Export Parameters*, *Export USD asset*
   (off by default; it adds `usdAsset` to the last texture set's export, which writes `<mesh>.usd`
@@ -292,15 +291,16 @@ that numbers hide once a tile is under 40 points on screen.
   adds "Maximum size for all Texture Sets" and 128. Padding uses the reference order; the
   dilation width is a button with a "Dilation (pixels)" slider, greyed for paddings without a
   width. Include all, Reset all, Cancel, Save settings, Export and the two greyed checkboxes carry
-  tooltips explaining which settings are applied, kept or restored.
+  tooltips saying what they select, write, keep or restore. The window is 1100 x 740 as in the reference
+  ([#789](https://github.com/storytold/texturecraft/issues/789)).
   Cancel, and closing the window, go back to the settings the window opened with; the window
   always opens on SETTINGS.
 - **Texture set pages** ([#669](https://github.com/storytold/texturecraft/issues/669)): a click
   on a texture set row shows its *General Export Parameters*: Output template, File type, Size and
   Padding with the inherited value as text (for example "1024x1024 (Texture Set size)"). The
   pencil button ("Enable override") turns a row into its list; a set with an override gets "*"
-  ("Override(s) active"). The header menu has *Override every item* and *Disable
-  override for all items*. The template list leaves out the entries the reference leaves out
+  ("Override(s) active"). The header menu has *Override every item* and *Clear all
+  overrides*. The template list leaves out the entries the reference leaves out
   there; sizes read "128x128" ... "8192x8192". Export, the footer count and LIST OF EXPORTS use
   each set's own settings. Ticks and overrides belong to the project and follow each texture set
   by name (another project starts without them); renaming a template on OUTPUT TEMPLATES takes
@@ -339,9 +339,37 @@ that numbers hide once a tile is under 40 points on screen.
   list is titled *Presets* and lists the templates sorted by name, without the template list's
   first group. A right click on a preset offers *Rename*, *Duplicate* and *Remove* (Rename and
   Remove are greyed for built-in templates, which are read-only); F2 renames the selected one.
-  "+" creates "new_export_preset", Duplicate "<name>_copy". *Naming pattern* (*OpenPBR*; the
-  reference's second pattern names another vendor's material and is left out) with its info
-  tooltip sits above the input maps. The middle reads "Current preset: <name>", *Output maps*
-  with *Create:* Gray, RGB, R+G+B, RGB+A, R+G+B+A, and a footer with drag-and-drop guidance and the number of output maps. TextureCraft keeps its
-  own list tools (rename, import, export) and asks before deleting; R+G+B and R+G+B+A create the
-  same maps as RGB and RGB+A (each channel takes its own source in either).
+  "+" creates "new_export_preset", Duplicate "<name>_copy". The *Presets* row holds copy, "−"
+  and "+" without tooltips ([#789](https://github.com/storytold/texturecraft/issues/789)).
+  *Naming pattern* (*OpenPBR*; the reference's second pattern names another vendor's material and
+  is left out) with its info tooltip sits at the right end of the tab row; this tab has no
+  *Include all*, *Reset all* or texture count, and *Save settings* and *Export* are greyed. The
+  middle reads "Current preset: <name>", *Output maps* with *Create:* Gray, RGB, R+G+B, RGB+A,
+  R+G+B+A on the same row, and a footer with drag-and-drop guidance and the number of output
+  maps. Each output map is one row: a drag grip (drag it onto another row to move the map), the
+  file name, "$" ("Insert a variable": $project,
+  $mesh, $textureSet, $udim, $uvTileName greyed, $colorSpace, then TextureCraft's $channel), the
+  channel swatches (Gr, RGB or R, G, B, then A), the file format ("File format") and bit depth
+  ("Bit depth"; "8 bits + dithering" greyed, templates do not keep it) lists, duplicate and "×".
+  Create names new rows "Gray", "RGB" and "RGBA" after "$mesh_$textureSet_", so the
+  texture sets of one export do not write the same file, with "_1", "_2" when taken. An
+  empty swatch's tooltip reads "Empty (writes black)" ("Empty (writes white)" for A, the other
+  way round when the swatch is inverted), a filled one
+  "<map>, <part>", e.g. "Base color, red channel" or "Metallic, gray value". Dropping a map on a
+  swatch asks "Which part of <map>?": a gray map offers *Gray value* and *Alpha channel*, a colour map
+  *Gray value*, *Red channel*, *Green channel*, *Blue channel* and *Alpha channel*, on the RGB swatch first *Red, green and blue*; Escape assigns
+  nothing. TextureCraft cannot read a map's gray or alpha yet, so those choices are greyed. A
+  click on a swatch offers *Clear channel*, on RGB, R, G and B also *Separate R, G and B*; R, G
+  and B that read different maps or are inverted differently cannot be joined (the item is greyed). The right side has the
+  *Input maps* pane in the OpenPBR parameter groups (Base ... Geometry, then Other for
+  TextureCraft's channels outside OpenPBR), each map TextureCraft has under its own name,
+  and a pane with *Mesh maps* above *Converted maps* (highlighted). Maps the selected template
+  uses get a square in their swatch's colour. OpenPBR inputs TextureCraft has no channel for
+  are greyed and cannot be dragged; *Converted maps* lists the maps TextureCraft computes. TextureCraft keeps
+  some things the reference does not have, out of the way: Import and Export of template files
+  at the end of a preset's right-click menu and in a *Template actions* button (three dots, left of
+  copy on the *Presets* row) that the keyboard reaches, with Import focused when it opens; a swatch's right-click menu with Invert (an inverted
+  swatch has a corner mark), Black, Gray 50%, White, the constant's value and the map's layout
+  (RGB, RGBA, Gray, Gray + A); *Move up* and *Move down* in the grip's right-click menu and the
+  arrow keys on a focused grip; the planned file name in the file name's tooltip; and
+  converted maps of its own such as Normal from height, Roughness from glossiness and Sheen color × weight. Built-in templates stay read-only and deleting asks first.

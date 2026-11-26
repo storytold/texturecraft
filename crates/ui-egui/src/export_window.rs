@@ -12,25 +12,44 @@ use crate::TextureCraftApp;
 use crate::file_dialogs::{Bound, FileDialog};
 use crate::i18n::{n_, tr, trf};
 use crate::state::{ConsoleLine, ExportSetPlan, ExportUi, FileType, MapExport, SIZE_OF_LARGEST_SET, SetExport};
-use crate::theme::{Tokens, caption};
+use crate::theme::{Tokens, caption, semibold};
 use crate::unavailable::NOT_AVAILABLE;
-use crate::widgets::{icon_button, primary_button};
+use crate::widgets::icon_button;
 
 mod inherited_settings;
 mod map_row;
 use inherited_settings::InheritedSettings;
 use map_row::MapRow;
 
-/// Initial height of the window's tab body, above its buttons
-const BODY_HEIGHT: f32 = 440.0;
-const DEFAULT_WINDOW_WIDTH_POINTS: f32 = 900.0;
-// Initial space for the tabs, separators and footer
-const WINDOW_CHROME_HEIGHT_POINTS: f32 = 80.0;
+/// The reference window's size; a smaller screen gets a smaller window
+const REFERENCE_WINDOW_SIZE_POINTS: egui::Vec2 = egui::vec2(1100.0, 740.0);
+/// Space kept free around the content on a small screen: the title bar, the frame and a gap
+const WINDOW_VIEWPORT_MARGIN_POINTS: f32 = 72.0;
 /// Width of the texture set list
-const LIST_WIDTH: f32 = 180.0;
+const LIST_WIDTH: f32 = 250.0;
 const ICON: f32 = 20.0;
+/// Width of the label column of the parameter rows, as in the reference
+const LABEL_COLUMN_WIDTH: f32 = 200.0;
 /// Width of the value column of the parameter rows
 const VALUE_WIDTH: f32 = 360.0;
+/// Width of the first File type list; the bit depth list fills the rest of the row
+const FILE_TYPE_WIDTH: f32 = 166.0;
+/// Width of the dilation button, with room for its drop-down arrow
+const DILATION_BUTTON_WIDTH: f32 = 60.0;
+/// Size of a drop-down arrow, and its distance from the button's right edge
+const CARET_SIZE: f32 = 10.0;
+const CARET_INSET: f32 = 6.0;
+/// A tab: padding around its name, the accent line on top of the open one, the name's size
+const TAB_PADDING: egui::Vec2 = egui::vec2(10.0, 6.0);
+const TAB_ACCENT_HEIGHT: f32 = 2.0;
+const TAB_TEXT_SIZE: f32 = 12.5;
+/// Height of a full-width row of the texture set list and where its text starts
+const LIST_ROW_HEIGHT: f32 = 24.0;
+const LIST_ROW_INDENT: f32 = 16.0;
+/// Width of the bottom bar's buttons, the same for all as in the reference
+const FOOTER_BUTTON_WIDTH: f32 = 126.0;
+/// Width of the keyboard focus outline on the window's drawn controls
+const FOCUS_OUTLINE_WIDTH: f32 = 2.0;
 
 /// The output sizes the Size list offers, in texels per side
 pub(crate) const SIZES: [u32; 7] = [128, 256, 512, 1024, 2048, 4096, 8192];
@@ -71,12 +90,12 @@ pub(crate) const FILE_TYPES: [(&str, Option<FileFormat>); 14] = [
 
 /// The bit depths `format` is written with, as the bit depth list offers them: (bits,
 /// dithering)
-fn depth_options(format: FileFormat) -> Vec<(u8, bool)> {
+pub(crate) fn depth_options(format: FileFormat) -> Vec<(u8, bool)> {
     format.bit_depths().iter().flat_map(|&d| if d == 8 && !format.holds_float(8) { vec![(8, false), (8, true)] } else { vec![(d, false)] }).collect()
 }
 
 /// A bit depth as listed: "8 bits", "8 bits + dithering", "16 bits", "16f bits", "32f bits"
-fn depth_label(format: Option<FileFormat>, bit_depth: u8, dithering: bool) -> String {
+pub(crate) fn depth_label(format: Option<FileFormat>, bit_depth: u8, dithering: bool) -> String {
     match (bit_depth, dithering) {
         (8, true) => tr("8 bits + dithering").to_string(),
         (16, _) if format == Some(FileFormat::Exr) => tr("16f bits").to_string(),
@@ -99,7 +118,7 @@ fn file_type_lists(ui: &mut Ui, id: (&str, usize, usize), from_template: bool, f
     let shown = if format.is_empty() { tr("Based on output template").to_string() } else { file_type_name(format) };
 
     // Tall enough for the whole list
-    let list = egui::ComboBox::from_id_salt(("type", id)).width(if from_template { 166.0 } else { 90.0 }).height(f32::INFINITY);
+    let list = egui::ComboBox::from_id_salt(("type", id)).width(if from_template { FILE_TYPE_WIDTH } else { 90.0 }).height(f32::INFINITY);
     list.selected_text(shown).show_ui(ui, |ui| {
         if from_template {
             if ui.selectable_label(format.is_empty(), tr("Based on output template")).clicked() {
@@ -125,7 +144,9 @@ fn file_type_lists(ui: &mut Ui, id: (&str, usize, usize), from_template: bool, f
     let options = parsed.map(depth_options).unwrap_or_default();
     let shown = if parsed.is_some() { depth_label(parsed, *bit_depth, *dithering) } else { String::new() };
     ui.add_enabled_ui(options.len() > 1, |ui| {
-        egui::ComboBox::from_id_salt(("bits", id)).width(if from_template { 160.0 } else { 120.0 }).selected_text(shown).show_ui(ui, |ui| {
+        // On the global page the bit depth list fills the row
+        let width = if from_template { VALUE_WIDTH - FILE_TYPE_WIDTH - ui.spacing().item_spacing.x } else { 120.0 };
+        egui::ComboBox::from_id_salt(("bits", id)).width(width).selected_text(shown).show_ui(ui, |ui| {
             for (d, dither) in options {
                 if ui.selectable_label((*bit_depth, *dithering) == (d, dither), depth_label(parsed, d, dither)).clicked() {
                     (*bit_depth, *dithering) = (d, dither);
@@ -290,7 +311,7 @@ fn start_export(app: &mut TextureCraftApp) {
     crate::web_files::export_textures(app, &jobs);
 }
 
-/// Write the next texture set of the running export, logging the steps as the reference does;
+/// Write the next texture set of the running export, logging each step;
 /// the last one finishes the export. A failed command (its error already shown) stops it.
 fn export_step(app: &mut TextureCraftApp, frame: u64) {
     let Some(job) = app.ui.export.job.as_mut() else { return };
@@ -342,6 +363,8 @@ fn export_step(app: &mut TextureCraftApp, frame: u64) {
         params["reservedNames"] = job.written.iter().chain(&job.material_udim_patterns).map(|name| json!(name)).collect();
     }
 
+    let directory = std::path::PathBuf::from(params["dir"].as_str().unwrap_or_default());
+
     // The last command writes the USD asset from the params of every command, so a canceled or failed export writes none
     if let Some(job) = app.ui.export.job.as_mut().filter(|job| job.usd_asset) {
         job.sent.push(params.clone());
@@ -361,9 +384,15 @@ fn export_step(app: &mut TextureCraftApp, frame: u64) {
         app.toast(warning.to_string(), true);
     }
 
-    let files: Vec<String> = response_strings(&response, "files")
-        .map(|file| std::path::Path::new(file).file_name().map_or_else(|| file.to_string(), |n| n.to_string_lossy().into_owned()))
-        .collect();
+    // Names relative to the output folder keep a template's folders
+    let relative = |file: &str| {
+        let path = std::path::Path::new(file);
+        match path.strip_prefix(&directory) {
+            Ok(inside) => inside.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"),
+            Err(_) => path.file_name().map_or_else(|| file.to_string(), |name| name.to_string_lossy().into_owned()),
+        }
+    };
+    let files: Vec<String> = response_strings(&response, "files").map(relative).collect();
     let mut lines = vec![set(), ConsoleLine::Step(tr("Saving texture files").into())];
     // The USD asset is no texture: it stays in the list of written files only
     for file in files.iter().filter(|file| !file.to_ascii_lowercase().ends_with(".usd")) {
@@ -520,7 +549,11 @@ fn map_rows(app: &mut TextureCraftApp, ts: usize) -> Vec<MapRow> {
         let format = f.get("format").and_then(serde_json::Value::as_str).unwrap_or("png").to_string();
         let bit_depth = f.get("bitDepth").and_then(serde_json::Value::as_u64).unwrap_or(8) as u8;
         let dithering = f.get("dithering").and_then(serde_json::Value::as_bool).unwrap_or(false);
-        let pattern = preset.as_ref().and_then(|p| p.maps.get(map)).map(|m| m.file.clone()).unwrap_or_default();
+        let pattern = preset
+            .as_ref()
+            .and_then(|p| p.maps.get(map))
+            .map(|m| m.file.replace("$channel", texturecraft_engine::formats::export::channel_label(m)))
+            .unwrap_or_default();
         rows.push(MapRow { map, pattern, inherited: FileType { format: file_type_name(&format), bit_depth, dithering } });
     }
     rows
@@ -596,6 +629,43 @@ fn selected_texture_count(app: &mut TextureCraftApp) -> usize {
     count
 }
 
+/// The keyboard focus outline of a drawn control: inside `response`'s rect, in the strong text
+/// colour, so it differs from the accent of the selected one and the fill of the hovered one
+fn paint_focus(ui: &Ui, response: &egui::Response) {
+    if response.has_focus() {
+        let stroke = egui::Stroke::new(FOCUS_OUTLINE_WIDTH, Tokens::get(ui.ctx()).text_strong);
+        ui.painter().rect_stroke(response.rect, 0.0, stroke, egui::StrokeKind::Inside);
+    }
+}
+
+/// A window tab: a box, lighter and with an accent line on top when open
+fn tab_button(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
+    let tokens = Tokens::get(ui.ctx());
+    let color = if selected { tokens.text_strong } else { tokens.text };
+    let galley = ui.painter().layout_no_wrap(label.to_string(), semibold(TAB_TEXT_SIZE), color);
+    let (rect, response) = ui.allocate_exact_size(galley.size() + 2.0 * TAB_PADDING, egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, label));
+
+    let painter = ui.painter();
+    let fill = match (selected, response.hovered()) {
+        (true, _) => tokens.panel,
+        (false, true) => tokens.row_hover,
+        (false, false) => tokens.row,
+    };
+    painter.rect(rect, 0.0, fill, egui::Stroke::new(1.0, tokens.separator), egui::StrokeKind::Inside);
+    if selected {
+        painter.rect_filled(egui::Rect::from_min_size(rect.min, vec2(rect.width(), TAB_ACCENT_HEIGHT)), 0.0, tokens.accent);
+    }
+    painter.galley(rect.min + TAB_PADDING, galley, color);
+    paint_focus(ui, &response);
+    response
+}
+
+/// A bottom bar button, as wide as the others
+fn footer_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(text).min_size(vec2(FOOTER_BUTTON_WIDTH, 0.0))
+}
+
 /// A header with a menu or tool at its right end
 fn header(ui: &mut Ui, title: &str, right: impl FnOnce(&mut Ui)) {
     ui.horizontal(|ui| {
@@ -654,11 +724,18 @@ fn dilation_button(ui: &mut Ui, padding: &str, dilation: &mut u32) {
     // The menu stays open while the slider is used
     let config = egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
     let r = ui.add_enabled_ui(enabled, |ui| {
-        egui::containers::menu::MenuButton::new(dilation.to_string()).config(config).ui(ui, |ui| {
+        let button = egui::Button::new(dilation.to_string()).min_size(vec2(DILATION_BUTTON_WIDTH, 0.0));
+        egui::containers::menu::MenuButton::from_button(button).config(config).ui(ui, |ui| {
             ui.label(tr("Dilation (pixels)"));
             ui.add(egui::Slider::new(dilation, 0..=256).step_by(1.0));
         })
     });
+
+    // The drop-down arrow is drawn apart, so the button's name stays the number
+    let tokens = Tokens::get(ui.ctx());
+    let arrow_color = if enabled { tokens.text } else { tokens.text_dim };
+    let arrow_at = r.response.rect.right_center() - vec2(CARET_INSET, 0.0);
+    ui.painter().text(arrow_at, egui::Align2::RIGHT_CENTER, ic::CARET_DOWN, egui::FontId::proportional(CARET_SIZE), arrow_color);
     if enabled {
         r.response.on_hover_text(tr("Dilation in pixels"));
     } else {
@@ -666,7 +743,7 @@ fn dilation_button(ui: &mut Ui, padding: &str, dilation: &mut u32) {
     }
 }
 
-/// A greyed reference checkbox with its tooltip and the "not available" hint
+/// A greyed checkbox with its tooltip and the "not available" hint
 fn unavailable_checkbox(ui: &mut Ui, label: &str, tooltip: &str) {
     let mut off = false;
     ui.add_enabled(false, egui::Checkbox::new(&mut off, label)).on_disabled_hover_ui(|ui| {
@@ -712,7 +789,7 @@ fn global_page(app: &mut TextureCraftApp, ui: &mut Ui, builtins: &[ExportPreset]
         crate::export_templates::select(app, defaults.preset);
     }
     let (first, rest) = template_groups(app, builtins);
-    egui::Grid::new("exp_grid").num_columns(2).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
+    egui::Grid::new("exp_grid").num_columns(2).min_col_width(LABEL_COLUMN_WIDTH).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
         // The browser downloads the files instead
         #[cfg(not(target_arch = "wasm32"))]
         output_directory(app, ui);
@@ -741,7 +818,8 @@ fn global_page(app: &mut TextureCraftApp, ui: &mut Ui, builtins: &[ExportPreset]
         ui.end_row();
         ui.label(tr("Padding"));
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("exp_pad").width(260.0).selected_text(tr(padding_label(&settings.padding))).show_ui(ui, |ui| {
+            let width = VALUE_WIDTH - DILATION_BUTTON_WIDTH - ui.spacing().item_spacing.x;
+            egui::ComboBox::from_id_salt("exp_pad").width(width).selected_text(tr(padding_label(&settings.padding))).show_ui(ui, |ui| {
                 for (value, label) in PADDINGS {
                     ui.selectable_value(&mut settings.padding, value.to_string(), tr(label));
                 }
@@ -753,11 +831,16 @@ fn global_page(app: &mut TextureCraftApp, ui: &mut Ui, builtins: &[ExportPreset]
 
     // The browser downloads the textures only, so it has no USD asset to add
     #[cfg(not(target_arch = "wasm32"))]
-    ui.checkbox(&mut app.ui.export.usd_asset, tr("Export USD asset")).on_hover_text(tr("Package the mesh, materials and textures together as USD"));
+    ui.checkbox(&mut app.ui.export.usd_asset, tr("Export USD asset"))
+        .on_hover_text(tr("Also write <mesh>.usd next to the textures: the whole mesh, with a material per texture set that reads the exported textures"));
     #[cfg(target_arch = "wasm32")]
-    unavailable_checkbox(ui, tr("Export USD asset"), tr("Package the mesh, materials and textures together as USD"));
+    unavailable_checkbox(
+        ui,
+        tr("Export USD asset"),
+        tr("Also write <mesh>.usd next to the textures: the whole mesh, with a material per texture set that reads the exported textures"),
+    );
 
-    // The browser downloads the textures only
+    // The MaterialX export sits below the USD one; the browser downloads the textures only
     #[cfg(not(target_arch = "wasm32"))]
     ui.checkbox(&mut app.ui.export.materialx, tr("Export MaterialX"));
     #[cfg(target_arch = "wasm32")]
@@ -766,7 +849,7 @@ fn global_page(app: &mut TextureCraftApp, ui: &mut Ui, builtins: &[ExportPreset]
     // Unavailable export controls stay disabled
     unavailable_checkbox(ui, tr("Export shader settings"), tr("Save the settings of each shader instance in a JSON file"));
     ui.add_space(8.0);
-    egui::Grid::new("exp_grid_more").num_columns(2).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
+    egui::Grid::new("exp_grid_more").num_columns(2).min_col_width(LABEL_COLUMN_WIDTH).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
         let settings = &mut app.ui.export;
         ui.label(tr("Normal map format"));
         let normal_label = match settings.normal_format.as_str() {
@@ -798,7 +881,7 @@ fn set_list(app: &mut TextureCraftApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| list_menu(ui, |ui| set_checks_menu(app, ui)));
     });
-    let header = ui.selectable_label(app.ui.export.page.is_none(), RichText::new(tr("Global settings")).strong());
+    let header = list_row(ui, tr("Global settings"), app.ui.export.page.is_none());
     if header.clicked() {
         app.ui.export.page = None;
     }
@@ -806,6 +889,24 @@ fn set_list(app: &mut TextureCraftApp, ui: &mut Ui) {
     // Many texture sets scroll inside the list; the footer stays in view
     let list_height = ui.available_height();
     egui::ScrollArea::vertical().id_salt("export_texture_sets").max_height(list_height.max(0.0)).show(ui, |ui| set_rows(app, ui));
+}
+
+/// A row across the whole list, its name in bold; the selected one framed
+fn list_row(ui: &mut Ui, text: &str, selected: bool) -> egui::Response {
+    let tokens = Tokens::get(ui.ctx());
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), LIST_ROW_HEIGHT), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, text));
+
+    let painter = ui.painter();
+    if selected {
+        painter.rect(rect, 0.0, tokens.row_selected, egui::Stroke::new(1.0, tokens.accent), egui::StrokeKind::Inside);
+    } else if response.hovered() {
+        painter.rect_filled(rect, 0.0, tokens.row_hover);
+    }
+    let font = semibold(egui::TextStyle::Body.resolve(ui.style()).size);
+    painter.text(rect.left_center() + vec2(LIST_ROW_INDENT, 0.0), egui::Align2::LEFT_CENTER, text, font, tokens.text_strong);
+    paint_focus(ui, &response);
+    response
 }
 
 /// A row per texture set: its export tick, its name and the override mark
@@ -830,6 +931,7 @@ fn set_rows(app: &mut TextureCraftApp, ui: &mut Ui) {
                 });
             }
         });
+        ui.separator();
     }
 }
 
@@ -909,7 +1011,7 @@ fn set_page(app: &mut TextureCraftApp, ui: &mut Ui, ts: usize, builtins: &[Expor
         });
     });
     let mut toggled = None;
-    egui::Grid::new(("exp_set_grid", ts)).num_columns(2).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
+    egui::Grid::new(("exp_set_grid", ts)).num_columns(2).min_col_width(LABEL_COLUMN_WIDTH).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
         let on = o.preset.is_some();
         if override_row(ui, tr("Output template"), on, &from.preset, |ui| {
             if let Some(p) = &mut o.preset {
@@ -980,8 +1082,19 @@ fn set_page(app: &mut TextureCraftApp, ui: &mut Ui, ts: usize, builtins: &[Expor
     }
 }
 
-/// Width of the LIST OF EXPORTS console
+/// The LIST OF EXPORTS console's and file tree's least width, as in the reference
 const CONSOLE_WIDTH: f32 = 300.0;
+const MIN_TREE_WIDTH: f32 = 300.0;
+/// Width of the strip between the file tree and the console
+const SPLITTER_WIDTH: f32 = 14.0;
+/// Padding of the CONSOLE header band, about 45 points high as in the reference
+const CONSOLE_HEADER_MARGIN_X: i8 = 12;
+const CONSOLE_HEADER_MARGIN_Y: i8 = 14;
+/// The file tree: indent of the file rows under their texture set, and the row height
+const TREE_INDENT: f32 = 35.0;
+const TREE_ROW_HEIGHT: f32 = 17.0;
+/// Half the width of the tree's chevron
+const CHEVRON_HALF_WIDTH: f32 = 4.0;
 
 /// Green of the console's success lines
 fn success(tk: &Tokens) -> egui::Color32 {
@@ -993,25 +1106,44 @@ fn success(tk: &Tokens) -> egui::Color32 {
 fn list_tab(app: &mut TextureCraftApp, ui: &mut Ui) {
     let tk = Tokens::get(ui.ctx());
     let hidden = app.ui.export.console_hidden;
-    let tree_width = ui.available_width() - if hidden { 24.0 } else { CONSOLE_WIDTH + 24.0 };
+
+    // Tree and console keep at least their reference width
+    let spacing = ui.spacing().item_spacing.x;
+    let room = ui.available_width() - SPLITTER_WIDTH - 2.0 * spacing;
+    let console_width = app.ui.export.console_width.min(room - MIN_TREE_WIDTH).max(CONSOLE_WIDTH);
+    let tree_width = if hidden { room } else { room - console_width };
     ui.vertical(|ui| {
         ui.set_width(tree_width);
         egui::ScrollArea::vertical().id_salt("exp_list").auto_shrink([false; 2]).show(ui, |ui| export_tree(app, ui, &tk));
     });
 
-    // The thin toggle at the console's left edge
-    let toggle = if hidden { ic::CARET_DOUBLE_LEFT } else { ic::CARET_DOUBLE_RIGHT };
-    let r = ui.add_sized(vec2(14.0, ui.available_height()), egui::Button::new(toggle).frame(false));
-    let r = if hidden { r } else { r.on_hover_text(tr("Hide Console")) };
-    if r.clicked() {
+    // The strip at the console's left edge: a click hides or shows the console, a drag resizes it
+    let (strip, response) = ui.allocate_exact_size(vec2(SPLITTER_WIDTH, ui.available_height()), egui::Sense::click_and_drag());
+    let tooltip = if hidden { tr("Show Console") } else { tr("Hide Console") };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tooltip));
+    let glyph = if hidden { ic::CARET_DOUBLE_LEFT } else { ic::CARET_DOUBLE_RIGHT };
+    let glyph_color = if response.hovered() { tk.text_strong } else { tk.text };
+    ui.painter().rect_filled(strip, 0.0, tk.chrome);
+    ui.painter().text(strip.center(), egui::Align2::CENTER_CENTER, glyph, egui::TextStyle::Body.resolve(ui.style()), glyph_color);
+    paint_focus(ui, &response);
+    let response = response.on_hover_text(tooltip);
+    if !hidden && (response.hovered() || response.dragged()) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    if response.dragged() && !hidden {
+        app.ui.export.console_width = (console_width - response.drag_delta().x).min(room - MIN_TREE_WIDTH).max(CONSOLE_WIDTH);
+    } else if response.clicked() {
         app.ui.export.console_hidden = !hidden;
     }
     if !hidden {
         ui.vertical(|ui| {
-            ui.set_width(CONSOLE_WIDTH);
-            ui.label(caption(&tr("Console").to_uppercase()).strong());
-            ui.separator();
-            egui::ScrollArea::vertical().id_salt("exp_console").auto_shrink([false; 2]).stick_to_bottom(true).show(ui, |ui| {
+            ui.set_width(console_width);
+            egui::Frame::new().fill(tk.row).inner_margin(egui::Margin::symmetric(CONSOLE_HEADER_MARGIN_X, CONSOLE_HEADER_MARGIN_Y)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(caption(&tr("Console").to_uppercase()).strong());
+            });
+            let console = egui::ScrollArea::vertical().id_salt("exp_console").auto_shrink([false; 2]).stick_to_bottom(true);
+            console.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show(ui, |ui| {
                 for line in &app.ui.export.console {
                     match line {
                         ConsoleLine::Step(t) => {
@@ -1038,7 +1170,7 @@ fn set_line(ui: &Ui, name: &str, tk: &Tokens) -> egui::text::LayoutJob {
     let plain = egui::TextFormat::simple(font.clone(), tk.text);
     let mut job = egui::text::LayoutJob::default();
     job.append(before, 0.0, plain.clone());
-    job.append(name, 0.0, egui::TextFormat::simple(font, tk.text_strong));
+    job.append(name, 0.0, egui::TextFormat::simple(semibold(font.size), tk.text_strong));
     job.append(after, 0.0, plain);
     job
 }
@@ -1071,9 +1203,11 @@ fn plan_set(app: &mut TextureCraftApp, index: usize, params: &serde_json::Value)
 }
 
 fn export_tree_set(ui: &mut Ui, index: usize, set: &ExportSetPlan, directory: &str, tokens: &Tokens) {
-    egui::CollapsingHeader::new(&set.name).id_salt(("exp_tree", index)).default_open(true).show(ui, |ui| match &set.files {
+    ui.spacing_mut().indent = TREE_INDENT;
+    let header = egui::CollapsingHeader::new(&set.name).id_salt(("exp_tree", index)).default_open(true).icon(chevron);
+    header.show(ui, |ui| match &set.files {
         Ok(files) => {
-            egui::Grid::new(("exp_tree_grid", index)).num_columns(4).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
+            egui::Grid::new(("exp_tree_grid", index)).num_columns(4).min_row_height(TREE_ROW_HEIGHT).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
                 for output in files.as_array().into_iter().flatten() {
                     let file = output.get("file").and_then(serde_json::Value::as_str).unwrap_or_default();
                     let format = FileFormat::from_extension(output.get("format").and_then(serde_json::Value::as_str).unwrap_or_default());
@@ -1094,6 +1228,21 @@ fn export_tree_set(ui: &mut Ui, index: usize, set: &ExportSetPlan, directory: &s
             ui.label(RichText::new(error).color(tokens.danger));
         }
     });
+}
+
+/// The tree's outline chevron: pointing down when open, right (left in right-to-left) when closed
+fn chevron(ui: &mut Ui, openness: f32, response: &egui::Response) {
+    let color = Tokens::get(ui.ctx()).text;
+    let center = response.rect.center();
+    let half = CHEVRON_HALF_WIDTH;
+    let points = if openness > 0.5 {
+        [center + vec2(-half, -half / 2.0), center + vec2(0.0, half / 2.0), center + vec2(half, -half / 2.0)]
+    } else if ui.style().right_to_left {
+        [center + vec2(half / 2.0, -half), center + vec2(-half / 2.0, 0.0), center + vec2(half / 2.0, half)]
+    } else {
+        [center + vec2(-half / 2.0, -half), center + vec2(half / 2.0, 0.0), center + vec2(-half / 2.0, half)]
+    };
+    ui.painter().add(egui::Shape::line(points.to_vec(), egui::Stroke::new(1.5, color)));
 }
 
 /// Show the output folder in the system's file manager (created first when missing)
@@ -1257,6 +1406,7 @@ fn cancel(app: &mut TextureCraftApp) {
         before.draft = None;
         before.renaming = None;
         before.ask = None;
+        before.pending_drop = None;
 
         // A template deleted since keeps the default instead
         if app.session.export_preset(&before.preset).is_none() {
@@ -1278,6 +1428,7 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
         let e = &mut app.ui.export;
         e.job = None;
         e.ask = None;
+        e.pending_drop = None;
         e.opened_with = None;
         e.tab = 0;
         e.page = None;
@@ -1292,6 +1443,11 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     }
     keep_file_type_visible(&mut app.ui.export);
     follow_texture_sets(app);
+
+    // A map waiting for its source channel belongs to the OUTPUT TEMPLATES tab
+    if app.ui.export.tab != 1 {
+        app.ui.export.pending_drop = None;
+    }
     if app.ui.export.opened_with.is_none() {
         let mut now = app.ui.export.clone();
         now.draft = None;
@@ -1302,8 +1458,14 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let mut do_export = false;
     let mut canceled = false;
     let presets = texturecraft_engine::formats::builtin_presets();
-    let dialog = crate::windows::dialog(ctx, "export_textures", tr("Export Textures"), &mut open)
-        .default_size(vec2(DEFAULT_WINDOW_WIDTH_POINTS, BODY_HEIGHT + WINDOW_CHROME_HEIGHT_POINTS));
+    // The reference size on a screen that has room for it, smaller on a smaller one; resizable from there.
+    // The window's size counts its frame and title bar, the reference size only the content
+    let style = ctx.global_style();
+    let title_height = ctx.fonts_mut(|fonts| fonts.row_height(&egui::TextStyle::Heading.resolve(&style))) + style.spacing.item_spacing.y;
+    let chrome = egui::Frame::window(&style).total_margin().sum() + vec2(0.0, title_height);
+    let window_size =
+        (REFERENCE_WINDOW_SIZE_POINTS + chrome).min(ctx.content_rect().size() - vec2(WINDOW_VIEWPORT_MARGIN_POINTS, WINDOW_VIEWPORT_MARGIN_POINTS));
+    let dialog = crate::windows::dialog(ctx, "export_textures", tr("Export Textures"), &mut open).default_size(window_size);
     dialog.show(ctx, |ui| {
         // Nothing to export without a project
         if !app.session.project_open {
@@ -1326,10 +1488,13 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
                     });
                 });
             } else {
-                let selected = selected_texture_count(app);
+                // OUTPUT TEMPLATES edits the templates only: no count, nothing to reset, save or export there
+                let templates_tab = app.ui.export.tab == 1;
+                let selected = if templates_tab { 0 } else { selected_texture_count(app) };
                 ui.horizontal(|ui| {
-                    // Not on LIST OF EXPORTS
-                    if app.ui.export.tab != 2 && ui.button(tr("Reset all")).on_hover_text(tr("Restore the export defaults and select every texture")).clicked()
+                    // Only on SETTINGS
+                    if app.ui.export.tab == 0
+                        && ui.add(footer_button(tr("Reset all"))).on_hover_text(tr("Restore the export defaults and select every texture")).clicked()
                     {
                         // Keep ownership so Cancel can restore the opening settings
                         let e = &mut app.ui.export;
@@ -1338,23 +1503,26 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Nothing to write without a ticked texture set
-                        let any = !export_selection(app).is_empty();
+                        let any = !export_selection(app).is_empty() && !templates_tab;
                         if ui
-                            .add_enabled(any, primary_button(ui, tr("Export")))
-                            .on_hover_text(tr("Write the selected textures using the settings above"))
+                            .add_enabled(any, footer_button(tr("Export")))
+                            .on_hover_text(tr("Write the selected textures, and the extra files ticked in the settings"))
                             .clicked()
                         {
                             do_export = true;
                         }
 
                         // Saving closes the window without starting an export
-                        if ui.button(tr("Save settings")).on_hover_text(tr("Keep these settings for the next export")).clicked() {
+                        let save = ui.add_enabled(!templates_tab, footer_button(tr("Save settings")));
+                        if save.on_hover_text(tr("Keep these settings for the next export and close the window")).clicked() {
                             app.ui.windows.export = false;
                         }
-                        if ui.button(tr("Cancel")).on_hover_text(tr("Restore the settings from when you opened this window")).clicked() {
+                        if ui.add(footer_button(tr("Cancel"))).on_hover_text(tr("Close the window and go back to the settings it opened with")).clicked() {
                             canceled = true;
                         }
-                        ui.label(trf("{n} textures selected for export", &[("n", &selected)]));
+                        if !templates_tab {
+                            ui.label(trf("{n} textures selected for export", &[("n", &selected)]));
+                        }
                     });
                 });
             }
@@ -1362,11 +1530,15 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
             ui.add_space(8.0);
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.horizontal(|ui| {
-                    for (i, t) in [tr("Settings"), tr("Output templates"), tr("List of exports")].iter().enumerate() {
-                        if ui.selectable_label(app.ui.export.tab == i as u8, caption(&t.to_uppercase())).clicked() {
-                            app.ui.export.tab = i as u8;
+                    // Boxed tabs side by side
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for (i, t) in [tr("Settings"), tr("Output templates"), tr("List of exports")].iter().enumerate() {
+                            if tab_button(ui, &t.to_uppercase(), app.ui.export.tab == i as u8).clicked() {
+                                app.ui.export.tab = i as u8;
+                            }
                         }
-                    }
+                    });
 
                     // The file list opens the destination folder
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1378,7 +1550,9 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
                             if ui.button(tr("Open output directory")).clicked() {
                                 open_output_directory(app);
                             }
-                        } else if ui.button(tr("Include all")).on_hover_text(tr("Select every texture set, UV tile and output map")).clicked() {
+                        } else if app.ui.export.tab == 1 {
+                            crate::export_templates::naming_pattern(ui);
+                        } else if ui.add(footer_button(tr("Include all"))).on_hover_text(tr("Select every texture set, UV tile and output map")).clicked() {
                             app.ui.export.skip.clear();
                             for o in app.ui.export.sets.values_mut() {
                                 o.maps.values_mut().for_each(|m| m.enabled = true);
@@ -1415,6 +1589,8 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
                         set_list(app, ui);
                     });
                     ui.separator();
+
+                    // A short or narrow window scrolls the settings, so the footer and every control stay reachable
                     ui.vertical(|ui| {
                         egui::ScrollArea::both().id_salt("export_settings_page").auto_shrink([false, false]).min_scrolled_height(0.0).show(ui, |ui| match app
                             .ui

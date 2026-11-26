@@ -6,7 +6,7 @@ use std::sync::Arc;
 use egui::ColorImage;
 use texturecraft_engine::compose::ImageRes;
 use texturecraft_engine::compose::ImageStore;
-use texturecraft_engine::core::ProceduralKind;
+use texturecraft_engine::core::{CurvatureMode, Generator, GeneratorKind, ProceduralKind, Source};
 use texturecraft_engine::materials;
 use texturecraft_engine::paint::BrushSettings;
 use texturecraft_engine::paint::alphas::LibraryAlpha;
@@ -28,6 +28,12 @@ pub enum ShelfPreview {
     SmartMaterial(&'static str),
     /// Smart mask rendering requires the worker's baked orb
     SmartMask(&'static str),
+    /// A mask generator at its defaults, rendered like a smart mask on the worker's baked orb
+    Generator(GeneratorKind),
+    /// A Curvature generator in `mode`, with only detail size `solo` (finest first) when given, rendered like [`ShelfPreview::Generator`]
+    Curvature { mode: CurvatureMode, solo: Option<usize> },
+    /// A generator as set, reading `images` (its image inputs by name), rendered like [`ShelfPreview::Generator`]
+    GeneratorSet { generator: Box<Generator>, images: Vec<(String, Arc<ImageRes>)> },
     /// A library filter on a sample material on a sphere
     Filter(&'static str),
     /// A procedural pattern as a grayscale swatch
@@ -45,6 +51,34 @@ pub enum ShelfPreview {
 }
 
 impl ShelfPreview {
+    /// The Curvature generator [`ShelfPreview::Curvature`] renders
+    pub fn curvature_generator(mode: CurvatureMode, solo: Option<usize>) -> Generator {
+        let mut generator = Generator::new(GeneratorKind::Curvature);
+        let mut detail = generator.detail.take().unwrap_or_default();
+        detail.mode = mode;
+        if let Some(solo) = solo {
+            detail.weights = std::array::from_fn(|size| if size == solo { 1.0 } else { 0.0 });
+        }
+        generator.detail = Some(detail);
+        generator
+    }
+
+    /// `generator` as set, with the images it reads from `store`
+    pub fn generator_set(generator: &Generator, store: &ImageStore) -> ShelfPreview {
+        // An image read in two slots goes once
+        let mut images: Vec<(String, Arc<ImageRes>)> = Vec::new();
+        for source in generator.sources() {
+            if let Source::Image { name, .. } = source
+                && let Some(image) = store.get(name)
+                && !images.iter().any(|(taken, _)| taken == name)
+            {
+                images.push((name.clone(), image.clone()));
+            }
+        }
+
+        ShelfPreview::GeneratorSet { generator: Box::new(generator.clone()), images }
+    }
+
     /// Resolve a saved brush's image alpha while the project images are available
     pub fn saved_brush(path: &std::path::Path, images: &ImageStore) -> Self {
         let settings = read_saved_brush(path);
@@ -72,6 +106,9 @@ impl ShelfPreview {
             ShelfPreview::Material(id) => format!("mat:{id}"),
             ShelfPreview::SmartMaterial(id) => format!("smart-mat:{id}"),
             ShelfPreview::SmartMask(id) => format!("mask:{id}"),
+            ShelfPreview::Generator(kind) => format!("generator:{kind:?}"),
+            ShelfPreview::Curvature { mode, solo } => format!("curvature:{mode:?}:{solo:?}"),
+            ShelfPreview::GeneratorSet { generator, images } => format!("generator-set:{:016x}", settings_hash(generator, images)),
             ShelfPreview::Filter(id) => format!("filter:{id}"),
             ShelfPreview::Procedural(kind) => format!("proc:{kind:?}"),
             ShelfPreview::Alpha(alpha) => format!("alpha:{}", alpha.id),
@@ -83,11 +120,15 @@ impl ShelfPreview {
     }
 
     /// Render a `size²` image; unknown assets return None
-    /// Smart masks and smart materials return None here because their bake belongs to the worker
+    /// Smart masks, generators and smart materials return None here because their bake belongs to the worker
     pub fn image(&self, size: usize) -> Option<ColorImage> {
         match self {
             ShelfPreview::Material(id) => Some(sphere_image(size, &preview::material(id, size)?)),
-            ShelfPreview::SmartMask(_) | ShelfPreview::SmartMaterial(_) => None,
+            ShelfPreview::SmartMask(_)
+            | ShelfPreview::Generator(_)
+            | ShelfPreview::Curvature { .. }
+            | ShelfPreview::GeneratorSet { .. }
+            | ShelfPreview::SmartMaterial(_) => None,
             ShelfPreview::Filter(id) => Some(sphere_image(size, &preview::filter(id, size)?)),
             ShelfPreview::Procedural(kind) => Some(procedural_image(*kind, size)),
             ShelfPreview::Alpha(alpha) => Some(alpha_image(alpha, size)),
@@ -134,14 +175,45 @@ pub(crate) fn read_saved_brush(_: &std::path::Path) -> Option<Arc<BrushSettings>
     None
 }
 
+/// What a generator preview depends on: its settings and which images it reads
+fn settings_hash(generator: &Generator, images: &[(String, Arc<ImageRes>)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(generator).unwrap_or_default().hash(&mut hasher);
+    for (name, image) in images {
+        name.hash(&mut hasher);
+        Arc::as_ptr(image).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
+    use texturecraft_engine::core::TextureLayer;
     use texturecraft_engine::filter_lib::FILTERS;
     use texturecraft_engine::materials::MATERIALS;
     use texturecraft_engine::paint::alphas;
     use texturecraft_engine::paint::presets::PRESETS;
 
     use super::*;
+
+    #[test]
+    fn a_generator_preview_is_keyed_by_its_settings_and_reads_an_image_once() {
+        let image = Arc::new(ImageRes::new(1, 1, vec![[0.5; 4]], false));
+        let store: ImageStore = [("grunge.png".to_owned(), image)].into();
+        let dirt = |grunge: Option<&str>, invert| Generator { grunge: grunge.map(Source::image), micro: None, invert, ..Generator::new(GeneratorKind::Dirt) };
+
+        let plain = ShelfPreview::generator_set(&dirt(None, false), &store);
+        assert_eq!(plain.key(), ShelfPreview::generator_set(&dirt(None, false), &store).key(), "the same settings share a picture");
+        assert_ne!(plain.key(), ShelfPreview::generator_set(&dirt(None, true), &store).key(), "another setting is another picture");
+        assert_ne!(plain.key(), ShelfPreview::generator_set(&dirt(Some("grunge.png"), false), &store).key(), "so is an image read");
+
+        let mut both = dirt(Some("grunge.png"), false);
+        both.texture = Some(Box::new(TextureLayer { source: Some(Source::image("grunge.png")), ..TextureLayer::default() }));
+        let ShelfPreview::GeneratorSet { images, .. } = ShelfPreview::generator_set(&both, &store) else { panic!("a generator preview") };
+        assert_eq!(images.len(), 1, "an image in two slots goes once");
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

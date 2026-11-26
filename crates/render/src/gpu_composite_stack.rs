@@ -691,9 +691,9 @@ mod tests {
     /// Fills inside folders with Scale and Rotation match the CPU: nested folders, a folder with
     /// a mask of its own (drawn as a group), a material deposit, a blur on the content and in the
     /// mask of a layer drawn under several offsets (an instance in another such folder and an
-    /// instanced folder), in the material with a partial update and in both mask previews; and
-    /// with a mask comparing the layers below with this layer, whose previews show the draw of
-    /// the requested layer on the GPU.
+    /// instanced folder), in the material with a partial update and in both mask previews. A mask
+    /// reading anchors previews the requested draw: see
+    /// `an_anchored_mask_inside_an_offset_folder_matches_the_cpu`.
     #[test]
     fn fills_inside_folders_with_scale_and_rotation_match_the_cpu() {
         let Some(mut gpu) = headless() else { return };
@@ -713,61 +713,103 @@ mod tests {
             id
         };
 
-        for reads_layers in [false, true] {
-            let mut project = Project::new("Folder offsets", "builtin:plane");
-            project.texture_sets.push(TextureSet::new("Plane", 0, TILE * 2));
-            let outer = folder(&mut project, ContentsOffset::new(2.0, 30.0), None);
-            let inner = folder(&mut project, ContentsOffset::new(1.5, -10.0), Some(outer));
-            let owner = project.alloc_id();
-            let sources = BTreeMap::from([(Channel::BaseColor, image()), (Channel::Roughness, image())]);
-            let fill = Fill { sources, projection: own.clone(), sampling: Sampling::SAVED_BEFORE, ..Default::default() };
-            let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &channels);
-            let deposit = Fill { sources: BTreeMap::from([(Channel::BaseColor, image())]), sampling: Sampling::SAVED_BEFORE, ..Default::default() };
-            let mut deposit = effect(EffectKind::Material(deposit));
-            deposit.opacity = 0.6;
-            deposit.blend = BlendMode::Multiply;
-            layer.content_effects.push(deposit);
+        let mut project = Project::new("Folder offsets", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, TILE * 2));
+        let outer = folder(&mut project, ContentsOffset::new(2.0, 30.0), None);
+        let inner = folder(&mut project, ContentsOffset::new(1.5, -10.0), Some(outer));
+        let owner = project.alloc_id();
+        let sources = BTreeMap::from([(Channel::BaseColor, image()), (Channel::Roughness, image())]);
+        let fill = Fill { sources, projection: own.clone(), sampling: Sampling::SAVED_BEFORE, ..Default::default() };
+        let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &channels);
+        let deposit = Fill { sources: BTreeMap::from([(Channel::BaseColor, image())]), sampling: Sampling::SAVED_BEFORE, ..Default::default() };
+        let mut deposit = effect(EffectKind::Material(deposit));
+        deposit.opacity = 0.6;
+        deposit.blend = BlendMode::Multiply;
+        layer.content_effects.push(deposit);
 
-            // A blur on the content and in the mask: each draw of the owner keeps its own fields
-            let blur = || effect(EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false }));
-            layer.content_effects.push(blur());
-            let mut mask = Mask::new(MaskBackground::Black);
-            mask.effects.push(effect(EffectKind::Fill { source: image(), projection: own.clone(), sampling: Sampling::SAVED_BEFORE }));
-            mask.effects.push(blur());
-            if reads_layers {
-                let layers = (CompareSource::LayersBelow, CompareSource::ThisLayer);
-                mask.effects.push(compare_effect(CompareOp::GreaterThan, layers, Channel::Roughness, 0.6, BlendMode::Multiply, 0.8));
+        // A blur on the content and in the mask: each draw of the owner keeps its own fields
+        let blur = || effect(EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false }));
+        layer.content_effects.push(blur());
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(effect(EffectKind::Fill { source: image(), projection: own.clone(), sampling: Sampling::SAVED_BEFORE }));
+        mask.effects.push(blur());
+        layer.mask = Some(mask);
+        project.insert_layer(0, layer, Some(inner), true).unwrap();
+
+        // A masked folder at part opacity draws as a group, its mask under the folders around it
+        let masked = folder(&mut project, ContentsOffset::new(0.5, 45.0), Some(outer));
+        let masked_layer = project.layer_mut(masked).unwrap();
+        masked_layer.channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Normal, opacity: 0.8 });
+        let mut group_mask = Mask::new(MaskBackground::Black);
+        group_mask.effects.push(effect(EffectKind::Fill { source: image(), projection: own.clone(), sampling: Sampling::SAVED_BEFORE }));
+        masked_layer.mask = Some(group_mask);
+        let instance = project.alloc_id();
+        project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source: owner }, &channels), Some(masked), true).unwrap();
+
+        // The inner folder instanced at the top, inside a folder of its own
+        let around = folder(&mut project, ContentsOffset::new(3.0, -60.0), None);
+        let instanced = project.alloc_id();
+        project.insert_layer(0, Layer::new(instanced, "Instanced folder", LayerKind::Instance { source: inner }, &channels), Some(around), true).unwrap();
+
+        let pixels = PixelStore::default();
+        for mask_owner in [owner, instance] {
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(mask_owner);
+            case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
+            assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("folder offsets, mask of {mask_owner:?}"));
+        }
+    }
+
+    /// A mask comparing Layers Below with This Layer on Roughness, on a layer in nested folders
+    /// with Scale and Rotation and on an instance of it in another such folder, matches the CPU in
+    /// the material and in both mask previews: each draw compares its own placed roughness with
+    /// what lies below it.
+    #[test]
+    fn layer_comparisons_in_transformed_nested_folders_match_the_cpu_for_owner_and_instance() {
+        let Some(mut gpu) = crate::headless::Headless::for_required_tests() else { return };
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let (baked, images, pixels) = (BakedMaps::default(), pattern_images(), PixelStore::default());
+        let channels = [Channel::BaseColor, Channel::Roughness];
+        let image = || Source::Image { name: "Pattern".into(), normal_format: NormalFormat::default() };
+        let folder = |project: &mut Project, offset: ContentsOffset, parent: Option<LayerId>| {
+            let id = project.alloc_id();
+            let mut group = Layer::new(id, "Folder", LayerKind::folder(), &channels);
+            if let LayerKind::Group { contents, .. } = &mut group.kind {
+                *contents = offset;
             }
-            layer.mask = Some(mask);
-            project.insert_layer(0, layer, Some(inner), true).unwrap();
+            assert!(project.insert_layer(0, group, parent, parent.is_some()).is_ok());
+            id
+        };
 
-            // A masked folder at part opacity draws as a group, its mask under the folders around it
-            let masked = folder(&mut project, ContentsOffset::new(0.5, 45.0), Some(outer));
-            let masked_layer = project.layer_mut(masked).unwrap();
-            masked_layer.channels.insert(Channel::BaseColor, ChannelBlend { mode: BlendMode::Normal, opacity: 0.8 });
-            let mut group_mask = Mask::new(MaskBackground::Black);
-            group_mask.effects.push(effect(EffectKind::Fill { source: image(), projection: own.clone(), sampling: Sampling::SAVED_BEFORE }));
-            masked_layer.mask = Some(group_mask);
-            let instance = project.alloc_id();
-            project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source: owner }, &channels), Some(masked), true).unwrap();
+        // Roughness below, then the compared layer in two nested folders, then its instance in a third
+        let mut project = Project::new("Folder comparisons", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, TILE * 2));
+        let below_projection = Projection::Uv { scale: [1.0, 2.0], rotation: -20.0, offset: [0.0, 0.2] };
+        let below_fill = Fill { sources: BTreeMap::from([(Channel::Roughness, image())]), projection: below_projection, ..Default::default() };
+        let below = Layer::new(project.alloc_id(), "Below", LayerKind::Fill(below_fill), &channels);
+        assert!(project.insert_layer(0, below, None, false).is_ok());
+        let outer = folder(&mut project, ContentsOffset::new(2.0, 30.0), None);
+        let inner = folder(&mut project, ContentsOffset::new(1.5, -10.0), Some(outer));
+        let owner = project.alloc_id();
+        let own = Projection::Uv { scale: [2.0, 1.0], rotation: 15.0, offset: [0.1, 0.0] };
+        let fill = Fill { sources: BTreeMap::from([(Channel::Roughness, image())]), projection: own, ..Default::default() };
+        let mut layer = Layer::new(owner, "Compared", LayerKind::Fill(fill), &channels);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(effect(EffectKind::Fill { source: Source::Uniform([0.6; 3]), projection: Projection::default(), sampling: Sampling::default() }));
+        let sides = (CompareSource::LayersBelow, CompareSource::ThisLayer);
+        mask.effects.push(compare_effect(CompareOp::GreaterThan, sides, Channel::Roughness, 0.6, BlendMode::Multiply, 0.8));
+        layer.mask = Some(mask);
+        assert!(project.insert_layer(0, layer, Some(inner), true).is_ok());
+        let around = folder(&mut project, ContentsOffset::new(0.5, 45.0), None);
+        let instance = project.alloc_id();
+        let instance_layer = Layer::new(instance, "Instance", LayerKind::Instance { source: owner }, &channels);
+        assert!(project.insert_layer(0, instance_layer, Some(around), true).is_ok());
 
-            // The inner folder instanced at the top, inside a folder of its own
-            let around = folder(&mut project, ContentsOffset::new(3.0, -60.0), None);
-            let instanced = project.alloc_id();
-            project.insert_layer(0, Layer::new(instanced, "Instanced folder", LayerKind::Instance { source: inner }, &channels), Some(around), true).unwrap();
+        for mask_owner in [owner, instance] {
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(mask_owner);
 
-            let pixels = PixelStore::default();
-            for mask_owner in [owner, instance] {
-                let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
-                case.mask_owner = Some(mask_owner);
-                case.region = Some(CompositeRegion { min: [61, 57], max: [75, 73] });
-                assert_matches_cpu(
-                    &mut gpu,
-                    &case,
-                    Tolerance::NEIGHBOURHOOD,
-                    &format!("folder offsets, reading layers {reads_layers}, mask of {mask_owner:?}"),
-                );
-            }
+            assert_matches_cpu(&mut gpu, &case, Tolerance::BILINEAR, &format!("layer comparison in transformed folders, mask of {mask_owner:?}"));
         }
     }
 

@@ -9,7 +9,7 @@ use texturecraft_paint::EyeDepth;
 use texturecraft_texel::TileImage;
 
 use crate::session::{Document, StackTarget};
-use crate::triangle_partition::TrianglePartition;
+use texturecraft_geom::TrianglePartition;
 
 /// A polygon fill box being dragged: the fill shows live and becomes one undo step when the drag ends
 pub(crate) struct PolygonFillDrag {

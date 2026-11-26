@@ -330,8 +330,10 @@ fn resampled_sample(layer: Operation, image: u32, pixel: vec2<u32>, empty: vec4<
         return stored_sample(layer, table, origin, window, pixel, empty);
     }
     let pos = max((vec2<f32>(pixel) + 0.5) * vec2<f32>(texels) / vec2<f32>(params.source.xy) - 0.5, vec2(0.0));
-    let base = vec2<u32>(pos);
-    let weights = fract(pos);
+    // The weights from the same floor as the texels (sample_field in neighbourhood.wgsl)
+    let cell = floor(pos);
+    let base = vec2<u32>(cell);
+    let weights = clamp(pos - cell, vec2(0.0), vec2(1.0));
     let last = texels - 1u;
     let a = stored_sample(layer, table, origin, window, min(base, last), empty);
     let b = stored_sample(layer, table, origin, window, min(base + vec2(1u, 0u), last), empty);

@@ -104,16 +104,17 @@ fn apply_picked(app: &mut TextureCraftApp, picked: Vec<(String, Vec<u8>, Pick)>)
     }
 }
 
-/// Bake mode: add high-definition meshes (or load the cage) with the native file dialog. The
-/// meshes load on a later frame, when the dialog answers.
+/// Bake mode: add high polys (they load on a worker) or load the cage with the native file dialog, once it answers
 #[cfg(not(target_arch = "wasm32"))]
 pub fn import_bake_mesh(app: &mut TextureCraftApp, _ctx: &egui::Context, cage: bool) {
     use crate::file_dialogs::{Bound, FileDialog};
     let dialog = if cage { FileDialog::open() } else { FileDialog::open_many() };
     app.ask_file(dialog.filter(tr("Meshes"), &MESH_EXTENSIONS), Bound::Project, move |app, paths| {
-        for p in paths {
-            let cmd = if cage { "bake.cage.set" } else { "bake.highPoly.add" };
-            app.run(cmd, serde_json::json!({ "path": p.display().to_string() }));
+        let mut paths = paths.iter().map(|path| path.display().to_string());
+        if !cage {
+            app.load_high_polys(paths);
+        } else if let Some(path) = paths.next() {
+            app.run("bake.cage.set", serde_json::json!({ "path": path }));
         }
     });
 }
@@ -507,8 +508,8 @@ mod tests {
             vec![("high.obj".into(), cage.clone(), Pick::HighPoly(old_project_id)), ("cage.obj".into(), cage, Pick::Cage(old_project_id))],
         );
 
-        assert!(harness.state().session.bake_meshes.high.is_empty());
-        assert!(harness.state().session.bake_meshes.cage.is_none());
+        assert!(harness.state().session.doc.bake_meshes.high.is_empty());
+        assert!(harness.state().session.doc.bake_meshes.cage.is_none());
         assert!(!harness.state().session.modified);
         assert_eq!(harness.state().toasts.iter().filter(|toast| toast.error).count(), 2);
 
@@ -521,8 +522,8 @@ mod tests {
             vec![("high.obj".into(), mesh.clone(), Pick::HighPoly(project_id)), ("cage.obj".into(), mesh, Pick::Cage(project_id))],
         );
 
-        assert_eq!(harness.state().session.bake_meshes.high.len(), 1);
-        assert!(harness.state().session.bake_meshes.cage.is_some());
+        assert_eq!(harness.state().session.doc.bake_meshes.high.len(), 1);
+        assert!(harness.state().session.doc.bake_meshes.cage.is_some());
     }
 
     #[test]

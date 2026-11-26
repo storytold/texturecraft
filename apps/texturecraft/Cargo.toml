@@ -30,7 +30,8 @@ ron = "0.12"
 # borderless (src/window_frame.rs; winsafe is MIT, User32 only).
 [target.'cfg(windows)'.dependencies]
 winit = { version = "0.30", default-features = false }
-winsafe = { version = "0.0.29", default-features = false, features = ["user"] }
+# `shell` carries SetCurrentProcessExplicitAppUserModelID, the Nightly taskbar identity (src/process_identity.rs).
+winsafe = { version = "0.0.29", default-features = false, features = ["user", "shell"] }
 # The update helper is a copy of this program (`main`).
 craft-update = { workspace = true }
 

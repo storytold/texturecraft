@@ -262,8 +262,8 @@ pub(crate) const TAB_HEIGHT: f32 = 30.0;
 
 /// Width of the bake layout's texture set and mesh map bakers column in points: the reference's scaled to our larger font
 const BAKERS_COLUMN_WIDTH: f32 = 232.0;
-/// Width of the bake layout's common and mesh map settings column, in points
-const SETTINGS_COLUMN_WIDTH: f32 = 330.0;
+/// Width of the bake layout's common and mesh map settings column, in points: both tab names fit beside the ×
+const SETTINGS_COLUMN_WIDTH: f32 = 380.0;
 /// Height of the log under the bake layout's columns, in points
 const BAKING_LOG_HEIGHT: f32 = 160.0;
 /// Share of the first bake column the texture set list takes above the mesh map bakers

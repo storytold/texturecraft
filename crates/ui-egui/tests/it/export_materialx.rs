@@ -48,6 +48,16 @@ fn mtlx_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 #[test]
+fn export_materialx_sits_directly_below_the_usd_option() {
+    let (app_harness, _dir) = harness("order");
+    let usd = app_harness.get_by_label("Export USD asset").rect().min.y;
+    let materialx = checkbox(&app_harness).rect().min.y;
+    let shaders = app_harness.get_by_label("Export shader settings").rect().min.y;
+
+    assert!(usd < materialx && materialx < shaders, "USD {usd}, MaterialX {materialx}, shaders {shaders}");
+}
+
+#[test]
 fn the_window_offers_export_materialx_off_by_default() {
     let (app_harness, _dir) = harness("offer");
 

@@ -1270,3 +1270,42 @@ fn a_folder_thumbnail_reads_compare_inputs_from_its_backdrop() {
 
     assert!(thumbnail.rgba[center] > thumbnail.rgba[center + 2], "visible red child");
 }
+
+#[test]
+fn replacing_a_generator_texture_image_invalidates_the_cached_stack() {
+    use std::sync::Arc;
+    use texturecraft_compose::{ImageRes, ImageStore};
+    use texturecraft_core::{TextureBlend, TextureLayer};
+
+    let mut fixture = fixture();
+    let hot_layer = heavy_stack(&mut fixture);
+    let texture = TextureLayer { enabled: true, source: Some(Source::image("grunge")), opacity: 1.0, blend: TextureBlend::Normal, ..TextureLayer::default() };
+    let mut mask = Mask::new(MaskBackground::Black);
+    mask.effects
+        .push(effect(&mut fixture, EffectKind::Generator(Generator { texture: Some(Box::new(texture)), ..Generator::new(GeneratorKind::AmbientOcclusion) })));
+    let textured = add(&mut fixture, 0, fill(&[(Channel::Roughness, procedural(ProceduralKind::Clouds, 0.0, 1.0))]), Some(mask));
+    let stack = &mut fixture.project.texture_sets[0].stack;
+    stack.retain(|id| *id != textured);
+    stack.insert(0, textured);
+
+    let image_with_value = |value| Arc::new(ImageRes::new(4, 4, vec![[value, value, value, 1.0]; 16], false));
+    let mut images = ImageStore::default();
+    let baked = Default::default();
+    let tiles = all_tiles(RES, RES);
+    let mut cache = BelowCache::default();
+    cache.set_hot(Some(hot_layer));
+    let mut output = Composite::new(&fixture.project.texture_sets[0].channel_list(), RES);
+
+    for (stage, value) in [("dark", 0.1), ("light", 0.9)] {
+        images.insert("grunge".into(), image_with_value(value));
+        let input = inputs(&fixture, 0, &images, &baked);
+        composite_tiles_cached(&input, &mut output, &tiles[..1], Some(&mut cache));
+        let retained = cache.len() - 1;
+        composite_tiles_cached(&input, &mut output, &tiles[1..], Some(&mut cache));
+        assert_eq!(retained, 0, "{stage}: a new texture image drops the tiles cached below the hot layer");
+
+        let mut expected = Composite::new(&fixture.project.texture_sets[0].channel_list(), RES);
+        composite_tiles(&input, &mut expected, &tiles);
+        assert!(output == expected, "{stage}");
+    }
+}

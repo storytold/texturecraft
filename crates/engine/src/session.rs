@@ -32,6 +32,8 @@ pub struct Document {
     pub bake_paint: BTreeMap<(usize, texturecraft_core::BakePaintTarget), Arc<texturecraft_bake::BakePaintMap>>,
     /// Imported image resources by name: original file bytes.
     pub resources: BTreeMap<String, Arc<Vec<u8>>>,
+    /// High-definition meshes and cage for baking (saved inside the project)
+    pub bake_meshes: crate::BakeMeshes,
 }
 
 /// A released dab keeps priority until its display upload is sent.
@@ -555,8 +557,6 @@ pub struct Session {
     pub bvh: Arc<Bvh>,
     /// Original mesh file (saved inside the project); None for built-in meshes.
     pub mesh_source: Option<(String, Vec<u8>)>,
-    /// High-definition meshes and cage for baking (saved inside the project).
-    pub bake_meshes: crate::BakeMeshes,
     pub caches: Vec<SetCache>,
     pub(crate) undo: Vec<(String, Document)>,
     pub(crate) redo: Vec<(String, Document)>,
@@ -658,7 +658,6 @@ impl Session {
             mesh,
             bvh: Arc::new(bvh),
             mesh_source,
-            bake_meshes: Default::default(),
             caches,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -740,8 +739,7 @@ impl Session {
         Session::new_project_tiled(name, mesh, mesh_ref, mesh_source, resolution, None)
     }
 
-    /// [`Session::new_project`] choosing the UV tile (UDIM) mode: `Some(true)` for every
-    /// set, `Some(false)` for none, `None` for the sets whose UVs leave tile 1001.
+    /// [`Session::new_project`] choosing the UV tile (UDIM) mode: `Some(true)` every set, `Some(false)` none, `None` the sets whose UVs leave tile 1001
     pub fn new_project_tiled(
         name: &str,
         mesh: Mesh,
@@ -764,8 +762,10 @@ impl Session {
             ts.stack.push(id);
             project.texture_sets.push(ts);
         }
+
         let mut s = Session::new(
             Document {
+                bake_meshes: Default::default(),
                 bake_paint: BTreeMap::new(),
                 project,
                 pixels: PixelStore::default(),
@@ -776,6 +776,7 @@ impl Session {
             mesh,
             mesh_source,
         )?;
+
         s.log.append(log);
         Ok(s)
     }

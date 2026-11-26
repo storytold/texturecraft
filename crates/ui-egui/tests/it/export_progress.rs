@@ -139,14 +139,13 @@ fn the_list_is_a_tree_per_texture_set_with_the_console_beside_it() {
     h.run_steps(30);
     assert!(h.query_by_label(&dir.join(&file).display().to_string()).is_some());
 
-    // The console's toggle hides it
-    let toggle = h.get_by_label(egui_phosphor::regular::CARET_DOUBLE_RIGHT).rect().center();
-    h.hover_at(toggle);
-    h.run_steps(30);
-    assert!(h.query_by_label("Hide Console").is_some());
-    click(&mut h, egui_phosphor::regular::CARET_DOUBLE_RIGHT);
-    h.run_steps(2);
+    // The strip at the console's edge hides it, then shows it again
+    h.get_by_role_and_label(egui::Role::Button, "Hide Console").click();
+    h.run_steps(4);
     assert!(h.state().ui.export.console_hidden && h.query_by_label("CONSOLE").is_none());
+    h.get_by_role_and_label(egui::Role::Button, "Show Console").click();
+    h.run_steps(4);
+    assert!(!h.state().ui.export.console_hidden);
 }
 
 #[test]

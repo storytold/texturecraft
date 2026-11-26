@@ -159,7 +159,8 @@ impl PropertySheet<'_> {
     pub(super) fn dropdown_button_led(&mut self, rect: Rect, value: &str, lead: impl FnOnce(&Painter) -> f32) -> Response {
         let id = self.next_id();
         let response = self.ui.interact(rect, id, Sense::click());
-        response.widget_info(|| WidgetInfo::labeled(Role::ComboBox, true, value));
+        let enabled = self.ui.is_enabled();
+        response.widget_info(|| WidgetInfo::labeled(Role::ComboBox, enabled, value));
         let tokens = self.tokens;
         let painter = self.ui.painter();
         painter.rect_filled(rect, CornerRadius::same(CONTROL_RADIUS), if response.hovered() { tokens.row_hover } else { tokens.button });

@@ -65,7 +65,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
     let mode = app.ui.mode;
     let bake_painting = mode == crate::state::Mode::Baking
         && app.ui.bake_paint_brush.on
-        && !app.session.bake_meshes.high.is_empty()
+        && !app.session.doc.bake_meshes.high.is_empty()
         && app.session.doc.project.texture_sets.get(app.session.ts()).is_some_and(|texture_set| {
             let settings = &texture_set.bake;
             match app.ui.bake_paint_brush.target {
@@ -905,9 +905,27 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         app.run("tool.cloneSource", json!({"x": at.x, "y": at.y, "viewport": [viewport.x, viewport.y]}));
     }
 
+    // A 3D generator's armed point pick: a click sets the point there instead of painting
+    let point_pick = crate::generator_point_pick::armed_on(ui.ctx(), &app.session);
+    if let Some(pick) = point_pick {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        if !alt
+            && response.clicked_by(PointerButton::Primary)
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let (at, viewport) = (local(pointer), app.session.viewport);
+            let params = json!({"effect": pick.effect, "point": pick.point, "x": at.x, "y": at.y, "viewport": [viewport.x, viewport.y]});
+
+            // A click off the mesh keeps it armed for the next
+            if app.run("effect.generator.pickPoint", params).is_some() {
+                crate::generator_point_pick::set(ui.ctx(), None);
+            }
+        }
+    }
+
     // Depth of field focus pick: a click focuses there instead of painting
-    let focus_pick = focus_picking(ui.ctx());
-    if focus_pick {
+    let focus_pick = focus_picking(ui.ctx()) || point_pick.is_some();
+    if focus_picking(ui.ctx()) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         if !alt
             && response.clicked_by(PointerButton::Primary)
@@ -1158,7 +1176,9 @@ fn bake_visualization(app: &TextureCraftApp) -> Option<texturecraft_render::Bake
         return None;
     }
 
-    Some(app.ui.bake_visualization.visualization(app.session.ts()))
+    let mut visualization = app.ui.bake_visualization.visualization(app.session.ts());
+    visualization.matching_error.shown &= crate::bake_mode::matching_error_applies(&app.session);
+    Some(visualization)
 }
 
 /// Draw the projection stencil in Paint Mode
@@ -3048,6 +3068,20 @@ mod tests {
         app.cancel_bake();
 
         assert_eq!(bake_visualization(app), Some(before));
+    }
+
+    #[test]
+    fn the_automatic_cage_shows_no_matching_error() {
+        let session = texturecraft_engine::sample_session(256, 64).unwrap();
+        let mut harness = egui_kittest::Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let app = harness.state_mut();
+        app.ui.mode = crate::state::Mode::Baking;
+        assert!(bake_visualization(app).unwrap().matching_error.shown);
+
+        app.session.doc.project.texture_sets[0].bake.cage.kind = texturecraft_engine::core::CageType::Automatic;
+
+        assert!(!bake_visualization(app).unwrap().matching_error.shown);
+        assert!(app.ui.bake_visualization.matching_error.shown, "the switch keeps its state for the other cage types");
     }
 
     const VIEW: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0));

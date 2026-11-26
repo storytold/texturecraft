@@ -672,6 +672,9 @@ pub struct Renderer {
     compositor: Option<GpuCompositor>,
     /// The compositor compiles new pipelines on worker threads (`set_asynchronous_compile`)
     asynchronous_compile: bool,
+    /// The compositor takes the pipelines the tests on the shared device share
+    /// ([`Renderer::share_test_pipelines`])
+    shared_test_pipelines: bool,
     quick_mask: Option<QuickMaskGpu>,
     #[cfg(not(target_arch = "wasm32"))]
     brush: Option<crate::gpu_brush::BrushPipeline>,
@@ -1324,6 +1327,7 @@ impl Renderer {
             mip_pipelines: HashMap::new(),
             compositor: None,
             asynchronous_compile: false,
+            shared_test_pipelines: false,
             quick_mask: None,
             #[cfg(not(target_arch = "wasm32"))]
             brush: None,
@@ -1621,9 +1625,9 @@ impl Renderer {
         if !GpuCompositor::supports(device) {
             return Err("adapter limits do not support the GPU brush".into());
         }
-        let asynchronous = self.asynchronous_compile;
+        let compile = (self.asynchronous_compile, self.shared_test_pipelines);
         let (compositor, brush, stroke) = crate::gpu_trace::scoped(device, "GPU brush startup", || {
-            let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, asynchronous));
+            let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, compile));
             let mut brush = self.brush.take().unwrap_or_else(|| crate::gpu_brush::BrushPipeline::new(device));
             let stroke = compositor.uv_surface(device, queue, &input.mesh, &input.uv).and_then(|surface| brush.begin(device, queue, input, surface));
             (compositor, brush, stroke)
@@ -1646,10 +1650,19 @@ impl Renderer {
         self.compositor.as_ref().map_or([0; 2], |compositor| compositor.update_bytes())
     }
 
-    fn new_compositor(device: &wgpu::Device, asynchronous: bool) -> GpuCompositor {
-        let mut compositor = GpuCompositor::new(device);
+    /// A compositor compiling on worker threads when `asynchronous`, and taking the tests' shared
+    /// pipelines when `shared`
+    fn new_compositor(device: &wgpu::Device, (asynchronous, shared): (bool, bool)) -> GpuCompositor {
+        let mut compositor = GpuCompositor::new_with(device, shared);
         compositor.set_asynchronous_compile(asynchronous);
         compositor
+    }
+
+    /// Let the compositor take the compiled pipelines the tests on the shared device share
+    /// ([`crate::headless::Headless::for_tests`])
+    #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+    pub(crate) fn share_test_pipelines(&mut self) {
+        self.shared_test_pipelines = true;
     }
 
     /// Compile new composite pipelines on worker threads: `composite_on_gpu` then answers
@@ -1669,8 +1682,8 @@ impl Renderer {
         if !self.asynchronous_compile || cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
             return;
         }
-        let asynchronous = self.asynchronous_compile;
-        self.compositor.get_or_insert_with(|| Self::new_compositor(device, asynchronous)).prewarm(device, program);
+        let compile = (self.asynchronous_compile, self.shared_test_pipelines);
+        self.compositor.get_or_insert_with(|| Self::new_compositor(device, compile)).prewarm(device, program);
     }
 
     /// Whether `program`'s pipelines are compiled (starting them otherwise): with asynchronous
@@ -1679,7 +1692,8 @@ impl Renderer {
         if !self.asynchronous_compile || cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
             return true;
         }
-        self.compositor.get_or_insert_with(|| Self::new_compositor(device, true)).pipelines_ready(device, program)
+        let compile = (true, self.shared_test_pipelines);
+        self.compositor.get_or_insert_with(|| Self::new_compositor(device, compile)).pipelines_ready(device, program)
     }
 
     /// Composite a supported layer stack or standalone mask into the viewport's textures.
@@ -1722,9 +1736,9 @@ impl Renderer {
 
         let mut submitted = None;
         let mut in_place = [false; DisplayKind::ALL.len()];
-        let asynchronous = self.asynchronous_compile;
+        let compile = (self.asynchronous_compile, self.shared_test_pipelines);
         let result = crate::gpu_trace::scoped(device, "viewport GPU composite", || {
-            let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, asynchronous));
+            let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, compile));
             let mut maps: Vec<_> = DisplayKind::ALL
                 .iter()
                 .zip(&self.default_texels)
@@ -1802,9 +1816,9 @@ impl Renderer {
         let reuse = (old.texture.width(), old.texture.height()) == (width, height);
         let region = if reuse { program.region } else { None };
         let mut submitted = None;
-        let asynchronous = self.asynchronous_compile;
+        let compile = (self.asynchronous_compile, self.shared_test_pipelines);
         let result = crate::gpu_trace::scoped(device, "viewport GPU mask preview", || {
-            let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, asynchronous));
+            let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, compile));
             let tex = if reuse {
                 old.clone()
             } else {

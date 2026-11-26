@@ -403,6 +403,7 @@ struct Params {
     bounds: [i32; 4],
 }
 
+#[derive(Clone)]
 pub(crate) struct NeighbourhoodGpu {
     box_blur: wgpu::ComputePipeline,
     apply: wgpu::ComputePipeline,
@@ -415,6 +416,19 @@ pub(crate) struct NeighbourhoodGpu {
 }
 
 impl NeighbourhoodGpu {
+    /// [`NeighbourhoodGpu::new`], or when `shared` (on the device tests share,
+    /// [`crate::headless::Headless::for_tests`]) one set of kernels for all of them, compiled once.
+    pub(crate) fn for_device(device: &wgpu::Device, shared: bool) -> Self {
+        #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+        if shared {
+            static SHARED: std::sync::OnceLock<NeighbourhoodGpu> = std::sync::OnceLock::new();
+            return SHARED.get_or_init(|| Self::new(device)).clone();
+        }
+        #[cfg(not(all(any(test, feature = "test-support"), not(target_arch = "wasm32"))))]
+        let _ = shared;
+        Self::new(device)
+    }
+
     /// The neighbourhood shader with the packages' files.
     pub(crate) fn source() -> String {
         [include_str!("shaders/noise.wgsl"), include_str!("shaders/neighbourhood.wgsl"), box_family::WGSL, gather::WGSL].join("\n")
@@ -917,14 +931,9 @@ mod tests {
             ("Slope Blur", Filter::SlopeBlur { radius: 2.0, scale: 2.0, seed: 4, divider: 1 }),
             ("Pixelate", Filter::Mosaic { size: 24.0, alpha: true }),
         ];
-        // llvmpipe's noise turns Slope Blur's direction (a finite difference of 0.02) at a few
-        // texels inside the set, where the stripes' hard edges make that a large step; the other
-        // backends check its copies
-        let gl = gpu.device.adapter_info().backend == wgpu::Backend::Gl;
+        // Slope Blur's direction is nearly along an axis at a few texels, so its reads land just
+        // below a stripe's edge: the case of a sample's floor and weights that must agree
         for (label, filter) in cases {
-            if gl && label == "Slope Blur" {
-                continue;
-            }
             let (project, pixels, owner) = striped(&[filter, wrap.clone()]);
             let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
             case.mask_owner = Some(owner);

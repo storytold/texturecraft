@@ -113,6 +113,7 @@ const ROW_PASS_WORK: u64 = 4;
 const COLUMN_PASS_WORK: u64 = 8;
 
 /// P4's own compute pipelines, created from the neighbourhood module.
+#[derive(Clone)]
 pub(super) struct Pipelines {
     prepare: wgpu::ComputePipeline,
     apply: wgpu::ComputePipeline,
@@ -521,8 +522,8 @@ mod tests {
     use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
     use texturecraft_core::{
         BakedMap, Bevel, BevelBlur, BevelCorner, BevelDirection, BevelSmooth, BlendMode, Channel, ChannelKind, ContentsOffset, DirectionalDistance, Effect,
-        EffectKind, Fill, Filter, Generator, GeneratorKind, GradientInput, GrayscaleMode, HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground,
-        MaskOutline, OutlinePosition, Procedural, ProceduralKind, Project, Source, TextureSet,
+        EffectKind, Fill, Filter, GeneratorKind, GradientInput, GrayscaleMode, HighpassSpace, Layer, LayerId, LayerKind, Mask, MaskBackground, MaskOutline,
+        OutlinePosition, Procedural, ProceduralKind, Project, Source, TextureSet,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::primitives;
@@ -761,7 +762,7 @@ mod tests {
         let Some(mut gpu) = headless() else { return };
         let stack = vec![(Filter::Blur { radius: 160.0, wrap: true }, 1.0, BlendMode::Normal)];
         let (mut project, pixels, owner) = painted_project(&stack, BlendMode::Normal, (true, SIZE)).unwrap();
-        let mut generator = Generator::new(GeneratorKind::Dirt);
+        let mut generator = crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Dirt);
         generator.global.blur = 0.85;
         generator.resolution.factor = -3;
         generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("Occlusion"));
@@ -865,7 +866,7 @@ mod tests {
     /// The fields after running the stage `filter` over `texels` as the compositor does.
     fn run_stage(gpu: &Headless, texels: &[([f32; 4], f32)], size: (u32, u32), filter: NeighbourhoodFilter) -> Vec<[u32; 5]> {
         let (scratch, region) = fields_on_gpu(gpu, texels, size);
-        let kernels = NeighbourhoodGpu::new(&gpu.device);
+        let kernels = NeighbourhoodGpu::for_device(&gpu.device, gpu.shared_test_device);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         kernels.encode(&gpu.device, &mut encoder, &scratch, region, filter);
         read_fields(gpu, encoder, &scratch)
@@ -1070,7 +1071,7 @@ mod tests {
     fn run_passes(gpu: &Headless, texels: &[([f32; 4], f32)], size: (u32, u32), filter: NeighbourhoodFilter, passes: &[(&str, [usize; 3])]) -> Vec<[u32; 5]> {
         let (scratch, region) = fields_on_gpu(gpu, texels, size);
         let offsets = [region.original, region.blur[0], region.blur[1], region.output];
-        let kernels = NeighbourhoodGpu::new(&gpu.device);
+        let kernels = NeighbourhoodGpu::for_device(&gpu.device, gpu.shared_test_device);
         let pipelines = &kernels.box_family;
         let texel_groups = [size.0.div_ceil(8), size.1.div_ceil(8)];
         let mut encoder = gpu.device.create_command_encoder(&Default::default());

@@ -2,9 +2,14 @@
 //! Presets use `mask.smart.apply`, materials use [`materials::apply`], both read back from the compositor
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde_json::json;
-use texturecraft_core::{BakeResolution, BakedMap, Channel, CurvatureMethod, LayerId};
+use texturecraft_compose::ImageRes;
+use texturecraft_core::{
+    BakeResolution, BakedMap, BlendMode, Channel, CurvatureMethod, EffectKind, Generator, GeneratorKind, KindControls, LayerId, MaskBackground, Procedural,
+    ProceduralKind, Source,
+};
 use texturecraft_geom::glam::Vec3;
 use texturecraft_geom::primitives;
 use texturecraft_texel::TILE;
@@ -14,7 +19,7 @@ pub use crate::material_preview_pixel::MaterialPreviewPixel;
 use crate::orb_camera::OrbCamera;
 use crate::preview::Sample;
 use crate::session::Document;
-use crate::{EngineError, Result, Session, materials};
+use crate::{EngineError, Result, Session, materials, smart_masks};
 
 /// Bake resolution in texels; 256 loses the thin edge lines
 const TEXTURE_PX: u32 = 512;
@@ -48,6 +53,16 @@ pub struct OrbPreview {
     cameras: Vec<OrbCamera>,
 }
 
+/// `generator` with clouds in Grayscale Conversion's empty image slot: it grays the image it is given, and its picture would be black without one
+fn with_sample_image(mut generator: Generator) -> Generator {
+    if let Some(KindControls::Grayscale(grayscale)) = generator.controls.as_deref_mut()
+        && grayscale.source.is_none()
+    {
+        grayscale.source = Some(Source::Procedural { pattern: Procedural::new(ProceduralKind::Clouds), low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() });
+    }
+    generator
+}
+
 impl OrbPreview {
     /// Bake the orb once (previews of any size reuse it)
     pub fn new() -> Result<OrbPreview> {
@@ -78,9 +93,49 @@ impl OrbPreview {
         }
 
         crate::execute(&mut self.session, "mask.smart.apply", &json!({ "name": id, "layer": self.layer.0 })).ok()?;
-        // Previews need no undo history; retaining snapshots grows memory across presets
-        self.session.undo.clear();
 
+        // Discard preview undo snapshots between presets
+        self.session.undo.clear();
+        self.mask_pixels(size)
+    }
+
+    /// Row-major `size²` pixels of a mask holding one generator of `kind` at its defaults, None outside the shape (and for sizes outside 1..=[`MAX_PREVIEW_SIZE_PX`])
+    pub fn generator(&mut self, kind: GeneratorKind, size: usize) -> Option<Vec<Option<MaskPreviewPixel>>> {
+        self.generator_of(with_sample_image(Generator::new(kind)), size)
+    }
+
+    /// [`Self::generator`] for `generator` as given (a Curvature generator with one detail size alone)
+    pub fn generator_of(&mut self, generator: Generator, size: usize) -> Option<Vec<Option<MaskPreviewPixel>>> {
+        if !valid_size(size) {
+            return None;
+        }
+
+        // Each generator goes on the bare shape, not over the previous mask
+        (self.session.doc, self.session.selected) = self.bare.clone();
+        let effects = vec![(EffectKind::Generator(generator), BlendMode::Normal)];
+        let mask = smart_masks::build_mask(&mut self.session.doc.project, MaskBackground::Black, effects);
+        self.session.doc.project.layer_mut(self.layer).ok()?.mask = Some(mask);
+        self.mask_pixels(size)
+    }
+
+    /// [`Self::generator_of`] with `images` (the images the generator reads, by name) loaded for this render only
+    pub fn generator_reading(&mut self, generator: Generator, images: &[(String, Arc<ImageRes>)], size: usize) -> Option<Vec<Option<MaskPreviewPixel>>> {
+        let replaced: Vec<_> = images.iter().map(|(name, image)| (name.clone(), self.session.images.insert(name.clone(), image.clone()))).collect();
+        let pixels = self.generator_of(generator, size);
+
+        // Restore in reverse so a name given twice ends as it began
+        for (name, previous) in replaced.into_iter().rev() {
+            match previous {
+                Some(previous) => self.session.images.insert(name, previous),
+                None => self.session.images.remove(&name),
+            };
+        }
+
+        pixels
+    }
+
+    /// Row-major `size²` pixels of the preview layer's current mask, with None outside the shape
+    fn mask_pixels(&mut self, size: usize) -> Option<Vec<Option<MaskPreviewPixel>>> {
         let camera = camera_for(&mut self.cameras, &self.session, size)?;
         let values = self.session.mask_at(self.layer, &camera.texels)?;
 
@@ -214,6 +269,24 @@ mod tests {
     }
 
     #[test]
+    fn a_render_reading_an_image_twice_leaves_the_orbs_own_images() {
+        let session = Session::new_project("Orb preview", primitives::cube(2.0), "builtin:cube", None, 128).unwrap();
+        let layer = session.doc.project.texture_set(SET).unwrap().stack[0];
+        let bare = (session.doc.clone(), session.selected.clone());
+        let mut preview = OrbPreview { session, layer, bare, cameras: Vec::new() };
+        let image = |value| Arc::new(ImageRes::new(1, 1, vec![[value; 4]], false));
+        let own = image(0.1);
+        preview.session.images.insert("shared.png".into(), own.clone());
+
+        let brought = image(0.9);
+        let images = [("shared.png".into(), brought.clone()), ("shared.png".into(), brought.clone()), ("added.png".into(), brought)];
+        preview.generator_reading(Generator::new(GeneratorKind::Dirt), &images, 0);
+
+        assert!(preview.session.images.get("shared.png").is_some_and(|kept| Arc::ptr_eq(kept, &own)), "the orb's own image is back");
+        assert!(!preview.session.images.contains_key("added.png"), "an image it lacked is gone again");
+    }
+
+    #[test]
     fn invalid_preview_sizes_are_rejected_before_changing_the_shape() {
         let session = Session::new_project("Orb preview", primitives::cube(2.0), "builtin:cube", None, 128).unwrap();
         let layer = session.doc.project.texture_set(SET).unwrap().stack[0];
@@ -260,6 +333,41 @@ mod tests {
 
         preview.mask("edges_sharp", size * 2).unwrap();
         assert_eq!(preview.cameras.len(), CAMERAS_KEPT, "only the most recent sizes keep their camera");
+    }
+
+    #[test]
+    fn generator_previews_render_on_the_orb_and_each_starts_from_the_bare_shape() {
+        let size = 24;
+        let mut preview = OrbPreview::new().unwrap();
+        for kind in GeneratorKind::ALL {
+            let pixels = preview.generator(kind, size).unwrap_or_else(|| panic!("{kind:?}"));
+            assert_eq!(pixels.len(), size * size, "{kind:?}");
+            assert!(pixels[0].is_none(), "{kind:?}: the corners are outside the shape");
+            for pixel in pixels.iter().flatten() {
+                assert!((0.0..=1.0).contains(&pixel.mask) && pixel.normal.is_finite() && pixel.coverage > 0.0, "{kind:?}: {pixel:?}");
+            }
+        }
+
+        let (edges, dirt) = (preview.generator(GeneratorKind::EdgeWear, size).unwrap(), preview.generator(GeneratorKind::Dirt, size).unwrap());
+        assert!(difference(&edges, &dirt) > 0.05, "edge wear and dirt differ: {}", difference(&edges, &dirt));
+
+        // A smart mask rendered in between leaves nothing behind
+        preview.mask("dirt_cavities", size).unwrap();
+        assert_eq!(preview.generator(GeneratorKind::EdgeWear, size).unwrap(), edges);
+        assert!(preview.generator(GeneratorKind::EdgeWear, 0).is_none());
+    }
+
+    #[test]
+    fn the_live_grayscale_preview_preserves_an_empty_slot() {
+        let mut preview = OrbPreview::new().unwrap();
+        let generator = Generator::new(GeneratorKind::GrayscaleConversion);
+        let thumbnail = preview.generator(GeneratorKind::GrayscaleConversion, 24).unwrap();
+        let expected = preview.generator_of(generator.clone(), 24).unwrap();
+
+        let live = preview.generator_reading(generator, &[], 24).unwrap();
+
+        assert!(difference(&thumbnail, &expected) > 0.05, "the catalog thumbnail demonstrates the effect on a sample");
+        assert!(live == expected, "the configured generator renders its actual input");
     }
 
     #[test]

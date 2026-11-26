@@ -2,7 +2,7 @@
 //! brush controls are in Common Settings.
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{Queryable, by};
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::state::{Mode, ViewLayout};
 
@@ -26,7 +26,7 @@ fn harness() -> Harness<'static, TextureCraftApp> {
 #[test]
 fn the_bake_panel_has_the_bake_paint_brush_and_dragging_paints_the_map() {
     let mut h = harness();
-    h.get_by_label("Skew Correction");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Reset Skew Correction");
     assert!(h.state().session.doc.bake_paint.is_empty() && !h.state().ui.bake_paint_brush.on);
 
     // Off: a drag in the view paints nothing
@@ -34,13 +34,15 @@ fn the_bake_panel_has_the_bake_paint_brush_and_dragging_paints_the_map() {
     h.hover_at(STROKE_END);
     h.drop_at(STROKE_END);
     h.run_steps(3);
+
     assert!(h.state().session.doc.bake_paint.is_empty(), "the brush is off");
 
     // On: the checkbox turns it on, and the same drag makes a map with paint along the stroke
-    h.get_by_label("Paint Skew Correction").scroll_to_me();
+    h.get(by().label_contains("Paint Skew Correction")).scroll_to_me();
     h.run_steps(3);
-    h.get_by_label("Paint Skew Correction").click();
+    h.get(by().label_contains("Paint Skew Correction")).click();
     h.run_steps(3);
+
     assert!(h.state().ui.bake_paint_brush.on);
     h.get_by_label("Radius");
     h.drag_at(STROKE_START);
@@ -53,11 +55,12 @@ fn the_bake_panel_has_the_bake_paint_brush_and_dragging_paints_the_map() {
     let painted = map.values.iter().filter(|v| **v > 0.5).count();
     assert!(painted > 50 && painted < map.values.len() / 2, "a stroke, not the whole map: {painted} of {}", map.values.len());
 
-    // Removing it from the panel clears the map
-    h.get_by_label("Remove Skew Correction").scroll_to_me();
+    // The section's reset menu clears the map
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Reset Skew Correction").click();
     h.run_steps(3);
-    h.get_by_label("Remove Skew Correction").click();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Clear All Skew Paint Strokes").click();
     h.run_steps(3);
+
     assert!(h.state().session.doc.bake_paint.is_empty());
 }
 

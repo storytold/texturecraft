@@ -234,7 +234,7 @@ impl PropertySheet<'_> {
     }
 
     /// A toggle's clickable area: a click flips `on`; returns whether it was clicked
-    fn toggle_hit(&mut self, hit: Rect, label: &str, on: &mut bool) -> bool {
+    pub(super) fn toggle_hit(&mut self, hit: Rect, label: &str, on: &mut bool) -> bool {
         let id = self.next_id();
         let response = self.ui.interact(hit, id, Sense::click());
         if response.clicked() {

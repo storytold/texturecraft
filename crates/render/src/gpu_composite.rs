@@ -2543,6 +2543,16 @@ fn source_operation(
 }
 
 fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
+    // The GPU has the earlier model alone: the wear, section, light and kind controls, a texture,
+    // a grunge, Micro Details and the kinds without an earlier model compose on the CPU
+    if !generator.on_earlier_model()
+        || generator.controls.is_some()
+        || generator.texture.is_some()
+        || generator.grunge.is_some()
+        || generator.micro_in_use().is_some()
+    {
+        return None;
+    }
     let kind = match generator.kind {
         GeneratorKind::EdgeWear => 40,
         GeneratorKind::Dirt => 41,
@@ -2551,6 +2561,7 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
         GeneratorKind::AmbientOcclusion => 44,
         GeneratorKind::Position => 45,
         GeneratorKind::Direction => 46,
+        _ => return None,
     };
     let direction = Vec3::from(generator.direction).try_normalize().unwrap_or(Vec3::Y);
     let mut op = Operation {
@@ -2560,18 +2571,26 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
         projection: [generator.noise_scale.max(1e-3), generator.offset, generator.global.balance, generator.global.contrast],
         ..Operation::zeroed()
     };
-    if let Some(source) = generator.kind.inputs().first().and_then(|map| generator.inputs.get(map)) {
+    // The map the earlier model reads (GeneratorKind::inputs lists the newer controls' maps too)
+    let earlier_input = match generator.kind {
+        GeneratorKind::EdgeWear | GeneratorKind::Curvature => Some(BakedMap::Curvature),
+        GeneratorKind::Dirt | GeneratorKind::AmbientOcclusion => Some(BakedMap::AmbientOcclusion),
+        GeneratorKind::ThinAreas => Some(BakedMap::Thickness),
+        _ => None,
+    };
+    if let Some(source) = earlier_input.and_then(|map| generator.inputs.get(&map)) {
         let mut source_op = source_operation(Some(source), &Projection::default(), Sampling::SAVED_BEFORE, [0.0; 3], ChannelKind::Scalar, inputs)?;
         bind_tile_source(&mut source_op, Some(source), patterns);
         inputs.generator_sources.push(source_op);
         op.effects[3] = inputs.generator_sources.len() as u32;
     }
-    if let Some(micro) = generator.micro {
-        let source = Source::Anchor { anchor: micro.anchor, channel: Channel::Height, ramp: Vec::new() };
+    // A micro detail saved before Micro Details: its anchor's height times the amount
+    if let Some((anchor, amount)) = generator.earlier_micro() {
+        let source = Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() };
         let source = source_operation(Some(&source), &Projection::default(), Sampling::SAVED_BEFORE, [0.0; 3], ChannelKind::Signed, inputs)?;
         inputs.generator_sources.push(source);
         op.effects[2] = inputs.generator_sources.len() as u32;
-        op.uv[2] = if micro.amount.is_finite() { micro.amount.clamp(0.0, 1.0) } else { 0.0 };
+        op.uv[2] = amount;
     }
     op.spatial[2] = u32::from(generator.global.blur > 0.0 || generator.resolution.can_reduce());
     let (blur, cell) = generator_stage(generator, inputs.resolution, inputs);
@@ -2756,6 +2775,8 @@ pub(crate) struct GpuCompositor {
     bindings: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     filter_gpu: Option<NeighbourhoodGpu>,
+    /// Take the neighbourhood kernels the tests on the shared device share
+    shared_test_kernels: bool,
     lookup: wgpu::Buffer,
     uniform_coverage: wgpu::Buffer,
     coverage: Vec<(Weak<UvGBuffer>, wgpu::Buffer)>,
@@ -2790,7 +2811,14 @@ impl GpuCompositor {
             && limits.max_compute_workgroup_size_y >= WORKGROUP
     }
 
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn new(device: &wgpu::Device) -> Self {
+        Self::new_with(device, false)
+    }
+
+    /// [`GpuCompositor::new`], taking the pipelines and kernels the tests on the shared device
+    /// share when `shared` ([`crate::headless::Headless::for_tests`])
+    pub(crate) fn new_with(device: &wgpu::Device, shared: bool) -> Self {
         let binding = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
         let buffer = |ty| wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None };
         let uniform = buffer(wgpu::BufferBindingType::Uniform);
@@ -2855,7 +2883,8 @@ impl GpuCompositor {
         let default_brush_alpha =
             input_texture(device, "tc_composite_empty_brush_alpha", (1, 1), 1, wgpu::TextureFormat::R16Uint).create_view(&Default::default());
         Self {
-            pipelines: pipelines::shared(device, supports_curvature, supports_id),
+            pipelines: pipelines::shared(shared, supports_curvature, supports_id),
+            shared_test_kernels: shared,
             asynchronous: false,
             bindings,
             pipeline_layout,
@@ -3288,7 +3317,8 @@ impl GpuCompositor {
             if tile_work == 0 {
                 band_rows = height.min(256);
             }
-            self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::new(device));
+            let shared = self.shared_test_kernels;
+            self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::for_device(device, shared));
         }
         let (pipeline, prepare) = self.pipelines().get(device, &self.pipeline_layout, program, self.asynchronous).ok_or(GPU_PIPELINES_PENDING)?;
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
@@ -4189,7 +4219,7 @@ mod procedural_tests {
     fn mask_and_content_anchors_match_cpu_in_material_and_mask_views() {
         use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
         use texturecraft_compose::tile_bytes;
-        use texturecraft_core::MicroDetail;
+        use texturecraft_core::MicroDetails;
 
         let Ok(mut gpu) = Headless::new() else { return };
         const SIZE: u32 = 64;
@@ -4233,8 +4263,8 @@ mod procedural_tests {
         )]);
         let mut layer = Layer::new(owner, "Reader", LayerKind::Fill(Fill { sources: source, ..Fill::default() }), &channels);
         let mut mask = Mask::new(MaskBackground::Black);
-        let mut generator = Generator::new(GeneratorKind::AmbientOcclusion);
-        generator.micro = Some(MicroDetail { anchor: height_anchor, amount: 0.8 });
+        let mut generator = crate::gpu_composite::oracle::earlier_generator(GeneratorKind::AmbientOcclusion);
+        generator.micro = MicroDetails::of_anchor(GeneratorKind::AmbientOcclusion, height_anchor, 0.8).map(Box::new);
         generator.inputs.insert(BakedMap::AmbientOcclusion, Source::Anchor { anchor: mask_anchor, channel: Channel::BaseColor, ramp: Vec::new() });
         generator.global.blur = 0.7;
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
@@ -4396,7 +4426,7 @@ mod procedural_tests {
         project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
         let owner = project.alloc_id();
         let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(Fill::default()), &[Channel::BaseColor]);
-        let mut generator = Generator::new(GeneratorKind::Dirt);
+        let mut generator = crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Dirt);
         generator.noise_amount = 0.0;
         generator.invert = true;
         generator.offset = 0.07;
@@ -4698,6 +4728,23 @@ mod procedural_tests {
                 assert!(pixel[0].abs_diff(expected) <= 2, "{filter:?} mask texel {index}: {} instead of {expected}", pixel[0]);
             }
         }
+    }
+
+    /// A generator on the earlier model composes on the GPU; one with the reference app's controls
+    /// (a new generator's), a kind without an earlier model or Micro Details composes on the CPU
+    #[test]
+    fn generators_beyond_the_earlier_model_compose_on_the_cpu() {
+        use texturecraft_core::MicroDetails;
+
+        let (mut inputs, mut patterns) = (ProceduralInputs::new(64), TilePatterns::default());
+        let mut gpu = |generator: &Generator| generator_operation(generator, &mut inputs, &mut patterns).is_some();
+        let earlier = oracle::earlier_generator(GeneratorKind::Dirt);
+        assert!(gpu(&earlier));
+        assert!(!gpu(&Generator::new(GeneratorKind::Dirt)), "the reference app's controls");
+        assert!(!gpu(&oracle::earlier_generator(GeneratorKind::UvChecker)), "no earlier model");
+        let micro = MicroDetails { enabled: true, ..MicroDetails::defaults(GeneratorKind::Curvature).unwrap() };
+        let curvature = Generator { micro: Some(Box::new(micro)), ..oracle::earlier_generator(GeneratorKind::Curvature) };
+        assert!(!gpu(&curvature), "Micro Details");
     }
 
     /// A costly fill splits into narrower bands and more submissions at any update size; only a
@@ -5278,7 +5325,7 @@ mod procedural_tests {
         folder.height_mask = HeightMask { enabled: true, contrast: 0.4, offset: 0.1 };
         folder.geometry_mask = Some(vec![mesh.submeshes[0].name.clone()]);
         let mut mask = Mask::new(MaskBackground::Black);
-        let position = Generator { direction: [1.0, 0.0, 0.0], softness: 0.18, ..Generator::new(GeneratorKind::Position) };
+        let position = Generator { direction: [1.0, 0.0, 0.0], softness: 0.18, ..crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Position) };
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(position)));
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0, wrap: false })));
         folder.mask = Some(mask);
@@ -5427,7 +5474,7 @@ mod procedural_tests {
         let owner = project.alloc_id();
         let mut layer = Layer::new(owner, "AO mask", LayerKind::Fill(Fill::default()), &[Channel::BaseColor]);
         let mut mask = Mask::new(MaskBackground::Black);
-        let generator = Generator { softness: Generator::MIN_SOFTNESS, ..Generator::new(GeneratorKind::AmbientOcclusion) };
+        let generator = Generator { softness: Generator::MIN_SOFTNESS, ..crate::gpu_composite::oracle::earlier_generator(GeneratorKind::AmbientOcclusion) };
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
         layer.mask = Some(mask);
         project.insert_layer(0, layer, None, false).unwrap();
@@ -5507,7 +5554,7 @@ mod procedural_tests {
                         noise_amount: 0.43,
                         noise_scale: 0.85,
                         seed: 27,
-                        ..Generator::new(kind)
+                        ..crate::gpu_composite::oracle::earlier_generator(kind)
                     };
                     mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
                     layer.mask = Some(mask);

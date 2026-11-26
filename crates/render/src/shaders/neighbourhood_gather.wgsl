@@ -232,8 +232,10 @@ fn gather_input_read(home: vec2<f32>, clamped: bool) -> vec2<f32> {
         return vec2(0.0);
     }
 
-    let base = vec2<i32>(floor(point)) - field_origin();
-    let t = fract(point);
+    // The weights from the same floor as the texels (sample_field)
+    let cell = floor(point);
+    let base = vec2<i32>(cell) - field_origin();
+    let t = clamp(point - cell, vec2(0.0), vec2(1.0));
     var sum = 0.0;
     var weight = 0.0;
     for (var corner = 0u; corner < 4u; corner++) {

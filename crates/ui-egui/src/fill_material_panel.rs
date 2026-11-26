@@ -138,7 +138,7 @@ fn resolution_json(resolution: CookResolution) -> Value {
 }
 
 /// The size of the texture set being painted, `fallback` when none is
-fn texture_set_size(app: &TextureCraftApp, fallback: u32) -> u32 {
+pub(crate) fn texture_set_size(app: &TextureCraftApp, fallback: u32) -> u32 {
     app.session.doc.project.texture_set(app.session.ts()).map_or(fallback, |texture_set| texture_set.resolution)
 }
 
@@ -484,7 +484,7 @@ fn procedural_rows(
 }
 
 /// The Resolution band's reading of a pattern's saved output resolution: a size of its own is Fixed, any other follows the texture set
-fn band_size(resolution: OutputResolution, texture_set: u32) -> CookResolution {
+pub(crate) fn band_size(resolution: OutputResolution, texture_set: u32) -> CookResolution {
     match resolution.mode {
         ResolutionMode::Custom => CookResolution::Fixed(resolution.output_size(texture_set, texture_set)),
         _ => CookResolution::Relative(resolution.factor),

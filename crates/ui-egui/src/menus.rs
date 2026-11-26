@@ -473,6 +473,8 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
     // Let the innermost popup consume Escape before cancelling the active tool
     let popup_open = egui::Popup::is_any_open(ctx);
+    let point_pick_armed = crate::generator_point_pick::armed(ctx).is_some();
+    let mut cancel_point_pick = false;
     let picker_open = crate::color_picker::open_window(ctx).is_some();
 
     let no_widget_focused = ctx.memory(|memory| memory.focused().is_none());
@@ -528,6 +530,8 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
             crate::import_resources::keys_in(app, input, nothing_focused, popup_open);
         } else if !popup_open && app.picking_color.is_some() && input.consume_key(Modifiers::NONE, Key::Escape) {
             app.picking_color = None;
+        } else if !popup_open && point_pick_armed && input.consume_key(Modifiers::NONE, Key::Escape) {
+            cancel_point_pick = true;
         } else if escape_is_free && app.properties_popup.is_some() && input.consume_key(Modifiers::NONE, Key::Escape) {
             app.properties_popup = None;
         } else if escape_is_free && crate::rail_popup::is_visible(app) && input.consume_key(Modifiers::NONE, Key::Escape) {
@@ -543,6 +547,9 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
         commands
     });
+    if cancel_point_pick {
+        crate::generator_point_pick::set(ctx, None);
+    }
 
     for id in &commands_to_invoke {
         if matches!(id.as_str(), "layer.copy" | "layer.cut")

@@ -253,8 +253,12 @@ fn add_weighted(acc: Texel, point: vec2<i32>, weight: f32) -> Texel {
 // paint-window split does not shift filter effects.
 fn sample_field(acc: Texel, point: vec2<f32>) -> Texel {
     if !all(abs(point) <= vec2(3.402823466e38)) { return acc; }
-    let base = vec2<i32>(floor(point)) - field_origin();
-    let fraction = fract(point);
+    // The weights from the same floor as the texels: a compiler may fuse the point's multiply-add
+    // for one of floor and fract and round it for the other (llvmpipe does), which at a point just
+    // below an integer reads the next texel at full weight
+    let cell = floor(point);
+    let base = vec2<i32>(cell) - field_origin();
+    let fraction = clamp(point - cell, vec2(0.0), vec2(1.0));
     let rest = 1.0 - fraction;
     var result = add_weighted(acc, base, rest.x * rest.y);
     result = add_weighted(result, base + vec2(1, 0), fraction.x * rest.y);
@@ -411,8 +415,10 @@ fn interpolate_cells(@builtin(global_invocation_id) id: vec3<u32>) {
     var value = original.value.x;
     if original.coverage > 0.0 {
         let position = (vec2<f32>(field_origin() + vec2<i32>(id.xy)) + 0.5) / f32(params.mode.x) - 0.5 - vec2<f32>(first_cell());
-        let cell = vec2<i32>(floor(position));
-        let f = fract(position);
+        // The weights from the same floor as the cells (sample_field)
+        let floored = floor(position);
+        let cell = vec2<i32>(floored);
+        let f = clamp(position - floored, vec2(0.0), vec2(1.0));
         let segment = copy_segment(vec2<i32>(id.xy));
         let size = i32(params.mode.x);
         let first = floor_div_cells(field_origin() + segment.xy, size) - first_cell();

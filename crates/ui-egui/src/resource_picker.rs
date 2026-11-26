@@ -45,6 +45,11 @@ const LOADING_GLYPH_SIZE: f32 = 24.0;
 /// The loading glyph is fainter than the other glyphs: it stands in for a picture still coming
 const LOADING_GLYPH_OPACITY: f32 = 0.5;
 const GLYPH_SIZE: f32 = 22.0;
+/// The randomness badge: a see-through dark disc at the picture's bottom-right corner holding a die
+const BADGE_RADIUS: f32 = 7.0;
+const BADGE_ICON_SIZE: f32 = 10.0;
+const BADGE_DISC: Color32 = Color32::from_black_alpha(140);
+const BADGE_ICON: Color32 = Color32::from_gray(228);
 
 /// The bright group header row and the dim sub-caption row
 const HEADER_HEIGHT: f32 = 24.0;
@@ -389,6 +394,7 @@ fn tile_ui<K>(ui: &mut Ui, thumbs: &mut Thumbs, rect: Rect, (place, item): (usiz
         TilePicture::Alpha(alpha) => thumbs.alpha(ui.ctx(), alpha),
         TilePicture::Image(name, image) => Some(thumbs.image(ui.ctx(), name, image)),
         TilePicture::Procedural(kind) => thumbs.procedural(ui.ctx(), *kind),
+        TilePicture::Generator(kind) => thumbs.generator(ui.ctx(), *kind),
         TilePicture::Swatch(_) | TilePicture::Glyph(_) | TilePicture::Import => None,
     };
 
@@ -396,7 +402,15 @@ fn tile_ui<K>(ui: &mut Ui, thumbs: &mut Thumbs, rect: Rect, (place, item): (usiz
         (_, Some(texture)) => {
             egui::Image::from_texture((texture.id(), picture.size())).corner_radius(rounding).paint_at(ui, picture);
         }
-        (TilePicture::Material(_) | TilePicture::Filter(_) | TilePicture::Alpha(_) | TilePicture::Image(..) | TilePicture::Procedural(_), None) => {
+        (
+            TilePicture::Material(_)
+            | TilePicture::Filter(_)
+            | TilePicture::Alpha(_)
+            | TilePicture::Image(..)
+            | TilePicture::Procedural(_)
+            | TilePicture::Generator(_),
+            None,
+        ) => {
             painter.text(
                 picture.center(),
                 Align2::CENTER_CENTER,
@@ -418,9 +432,21 @@ fn tile_ui<K>(ui: &mut Ui, thumbs: &mut Thumbs, rect: Rect, (place, item): (usiz
             painter.text(picture.center(), Align2::CENTER_CENTER, ic::PLUS, FontId::proportional(IMPORT_GLYPH_SIZE), color);
         }
     }
+    if let TilePicture::Generator(kind) = &item.picture
+        && kind.includes_randomness()
+    {
+        randomness_badge(painter, picture);
+    }
     name_lines(ui, rect, &item.label, hovered || chosen, chosen);
 
     response
+}
+
+/// A die on a see-through dark disc at `picture`'s bottom-right corner: the item's result depends on a random seed
+fn randomness_badge(painter: &egui::Painter, picture: Rect) {
+    let center = picture.right_bottom() - vec2(BADGE_RADIUS, BADGE_RADIUS);
+    painter.circle_filled(center, BADGE_RADIUS, BADGE_DISC);
+    painter.text(center, Align2::CENTER_CENTER, ic::DICE_FIVE, FontId::proportional(BADGE_ICON_SIZE), BADGE_ICON);
 }
 
 /// The tile's name under its picture: whole words on the first line, the rest on a second, each cut with "…" when too long

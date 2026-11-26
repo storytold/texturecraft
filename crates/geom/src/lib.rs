@@ -11,6 +11,7 @@ pub mod camera;
 pub mod gbuffer;
 pub mod mesh;
 pub mod primitives;
+pub mod triangle_partition;
 pub mod unwrap;
 
 pub use bvh::{Bvh, Hit};
@@ -18,6 +19,7 @@ pub use camera::{OrbitCamera, Ray};
 pub use gbuffer::{NO_TRI, Surface, UvGBuffer, surface_at};
 pub use glam;
 pub use mesh::{BaseColor, MAX_TRIANGLES, Mesh, SubMesh};
+pub use triangle_partition::TrianglePartition;
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum GeomError {

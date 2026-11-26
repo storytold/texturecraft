@@ -26,10 +26,20 @@ fn harness(render: bool) -> (Harness<'static, TextureCraftApp>, LayerId) {
     (harness, LayerId(effect))
 }
 
+/// The name the panel's Mode dropdown gives `mode`
+fn mode_label(mode: CurvatureMode) -> &'static str {
+    match mode {
+        CurvatureMode::Edges => "Edges",
+        CurvatureMode::Cavities => "Cavities",
+        CurvatureMode::Both => "Dual",
+        CurvatureMode::Raw => "Unprocessed",
+    }
+}
+
 fn select_mode(harness: &mut Harness<'_, TextureCraftApp>, current: CurvatureMode, next: CurvatureMode) {
-    harness.get_all_by_role(Role::ComboBox).find(|node| node.value().as_deref() == Some(current.label())).unwrap().click();
+    harness.get_by_role_and_label(Role::ComboBox, mode_label(current)).click();
     harness.run_steps(2);
-    harness.get_by_label(next.label()).click();
+    harness.get_by_role_and_label(Role::ListBoxOption, mode_label(next)).click();
     harness.run_steps(4);
 }
 
@@ -44,11 +54,10 @@ fn mode_and_detail_controls_apply_and_undo() {
     assert_eq!(detail(&harness).mode, CurvatureMode::Cavities);
     let previous = detail(&harness);
     let history = harness.state().session.history_labels().len();
-    harness.get_by_label("8 px").scroll_to_me();
+    harness.get_by_role_and_label(Role::Slider, "Large").scroll_to_me();
     harness.run_steps(3);
-    let label = harness.get_by_label("8 px").rect();
-    let start = egui::pos2(label.left() + 20.0, label.bottom() + 10.0);
-    let end = start + egui::vec2(100.0, 0.0);
+    let column = harness.get_by_role_and_label(Role::Slider, "Large").rect();
+    let (start, end) = (egui::pos2(column.center().x, column.bottom() - 30.0), egui::pos2(column.center().x, column.top() + 24.0));
     harness.drag_at(start);
     harness.run_steps(2);
     harness.hover_at(end);

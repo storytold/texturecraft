@@ -30,6 +30,7 @@ fn lowest_list<'a>(harness: &'a Harness<'_, TextureCraftApp>, label: &'a str) ->
 
 fn save(harness: &mut Harness<'_, TextureCraftApp>, dir: &Path, name: &str) {
     harness.run_steps(6);
+
     // Material orbs render off the UI thread: wait for their full pictures
     let start = std::time::Instant::now();
     while !texturecraft_ui_egui::orb_previews::OrbPreviews::settled(&harness.ctx) && start.elapsed() < std::time::Duration::from_secs(20) {
@@ -40,16 +41,18 @@ fn save(harness: &mut Harness<'_, TextureCraftApp>, dir: &Path, name: &str) {
     let img = harness.render().unwrap_or_else(|e| panic!("{name}: {e}"));
     let path = dir.join(format!("{name}.png"));
     img.save(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let tree = [egui::Role::Button, egui::Role::SpinButton, egui::Role::CheckBox]
+
+    let control_roles = [egui::Role::Button, egui::Role::CheckBox, egui::Role::ComboBox, egui::Role::Slider, egui::Role::SpinButton, egui::Role::TextInput];
+    let control_tree = control_roles
         .into_iter()
-        .flat_map(|role| harness.get_all_by_role(role))
-        .filter_map(|button| {
-            let node = button.accesskit_node();
-            node.label().map(|label| format!("{label}: disabled={}, checked={:?}", node.is_disabled(), node.toggled()))
+        .flat_map(|role| harness.query_all_by_role(role).map(move |control| (role, control)))
+        .filter_map(|(role, control)| {
+            let node = control.accesskit_node();
+            node.label().map(|label| format!("{role:?} {label}: disabled={}, checked={:?}", node.is_disabled(), node.toggled()))
         })
         .collect::<Vec<_>>()
         .join("\n");
-    std::fs::write(dir.join(format!("{name}.txt")), tree).unwrap();
+    std::fs::write(dir.join(format!("{name}.txt")), control_tree).unwrap();
     eprintln!("wrote {}", path.display());
 }
 
@@ -424,7 +427,11 @@ fn window_snapshots() {
     save(&mut harness, &output_dir, "bake-settings-cage-skew");
     harness.get_by_label("Edge Contrast").scroll_to_me();
     save(&mut harness, &output_dir, "bake-settings-skew");
-    harness.get_by_label("Output Size").scroll_to_me();
+    let output_width = harness
+        .get_all_by_role_and_label(egui::Role::ComboBox, "Output Size")
+        .find(|choice| !choice.accesskit_node().is_disabled())
+        .expect("the linked output size has an enabled width control");
+    output_width.scroll_to_me();
     harness.state_mut().session.doc.project.texture_sets[0].bake.common.resolution_height = Some(BakeResolution::R1024);
     save(&mut harness, &output_dir, "bake-settings-unlocked");
     harness.set_pixels_per_point(1.5);
@@ -441,7 +448,7 @@ fn window_snapshots() {
     save(&mut harness, &output_dir, "bake-curvature-mesh");
     select_map(&mut harness, "Height");
     save(&mut harness, &output_dir, "bake-height-manual");
-    harness.state_mut().session.bake_meshes.high.clear();
+    harness.state_mut().session.doc.bake_meshes.high.clear();
     harness.state_mut().ui.mode = Mode::Painting;
     save(&mut harness, &output_dir, "painting-restored");
 
@@ -750,7 +757,14 @@ fn mask_anchor_micro_detail_snapshot() {
         .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.dock.focus(Panel::Properties);
     harness.run_steps(6);
-    harness.get_by_label("Micro detail").scroll_to_me();
+    harness.get_by_role_and_label(egui::Role::Button, "Micro Details").scroll_to_me();
+    harness.run_steps(3);
+    harness.get_by_role_and_label(egui::Role::Button, "Micro Details").click();
+    harness.run_steps(3);
+
+    let height = harness.get_by_role_and_label(egui::Role::ComboBox, "Micro Height");
+    assert!(height.accesskit_node().value().is_some_and(|value| value.contains("Wear")));
+    height.scroll_to_me();
     save(&mut harness, &output_dir, "mask-anchor-micro-detail");
 }
 
