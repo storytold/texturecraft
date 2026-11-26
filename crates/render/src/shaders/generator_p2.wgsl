@@ -42,7 +42,8 @@ fn generator_micro(effect: Operation, pixel: vec2<u32>, baked: vec3<f32>) -> vec
 
 // An image slot's record (p2 slot_words in Rust): the side-table word holding its image's record
 // (0: a uniform colour), the uniform colour, the scale and offset it is read at, triplanar (1) or
-// in UV (0), the triplanar contrast, and whether the X projection mirrors about the centre
+// in UV (0), the triplanar contrast, whether the X projection mirrors about the centre, and the
+// source operation plus one of a procedural or an anchor (0: none)
 const P2_SLOT_IMAGE: u32 = 0u;
 const P2_SLOT_COLOR: u32 = 1u;
 const P2_SLOT_SCALE: u32 = 4u;
@@ -50,14 +51,14 @@ const P2_SLOT_OFFSET: u32 = 5u;
 const P2_SLOT_TRIPLANAR: u32 = 6u;
 const P2_SLOT_CONTRAST: u32 = 7u;
 const P2_SLOT_MIRRORED: u32 = 8u;
-const P2_SLOT_WORDS: u32 = 9u;
+const P2_SLOT_OPERATION: u32 = 9u;
 // The texture record after its slot: grayscale mode, invert, contrast, brightness, blend, opacity
-const P2_TEXTURE_GRAY: u32 = 9u;
-const P2_TEXTURE_INVERT: u32 = 10u;
-const P2_TEXTURE_CONTRAST: u32 = 11u;
-const P2_TEXTURE_BRIGHTNESS: u32 = 12u;
-const P2_TEXTURE_BLEND: u32 = 13u;
-const P2_TEXTURE_OPACITY: u32 = 14u;
+const P2_TEXTURE_GRAY: u32 = 10u;
+const P2_TEXTURE_INVERT: u32 = 11u;
+const P2_TEXTURE_CONTRAST: u32 = 12u;
+const P2_TEXTURE_BRIGHTNESS: u32 = 13u;
+const P2_TEXTURE_BLEND: u32 = 14u;
+const P2_TEXTURE_OPACITY: u32 = 15u;
 // The grunge record: its mode (0 the wear's own pattern, 1 a custom image), then the pattern's
 // source operation and its breakup's (plus one; 0: none), mean and spread, or the custom slot
 // and its gain
@@ -67,7 +68,7 @@ const P2_GRUNGE_BREAKUP: u32 = 2u;
 const P2_GRUNGE_MEAN: u32 = 3u;
 const P2_GRUNGE_SPREAD: u32 = 4u;
 const P2_GRUNGE_SLOT: u32 = 1u;
-const P2_GRUNGE_GAIN: u32 = 10u;
+const P2_GRUNGE_GAIN: u32 = 11u;
 // How much a breakup pattern varies the grunge's strength (compose's BREAKUP_DEPTH)
 const P2_BREAKUP_DEPTH: f32 = 0.6;
 // The gray at which a custom grunge neither adds nor removes wear
@@ -95,12 +96,17 @@ fn p2_triplanar_weights(contrast: f32, normal: vec3<f32>) -> vec3<f32> {
     return select(vec3(1.0 / 3.0), weights / total, total > 0.0);
 }
 
-// The colour of the image slot at `record` (Texel::slot_color): its uniform colour, or its image
-// read where the slot places it, in UV or from the mesh's three axes; `found` false where the
-// image is not loaded. `position` is the texel across the mesh's bounds, `normal` the
-// generator's world normal.
-fn p2_slot_color(record: u32, uv: vec2<f32>, position: vec3<f32>, normal: vec3<f32>, found: ptr<function, bool>) -> vec3<f32> {
+// The colour of the image slot at `record` (Texel::slot_color): its uniform colour, its
+// procedural or anchor read unprojected, or its image read where the slot places it, in UV or
+// from the mesh's three axes; `found` false where the image is not loaded. `position` is the
+// texel across the mesh's bounds, `normal` the generator's world normal.
+fn p2_slot_color(record: u32, texel: LayerTexel, position: vec3<f32>, normal: vec3<f32>, found: ptr<function, bool>) -> vec3<f32> {
     *found = true;
+    let operation = srgb[record + P2_SLOT_OPERATION];
+    if operation != 0u {
+        return fill_value(layers[operation - 1u], texel.uv, texel.surface).rgb;
+    }
+    let uv = texel.uv;
     let image_word = srgb[record + P2_SLOT_IMAGE];
     if image_word == 0u {
         return bitcast<vec3<f32>>(vec3(srgb[record + P2_SLOT_COLOR], srgb[record + P2_SLOT_COLOR + 1u], srgb[record + P2_SLOT_COLOR + 2u]));
@@ -189,7 +195,7 @@ fn generator_texture(effect: Operation, texel: LayerTexel, signal: f32, position
         return signal;
     }
     var found = true;
-    let rgb = p2_slot_color(record, texel.uv, position, normal, &found);
+    let rgb = p2_slot_color(record, texel, position, normal, &found);
     // An image still loading reads black
     let gray = select(0.0, p2_texture_gray(record, rgb), found);
     return p2_blended_over(record, signal, gray);
@@ -204,7 +210,7 @@ fn generator_grunge(effect: Operation, texel: LayerTexel, position: vec3<f32>, n
     }
     if srgb[record + P2_GRUNGE_MODE] != 0u {
         var found = true;
-        let rgb = p2_slot_color(record + P2_GRUNGE_SLOT, texel.uv, position, normal, &found);
+        let rgb = p2_slot_color(record + P2_GRUNGE_SLOT, texel, position, normal, &found);
         // An image not loaded yet reads mid gray, which leaves the wear as without grunge
         let gray = select(P2_CUSTOM_GRUNGE_MID_GRAY, luminance(rgb), found);
         return p2_float(record, P2_GRUNGE_GAIN) * (gray - P2_CUSTOM_GRUNGE_MID_GRAY);

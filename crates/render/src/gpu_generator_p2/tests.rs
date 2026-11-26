@@ -4,12 +4,13 @@ use std::sync::Arc;
 use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
 use texturecraft_core::{
     BakedMap, BlendMode, Channel, Effect, EffectKind, Fill, Generator, GeneratorKind, Layer, LayerKind, Mask, MaskBackground, MicroCurvatureType, MicroDetails,
-    NormalFormat, Project, Source, TextureLayer, TextureSet,
+    NormalFormat, Procedural, ProceduralKind, Project, Source, TextureLayer, TextureSet,
 };
 use texturecraft_geom::primitives;
 use texturecraft_texel::TILE;
 
-use super::block_groups;
+use super::super::{LOOKUP_WORDS, ProceduralInputs};
+use super::{bind_sources, block_groups, grunge_record, texture_record};
 use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, earlier_generator, headless};
 
 /// Blocks of one size come out together, the clipped last column, row and corner apart
@@ -20,6 +21,26 @@ fn blocks_group_by_their_clipped_size() {
     let sizes: Vec<_> = groups.iter().map(|group| (group.origin, group.count, group.size)).collect();
     assert_eq!(sizes, vec![([0, 0], [3, 2], [3, 3]), ([9, 0], [1, 2], [1, 3]), ([0, 6], [3, 1], [3, 1]), ([9, 6], [1, 1], [1, 1])]);
     assert_eq!(block_groups([8, 8], [1, 1]).len(), 1, "a classic set is one block");
+}
+
+/// A texture slot holding a procedural and a wear grunge's own pattern read source operations
+/// whose indices become absolute once the program lays out its generator sources
+#[test]
+fn slot_and_grunge_sources_become_operation_indices() {
+    let mut inputs = ProceduralInputs::new(64);
+    let pattern = Source::Procedural { pattern: Procedural::new(ProceduralKind::Clouds), low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() };
+    let texture = TextureLayer { enabled: true, opacity: 1.0, source: Some(pattern), ..TextureLayer::default() };
+    let textured = Generator { texture: Some(Box::new(texture)), ..Generator::new(GeneratorKind::Curvature) };
+    const OPERATIONS: u32 = 100;
+
+    let texture = texture_record(&textured, &mut inputs).unwrap();
+    let grunge = grunge_record(&Generator::new(GeneratorKind::EdgeWear), &mut inputs).unwrap();
+    bind_sources(&mut inputs, OPERATIONS);
+
+    let word = |record: u32, index: u32| inputs.ramp_words[(record - LOOKUP_WORDS + index) as usize];
+    assert_eq!(word(texture, 9), OPERATIONS + 1, "the texture's procedural, the first source");
+    assert_eq!((word(grunge, 1), word(grunge, 2)), (OPERATIONS + 2, 0), "the edge wear's scratches, without a breakup");
+    assert_eq!(inputs.generator_sources.len(), 2);
 }
 
 /// An image of `size` texels of hashed noise, each channel its own

@@ -52,6 +52,10 @@ use slot_placement::SlotPlacement;
 /// Words of a generator's P2 record
 const RECORD_WORDS: usize = 5;
 
+/// Words of an image slot (`p2_slot_color` in WGSL), and the one naming its source operation
+const SLOT_WORDS: usize = 10;
+const SLOT_OPERATION: usize = 9;
+
 /// Layers of the micro map texture: two per generator (its curvature term, its occlusion factor)
 const MAX_MICRO_LAYERS: u32 = 256;
 
@@ -161,12 +165,19 @@ fn micro_record(generator: &Generator, inputs: &mut ProceduralInputs) -> Option<
 
 /// The words of an image slot holding `source` (`p2_slot_color` in WGSL): an empty slot reads
 /// black; None for a procedural or an anchor, which the GPU does not read there
-fn slot_words(source: Option<&Source>, placement: &SlotPlacement, inputs: &mut ProceduralInputs) -> Option<[u32; 9]> {
-    let (image, color) = match source {
-        None => (0, [0.0; 3]),
-        Some(Source::Uniform(value)) => (0, *value),
-        Some(Source::Image { name, .. }) => (inputs.pack_image(name, ImageUse::Material)?, [0.0; 3]),
-        Some(Source::Procedural { .. } | Source::Anchor { .. }) => return None,
+fn slot_words(source: Option<&Source>, placement: &SlotPlacement, inputs: &mut ProceduralInputs) -> Option<[u32; SLOT_WORDS]> {
+    let (image, color, operation) = match source {
+        None => (0, [0.0; 3], 0),
+        Some(Source::Uniform(value)) => (0, *value, 0),
+        Some(Source::Image { name, .. }) => (inputs.pack_image(name, ImageUse::Material)?, [0.0; 3], 0),
+
+        // A procedural or an anchor reads the same wherever the slot places it: its own source
+        // operation, unprojected (Texel::slot_color)
+        Some(other) => {
+            let operation = source_operation(Some(other), &Projection::default(), Sampling::default(), [0.0; 3], ChannelKind::NormalMap, inputs)?;
+            inputs.generator_sources.push(operation);
+            (0, [0.0; 3], inputs.generator_sources.len() as u32)
+        }
     };
     let values = [color[0], color[1], color[2], placement.scale, placement.offset, placement.triplanar_contrast.unwrap_or(0.0)];
     if values.iter().any(|value| !value.is_finite()) {
@@ -174,7 +185,18 @@ fn slot_words(source: Option<&Source>, placement: &SlotPlacement, inputs: &mut P
     }
 
     let [red, green, blue, scale, offset, contrast] = values.map(f32::to_bits);
-    Some([image, red, green, blue, scale, offset, u32::from(placement.triplanar_contrast.is_some()), contrast, u32::from(placement.mirrored_about_centre)])
+    let triplanar = u32::from(placement.triplanar_contrast.is_some());
+    Some([image, red, green, blue, scale, offset, triplanar, contrast, u32::from(placement.mirrored_about_centre), operation])
+}
+
+/// Pack a record whose image slot starts at word `slot`: a slot reading a source operation has
+/// its local index made absolute by [`bind_sources`]
+fn pack_slot_record(words: &[u32], slot: usize, inputs: &mut ProceduralInputs) -> Option<u32> {
+    let offset = inputs.pack_words(words)?;
+    if words.get(slot + SLOT_OPERATION).is_some_and(|operation| *operation != 0) {
+        inputs.micro.source_words.push((offset - super::LOOKUP_WORDS) as usize + slot + SLOT_OPERATION);
+    }
+    Some(offset)
 }
 
 /// The record of the texture the generator blends over its signal (0: none): its slot, then its
@@ -200,7 +222,7 @@ fn texture_record(generator: &Generator, inputs: &mut ProceduralInputs) -> Optio
     let [contrast, brightness, opacity] = adjustments.map(f32::to_bits);
     let mut words = slot.to_vec();
     words.extend([gray, u32::from(texture.invert), contrast, brightness, blend, opacity]);
-    inputs.pack_words(&words)
+    pack_slot_record(&words, 0, inputs)
 }
 
 /// Where the reference app reads a custom grunge at the UV square's origin: half way across
@@ -227,7 +249,7 @@ fn grunge_record(generator: &Generator, inputs: &mut ProceduralInputs) -> Option
         let mut words = vec![1];
         words.extend(slot_words(generator.grunge.as_ref(), &placement, inputs)?);
         words.push(pattern.custom_gain.to_bits());
-        return inputs.pack_words(&words);
+        return pack_slot_record(&words, 1, inputs);
     }
 
     let sharpness = TRIPLANAR_SHARPNESS.start() + (TRIPLANAR_SHARPNESS.end() - TRIPLANAR_SHARPNESS.start()) * wear.triplanar_contrast;
