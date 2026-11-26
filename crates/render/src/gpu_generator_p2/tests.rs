@@ -183,3 +183,44 @@ fn micro_details_match_the_cpu() {
         assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, label);
     }
 }
+
+/// A micro height read from an anchor point matches the CPU: the anchor's height under the
+/// reader, gathered over the whole set, feeds the micro curvature and its detail sizes
+#[test]
+fn a_micro_height_read_from_an_anchor_matches_the_cpu() {
+    let Some(mut gpu) = headless() else { return };
+    const BAKE: u32 = 256;
+    let mesh = Arc::new(primitives::plane(1.0, 1));
+    let curvature = (0..BAKE * BAKE).map(|texel| 0.5 + 0.2 * ((texel % BAKE) as f32 * 0.07).sin() * ((texel / BAKE) as f32 * 0.05).cos()).collect();
+    let baked = BakedMaps { resolution: BAKE, maps: BTreeMap::from([(BakedMap::Curvature, Arc::new(curvature))]) };
+    let images = ImageStore::from([("height".to_string(), noise((53, 47), 3))]);
+    let mut project = Project::new("Micro anchor", "builtin:plane");
+    project.texture_sets.push(TextureSet::new("Plane", 0, TILE));
+
+    // A height fill with an anchor point after it, under a layer whose mask reads it as its micro height
+    let height = project.alloc_id();
+    let fill = Fill { sources: BTreeMap::from([(Channel::Height, Source::image("height"))]), ..Default::default() };
+    let mut layer = Layer::new(height, "Height", LayerKind::Fill(fill), &[Channel::BaseColor, Channel::Height]);
+    let anchor = project.alloc_id();
+    layer.content_effects.push(Effect::new(anchor, EffectKind::Anchor));
+    project.insert_layer(0, layer, None, false).unwrap();
+    let owner = project.alloc_id();
+    let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.9, 0.6, 0.3]))]), ..Default::default() };
+    let mut layer = Layer::new(owner, "Micro", LayerKind::Fill(fill), &[Channel::BaseColor]);
+    let micro = MicroDetails {
+        enabled: true,
+        normal: false,
+        height_source: Some(Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() }),
+        ..MicroDetails::defaults(GeneratorKind::Curvature).unwrap()
+    };
+    let mut mask = Mask::new(MaskBackground::Black);
+    let generator = Generator { micro: Some(Box::new(micro)), ..earlier_generator(GeneratorKind::Curvature) };
+    mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
+    layer.mask = Some(mask);
+    project.insert_layer(0, layer, None, false).unwrap();
+    let pixels = PixelStore::default();
+    let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+    case.mask_owner = Some(owner);
+
+    assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, "a micro height read from an anchor point");
+}

@@ -24,6 +24,8 @@ struct Features {
     color_selection: bool,
     // P2: a generator reads Micro Details (gpu_generator_p2.rs)
     generator_p2: bool,
+    // P2: a capture program, whose Height display keeps the f32 value (the micro anchor heights)
+    capture: bool,
     // The GPU port packages' WGSL files compiled in full (gpu_composite_packages.rs)
     packages: ShaderFlags,
 }
@@ -35,6 +37,7 @@ impl Features {
             mask_preview: program.is_mask_preview(),
             spatial: !program.filters.stages.is_empty(),
             packages: ShaderFlags::of(program),
+            capture: program.micro.is_capture(),
             ..Self::default()
         };
         features.material_anchors = program.filters.stages.iter().any(|stage| stage.anchor.is_some());
@@ -76,7 +79,7 @@ impl Features {
         // function bodies. Omit those helpers so Mesa does not inline them
         // before its dead-code pass.
         [
-            "override enable_authored_images: bool = false;\n             override enable_generators: bool = false;\n             override enable_curvature_detail: bool = false;\n             override enable_spatial_fields: bool = false;\n             override enable_anchor_reads: bool = false;",
+            "override enable_authored_images: bool = false;\n             override enable_generators: bool = false;\n             override enable_curvature_detail: bool = false;\n             override enable_spatial_fields: bool = false;\n             override enable_anchor_reads: bool = false;\n             override composite_capture: bool = false;",
             include_str!("shaders/noise.wgsl"),
             // Keep the gradient fallback when the program has no extended patterns.
             include(
@@ -169,7 +172,7 @@ impl Features {
         .join("\n")
     }
 
-    fn constants(self, grouped: bool) -> [(&'static str, f64); 8] {
+    fn constants(self, grouped: bool) -> [(&'static str, f64); 9] {
         [
             ("enable_authored_images", f64::from(u8::from(self.authored_images))),
             ("enable_generators", f64::from(u8::from(self.generators))),
@@ -179,6 +182,7 @@ impl Features {
             ("composite_groups", f64::from(u8::from(grouped))),
             ("composite_mask_preview", f64::from(u8::from(self.mask_preview))),
             ("enable_extended_blend_modes", f64::from(u8::from(self.extended_blend_modes))),
+            ("composite_capture", f64::from(u8::from(self.capture))),
         ]
     }
 }
@@ -353,6 +357,7 @@ mod tests {
             material_anchors: true,
             color_selection: true,
             generator_p2: true,
+            capture: true,
             packages: ShaderFlags::ALL,
         });
         variants

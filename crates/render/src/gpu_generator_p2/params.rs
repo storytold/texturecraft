@@ -14,6 +14,8 @@ pub(super) struct Params {
     pub(super) gains: [f32; 4],
     pub(super) scales: [f32; 4],
     pub(super) intensity: [f32; 4],
+    pub(super) anchor: [u32; 4],
+    pub(super) anchor_block: [f32; 4],
     pub(super) kernel: [[f32; 4]; KERNEL_TAPS / 4],
     pub(super) directions: [[f32; 4]; OCCLUSION_DIRECTIONS],
     pub(super) taps: [[f32; 4]; OCCLUSION_DIRECTIONS * OCCLUSION_STEPS],

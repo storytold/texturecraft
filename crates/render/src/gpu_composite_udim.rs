@@ -727,8 +727,9 @@ mod tests {
 
     /// P2: Micro Details sample, blur and occlude each UV tile block of the bake on its own, the
     /// detail sizes blur each block's micro curvature, a micro map of its own height (the
-    /// occlusion's, shorter than the curvature's) reads at that height, and a blurred
-    /// generator's stage reads the micro maps
+    /// occlusion's, shorter than the curvature's) reads at that height, a blurred generator's
+    /// stage reads the micro maps, and a micro height read from an anchor point reads each tile's
+    /// share of the anchor's height
     #[test]
     fn micro_details_work_per_uv_tile_block() {
         use texturecraft_core::{Generator, MicroDetails, NormalFormat};
@@ -765,11 +766,28 @@ mod tests {
         let pixels = PixelStore::default();
 
         for scaled in [false, true] {
-            let (mut project, mesh) = atlas(scaled, &[Channel::BaseColor]);
+            let (mut project, mesh) = atlas(scaled, &[Channel::BaseColor, Channel::Height]);
+
+            // A height fill with an anchor point, which a micro height reads per tile block
+            let height = Fill { sources: BTreeMap::from([(Channel::Height, Source::image("Micro height"))]), ..Fill::default() };
+            let mut height = Layer::new(project.alloc_id(), "Height", LayerKind::Fill(height), &[Channel::Height]);
+            let anchor = project.alloc_id();
+            height.content_effects.push(Effect::new(anchor, EffectKind::Anchor));
+            project.insert_layer(0, height, None, false).unwrap();
             let owner = project.alloc_id();
             let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.7, 0.4, 0.2]))]), ..Fill::default() };
             let mut layer = Layer::new(owner, "Micro", LayerKind::Fill(fill), &[Channel::BaseColor]);
             let mut mask = Mask::new(MaskBackground::Black);
+            let anchored = MicroDetails {
+                height: true,
+                height_source: Some(Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() }),
+                ..micro(GeneratorKind::Dirt)
+            };
+            let mut dirt = Effect::new(
+                project.alloc_id(),
+                EffectKind::Generator(Generator { micro: Some(Box::new(anchored)), ..crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Dirt) }),
+            );
+            dirt.blend = BlendMode::Multiply;
             for kind in [GeneratorKind::Curvature, GeneratorKind::AmbientOcclusion] {
                 let occlusion = kind == GeneratorKind::AmbientOcclusion;
                 let mut generator = Generator { micro: Some(Box::new(micro(kind))), ..crate::gpu_composite::oracle::earlier_generator(kind) };
@@ -784,6 +802,7 @@ mod tests {
                 }
                 mask.effects.push(generated);
             }
+            mask.effects.push(dirt);
             layer.mask = Some(mask);
             project.insert_layer(0, layer, None, false).unwrap();
             let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);

@@ -12,22 +12,25 @@
 //! controls alone (P1's paths call `generator_texture` and `generator_grunge` in WGSL), so on the
 //! earlier model their records stay 0.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use texturecraft_compose::ImageRes;
+use texturecraft_compose::{DisplayKind, ImageRes, PixelStore};
 use texturecraft_core::{
-    ChannelKind, Generator, GeneratorGrayscale, GeneratorKind, MicroCurvatureType, MicroDetails, Procedural, ProceduralKind, Projection, Sampling, Source,
-    TextureBlend, WearParameters,
+    Channel, ChannelFormat, ChannelKind, EffectKind, Fill, Generator, GeneratorGrayscale, GeneratorKind, Layer, LayerId, LayerKind, MicroCurvatureType,
+    MicroDetails, Procedural, ProceduralKind, Project, Projection, Sampling, Source, TextureBlend, WearParameters,
 };
 
-use super::{ImageUse, ProceduralInputs, source_operation};
+use super::{CompositeProgram, GpuCompositor, ImageUse, ProceduralInputs, display_bit, source_operation};
 
 mod block_group;
+mod capture_layout;
 mod dummies;
 mod field_buffers;
 mod fields;
 mod grunge_pattern;
 mod micro_cache;
+mod micro_capture;
 mod micro_gpu;
 mod micro_key;
 mod micro_maps;
@@ -43,6 +46,7 @@ mod tests;
 
 use block_group::BlockGroup;
 use grunge_pattern::{DIRT_GRUNGE, EDGE_WEAR_GRUNGE, FIBER_GLASS_GRUNGE, TRIPLANAR_SHARPNESS};
+use micro_capture::MicroCapture;
 pub(super) use micro_gpu::MicroGpu;
 pub(super) use micro_plan::MicroPlan;
 use micro_request::MicroRequest;
@@ -140,8 +144,8 @@ fn micro_record(generator: &Generator, inputs: &mut ProceduralInputs) -> Option<
     let Some(micro) = generator.micro_in_use() else { return Some(([0; 2], None)) };
 
     let micro = micro.clone().clamped(generator.kind);
-    let height = if micro.height { Some(MicroSlot::of(micro.height_source.as_ref(), true)?) } else { None };
-    let normal = if micro.normal { MicroSlot::of(micro.normal_source.as_ref(), false) } else { None };
+    let height = micro.height.then(|| MicroSlot::of(micro.height_source.as_ref(), true));
+    let normal = micro.normal.then(|| MicroSlot::of(micro.normal_source.as_ref(), false));
     let (curvature, occlusion) = reads_micro(generator.kind);
     let request = MicroRequest { micro, curvature, occlusion: occlusion && height.is_some(), height, normal };
     if !request.curvature && !request.occlusion {
@@ -312,6 +316,23 @@ fn block_groups(size: [u32; 2], grid: [u32; 2]) -> Vec<BlockGroup> {
         .collect()
 }
 
+/// Each block of `groups` as a group of its own
+fn single_blocks(groups: Vec<BlockGroup>) -> Vec<BlockGroup> {
+    groups
+        .into_iter()
+        .flat_map(|group| {
+            (0..group.count[1]).flat_map(move |down| {
+                (0..group.count[0]).map(move |across| BlockGroup {
+                    origin: [group.origin[0] + group.step[0] * across, group.origin[1] + group.step[1] * down],
+                    step: group.step,
+                    count: [1, 1],
+                    size: group.size,
+                })
+            })
+        })
+        .collect()
+}
+
 /// A gaussian of `sigma` sampled at whole texels each side of its centre, its weights summing to
 /// 1 (compose's `gaussian_kernel`)
 fn gaussian_kernel(sigma: f32) -> Vec<f32> {
@@ -390,4 +411,104 @@ fn dispatch(encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::ComputePipeline
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bindings, &[]);
     pass.dispatch_workgroups(groups[0].max(1), groups[1].max(1), 1);
+}
+
+/// Compile the capture program of each anchor point whose height a micro details slot reads
+pub(super) fn compile_captures(plan: &mut MicroPlan, project: &Project, pixels: &PixelStore, ts: usize) -> Result<(), &'static str> {
+    for anchor in plan.anchors() {
+        let captured = capture_project(project, ts, anchor)?;
+        let mut program = CompositeProgram::try_compile_region(&captured, pixels, ts, None)?;
+        program.micro.capture = true;
+        program.display_outputs |= display_bit(DisplayKind::Height);
+        plan.captures.push(MicroCapture { anchor, program: Box::new(program) });
+    }
+    Ok(())
+}
+
+/// The project whose Height is anchor point `anchor`'s height as its first micro height reader
+/// reads it (compose's `anchor_heights`): that reader and every draw after it hidden, under a top
+/// layer whose Height reads the anchor
+fn capture_project(project: &Project, ts: usize, anchor: LayerId) -> Result<Project, &'static str> {
+    let set = project.texture_sets.get(ts).ok_or("The texture set is missing.")?;
+    let order = draw_order(project, &set.stack);
+    let reads_anchor = |id: &LayerId| {
+        let effects = project.layers.get(id).and_then(|layer| layer.mask.as_ref()).into_iter().flat_map(|mask| &mask.effects);
+        effects
+            .filter(|effect| effect.visible)
+            .any(|effect| matches!(&effect.kind, EffectKind::Generator(generator) if micro_height_anchor(generator) == Some(anchor)))
+    };
+    let first = order.iter().position(reads_anchor).unwrap_or(order.len());
+
+    let mut captured = project.clone();
+    for id in &order[first..] {
+        if let Some(layer) = captured.layers.get_mut(id) {
+            layer.visible = false;
+        }
+    }
+    let set = captured.texture_sets.get_mut(ts).ok_or("The texture set is missing.")?;
+    if !set.channels.iter().any(|(channel, _)| *channel == Channel::Height) {
+        set.channels.push((Channel::Height, ChannelFormat::L16F));
+    }
+    let id = captured.alloc_id();
+    let source = Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() };
+    let fill = Fill { sources: BTreeMap::from([(Channel::Height, source)]), ..Fill::default() };
+    let reader = Layer::new(id, "Micro anchor height", LayerKind::Fill(fill), &[Channel::Height]);
+    captured.insert_layer(ts, reader, None, false).map_err(|_| "The micro anchor height reader does not fit the texture set.")?;
+    Ok(captured)
+}
+
+/// The anchor point a generator's micro details read as their height
+fn micro_height_anchor(generator: &Generator) -> Option<LayerId> {
+    let micro = generator.micro_in_use().filter(|micro| micro.height)?;
+    match &micro.height_source {
+        Some(Source::Anchor { anchor, .. }) => Some(*anchor),
+        _ => None,
+    }
+}
+
+/// The layers of `stack` (bottom first) in the order they draw: each folder before its children
+fn draw_order(project: &Project, stack: &[LayerId]) -> Vec<LayerId> {
+    stack
+        .iter()
+        .flat_map(|id| {
+            let children = match project.layers.get(id).map(|layer| &layer.kind) {
+                Some(LayerKind::Group { children, .. }) => draw_order(project, children),
+                _ => Vec::new(),
+            };
+            std::iter::once(*id).chain(children)
+        })
+        .collect()
+}
+
+/// Composite each capture program of `program` over the whole `size` set before it: the anchor
+/// heights its micro details read, at f32 in the red of an Rg32Float texture
+pub(super) fn compose_captures(
+    compositor: &mut GpuCompositor,
+    gpu: (&wgpu::Device, &wgpu::Queue),
+    (ts, size): (usize, (u32, u32)),
+    program: &CompositeProgram,
+) -> Result<Vec<(LayerId, wgpu::TextureView)>, String> {
+    let mut heights = Vec::new();
+    for capture in &program.micro.captures {
+        // Each display at its own texel size; the Height's words are the f32 height and nothing
+        let usage = wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING;
+        let textures: Vec<wgpu::Texture> = DisplayKind::ALL
+            .iter()
+            .map(|&kind| {
+                let format = match (kind, kind.bytes_per_texel()) {
+                    (DisplayKind::Height, _) => wgpu::TextureFormat::Rg32Float,
+                    (_, 8) => wgpu::TextureFormat::Rg32Uint,
+                    _ => wgpu::TextureFormat::R32Uint,
+                };
+                texture(gpu.0, "tc_micro_capture", [size.0, size.1, 1], format, usage)
+            })
+            .collect();
+        let targets: Vec<&wgpu::Texture> = textures.iter().collect();
+
+        // A cache key of its own beside the set's, so the set's caches keep theirs
+        compositor.compose(gpu, &capture.program, (usize::MAX - ts, size, 0, None), &targets, &mut None)?;
+        let height = textures.get(DisplayKind::Height as usize).ok_or("The micro anchor height capture is missing.")?;
+        heights.push((capture.anchor, height.create_view(&Default::default())));
+    }
+    Ok(heights)
 }

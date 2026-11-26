@@ -2,6 +2,7 @@ use bytemuck::Zeroable;
 use texturecraft_core::MicroCurvatureType;
 
 use super::block_group::BlockGroup;
+use super::capture_layout::CaptureLayout;
 use super::dummies::Dummies;
 use super::fields::Fields;
 use super::micro_gpu::MicroGpu;
@@ -22,6 +23,8 @@ pub(super) struct Run<'a> {
     pub(super) target: &'a wgpu::TextureView,
     pub(super) group: &'a BlockGroup,
     pub(super) layer: u32,
+    /// The anchor heights the height slot reads, where they lie, and the map's size
+    pub(super) capture: Option<(&'a wgpu::TextureView, &'a CaptureLayout, [u32; 2])>,
 }
 
 impl Run<'_> {
@@ -59,12 +62,15 @@ impl Run<'_> {
             uniforms: self.slots.uniforms,
             origins: [group.origin[0], group.origin[1], group.step[0], group.step[1]],
             place: [group.count[0], group.count[1], self.layer, 0],
+            anchor: self.capture.map_or([0; 4], |(_, layout, map)| [map[0], map[1], layout.working[0], layout.working[1]]),
+            anchor_block: self.capture.map_or([0.0; 4], |(_, layout, map)| [layout.block as f32, layout.scale_at(group.origin, map), 0.0, 0.0]),
             ..Params::zeroed()
         }
     }
 
     pub(super) fn pass(&self, encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::ComputePipeline, params: &Params, fields: &Fields, lines: Option<u32>) {
-        let bindings = self.gpu.bindings(self.device, params, fields, (self.target, &self.dummy.bake, &self.dummy.maps_in, &self.dummy.bake_out));
+        let capture = self.capture.map_or(&self.dummy.capture, |(heights, _, _)| heights);
+        let bindings = self.gpu.bindings(self.device, params, fields, (self.target, &self.dummy.bake, &self.dummy.maps_in, &self.dummy.bake_out, capture));
         let groups = match lines {
             Some(count) => [count.div_ceil(LINE_WORKGROUP), 1],
             None => [self.group.size[0].div_ceil(WORKGROUP), self.group.size[1].div_ceil(WORKGROUP)],
