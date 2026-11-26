@@ -25,6 +25,19 @@ pub(crate) trait Gizmo: Clone + Send + Sync + 'static {
         self.edit(app, rect, grab, from, to)
     }
 
+    /// As [`Gizmo::edit`], receiving the active keyboard modifiers
+    fn edit_with_modifiers(
+        &self,
+        app: &TextureCraftApp,
+        rect: Rect,
+        grab: Self::Grab,
+        from: Pos2,
+        to: Pos2,
+        modifiers: egui::Modifiers,
+    ) -> Option<(&'static str, Value)> {
+        self.edit_with_snap(app, rect, grab, from, to, modifiers.ctrl || modifiers.command)
+    }
+
     /// The cursor over `grab`, or dragging it
     fn cursor(&self, grab: Self::Grab, dragging: bool) -> egui::CursorIcon;
 }
