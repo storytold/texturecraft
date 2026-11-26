@@ -158,12 +158,14 @@ pub(crate) type Slot = (FieldKey, usize);
 struct Key {
     stack: Arc<StackKey>,
     rules: CompositeRules,
+    /// The working atlas size: a field made at another size has other samples
+    atlas: (u32, u32),
 }
 
 impl Key {
     fn of(inp: &Inputs, roots: Vec<LayerId>, tree: &BTreeSet<LayerId>) -> Option<Key> {
         let stack = StackKey::of_tree(inp.project, inp.pixels, inp.baked, inp.images, inp.ts, roots, tree)?;
-        Some(Key { stack: Arc::new(stack), rules: inp.project.rules })
+        Some(Key { stack: Arc::new(stack), rules: inp.project.rules, atlas: (inp.gbuf.width, inp.gbuf.height) })
     }
 }
 
@@ -298,7 +300,7 @@ impl SetFieldCache {
             return c;
         }
         let key = match &self.stack_key {
-            Some(stack) => Some(Key { stack: stack.clone(), rules: inp.project.rules }),
+            Some(stack) => Some(Key { stack: stack.clone(), rules: inp.project.rules, atlas: (inp.gbuf.width, inp.gbuf.height) }),
             None => {
                 let stack = inp.project.texture_set(inp.ts).map(|s| s.stack.clone()).unwrap_or_default();
                 Key::of(inp, stack.clone(), &inp.project.render_tree(&stack))

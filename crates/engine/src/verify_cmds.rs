@@ -165,14 +165,20 @@ impl Session {
             }
             let n = sc.channel.components();
             let mut tally = Tally::default();
+            let mut compared_texels = 0usize;
             for y in 0..h {
                 for x in 0..w {
                     if mask.contains(x, y) {
+                        compared_texels += 1;
                         let a = sc.encode(ours.value(sc.channel, x, y));
                         let b = sc.final_look(x, y);
                         tally.add(a.get(..n).unwrap_or(&a), b.get(..n).unwrap_or(&b));
                     }
                 }
+            }
+            if compared_texels == 0 {
+                out.push(ChannelReport::not_compared(id, "no texel is left to compare after the border"));
+                continue;
             }
             out.push(ChannelReport::compared(id, tally.finish()));
         }

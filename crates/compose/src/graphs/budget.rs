@@ -109,7 +109,8 @@ pub fn acquire(bytes: u64) -> Permit {
     let b = budget();
     let mut s = b.state.lock().unwrap_or_else(PoisonError::into_inner);
     loop {
-        let share = bytes.min(s.0);
+        // The whole estimate stays reserved, so a later raise of the limit cannot admit a render beside it
+        let share = bytes;
         if s.2 == 0 || s.1.saturating_add(share) <= s.0 {
             s.1 = s.1.saturating_add(share);
             s.2 += 1;
@@ -163,13 +164,16 @@ mod tests {
         // (the budget is process-wide: this test is the only one changing it)
         set_limit(Some(4 << 30));
         let big = acquire(16 << 30);
-        assert_eq!(big.bytes, 4 << 30, "a render alone runs, its share capped at the limit");
+        assert_eq!(big.bytes, 16 << 30, "a render alone runs and keeps its whole estimate reserved");
         let waiting = std::thread::spawn(|| {
             let p = acquire(2 << 30);
             p.bytes
         });
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!waiting.is_finished(), "no room beside the big render");
+        set_limit(Some(8 << 30));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!waiting.is_finished(), "a raised limit does not free room beside the oversized render");
         drop(big);
         assert_eq!(waiting.join().unwrap(), 2 << 30);
         // a render started inside another's share takes none

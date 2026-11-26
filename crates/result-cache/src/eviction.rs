@@ -76,8 +76,8 @@ pub fn trim(folder: &Path, limit: u64, now: SystemTime) -> Trimmed {
         if std::fs::remove_file(&found.path).is_ok() {
             done.removed += 1;
             done.freed_bytes += found.bytes;
+            *total = total.saturating_sub(found.bytes);
         }
-        *total = total.saturating_sub(found.bytes);
     };
     for t in contents.temporaries.iter().filter(|t| now.duration_since(t.used).is_ok_and(|age| age > STALE_TEMPORARY)) {
         remove(t, &mut total);

@@ -306,7 +306,13 @@ fn seen_in(geometry: &SetGeometry, rect: &Rect, ray: &impl Fn([f32; 2]) -> Optio
     while (w / step) * (h / step) > SEEN_MAX_RAYS {
         step *= SEEN_COARSEN;
     }
-    let (nx, ny) = ((w / step).ceil().max(1.0) as usize, (h / step).ceil().max(1.0) as usize);
+    let grid = |step: f32| ((w / step).ceil().max(1.0) as usize, (h / step).ceil().max(1.0) as usize);
+    let (mut nx, mut ny) = grid(step);
+    // The budget counts the rounded grid: a thin rectangle still gets one row
+    while (nx as f64) * (ny as f64) > f64::from(SEEN_MAX_RAYS) {
+        step *= SEEN_COARSEN;
+        (nx, ny) = grid(step);
+    }
     for j in 0..ny {
         for i in 0..nx {
             let q = [rect.lo[0] + (i as f32 + 0.5) * w / nx as f32, rect.lo[1] + (j as f32 + 0.5) * h / ny as f32];
@@ -358,7 +364,10 @@ fn overlaps(t: [[f32; 2]; 3], a: [f32; 2], b: [f32; 2]) -> bool {
 fn contains(t: [[f32; 2]; 3], q: [f32; 2]) -> bool {
     let side = |a: [f32; 2], b: [f32; 2]| (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0]);
     let s = [side(t[0], t[1]), side(t[1], t[2]), side(t[2], t[0])];
-    s.iter().all(|v| *v >= 0.0) || s.iter().all(|v| *v <= 0.0)
+
+    // A collapsed triangle has no inside: every side test would read zero
+    let collapsed = (t[1][0] - t[0][0]) * (t[2][1] - t[0][1]) - (t[1][1] - t[0][1]) * (t[2][0] - t[0][0]) == 0.0;
+    !collapsed && (s.iter().all(|v| *v >= 0.0) || s.iter().all(|v| *v <= 0.0))
 }
 
 /// Every picked triangle grown by `granularity`.

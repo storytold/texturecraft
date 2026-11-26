@@ -681,6 +681,10 @@ fn decode_base64(s: &str) -> Option<Vec<u8>> {
             _ => return None,
         } as u32)
     };
+    // Counted before the copy is made, so an oversized input is refused without a second buffer
+    if s.bytes().filter(|c| !c.is_ascii_whitespace()).count() / 4 * 3 > MAX_BYTES + 3 {
+        return None;
+    }
     let clean: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
     let clean = clean.strip_suffix(b"==").or_else(|| clean.strip_suffix(b"=")).unwrap_or(&clean);
     if clean.len() / 4 * 3 > MAX_BYTES {

@@ -296,7 +296,6 @@ fn running(app: &mut TextureCraftApp, ctx: &egui::Context, state: ImportUi, prev
         }
         Ok(Ok(out)) => {
             let camera = finish_preview(app, ctx);
-            let handoff = std::time::Instant::now();
             return match app.session.install_import(out) {
                 Ok(_) => {
                     app.clear_project_jobs();
@@ -305,7 +304,6 @@ fn running(app: &mut TextureCraftApp, ctx: &egui::Context, state: ImportUi, prev
                         app.session.camera = camera;
                     }
                     app.session.log.push(format!("Import {file}: finished in {}", clock(now - started)));
-                    progress.log_detail(format!("Editable project installed in {} ms", handoff.elapsed().as_millis()));
                     app.ui.mode = crate::state::Mode::Painting;
                     None
                 }

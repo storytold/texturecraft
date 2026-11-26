@@ -1982,6 +1982,7 @@ impl CompositeProgram {
                 }
                 if weights.iter().all(|&opacity| opacity == 0.0)
                     && mask.is_none_or(|mask| !mask.effects.iter().any(|effect| effect.visible && matches!(effect.kind, EffectKind::Anchor)))
+                    && !groups::children_publish_anchors(project, children, depth + 1)
                 {
                     continue;
                 }
@@ -6476,7 +6477,9 @@ mod procedural_tests {
             flip: [true, false],
         };
         let points = texturecraft_compose::placed::warp::regular_points(3, 3)
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .rev()
             .flatten()
             .map(|point| texturecraft_core::WarpPoint {

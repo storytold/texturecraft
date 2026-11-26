@@ -801,6 +801,7 @@ impl Source {
     /// Whether this source reads anchor point `anchor` (any anchor point when None)
     pub fn reads_anchor(&self, anchor: Option<LayerId>) -> bool {
         self.anchor().is_some_and(|found| anchor.is_none_or(|wanted| wanted == found))
+            || self.graph().is_some_and(|graph| graph.anchors().any(|found| anchor.is_none_or(|wanted| wanted == found)))
     }
 }
 

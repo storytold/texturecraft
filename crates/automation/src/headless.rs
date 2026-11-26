@@ -325,8 +325,18 @@ impl Headless {
         let mut warnings: Vec<String> = Vec::new();
         // set by set, each one's files written before the next is composited: a large project's maps are never all
         // held at once
+        let mut taken = std::collections::HashSet::new();
         for ts in sets {
             for f in self.session.export_files(&[ts], &opts)? {
+                // the first set to name a file keeps it, whatever the case of the later one
+                if !taken.insert(f.name.to_lowercase()) {
+                    warnings.push(format!(
+                        "\"{}\" of a later texture set has the name of a file an earlier texture set exports, so it was not written; add $textureSet to the template's file names or rename a texture set",
+                        f.name
+                    ));
+                    warnings.extend(f.warnings);
+                    continue;
+                }
                 let path = join(dir, &f.name);
                 self.write(&path, &f.bytes)?;
                 written.push(path);

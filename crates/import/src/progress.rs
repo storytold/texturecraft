@@ -19,12 +19,9 @@ pub fn watching<R>(period: std::time::Duration, poll: &(dyn Fn() + Sync), work: 
                     poll();
                 }
             });
-            let out = work();
-            done.store(true, std::sync::atomic::Ordering::Release);
-            if let Ok(w) = &watcher {
-                w.thread().unpark();
-            }
-            out
+            // Stops the watcher when `work` unwinds too, so the scope can join it
+            let _stop = watcher.as_ref().ok().map(|w| StopWatcher { done, watcher: w.thread().clone() });
+            work()
         });
         poll();
         out
@@ -35,6 +32,21 @@ pub fn watching<R>(period: std::time::Duration, poll: &(dyn Fn() + Sync), work: 
         let out = work();
         poll();
         out
+    }
+}
+
+/// Tells the watcher thread to finish when dropped.
+#[cfg(not(target_arch = "wasm32"))]
+struct StopWatcher<'a> {
+    done: &'a std::sync::atomic::AtomicBool,
+    watcher: std::thread::Thread,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for StopWatcher<'_> {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.watcher.unpark();
     }
 }
 

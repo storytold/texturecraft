@@ -146,6 +146,11 @@ impl Cooked {
         self.outputs.values().map(TileImage::bytes).sum()
     }
 
+    /// Bytes the cook holds in memory: its tiles and the mip levels built so far.
+    pub fn resident_bytes(&self) -> usize {
+        self.bytes() + self.mips.bytes()
+    }
+
     /// Output `name` (`None`: the first).
     pub fn output(&self, name: Option<&str>) -> Option<&TileImage> {
         match name {
@@ -177,6 +182,17 @@ impl Mips {
                 spare
             }
         }
+    }
+}
+
+impl Mips {
+    /// Bytes of the levels built so far.
+    fn bytes(&self) -> usize {
+        let level_bytes = |level: &Mip| match &level.px {
+            MipPixels::Rgba(px) => px.len() * std::mem::size_of::<[f32; 4]>(),
+            MipPixels::Grey(px) => px.len() * std::mem::size_of::<f32>(),
+        };
+        self.0.values().filter_map(|slot| slot.get()).flat_map(|levels| levels.iter()).map(level_bytes).sum()
     }
 }
 
@@ -558,9 +574,10 @@ impl GraphStore {
     /// The currently shown and incoming results stay resident so neither view reads them back tile by tile.
     pub fn park_old_resize_results(&self, limit: usize) {
         let Some(source) = self.cooks.resize_source.as_ref() else { return };
-        let incoming: HashMap<_, _> = self.cooks.cooks.values().into_iter().filter_map(|(key, result)| result.ok().map(|cook| (key, cook.bytes()))).collect();
+        let incoming: HashMap<_, _> =
+            self.cooks.cooks.values().into_iter().filter_map(|(key, result)| result.ok().map(|cook| (key, cook.resident_bytes()))).collect();
         let previous: Vec<_> = source.cooks.values().into_iter().filter_map(|(key, result)| result.ok().map(|cook| (key, cook))).collect();
-        let held: usize = previous.iter().filter(|(key, _)| !incoming.contains_key(key)).map(|(_, cook)| cook.bytes()).sum();
+        let held: usize = previous.iter().filter(|(key, _)| !incoming.contains_key(key)).map(|(_, cook)| cook.resident_bytes()).sum();
         let mut occupied = held.saturating_add(incoming.values().sum());
         if occupied <= limit {
             return;
@@ -569,7 +586,7 @@ impl GraphStore {
         for (key, cook) in previous {
             if !active.contains(&key) && !incoming.contains_key(&key) && (source.spilled.outline(&key).is_some() || source.spilled.put(&key, &cook)) {
                 source.cooks.remove(&key);
-                occupied = occupied.saturating_sub(cook.bytes());
+                occupied = occupied.saturating_sub(cook.resident_bytes());
                 if occupied <= limit {
                     break;
                 }
@@ -740,7 +757,7 @@ impl GraphStore {
 
     /// Bytes of the cooks held in memory.
     pub fn held_bytes(&self) -> usize {
-        self.cooks.cooks.values().into_iter().filter_map(|(_, v)| v.ok()).map(|c| c.bytes()).sum()
+        self.cooks.cooks.values().into_iter().filter_map(|(_, v)| v.ok()).map(|c| c.resident_bytes()).sum()
     }
 
     /// When the cooks held in memory take more than `limit` bytes, lets go of those that can be read again (spilled,
@@ -858,6 +875,8 @@ impl GraphStore {
         rendered.iter().for_each(|o| {
             h.str(o);
         });
+        // Where each level's inputs end, so a constant wired at the parent and one wired at the child hash apart
+        h.u64(g.inputs.len() as u64);
         for (k, input) in &g.inputs {
             h.u64(u64::from(*k));
             match input {
@@ -1088,8 +1107,10 @@ impl GraphStore {
         }
         let have = plan.output_idents();
         let mut names: Vec<&str> = g.rendered().into_iter().filter(|n| have.iter().any(|h| h == n)).collect();
-        if names.is_empty() {
-            names.extend(have.first().map(String::as_str));
+        // The default output is read by every channel the graph writes without naming an output
+        let reads_default = names.is_empty() || (g.output.is_none() && g.outputs.is_empty());
+        if reads_default && let Some(first) = have.first().map(String::as_str).filter(|first| !names.contains(first)) {
+            names.insert(0, first);
         }
         let output_keys = if given.is_empty() { self.output_keys(g, env, &plan, &names, accelerator.as_deref()) } else { Vec::new() };
         let reused = lock(&self.read_cache().outputs).find(&output_keys);

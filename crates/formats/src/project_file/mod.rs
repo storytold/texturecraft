@@ -13,7 +13,7 @@
 //! | `baked/<ts>_<mapId>.bin` | a baked mesh map of texture set `<ts>` |
 //! | `thumbnail.png` | optional preview supplied by the caller |
 //! | `graphs/<key>.txt` | the text of a graph the layers run, once per distinct graph, named by its text key |
-//! | `cooked/<key>_<output>.bin` | one output of a graph's cooked render (pixel tiles), named by the cook's key |
+//! | `cooked/<key>_n<output>.bin` | one output of a graph's cooked render (pixel tiles), named by the cook's key |
 //! | `cooked/index.json` | the cooks' outputs (and which hold linear colour) and the cook each graph use read last |
 //! | `paint_strokes.json` | the native brush operations retained for resolution changes |
 //! | `strokes/<id>.bin` | the imported stroke record behind the pixels keyed by `<id>` (see [`strokes`]) |
@@ -439,10 +439,10 @@ struct CookEntry {
     linear: Vec<String>,
 }
 
-/// An output name as part of an entry name: as it is when it is plain, else hex.
+/// An output name as part of an entry name: as it is when it is plain (marked `n`), else hex (marked `x`), so the two never meet.
 fn output_entry(key: &str, output: &str) -> String {
     let plain = !output.is_empty() && output.len() <= 64 && output.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-    if plain { format!("cooked/{key}_{output}.bin") } else { format!("cooked/{key}_x{}.bin", output.bytes().map(|b| format!("{b:02x}")).collect::<String>()) }
+    if plain { format!("cooked/{key}_n{output}.bin") } else { format!("cooked/{key}_x{}.bin", output.bytes().map(|b| format!("{b:02x}")).collect::<String>()) }
 }
 
 /// The graph texts the project references and the cooks its uses read.

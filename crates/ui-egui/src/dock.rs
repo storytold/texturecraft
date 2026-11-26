@@ -1250,10 +1250,12 @@ fn geometry_mask_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
     }
     let lid = layer.id.0;
     let shown = layer.geometry_mask.as_ref().and_then(|m| m.parts()).unwrap_or(parts.as_slice());
+    // The mask holds one restriction: editing parts would replace a UV-tile one
+    let tiles_restricted = matches!(layer.geometry_mask, Some(texturecraft_engine::core::GeometryMask::UvTiles(_)));
     ui.menu_button(tr("Geometry mask"), |ui| {
         for part in &parts {
             let mut on = shown.contains(part);
-            if ui.checkbox(&mut on, part.as_str()).changed() {
+            if ui.add_enabled(!tiles_restricted, egui::Checkbox::new(&mut on, part.as_str())).changed() {
                 let next: Vec<&String> = parts.iter().filter(|q| if *q == part { on } else { shown.contains(q) }).collect();
                 let value = if next.len() == parts.len() { Value::Null } else { json!(next) };
                 app.run("layer.set", json!({"layer": lid, "geometryMask": value}));

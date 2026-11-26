@@ -39,6 +39,9 @@ impl Rgba {
     }
 
     pub fn get(&self, x: u32, y: u32) -> [f32; 4] {
+        if x >= self.width {
+            return [0.0; 4];
+        }
         self.px.get(y as usize * self.width as usize + x as usize).copied().unwrap_or([0.0; 4])
     }
 

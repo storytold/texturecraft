@@ -648,6 +648,7 @@ fn a_mask_group_of_strokes_with_polygon_fills_above_them_is_one_paint_effect() {
     assert_eq!(m.effects.len(), 1, "{:?}", m.effects);
     assert_eq!((m.effects[0].kind.clone(), m.effects[0].blend), (EffectKind::Paint, BlendMode::Subtract));
     assert!(stack.fills.len() == 1 && stack.fills[0].over_strokes);
+    assert!(!stack.verdict.all_exact(), "the reversed order is reported as an approximation: {:?}", stack.verdict);
 }
 
 #[test]

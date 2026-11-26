@@ -688,12 +688,13 @@ fn neighbourhood_filters(effects: &[Effect], res: u32, channel: Option<Channel>)
         })
 }
 
+/// The resolution neighbourhood effects are probed at when only whether they read neighbours matters.
+const NEIGHBOUR_PROBE_RESOLUTION: u32 = 2048;
+
 /// Whether any mask or content effect in a texture set reads neighbouring texels. Includes
 /// filters, blurred generators and reduced-resolution generators. Hidden layers and disabled
 /// masks count too, so partial invalidation remains conservative.
 pub fn stack_reads_neighbours(project: &Project, texture_set_index: usize) -> bool {
-    const NEIGHBOUR_PROBE_RESOLUTION: u32 = 2048;
-
     let Some(set) = project.texture_sets.get(texture_set_index) else {
         return false;
     };
@@ -720,6 +721,13 @@ pub fn painted_tile_margin(project: &Project, ts: usize, target: PaintTarget) ->
         let lit = layer.content_effects.iter().any(|effect| effect.visible && lights_material(&effect.kind));
         if layer.reads_stack() || lit {
             return (!stack_reads_neighbours(project, ts)).then_some(0);
+        }
+        // A passthrough layer's filter acts on the stack below it, painted pixels included
+        if owner != layer.id
+            && layer.channels.values().any(|blend| blend.mode == BlendMode::Passthrough)
+            && neighbourhood(&layer.content_effects, NEIGHBOUR_PROBE_RESOLUTION).is_some()
+        {
+            return None;
         }
         if owner == layer.id {
             let effects = match target {

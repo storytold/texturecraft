@@ -427,6 +427,11 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
                     && let Some((filter, note)) = graph_uses::native_filter(f)
                 {
                     let mut e = effect(self.ids.alloc(), &f.header.label, EffectKind::Filter(filter), on);
+                    if channels.is_empty() {
+                        e.visible = false;
+                    } else {
+                        act_on_only(&mut e, &channels);
+                    }
                     if let Some(b) = &blend {
                         e.blend = b.mode();
                         e.opacity = b.opacity;
