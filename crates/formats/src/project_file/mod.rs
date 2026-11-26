@@ -37,9 +37,11 @@ use self::load_budget::LoadBudget;
 use self::uv_layout::{MAX_UV_LAYOUT_BYTES, UV_LAYOUT_ENTRY, read_uv_layout, uv_layout_bytes, write_uv_layout};
 use crate::{FormatError, MAX_IMAGE_SIZE, Result, malformed};
 
+mod allowance;
 mod entries;
 mod load_budget;
 mod project_open_limit;
+mod ram_allowance;
 mod ram_operation;
 mod ram_reservation;
 mod save_progress;
@@ -47,6 +49,7 @@ mod uv_layout;
 #[cfg(not(target_arch = "wasm32"))]
 pub use entries::{DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, configured_ram_budget, save_ram_budget, set_save_resources};
 pub use project_open_limit::{DEFAULT_PROJECT_OPEN_LIMIT_GIB, project_open_limit_gib, set_project_open_limit_gib};
+pub use ram_allowance::RamAllowance;
 pub use ram_reservation::RamReservation;
 pub use save_progress::SaveProgress;
 

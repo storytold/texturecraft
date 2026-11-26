@@ -94,7 +94,7 @@ impl Session {
 
     /// The smart material file holding `mini` (a document from [`one_set_document`]) and the images layer `root` of it uses.
     pub(crate) fn file_bytes(&self, mini: Document, root: LayerId) -> Result<Vec<u8>> {
-        let mut reservation = texturecraft_formats::RamReservation::for_save().map_err(fe)?;
+        let mut reservation = self.reserve_save()?;
         let mut used = Vec::new();
         images_used(&mini.project, root, &mut used, 0);
         let resources = used.into_iter().filter_map(|name| self.doc.resources.get(&name).map(|bytes| (name, Arc::clone(bytes)))).collect();
@@ -205,7 +205,8 @@ fn load(s: &mut Session, p: &Value) -> Result<Value> {
     } else {
         let set = s.ts();
         let resolution = s.doc.project.texture_set(set)?.resolution;
-        let (source, cooked) = crate::link_cmds::cook_link_file(source, resolution, s.baked(set).cloned(), s.link_memory_budget(), Arc::default())?;
+        let (source, cooked) =
+            crate::link_cmds::cook_link_file_with(source, resolution, s.baked(set).cloned(), s.link_memory_budget(), Arc::default(), s.ram_allowance.clone())?;
         s.add_cooked_material(&cooked, source.package, source.source_ext, place)?
     };
     Ok(json!({ "layer": id.0 }))

@@ -16,6 +16,7 @@ use texturecraft_engine::{Session, execute};
 
 fn session() -> Session {
     let mut s = Session::new_project("t", primitives::sphere(1.0, 32, 16), "builtin:sphere", None, 128).unwrap();
+    s.isolate_ram_allowance();
     s.update();
     s
 }
@@ -493,7 +494,7 @@ fn installing_a_bake_reuses_its_encoded_map_buffers() {
 #[ignore = "requires MaterialCraft CLI and at least 8 GiB of available memory"]
 fn three_8k_maps_respect_budget_and_survive_reopen() {
     use texturecraft_engine::formats::save_ram_budget;
-    use texturecraft_engine::link_cmds::cook_link_file;
+    use texturecraft_engine::link_cmds::cook_link_file_with;
 
     const RESOLUTION: u32 = 8192;
     const FIXTURE_AVAILABLE_BYTES: u64 = 16 << 30;
@@ -518,29 +519,31 @@ fn three_8k_maps_respect_budget_and_survive_reopen() {
     let path = temp.path().join("three.mcmat");
     assert!(std::process::Command::new(&cli).arg("publish").arg(&authoring).arg(&path).args(["--graph", "0"]).status().unwrap().success());
     let mut session = Session::new_project("Budget", primitives::cube(1.0), "builtin:cube", None, RESOLUTION).unwrap();
+    let allowance = session.isolate_ram_allowance();
     let original = session.to_project_bytes().unwrap();
 
-    let save = texturecraft_engine::formats::RamReservation::for_save().unwrap();
-    let blocked = cook_link_file(&path, RESOLUTION, None, LinkMemoryBudget::new(FIXTURE_AVAILABLE_BYTES), Arc::default()).unwrap_err();
+    let save = allowance.for_save().unwrap();
+    let blocked =
+        cook_link_file_with(&path, RESOLUTION, None, LinkMemoryBudget::new(FIXTURE_AVAILABLE_BYTES), Arc::default(), Some(Arc::clone(&allowance))).unwrap_err();
     assert!(blocked.to_string().contains("a project save is using the RAM allowance"));
     drop(save);
 
     let low = LinkMemoryBudget::new(save_ram_budget(FIXTURE_AVAILABLE_BYTES, 1));
     let companion_limited = LinkMemoryBudget::new(save_ram_budget(FIXTURE_AVAILABLE_BYTES, 10));
 
-    let error = cook_link_file(&path, RESOLUTION, None, low, Arc::default()).unwrap_err();
+    let error = cook_link_file_with(&path, RESOLUTION, None, low, Arc::default(), Some(Arc::clone(&allowance))).unwrap_err();
 
     assert!(error.to_string().contains("configured cap"), "{error}");
     assert_eq!(session.to_project_bytes().unwrap(), original);
 
-    let error = cook_link_file(&path, RESOLUTION, None, companion_limited, Arc::default()).unwrap_err();
+    let error = cook_link_file_with(&path, RESOLUTION, None, companion_limited, Arc::default(), Some(Arc::clone(&allowance))).unwrap_err();
 
     assert!(error.to_string().contains("MaterialCraft cook failed"), "{error}");
     assert!(error.to_string().contains("configured cap"), "{error}");
     assert_eq!(session.to_project_bytes().unwrap(), original);
 
     let high = LinkMemoryBudget::new(save_ram_budget(FIXTURE_AVAILABLE_BYTES, 50));
-    let (source, cook) = cook_link_file(&path, RESOLUTION, None, high, Arc::default()).unwrap();
+    let (source, cook) = cook_link_file_with(&path, RESOLUTION, None, high, Arc::default(), Some(Arc::clone(&allowance))).unwrap();
     let probes: Vec<_> = cook.maps.iter().map(|map| Arc::downgrade(&map.image)).collect();
 
     assert_eq!(cook.maps.len(), 3);
@@ -576,4 +579,20 @@ fn image_with_material_extension_reopens_as_an_image() {
     let reopened = Session::from_project_bytes(&session.to_project_bytes().unwrap()).unwrap();
 
     assert_eq!(reopened.images[&name].rgba.len(), 4);
+}
+
+#[test]
+fn isolated_ram_allowance_does_not_block_other_sessions() {
+    let mut busy = session();
+    let allowance = busy.isolate_ram_allowance();
+    let cook = allowance.for_cook().unwrap();
+
+    let blocked = busy.to_project_bytes().unwrap_err();
+    assert!(blocked.to_string().contains("a MaterialCraft cook is using the RAM allowance"), "{blocked}");
+
+    let other = session();
+    assert!(!other.to_project_bytes().unwrap().is_empty());
+
+    drop(cook);
+    assert!(!busy.to_project_bytes().unwrap().is_empty());
 }

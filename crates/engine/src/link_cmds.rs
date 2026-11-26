@@ -362,6 +362,7 @@ fn cook_source(
     #[cfg(not(target_arch = "wasm32"))] baked: Option<texturecraft_compose::BakedMaps>,
     mut budget: LinkMemoryBudget,
     canceled: Arc<std::sync::atomic::AtomicBool>,
+    ram_allowance: Option<Arc<texturecraft_formats::RamAllowance>>,
     reservation: CookReservation,
 ) -> Result<(LinkJob, CookedMaterial)> {
     check_source_size(bytes.len())?;
@@ -388,6 +389,7 @@ fn cook_source(
         baked,
         #[cfg(not(target_arch = "wasm32"))]
         budget,
+        ram_allowance,
         canceled,
     };
     let material = job.run_reserved(reservation)?;
@@ -419,12 +421,28 @@ pub fn cook_link_file(
     budget: LinkMemoryBudget,
     canceled: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(LinkJob, CookedMaterial)> {
-    let reservation = CookReservation::for_cook().map_err(|error| EngineError::Other(error.to_string()))?;
+    cook_link_file_with(path, size, baked, budget, canceled, None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn cook_link_file_with(
+    path: &std::path::Path,
+    size: u32,
+    baked: Option<texturecraft_compose::BakedMaps>,
+    budget: LinkMemoryBudget,
+    canceled: Arc<std::sync::atomic::AtomicBool>,
+    ram_allowance: Option<Arc<texturecraft_formats::RamAllowance>>,
+) -> Result<(LinkJob, CookedMaterial)> {
+    let reservation = match &ram_allowance {
+        Some(allowance) => allowance.for_cook(),
+        None => CookReservation::for_cook(),
+    }
+    .map_err(|error| EngineError::Other(error.to_string()))?;
     let metadata = std::fs::metadata(path).map_err(|error| bad("material.load", format!("cannot read {}: {error}", path.display())))?;
     budget.check(metadata.len())?;
 
     let bytes = crate::resource_cmds::read_resource_file("material.load", path, budget.remaining().min(crate::resource_cmds::MAX_BYTES as u64))?;
-    cook_source(bytes, size, baked, budget, canceled, reservation)
+    cook_source(bytes, size, baked, budget, canceled, ram_allowance, reservation)
 }
 
 impl Session {
@@ -434,7 +452,7 @@ impl Session {
         check_source_size(bytes.len())?;
         let ts = self.ts();
         let size = self.doc.project.texture_set(ts)?.resolution;
-        let reservation = CookReservation::for_cook().map_err(|error| EngineError::Other(error.to_string()))?;
+        let reservation = self.reserve_cook()?;
         let budget = self.link_memory_budget();
         budget.check(bytes.len() as u64)?;
 
@@ -448,6 +466,7 @@ impl Session {
             self.doc.baked.get(&ts).cloned(),
             budget,
             Arc::default(),
+            self.ram_allowance.clone(),
             reservation,
         )?;
         self.add_cooked_material(&material, job.package, job.source_ext, place)
@@ -569,6 +588,7 @@ impl Session {
             baked: self.doc.baked.get(&texture_set).cloned(),
             #[cfg(not(target_arch = "wasm32"))]
             budget: self.link_memory_budget(),
+            ram_allowance: self.ram_allowance.clone(),
             canceled: Arc::default(),
         })
     }

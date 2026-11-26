@@ -55,8 +55,8 @@ pub use mesh_import::{HighPolyMesh, ImportedMesh, MeshFile, MeshReport, import_h
 pub use presets::load_preset;
 pub use presets::{DEFAULT_PRESET, builtin_preset, builtin_presets, preset_from_json, preset_to_json};
 pub use project_file::{
-    BakePaintData, DEFAULT_PROJECT_OPEN_LIMIT_GIB, MAX_RESOURCE_NAME_LEN, ProjectFile, RamReservation, load_project_bytes, project_open_limit_gib,
-    sanitize_resource_name, save_project_bytes, set_project_open_limit_gib,
+    BakePaintData, DEFAULT_PROJECT_OPEN_LIMIT_GIB, MAX_RESOURCE_NAME_LEN, ProjectFile, RamAllowance, RamReservation, load_project_bytes,
+    project_open_limit_gib, sanitize_resource_name, save_project_bytes, set_project_open_limit_gib,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
