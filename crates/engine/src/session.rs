@@ -1380,8 +1380,9 @@ impl Session {
                     c.material_revision = c.material_revision.wrapping_add(1);
                 }
                 c.queue_painted(&self.doc.project, i, target, &tiles, |c| if settle { &mut c.settle } else { &mut c.dirty });
-            } else if settle {
-                // Resampled instances first see the stroke when its source pixels are committed.
+            } else if settle || changed_document {
+                // Resampled instances first see paint when its source pixels are committed (a
+                // settled stroke, or a document edit such as a path repaint)
                 c.invalidate_all();
             }
         }

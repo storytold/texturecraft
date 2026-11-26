@@ -1694,10 +1694,10 @@ impl Renderer {
     }
 
     /// Whether `program`'s pipelines are compiled (starting them otherwise): with asynchronous
-    /// compiles, a composite first waits for this.
-    fn composite_pipelines_ready(&mut self, device: &wgpu::Device, program: &CompositeProgram) -> bool {
+    /// compiles, a composite first waits for this. An error when their compile failed.
+    fn composite_pipelines_ready(&mut self, device: &wgpu::Device, program: &CompositeProgram) -> Result<bool, String> {
         if !self.asynchronous_compile || cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
-            return true;
+            return Ok(true);
         }
         let compile = (true, self.shared_test_pipelines);
         self.compositor.get_or_insert_with(|| Self::new_compositor(device, compile)).pipelines_ready(device, program)
@@ -1707,7 +1707,7 @@ impl Renderer {
     /// Scratch holds one band. The final maps stay on the adapter for shading and mip generation.
     pub fn composite_on_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<(), String> {
         // New pipelines compile on worker threads: the set keeps its textures meanwhile
-        if !program.is_neutral() && !self.composite_pipelines_ready(device, program) {
+        if !program.is_neutral() && !self.composite_pipelines_ready(device, program)? {
             return Err(crate::gpu_composite::GPU_PIPELINES_PENDING.into());
         }
         if program.is_mask_preview() {
@@ -1727,9 +1727,11 @@ impl Renderer {
             })?;
             let set = &mut self.sets[ts];
             set.pending_seed = None;
+            // A replaced slot's earlier allocation failure no longer holds: later tiles may grow it
             for (i, texture) in textures.into_iter().enumerate() {
                 set.tex[i] = texture;
                 set.pending[i] = None;
+                set.failed[i] = false;
                 set.mips_dirty[i] = MipsDirty::Clean;
             }
             set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
@@ -1800,6 +1802,7 @@ impl Renderer {
             }
             set.tex = textures;
             set.pending.iter_mut().take(DisplayKind::ALL.len()).for_each(|slot| *slot = None);
+            set.failed.iter_mut().take(DisplayKind::ALL.len()).for_each(|failed| *failed = false);
             set.pending_seed = None;
             set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
             self.content_rev += 1;
@@ -2140,6 +2143,12 @@ impl Renderer {
             return;
         }
 
+        // A pending allocation of another extent (a mesh map view still allocating when the mask
+        // view takes the slot) is retired: this upload sizes the slot anew
+        let pending_extent = set.pending.get(aux_index).and_then(Option::as_ref).map(|p| (p.tex.texture.width(), p.tex.texture.height()));
+        if pending_extent.is_some_and(|pending| pending != extent) {
+            set.pending[aux_index] = None;
+        }
         let allocation_pending = set.pending.get(aux_index).is_some_and(Option::is_some);
         if !allocation_pending && (texture.texture.width(), texture.texture.height()) != extent {
             if set.failed.get(aux_index).copied().unwrap_or(true) {

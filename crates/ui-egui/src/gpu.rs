@@ -375,6 +375,8 @@ impl SetCompositor {
         {
             Some(tiles)
         } else if stroke.is_none()
+            // Only over a preview the renderer accepted: a pending one never wrote its tiles
+            && !waited
             && let Some(previous_id) = self.stroke
             && let Some(previous) = self.current.filter(|old| old.mesh == key.mesh && old.size == key.size && old.shift == key.shift)
         {
@@ -777,9 +779,10 @@ impl GpuLink {
                     self.aux.remove(&ts);
                 }
                 // A material view that is re-opened mid-stroke must rebuild from the
-                // complete coverage, since this view acknowledged the recent tiles.
+                // complete coverage, since this view acknowledged the recent tiles: every set
+                // the stroke feeds (an instance of the layer too), not only the ones that saw it
                 for (ts, material) in self.compositors.iter_mut().enumerate() {
-                    if material.stroke.is_some() || session.stroke_texture_set() == Some(ts) {
+                    if material.stroke.is_some() || session.stroke_texture_set() == Some(ts) || session.pending_display_stroke(ts).is_some() {
                         if material.current.take().is_some() {
                             session.caches[ts].queue_ready_uploads();
                         }
