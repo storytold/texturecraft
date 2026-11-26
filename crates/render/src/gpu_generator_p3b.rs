@@ -208,13 +208,13 @@ mod tests {
         let occlusion: Vec<f32> = (0..BAKE * BAKE).map(|texel| 0.3 + 0.6 * (((texel % BAKE) + texel / BAKE) as f32 / (2 * BAKE) as f32)).collect();
         let baked = BakedMaps { resolution: BAKE, maps: BTreeMap::from([(BakedMap::AmbientOcclusion, Arc::new(occlusion))]) };
         let (pixels, images) = (PixelStore::default(), ImageStore::default());
-        let layouts: [(&str, u32, &[(u32, u32)]); 3] =
-            [("one resolution", 128, &[]), ("a tile at half its block", 128, &[(1002, 64)]), ("both tiles apart from the set", 128, &[(1001, 64), (1002, 64)])];
+        let layouts =
+            [("one resolution", Vec::new()), ("a tile at half its block", vec![(1002, 64)]), ("both tiles apart from the set", vec![(1001, 64), (1002, 64)])];
 
-        for (label, resolution, tile_resolutions) in layouts {
-            let mut set = TextureSet::new("Tiles", 0, resolution);
+        for (label, tile_resolutions) in layouts {
+            let mut set = TextureSet::new("Tiles", 0, 128);
             set.uv_tiles = vec![1001, 1002];
-            set.tile_resolutions.extend(tile_resolutions.iter().copied());
+            set.tile_resolutions.extend(tile_resolutions);
             let grid = set.tile_grid().unwrap();
             let mut mesh = Mesh::default();
             for column in 0..2 {
