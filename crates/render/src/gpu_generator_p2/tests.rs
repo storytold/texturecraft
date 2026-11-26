@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
 use texturecraft_core::{
-    BakedMap, Channel, Effect, EffectKind, Fill, Generator, GeneratorKind, Layer, LayerKind, Mask, MaskBackground, MicroCurvatureType, MicroDetails,
+    BakedMap, BlendMode, Channel, Effect, EffectKind, Fill, Generator, GeneratorKind, Layer, LayerKind, Mask, MaskBackground, MicroCurvatureType, MicroDetails,
     NormalFormat, Project, Source, TextureLayer, TextureSet,
 };
 use texturecraft_geom::primitives;
@@ -36,8 +36,8 @@ fn noise(size: (u32, u32), seed: u32) -> Arc<ImageRes> {
 /// of a height and a normal image (Sobel's normal DirectX, with the detail sizes blurring the
 /// micro curvature; Smooth's kernel and box blurs), a uniform height and an empty normal slot,
 /// the occlusion of a height image over at most and over more than 16 steps, a radius that
-/// occludes nothing and no baked occlusion; a texture and a custom grunge leave the earlier
-/// model as it is
+/// occludes nothing and no baked occlusion; the bake's own detail sizes beside two micro
+/// curvatures' in one mask; a texture and a custom grunge leave the earlier model as it is
 #[test]
 fn micro_details_match_the_cpu() {
     let Some(mut gpu) = headless() else { return };
@@ -64,34 +64,34 @@ fn micro_details_match_the_cpu() {
     let cases = [
         (
             "Sobel with detail sizes",
-            Generator {
+            vec![Generator {
                 micro: Some(Box::new(MicroDetails { normal_source: normal, curvature_intensity: 0.6, ..images_of(MicroCurvatureType::Sobel) })),
                 ..earlier_generator(GeneratorKind::Curvature)
-            },
+            }],
             &baked,
         ),
-        ("Standard", curvature(images_of(MicroCurvatureType::Standard)), &baked),
-        ("Smooth", curvature(MicroDetails { height_intensity: 4.0, ..images_of(MicroCurvatureType::Smooth) }), &baked),
+        ("Standard", vec![curvature(images_of(MicroCurvatureType::Standard))], &baked),
+        ("Smooth", vec![curvature(MicroDetails { height_intensity: 4.0, ..images_of(MicroCurvatureType::Smooth) })], &baked),
         (
             "a uniform height and an empty normal",
-            curvature(MicroDetails {
+            vec![curvature(MicroDetails {
                 curvature_type: MicroCurvatureType::Standard,
                 height_source: Some(Source::Uniform([0.3, 0.5, 0.7])),
                 ..micro(GeneratorKind::Curvature)
-            }),
+            })],
             &baked,
         ),
         (
             "occlusion over more than 16 steps",
-            Generator {
+            vec![Generator {
                 micro: Some(Box::new(MicroDetails { height_source: height.clone(), ao_radius: 1.0, ao_depth: 0.3, ..micro(GeneratorKind::AmbientOcclusion) })),
                 ..earlier_generator(GeneratorKind::AmbientOcclusion)
-            },
+            }],
             &baked,
         ),
         (
             "occlusion over 16 steps at most",
-            Generator {
+            vec![Generator {
                 micro: Some(Box::new(MicroDetails {
                     height: true,
                     height_source: height.clone(),
@@ -100,44 +100,59 @@ fn micro_details_match_the_cpu() {
                     ..micro(GeneratorKind::Dirt)
                 })),
                 ..earlier_generator(GeneratorKind::Dirt)
-            },
+            }],
             &baked,
         ),
         (
             "an occlusion radius too short to occlude",
-            Generator {
+            vec![Generator {
                 micro: Some(Box::new(MicroDetails { height_source: height.clone(), ao_radius: 0.1, ..micro(GeneratorKind::AmbientOcclusion) })),
                 ..earlier_generator(GeneratorKind::AmbientOcclusion)
-            },
+            }],
             &baked,
         ),
         (
             "occlusion without a baked map",
-            Generator {
+            vec![Generator {
                 micro: Some(Box::new(MicroDetails { height_source: height.clone(), ao_radius: 1.0, ..micro(GeneratorKind::AmbientOcclusion) })),
                 ..earlier_generator(GeneratorKind::AmbientOcclusion)
-            },
+            }],
             &unbaked,
         ),
         (
             "a texture and a custom grunge, which the earlier model does not read",
-            Generator {
+            vec![Generator {
                 detail: None,
                 texture: Some(Box::new(TextureLayer { enabled: true, opacity: 0.8, source: height.clone(), ..TextureLayer::default() })),
                 grunge: height.clone(),
                 ..earlier_generator(GeneratorKind::Curvature)
-            },
+            }],
+            &baked,
+        ),
+        (
+            "the bake's own detail sizes and two micro curvatures'",
+            vec![
+                earlier_generator(GeneratorKind::Curvature),
+                Generator { micro: Some(Box::new(images_of(MicroCurvatureType::Sobel))), ..earlier_generator(GeneratorKind::Curvature) },
+                Generator { micro: Some(Box::new(images_of(MicroCurvatureType::Standard))), ..earlier_generator(GeneratorKind::EdgeWear) },
+            ],
             &baked,
         ),
     ];
-    for (label, generator, baked) in cases {
+    for (label, generators, baked) in cases {
         let mut project = Project::new("Micro Details", "builtin:plane");
         project.texture_sets.push(TextureSet::new("Plane", 0, TILE));
         let owner = project.alloc_id();
         let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.9, 0.6, 0.3]))]), ..Default::default() };
         let mut layer = Layer::new(owner, "Micro", LayerKind::Fill(fill), &[Channel::BaseColor]);
         let mut mask = Mask::new(MaskBackground::Black);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
+        for (index, generator) in generators.into_iter().enumerate() {
+            let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(generator));
+            if index > 0 {
+                generated.blend = BlendMode::Multiply;
+            }
+            mask.effects.push(generated);
+        }
         layer.mask = Some(mask);
         project.insert_layer(0, layer, None, false).unwrap();
 

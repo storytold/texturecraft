@@ -1,18 +1,23 @@
+use std::collections::BTreeSet;
 use std::sync::Weak;
 
 use texturecraft_compose::ImageRes;
+use texturecraft_core::CurvatureDetail;
+use texturecraft_geom::UvGBuffer;
 
 use super::micro_request::MicroRequest;
 
-/// The cache key of a program's micro maps: the requests, their images, the bake's maps and the
-/// layout they are built in
+/// The cache key of a program's micro maps: the requests, their images, the bake's maps, the
+/// layout they are built in, and the coverage and sizes of the micro curvatures' detail sizes
 pub(super) struct MicroKey {
     pub(super) requests: Vec<MicroRequest>,
     pub(super) images: Vec<[Option<Weak<ImageRes>>; 2]>,
     pub(super) maps: [Option<Weak<Vec<f32>>>; 2],
     pub(super) size: [u32; 3],
     pub(super) grid: [u32; 2],
-    pub(super) levels: Option<Option<usize>>,
+    pub(super) level_sets: BTreeSet<usize>,
+    pub(super) gbuf: Option<Weak<UvGBuffer>>,
+    pub(super) needed: [bool; CurvatureDetail::BLURRED_SIZES],
 }
 
 impl MicroKey {
@@ -28,7 +33,9 @@ impl MicroKey {
         self.requests == other.requests
             && self.size == other.size
             && self.grid == other.grid
-            && self.levels == other.levels
+            && self.level_sets == other.level_sets
+            && self.needed == other.needed
+            && same(&self.gbuf, &other.gbuf)
             && self.maps.iter().zip(&other.maps).all(|(a, b)| same(a, b))
             && self.images.len() == other.images.len()
             && self.images.iter().zip(&other.images).all(|(a, b)| a.iter().zip(b).all(|(a, b)| same(a, b)))

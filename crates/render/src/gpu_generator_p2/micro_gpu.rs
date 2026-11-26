@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock};
 
 use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
@@ -13,7 +13,8 @@ use super::micro_maps::MicroMaps;
 use super::params::Params;
 use super::run::Run;
 use super::slot_data::SlotData;
-use super::{WORKGROUP, block_groups, dispatch, texture};
+use super::{LINE_WORKGROUP, WORKGROUP, block_groups, dispatch, texture};
+use crate::gpu_curvature::CurvatureLevels;
 use crate::gpu_trace::{entry, storage};
 
 /// The micro detail passes, and each texture set's last maps
@@ -132,7 +133,16 @@ impl MicroGpu {
         let grid = program.udim_layout.as_ref().map_or([1, 1], |layout| [layout.grid.cols, layout.grid.rows]);
         let images = plan.images.iter().map(|pair| pair.each_ref().map(|image| image.as_ref().map(Arc::downgrade))).collect();
         let maps = [0, 2].map(|index| bake.and_then(|baked| baked.maps[index].as_ref().map(Arc::downgrade)));
-        let key = MicroKey { requests: plan.requests.clone(), images, maps, size: [width, occlusion_rows, curvature_rows], grid, levels: plan.levels };
+        let key = MicroKey {
+            requests: plan.requests.clone(),
+            images,
+            maps,
+            size: [width, occlusion_rows, curvature_rows],
+            grid,
+            level_sets: plan.level_sets.clone(),
+            gbuf: program.surface.as_ref().map(|(_, gbuf)| Arc::downgrade(gbuf)),
+            needed: program.curvature_sizes,
+        };
         let gpu = slot.get_or_insert_with(|| MicroGpu::new(device));
         if let Some(cache) = gpu.cache.get(&ts).filter(|cache| cache.key.matches(&key)) {
             return Ok(Some(cache.maps.clone()));
@@ -221,26 +231,82 @@ impl MicroGpu {
             }
         }
 
-        // The detail sizes blur the bake with the claimed micro curvature added
-        let adjusted = match plan.levels {
-            Some(Some(index)) if curvature_rows > 0 => {
-                let bake = texture(
-                    device,
-                    "tc_micro_bake",
-                    [width, curvature_rows, 1],
-                    wgpu::TextureFormat::Rgba32Uint,
-                    wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-                );
-                let view = bake.create_view(&Default::default());
-                let params = Params { place: [0, 0, index as u32 * 2, 0], ..Params::zeroed() };
-                let bindings = self.bindings(device, &params, &dummy, (&dummy.maps_out, baked, &maps_view, &view));
-                dispatch(&mut encoder, &self.adjust, &bindings, [width.div_ceil(WORKGROUP), curvature_rows.div_ceil(WORKGROUP)]);
-                Some(view)
-            }
-            _ => None,
-        };
+        // Each micro curvature the detail sizes read, added to the bake they blur
+        let read_curvature = if curvature_rows > 0 && program.curvature_sizes.contains(&true) { &plan.level_sets } else { &BTreeSet::new() };
+        let mut bakes = Vec::new();
+        for &index in read_curvature {
+            let bake = texture(
+                device,
+                "tc_micro_bake",
+                [width, curvature_rows, 1],
+                wgpu::TextureFormat::Rgba32Uint,
+                wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            );
+            let view = bake.create_view(&Default::default());
+            let params = Params { place: [0, 0, index as u32 * 2, 0], ..Params::zeroed() };
+            let bindings = self.bindings(device, &params, &dummy, (&dummy.maps_out, baked, &maps_view, &view));
+            dispatch(&mut encoder, &self.adjust, &bindings, [width.div_ceil(WORKGROUP), curvature_rows.div_ceil(WORKGROUP)]);
+            bakes.push((index, view));
+        }
         queue.submit([encoder.finish()]);
-        Ok(MicroMaps { maps: maps_view, bake: adjusted })
+        Ok(MicroMaps { maps: maps_view, bakes, levels: OnceLock::new() })
+    }
+
+    /// Copy each micro curvature's detail sizes (`sets`, in the order of `maps.bakes`) into one
+    /// atlas the composite reads (`generator_p2_levels_read.wgsl`): row 0 names each request's
+    /// header row and the layout's level count, then each set's levels and its header row
+    pub(crate) fn store_levels(&self, device: &wgpu::Device, queue: &wgpu::Queue, maps: &MicroMaps, sets: &[CurvatureLevels]) -> Result<(), String> {
+        let Some(first) = sets.first() else { return Ok(()) };
+
+        // Every set's layout has the same vec4s: its levels, then the bake's size
+        let vec4s = (first.layout.size() / 16) as u32;
+        let requests = maps.bakes.iter().map(|(index, _)| index + 1).max().unwrap_or(0) as u32;
+        let extents: Vec<wgpu::Extent3d> = sets.iter().map(|set| set.image.texture().size()).collect();
+        let width = extents.iter().map(|extent| extent.width).max().unwrap_or(1).max(4 * vec4s).max(requests + 1);
+        let height = extents.iter().fold(1u32, |rows, extent| rows.saturating_add(extent.height + 1));
+        if width.max(height) > device.limits().max_texture_dimension_2d {
+            return Err("Micro curvature detail sizes exceed the GPU texture dimensions.".into());
+        }
+
+        let usage = wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+        let atlas = texture(device, "tc_micro_levels", [width, height, 1], wgpu::TextureFormat::R32Uint, usage);
+        let view = atlas.create_view(&Default::default());
+        let (layout, copy, header) = levels_pipelines(device, vec4s);
+        let mut directory = vec![0u32; width as usize];
+        directory[width as usize - 1] = vec4s - 1;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_micro_levels") });
+        let mut row = 1;
+        for (((index, _), set), extent) in maps.bakes.iter().zip(sets).zip(&extents) {
+            let header_row = row + extent.height;
+            directory[*index] = header_row;
+            let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tc_micro_levels_params"),
+                contents: bytemuck::bytes_of(&[row, header_row, 0, 0]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("tc_micro_levels"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&set.image) },
+                    wgpu::BindGroupEntry { binding: 1, resource: set.layout.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
+                ],
+            });
+            dispatch(&mut encoder, &copy, &bindings, [extent.width.div_ceil(WORKGROUP), extent.height.div_ceil(WORKGROUP)]);
+            dispatch(&mut encoder, &header, &bindings, [(4 * vec4s).div_ceil(LINE_WORKGROUP), 1]);
+            row = header_row + 1;
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &atlas, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&directory),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: None, rows_per_image: None },
+            wgpu::Extent3d { width, height: 1, depth_or_array_layers: 1 },
+        );
+        queue.submit([encoder.finish()]);
+        let _ = maps.levels.set(view);
+        Ok(())
     }
 
     /// A pass's bind group: `params`, the run's fields and the images (`maps_out`, `bake`,
@@ -269,4 +335,48 @@ impl MicroGpu {
         ]);
         device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("tc_micro_pass"), layout: &self.layout, entries: &entries })
     }
+}
+
+/// The levels atlas's bind group layout, and its copy and header pipelines for layouts of `vec4s`
+/// vec4s (`generator_p2_levels.wgsl`)
+fn levels_pipelines(device: &wgpu::Device, vec4s: u32) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline, wgpu::ComputePipeline) {
+    let uniform = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("tc_micro_levels_inputs"),
+        entries: &[
+            entry(
+                0,
+                wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+            ),
+            entry(1, uniform),
+            entry(
+                2,
+                wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::R32Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+            ),
+            entry(3, uniform),
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("tc_micro_levels_pipeline"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let source = format!("const LAYOUT_VEC4S: u32 = {vec4s}u;\n{}", include_str!("../shaders/generator_p2_levels.wgsl"));
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc_micro_levels"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+    let pipeline = |name| {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(name),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some(name),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    };
+    let (copy, header) = (pipeline("copy_levels"), pipeline("write_header"));
+    (layout, copy, header)
 }

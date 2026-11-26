@@ -6,8 +6,9 @@
 //! curvature added, as `GeneratorMaps::of` blurs `MicroCurvature::curvature`.
 //!
 //! A generator's P2 record (`Operation::uv[3]`, the side-table offset; 0: none) holds its micro
-//! curvature layer plus one, its micro occlusion layer plus one, then its texture and grunge
-//! records (0: none). The texture and the grunge are read on the new model's section and wear
+//! curvature layer plus one, its micro occlusion layer plus one, its texture and grunge records
+//! (0: none), and the micro curvature set its detail sizes read (its request plus one; 0: the
+//! bake's own, the curvature levels binding). The texture and the grunge are read on the new model's section and wear
 //! controls alone (P1's paths call `generator_texture` and `generator_grunge` in WGSL), so on the
 //! earlier model their records stay 0.
 
@@ -43,14 +44,13 @@ mod tests;
 use block_group::BlockGroup;
 use grunge_pattern::{DIRT_GRUNGE, EDGE_WEAR_GRUNGE, FIBER_GLASS_GRUNGE, TRIPLANAR_SHARPNESS};
 pub(super) use micro_gpu::MicroGpu;
-pub(super) use micro_maps::MicroMaps;
 pub(super) use micro_plan::MicroPlan;
 use micro_request::MicroRequest;
 use micro_slot::MicroSlot;
 use slot_placement::SlotPlacement;
 
 /// Words of a generator's P2 record
-const RECORD_WORDS: usize = 4;
+const RECORD_WORDS: usize = 5;
 
 /// Layers of the micro map texture: two per generator (its curvature term, its occlusion factor)
 const MAX_MICRO_LAYERS: u32 = 256;
@@ -103,22 +103,31 @@ fn reads_micro(kind: GeneratorKind) -> (bool, bool) {
     (curvature, occlusion)
 }
 
-/// The generator's P2 record for `Operation::uv[3]` (0: none) and its micro details' request
-/// (None without them); None when the GPU leaves something it reads to the CPU (a micro height
+/// The generator's P2 record for `Operation::uv[3]` (0: none), `reads_levels` when it reads
+/// curvature detail sizes; None when the GPU leaves something it reads to the CPU (a micro height
 /// read from an anchor point, a texture or grunge slot holding a procedural or an anchor)
-pub(super) fn generator_record(generator: &Generator, inputs: &mut ProceduralInputs) -> Option<(f32, Option<usize>)> {
+pub(super) fn generator_record(generator: &Generator, reads_levels: bool, inputs: &mut ProceduralInputs) -> Option<f32> {
     let (micro_words, micro) = micro_record(generator, inputs)?;
     let texture = texture_record(generator, inputs)?;
     let grunge = grunge_record(generator, inputs)?;
-    let words = [micro_words[0], micro_words[1], texture, grunge];
+
+    // Detail sizes read with a micro curvature blur the bake with it added: a set of their own
+    let levels = match micro.filter(|_| reads_levels) {
+        Some(index) => {
+            inputs.micro.level_sets.insert(index);
+            index as u32 + 1
+        }
+        None => 0,
+    };
+    let words = [micro_words[0], micro_words[1], texture, grunge, levels];
     if words == [0; RECORD_WORDS] {
-        return Some((0.0, None));
+        return Some(0.0);
     }
 
     let offset = inputs.pack_words(&words)?;
 
     // The record's offset travels as an exact float
-    (offset < 1 << 24).then_some((offset as f32, micro))
+    (offset < 1 << 24).then_some(offset as f32)
 }
 
 /// The micro curvature and occlusion layers (plus one; 0: none) of the generator's micro

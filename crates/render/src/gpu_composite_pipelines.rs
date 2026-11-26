@@ -111,6 +111,11 @@ impl Features {
                 "fn generator_curvature(effect: Operation, pixel: vec2<u32>, finest: f32, mode: u32, micro: f32) -> f32 { return 0.0; }",
             ),
             include(
+                self.generator_p2 && self.curvature && supports_curvature,
+                include_str!("shaders/generator_p2_levels_read.wgsl"),
+                "fn generator_level_at(effect: Operation, pixel: vec2<u32>, level: u32) -> f32 { return curvature_level_at(pixel, level); }",
+            ),
+            include(
                 self.generator_p2 && supports_curvature,
                 include_str!("shaders/generator_p2.wgsl"),
                 "fn generator_micro(effect: Operation, pixel: vec2<u32>, baked: vec3<f32>) -> vec3<f32> { return baked; }",

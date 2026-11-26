@@ -13,7 +13,7 @@ fn generator_curvature(effect: Operation, pixel: vec2<u32>, finest: f32, mode: u
             let size = f32(1u << (i - 1u));
             response = 0.0;
             if effect.effects.w == 0u {
-                response = curvature_level_at(bake_pixel, i - 1u) * (2.8284271247461903 * size);
+                response = generator_level_at(effect, bake_pixel, i - 1u) * (2.8284271247461903 * size);
             }
         }
         edges = 1.0 - (1.0 - edges) * (1.0 - weight * clamp(response, 0.0, 1.0));
