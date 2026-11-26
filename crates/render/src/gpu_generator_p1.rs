@@ -427,13 +427,13 @@ mod tests {
         }
     }
 
-    #[allow(clippy::unwrap_used)] // A test helper: the wear kinds have defaults
     /// Clouds between 0.1 and 0.9, for a slot holding a pattern
     fn clouds() -> Source {
         let pattern = Procedural { scale: 3.7, seed: 19, ..Procedural::new(ProceduralKind::Clouds) };
         Source::Procedural { pattern, low: [0.1; 3], high: [0.9; 3], ramp: Vec::new() }
     }
 
+    #[allow(clippy::unwrap_used)] // A test helper: the wear kinds have defaults
     fn wear(kind: GeneratorKind, change: impl FnOnce(&mut WearParameters)) -> Generator {
         let mut wear = WearParameters { grunge_amount: 0.0, ..WearParameters::defaults(kind).unwrap() };
         change(&mut wear);
