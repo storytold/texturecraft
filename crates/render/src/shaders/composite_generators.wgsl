@@ -1,16 +1,21 @@
 fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
+    // A replaced input read at one call site for every kind: the driver inlines fill_value at
+    // each, and with anchor reads more copies overflow lavapipe's shader stack
+    var input = vec3(0.0);
+    if effect.effects.w != 0u {
+        input = generator_source_value(effect.effects.w - 1u, texel);
+    }
     // P3a and P3b: the generators with their own controls (gpu_generator_p3a.rs)
     if effect.ids.y == GENERATOR_KIND_OPCODE {
-        return generator_p3a_ramp(effect, texel);
+        return generator_p3a_ramp(effect, texel, input);
     }
     let surface = texel.surface;
     var baked = texel.baked;
     if effect.effects.w != 0u {
-        let input = generator_source_value(effect.effects.w - 1u, texel);
         switch effect.ids.y {
-            case 40u, 43u: { baked.y = input; }
-            case 41u, 44u: { baked.x = input; }
-            case 42u: { baked.z = input; }
+            case 40u, 43u: { baked.y = input.x; }
+            case 41u, 44u: { baked.x = input.x; }
+            case 42u: { baked.z = input.x; }
             default: {}
         }
     }

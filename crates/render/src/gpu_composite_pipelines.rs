@@ -109,8 +109,8 @@ impl Features {
             ),
             include(
                 self.sampled_generator_inputs,
-                "fn generator_source_value(index: u32, texel: LayerTexel) -> f32 {\n                     return fill_value(layers[index], texel.uv, texel.surface).x;\n                 }",
-                "fn generator_source_value(index: u32, texel: LayerTexel) -> f32 { return layers[index].low.x; }",
+                "fn generator_source_value(index: u32, texel: LayerTexel) -> vec3<f32> {\n                     return fill_value(layers[index], texel.uv, texel.surface).xyz;\n                 }",
+                "fn generator_source_value(index: u32, texel: LayerTexel) -> vec3<f32> { return layers[index].low.xyz; }",
             ),
             include(
                 self.generators,
