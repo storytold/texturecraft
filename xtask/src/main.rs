@@ -295,13 +295,20 @@ fn cmd_ci() -> Result<(), String> {
     };
     type Step = (&'static str, Box<dyn Fn() -> Result<(), String>>);
     // Reject invalid dependency layering before spending time compiling and running the workspace.
-    let steps: Vec<Step> = vec![
+    let mut steps: Vec<Step> = vec![
         ("fmt", Box::new(cargo_step(&["fmt", "--all", "--", "--check"]))),
         ("layers", Box::new(cmd_layers)),
         ("clippy", Box::new(cargo_step(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))),
         ("test", Box::new(cmd_test)),
-        ("wasm", Box::new(cmd_wasm)),
     ];
+    // The check compiles for wasm32 and gives the same answer on any host, so the non-Windows legs
+    // cover it and the slower Windows leg skips it. A skipped step is not in the list, so the
+    // summary never reports it as ok.
+    if cfg!(windows) {
+        eprintln!("ci: wasm check not run on Windows (the other hosts cover it)");
+    } else {
+        steps.push(("wasm", Box::new(cmd_wasm)));
+    }
     for (i, (name, step)) in steps.iter().enumerate() {
         eprintln!("\n=== ci: {name} ===");
         if let Err(e) = step() {

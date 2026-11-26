@@ -17,7 +17,11 @@ const WINDOW: egui::Vec2 = vec2(1280.0, 800.0);
 /// The app showing only one view, so that the view fills the viewport rect the 3D view reports
 fn app(layout: ViewLayout) -> (Harness<'static, TextureCraftApp>, Rect) {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(WINDOW).with_pixels_per_point(1.0).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .with_pixels_per_point(1.0)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().session.tool.tool = texturecraft_engine::Tool::Paint;
     harness.state_mut().ui.layout = ViewLayout::Only3D;
     harness.run_steps(4);

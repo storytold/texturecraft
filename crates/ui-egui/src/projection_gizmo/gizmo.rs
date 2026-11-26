@@ -20,6 +20,11 @@ pub(crate) trait Gizmo: Clone + Send + Sync + 'static {
     /// The command and params a drag of `grab` from `from` to `to` runs
     fn edit(&self, app: &TextureCraftApp, rect: Rect, grab: Self::Grab, from: Pos2, to: Pos2) -> Option<(&'static str, Value)>;
 
+    /// As [`Gizmo::edit`], the drag snapping to the tool bar's steps while `snapping` (a gizmo with none ignores it)
+    fn edit_with_snap(&self, app: &TextureCraftApp, rect: Rect, grab: Self::Grab, from: Pos2, to: Pos2, _snapping: bool) -> Option<(&'static str, Value)> {
+        self.edit(app, rect, grab, from, to)
+    }
+
     /// The cursor over `grab`, or dragging it
     fn cursor(&self, grab: Self::Grab, dragging: bool) -> egui::CursorIcon;
 }

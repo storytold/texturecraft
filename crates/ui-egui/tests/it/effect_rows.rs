@@ -7,6 +7,8 @@ use texturecraft_engine::core::LayerId;
 use texturecraft_engine::execute;
 use texturecraft_ui_egui::TextureCraftApp;
 
+use super::layers_panel::click_selected_content_thumbnail;
+
 fn id(v: Value, key: &str) -> u64 {
     v[key].as_u64().unwrap()
 }
@@ -37,8 +39,12 @@ fn dragging_an_effect_row_reorders_its_stack() {
         |name: &str| id(execute(&mut session, "effect.add.filter", &json!({"target": "content", "filter": "invert", "name": name})).unwrap(), "effect");
     let (a, b, c) = (add("Effect A"), add("Effect B"), add("Effect C"));
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
     harness.run_steps(4);
+    click_selected_content_thumbnail(&mut harness);
     let order =
         |harness: &Harness<'_, TextureCraftApp>| harness.state().session.doc.project.layers[&layer].content_effects.iter().map(|e| e.id.0).collect::<Vec<_>>();
     assert_eq!(order(&harness), [a, b, c]);
@@ -66,8 +72,12 @@ fn an_effect_row_sets_its_blend_mode_and_opacity() {
     let layer = LayerId(id(execute(&mut session, "layer.add.fill", &Value::Null).unwrap(), "layer"));
     let effect = id(execute(&mut session, "effect.add.filter", &json!({"target": "content", "filter": "invert", "name": "Effect A"})).unwrap(), "effect");
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
     harness.run_steps(4);
+    click_selected_content_thumbnail(&mut harness);
     let effect_of = |harness: &Harness<'_, TextureCraftApp>| harness.state().session.doc.project.layers[&layer].content_effects[0].clone();
 
     assert_eq!(effect, effect_of(&harness).id.0);
@@ -112,8 +122,12 @@ fn an_opacity_drag_starting_without_a_change_is_its_own_undo_step() {
     let effect = id(execute(&mut session, "effect.add.filter", &json!({"target": "content", "filter": "invert", "name": "Effect A"})).unwrap(), "effect");
     execute(&mut session, "effect.set", &json!({"effect": effect, "blend": "Multiply"})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
     harness.run_steps(4);
+    click_selected_content_thumbnail(&mut harness);
     let effect_of = |harness: &Harness<'_, TextureCraftApp>| harness.state().session.doc.project.layers[&layer].content_effects[0].clone();
 
     let history = harness.state().session.history_labels().len();
@@ -151,8 +165,12 @@ fn an_effect_rows_blending_options_reach_every_channel() {
     let effect = id(execute(&mut session, "effect.add.filter", &json!({"target": "content", "filter": "invert", "name": "Effect A"})).unwrap(), "effect");
     execute(&mut session, "effect.set", &json!({"effect": effect, "channel": "baseColor", "blend": "Multiply"})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
     harness.run_steps(4);
+    click_selected_content_thumbnail(&mut harness);
     let effect_of = |harness: &Harness<'_, TextureCraftApp>| harness.state().session.doc.project.layers[&layer].content_effects[0].clone();
 
     assert_eq!(effect_of(&harness).blend_of(Some(Channel::Roughness)).mode, BlendMode::Normal);

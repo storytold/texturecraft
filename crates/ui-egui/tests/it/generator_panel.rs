@@ -30,7 +30,8 @@ fn harness_with(render: bool, added: serde_json::Value) -> (Harness<'static, Tex
     session.update();
     let builder = Harness::builder().with_size(egui::vec2(1600.0, 2400.0));
     let builder = if render { builder.wgpu() } else { builder };
-    let mut harness = builder.build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness =
+        builder.with_context_setup(texturecraft_ui_egui::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.dock.close(Panel::Layers);
     harness.state_mut().ui.dock.close(Panel::TextureSetSettings);
     harness.state_mut().ui.dock.focus(Panel::Properties);
@@ -336,7 +337,10 @@ fn an_inherited_generators_micro_height_lists_only_anchors_below_its_owner() {
     let instance = execute(&mut session, "layer.instance", &json!({"layer": source})).unwrap()["layer"].clone();
     execute(&mut session, "layer.select", &json!({"layer": instance})).unwrap();
     session.target = texturecraft_engine::StackTarget::Effect(effect);
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 2400.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 2400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.dock.close(Panel::Layers);
     harness.state_mut().ui.dock.focus(Panel::Properties);
     harness.run_steps(6);

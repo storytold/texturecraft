@@ -40,7 +40,11 @@ fn open(mut session: Session, effect: LayerId) -> (Harness<'static, TextureCraft
     execute(&mut session, "layer.select", &json!({"layer": layer.0, "target": effect.0})).unwrap();
 
     // Frames of a 60 Hz screen: kittest's default quarter second spreads a double-click past egui's delay
-    let mut harness = Harness::builder().with_size(PROPERTIES_WINDOW).with_step_dt(FRAME_SECONDS).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_step_dt(FRAME_SECONDS)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(STARTUP_FRAMES);
     (harness, effect)
 }

@@ -30,7 +30,10 @@ const BESIDE_LINE_IN_RADII: f32 = 3.0;
 /// The sample project with only the 2D view, at 1600 x 960
 fn uv_view_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.layout = ViewLayout::Only2D;
     harness.run_steps(4);
     harness
@@ -249,11 +252,16 @@ fn shift_line_snapshots() {
     let output_dir = std::path::PathBuf::from(std::env::var_os("TC_UI_SNAPSHOTS").expect("set TC_UI_SNAPSHOTS to the output directory"));
     std::fs::create_dir_all(&output_dir).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|context| {
-        let adapter = &context.wgpu_render_state.as_ref().expect("wgpu render state").adapter;
-        eprintln!("Shift-line snapshot adapter: {:?}", adapter.get_info());
-        TextureCraftApp::new(context, session)
-    });
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| {
+            let adapter = &context.wgpu_render_state.as_ref().expect("wgpu render state").adapter;
+            eprintln!("Shift-line snapshot adapter: {:?}", adapter.get_info());
+            TextureCraftApp::new(context, session)
+        });
     harness.state_mut().ui.layout = ViewLayout::Only2D;
     harness.run_steps(4);
     click(&mut harness, FIRST_CLICK, false);

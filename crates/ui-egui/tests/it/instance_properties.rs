@@ -23,7 +23,11 @@ fn instance_harness(dangling: bool) -> (Harness<'static, TextureCraftApp>, Layer
         session.doc.project.layers.get_mut(&instance).unwrap().kind = LayerKind::Instance { source: GONE };
     }
     execute(&mut session, "layer.select", &json!({"layer": instance.0, "target": "content"})).unwrap();
-    let mut harness = Harness::builder().with_size(PROPERTIES_WINDOW).with_step_dt(FRAME_SECONDS).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_step_dt(FRAME_SECONDS)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(STARTUP_FRAMES);
     (harness, instance, source)

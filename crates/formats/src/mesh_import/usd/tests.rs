@@ -707,7 +707,7 @@ def Xform "Root"
 }
 "#;
     let albedo = png([200, 10, 10]);
-    let mut writer = craft_zip_usdz::Writer::new();
+    let mut writer = craft_zip::Writer::new();
     writer.add_stored_aligned("sub/scene.usda", usda.as_bytes(), 64).unwrap();
     writer.add_stored_aligned("sub/tex/albedo.png", &albedo, 64).unwrap();
     let pkg = writer.finish().unwrap();

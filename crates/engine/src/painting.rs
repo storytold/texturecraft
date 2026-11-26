@@ -865,8 +865,7 @@ impl Session {
             self.undo.remove(0);
         }
         self.redo.clear();
-        self.modified = true;
-        self.revision = self.revision.wrapping_add(1);
+        self.mark_modified();
 
         let previous_revision = self.caches.get(stroke.ts).map_or(0, |cache| cache.material_revision);
         // Recompute committed tiles at low priority because the live preview already shows them

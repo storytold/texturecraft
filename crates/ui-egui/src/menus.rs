@@ -148,6 +148,11 @@ fn tooltip_of(id: &str) -> Option<&'static str> {
 
 /// Whether an item can run now
 pub fn enabled(app: &TextureCraftApp, id: &str) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.save_job.is_some() && crate::manual_save::is_save(id) {
+        return false;
+    }
+
     if UNAVAILABLE.contains(&id) {
         return false;
     }
@@ -419,7 +424,7 @@ pub fn forwarded_shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context, event
             continue;
         }
         let Some(id) = app.bindings.command_of(&event) else { continue };
-        invoke(app, ctx, effect_command(app, &id));
+        run_shortcut(app, ctx, &id);
     }
 }
 
@@ -452,15 +457,29 @@ fn effect_command<'a>(app: &TextureCraftApp, id: &'a str) -> &'a str {
     }
 }
 
-/// Runs the commands bound to the keys pressed this frame, outside text fields and key capture
+/// Runs the commands bound to the keys pressed this frame, with no widget but the viewport focused, outside key capture
 pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
-    if crate::keymap::capturing(ctx) || (ctx.memory(|memory| memory.focused().is_some()) && ctx.egui_wants_keyboard_input()) {
+    if crate::keymap::capturing(ctx) || crate::framework::widget_has_keyboard(ctx) {
         return;
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     if crate::updates_ui::blocks_input(app) {
         return;
+    }
+
+    // A plain Escape or Enter while no widget of TextureCraft's has the keyboard is the window's cancel or submit: back
+    // in egui's input, it runs the Escape and Enter handlers below, the shortcuts and the Path tool's keys
+    for (key, taken) in [(Key::Escape, crate::framework::take_window_cancel(ctx)), (Key::Enter, crate::framework::take_window_submit(ctx))] {
+        if taken {
+            let escape = craft_ui::runtime::keys::escape_mods(ctx).filter(|_| key == Key::Escape);
+            ctx.input_mut(|i| {
+                // A submit's Enter had no Ctrl or Cmd; one that came down later in the pass is not its own
+                let (shift, alt) = escape.map_or((i.modifiers.shift, i.modifiers.alt), |held| (held.shift, held.alt));
+                let modifiers = Modifiers { shift, alt, ..Modifiers::NONE };
+                i.events.insert(0, egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers });
+            });
+        }
     }
 
     // The dispatcher reads clipboard events as shortcuts; a pasted image also means Ctrl+V
@@ -477,14 +496,13 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
     });
 
     // Let the innermost popup consume Escape before cancelling the active tool
-    let popup_open = egui::Popup::is_any_open(ctx);
+    // (the drop popup of the Output templates tab is open without registering with egui, and reads Escape itself)
+    let popup_open = egui::Popup::is_any_open(ctx) || app.ui.export.pending_drop.is_some();
     let point_pick_armed = crate::generator_point_pick::armed(ctx).is_some();
     let mut cancel_point_pick = false;
     let picker_open = crate::color_picker::open_window(ctx).is_some();
 
-    let no_widget_focused = ctx.memory(|memory| memory.focused().is_none());
-    #[cfg(not(target_arch = "wasm32"))]
-    let nothing_focused = ctx.memory(|memory| memory.focused().is_none());
+    let nothing_focused = !crate::framework::widget_has_keyboard(ctx);
     let log_copies = crate::log_panel::takes_copy(app, ctx);
     let commands_to_invoke = ctx.input_mut(|input| {
         // egui's label selection copies on these events at the end of the frame
@@ -496,7 +514,7 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
         // Escape and Enter answer the Reset UI question first, even when a shortcut binds them
         let confirming_reset = app.ui.windows.confirm_reset_ui;
         if confirming_reset && !popup_open {
-            crate::windows::reset_ui_keys(app, input, no_widget_focused);
+            crate::windows::reset_ui_keys(app, input, nothing_focused);
         }
 
         // F2 renames the selected template on Output templates, before its 3D view binding
@@ -557,15 +575,20 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
     }
 
     for id in &commands_to_invoke {
-        if matches!(id.as_str(), "layer.copy" | "layer.cut")
-            && let Some(layer) = app.session.selected_layer().and_then(|layer| app.session.doc.project.layers.get(&layer))
-        {
-            // Ctrl+V reaches the app only while the system clipboard holds text or an image
-            ctx.copy_text(layer.name.clone());
-        }
-
-        invoke(app, ctx, effect_command(app, id));
+        run_shortcut(app, ctx, id);
     }
+}
+
+/// Runs the command a shortcut is bound to. A layer copy or cut also puts the layer's name on the system clipboard:
+/// Ctrl+V reaches the app only while that clipboard holds text or an image.
+fn run_shortcut(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
+    if matches!(id, "layer.copy" | "layer.cut")
+        && let Some(layer) = app.session.selected_layer().and_then(|layer| app.session.doc.project.layers.get(&layer))
+    {
+        ctx.copy_text(layer.name.clone());
+    }
+
+    invoke(app, ctx, effect_command(app, id));
 }
 
 /// The desktop and web shells turn Ctrl+C, Ctrl+X and Ctrl+V (and Ctrl+Insert, Shift+Delete,

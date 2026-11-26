@@ -285,9 +285,8 @@ impl PropertySheet<'_> {
         });
 
         // Escape ends hex editing first even when egui has already dropped the field's focus
-        let escape = ctx.input(|input| input.key_pressed(egui::Key::Escape))
-            && ctx.memory(|memory| memory.focused().is_none_or(|focused| focused == bar.id))
-            && !hex_took_escape(&ctx);
+        let escape =
+            crate::framework::escape_pressed(&ctx) && crate::framework::focused_widget(&ctx).is_none_or(|focused| focused == bar.id) && !hex_took_escape(&ctx);
         if closed || (!list_open && !waiting && (pressed_outside || escape)) {
             state.open = false;
             crate::color_picker::forget_window(&ctx);

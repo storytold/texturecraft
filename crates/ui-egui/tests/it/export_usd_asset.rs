@@ -26,7 +26,10 @@ impl Drop for Scratch {
 /// The Export textures window writing into a scratch folder of its own for `name`
 fn harness(name: &str) -> (Harness<'static, TextureCraftApp>, Scratch) {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     let dir = std::env::temp_dir().join(format!("tc-export-usd-asset-{name}-{}", std::process::id()));

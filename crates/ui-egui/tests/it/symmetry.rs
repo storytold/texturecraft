@@ -27,7 +27,12 @@ const VIEW_CORNER_INSET: f32 = 40.0;
 
 fn app_harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(1024, 256).unwrap();
-    let mut harness = Harness::builder().with_size(WINDOW_SIZE).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().session.tool.tool = Tool::Paint;
     harness.run_steps(4);
     harness

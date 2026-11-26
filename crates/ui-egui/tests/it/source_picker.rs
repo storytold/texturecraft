@@ -32,7 +32,10 @@ fn app_with_fill(prepare: impl FnOnce(&mut texturecraft_engine::Session, LayerId
     let added = texturecraft_engine::execute(&mut session, "layer.add.fill", &json!({})).unwrap();
     let layer = LayerId(added["layer"].as_u64().unwrap());
     prepare(&mut session, layer);
-    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
 
     // The labels below are English; a first run would speak the system's language
     harness.state_mut().ui.prefs.language = "en".into();
@@ -225,7 +228,12 @@ fn near_the_windows_bottom_the_picker_opens_above_its_slot_at_full_size() {
 fn picker_above_its_slot_snapshot() {
     let mut session = texturecraft_engine::sample_session(TEXTURE_RESOLUTION, BAKE_RESOLUTION).unwrap();
     texturecraft_engine::execute(&mut session, "layer.add.fill", &json!({})).unwrap();
-    let mut harness = Harness::builder().with_size(SNAPSHOT_WINDOW_SIZE).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(SNAPSHOT_WINDOW_SIZE)
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(STARTUP_FRAMES);
     click_widget(&mut harness, Role::Tab, "Material");

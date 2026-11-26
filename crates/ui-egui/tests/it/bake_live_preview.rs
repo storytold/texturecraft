@@ -22,7 +22,10 @@ fn harness() -> Harness<'static, TextureCraftApp> {
 
     // No earlier bake to start the preview from: its first picture is a preview bake at the chosen size
     session.doc.baked.clear();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.mode = Mode::Baking;
     harness.state_mut().ui.bake_visualization.map_preview_size = BakeResolution::R256;
     harness.run_steps(4);
@@ -100,6 +103,31 @@ fn switching_the_preview_off_hides_it() {
     harness.run_steps(1);
 
     assert!(!harness.state().session.bake_preview_active());
+}
+
+#[test]
+fn disabling_live_preview_in_preferences_releases_the_picture_and_can_be_reenabled() {
+    let mut harness = harness();
+
+    for resolution in [BakeResolution::R256, BakeResolution::R128] {
+        let state = harness.state_mut();
+        state.ui.bake_visualization.map_preview_size = resolution;
+        state.ui.prefs.live_preview_baking = true;
+
+        assert!(wait_for_preview(&mut harness, |size| size == resolution.pixels()).is_some());
+        let pixels = &harness.state().session.bake_preview_baked(0).unwrap().maps[&BakedMap::AmbientOcclusion];
+        let picture = std::sync::Arc::downgrade(pixels);
+        let bytes = pixels.len() * std::mem::size_of::<f32>();
+
+        harness.state_mut().ui.prefs.live_preview_baking = false;
+        harness.run_steps(3);
+
+        let remaining_owners = picture.strong_count();
+        eprintln!("preview resolution: {resolution:?}, published bytes: {bytes}, owners after disabling: {remaining_owners}");
+        assert!(!harness.state().session.bake_preview_active());
+        assert_eq!(remaining_owners, 0, "disabling the preview releases its image");
+        assert_ne!(harness.state().session.view, texturecraft_engine::ViewMode::MeshMap(BakedMap::AmbientOcclusion));
+    }
 }
 
 #[test]

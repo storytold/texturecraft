@@ -553,7 +553,7 @@ pub struct Session {
     pub(crate) source: Arc<Mesh>,
     pub bvh: Arc<Bvh>,
     /// Original mesh file (saved inside the project); None for built-in meshes.
-    pub mesh_source: Option<(String, Vec<u8>)>,
+    pub mesh_source: Option<(String, Arc<Vec<u8>>)>,
     pub caches: Vec<SetCache>,
     pub(crate) undo: Vec<(String, Document)>,
     pub(crate) redo: Vec<(String, Document)>,
@@ -608,6 +608,9 @@ pub struct Session {
     /// (see [`crate::commands::check_enabled`]).
     pub project_open: bool,
     pub modified: bool,
+    /// Edits to saved data, independent of viewport and tool changes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) save_revision: u64,
     /// Bumps on every document change.
     pub revision: u64,
     /// Messages for the UI (status bar / toasts).
@@ -655,7 +658,7 @@ impl Session {
             source,
             mesh,
             bvh: Arc::new(bvh),
-            mesh_source,
+            mesh_source: mesh_source.map(|(extension, bytes)| (extension, Arc::new(bytes))),
             caches,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -688,6 +691,8 @@ impl Session {
             path: None,
             project_open: true,
             modified: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            save_revision: 0,
             revision: 1,
             log: crate::log::SessionLog::new(),
             log_id: next_mesh_id(),
@@ -717,6 +722,10 @@ impl Session {
     pub fn switch_to(&mut self, mut next: Session) {
         // Invalidate caches even when both projects were loaded with the same revision
         next.revision = self.revision.wrapping_add(1);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            next.save_revision = self.save_revision.wrapping_add(1);
+        }
 
         next.viewport = self.viewport;
         next.export_presets = std::mem::take(&mut self.export_presets);
@@ -869,8 +878,7 @@ impl Session {
             self.path_steps = Default::default();
         }
 
-        self.modified = true;
-        self.revision = self.revision.wrapping_add(1);
+        self.mark_modified();
         if !(merge && self.undo.last().is_some_and(|(l, _)| l == label)) {
             self.undo.push((label.to_string(), before));
         }
@@ -881,8 +889,7 @@ impl Session {
 
     /// A change from `other` to the current document that is not an undo step (a path preview)
     pub(crate) fn changed_without_history(&mut self, other: &Document) {
-        self.modified = true;
-        self.revision = self.revision.wrapping_add(1);
+        self.mark_modified();
         self.invalidate_changed(other);
     }
 
@@ -1000,11 +1007,20 @@ impl Session {
 
     /// Mark the document changed and every texture set dirty.
     pub fn touched(&mut self) {
-        self.modified = true;
-        self.revision = self.revision.wrapping_add(1);
+        self.mark_modified();
         self.sync_caches();
         for c in &mut self.caches {
             c.invalidate_all();
+        }
+    }
+
+    /// Mark saved data changed without invalidating the texture sets.
+    pub fn mark_modified(&mut self) {
+        self.modified = true;
+        self.revision = self.revision.wrapping_add(1);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.save_revision = self.save_revision.wrapping_add(1);
         }
     }
 
@@ -1120,11 +1136,10 @@ impl Session {
     fn after_history(&mut self, other: &Document) {
         // Pending operations may still hold layer IDs from the discarded snapshot
         self.doc.project.next_id = self.doc.project.next_id.max(other.project.next_id);
-        self.modified = true;
+        self.mark_modified();
 
         // Layers picked together belong to the stack they were picked in
         self.multi.clear();
-        self.revision = self.revision.wrapping_add(1);
         self.invalidate_changed(other);
 
         // An undone add or duplicate takes the selected effect away

@@ -148,7 +148,7 @@ impl RoundGizmo {
         let pixels = (project(app, rect, origin + right * reach)? - center).length() / reach;
         let ring = TURN_RING / pixels.max(f32::MIN_POSITIVE);
         self.rings = directions.map(|direction| {
-            if !ring_open(app, rect, center, direction) {
+            if !ring_open(app, rect, center, direction, TURN_RING) {
                 return Vec::new();
             }
 

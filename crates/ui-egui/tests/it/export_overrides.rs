@@ -12,7 +12,10 @@ fn harness() -> Harness<'static, TextureCraftApp> {
 }
 
 fn harness_with_session(session: texturecraft_engine::Session) -> Harness<'static, TextureCraftApp> {
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     h.state_mut().ui.windows.export = true;
@@ -269,7 +272,10 @@ fn reset_all_then_cancel_restores_the_ticks_and_overrides() {
 #[test]
 fn ticks_saved_before_settings_named_their_project_are_kept() {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
 

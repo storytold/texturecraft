@@ -15,7 +15,10 @@ const DRAGGED: [(BakedMap, &str); 3] = [(BakedMap::Normal, "Normal"), (BakedMap:
 fn harness() -> Harness<'static, TextureCraftApp> {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     session.doc.project.texture_sets[0].bake.maps.select(BakedMap::ALL);
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1500.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1500.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.mode = Mode::Baking;
     harness.run_steps(4);
     harness.state_mut().ui.dock.focus(Panel::MeshMapBakers);

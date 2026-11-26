@@ -61,7 +61,7 @@ pub fn texture_sets(app: &mut TextureCraftApp, ui: &mut Ui) {
                 .collect();
 
             ui.push_id(set_index, |ui| {
-                ui.horizontal(|ui| {
+                let row = ui.horizontal(|ui| {
                     let button_size = ui.spacing().interact_size.y;
                     if icon_button(ui, if visible { icon::EYE } else { icon::EYE_SLASH }, tr("Show or hide the texture set"), false, button_size).clicked() {
                         app.run("textureSet.visible", json!({ "ts": set_index }));
@@ -87,6 +87,10 @@ pub fn texture_sets(app: &mut TextureCraftApp, ui: &mut Ui) {
                         app.start_resize(set_index, selected);
                     }
                 });
+
+                if ui.is_enabled() && ui.rect_contains_pointer(row.response.rect) {
+                    app.next_hovered_texture_set = Some((app.session.project_id, set_index));
+                }
 
                 if !tiles.is_empty() {
                     egui::CollapsingHeader::new(format!("{} ({})", tr("UV tiles (UDIM)"), tiles.len())).default_open(true).show(ui, |ui| {

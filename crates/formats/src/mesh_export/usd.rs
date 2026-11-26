@@ -287,7 +287,7 @@ pub(crate) fn material_maps(mesh: &Mesh, stem: &str, textures: &[Vec<ExportedFil
 
 /// A usdz package: the layer first, every entry stored uncompressed at a 64-byte aligned offset.
 pub(crate) fn usdz(layer_name: &str, layer: &[u8], files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
-    let mut zip = craft_zip_usdz::Writer::new();
+    let mut zip = craft_zip::Writer::new();
     let err = |e| FormatError::Invalid(format!("usdz package: {e}"));
     for (name, bytes) in std::iter::once((layer_name, layer)).chain(files.iter().map(|(n, b)| (n.as_str(), b.as_slice()))) {
         zip.add_stored_aligned(name, bytes, 64).map_err(err)?;

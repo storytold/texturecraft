@@ -197,7 +197,11 @@ fn toolbar_window_snapshots() {
 
     std::fs::create_dir_all(&directory).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).wgpu().build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().session.tool.tool = Tool::Path;
     harness.state_mut().session.tool.brush.lazy = 20.0;
     for (width, scale) in [(1600.0, 1.0), (960.0, 1.0), (960.0, 1.5)] {

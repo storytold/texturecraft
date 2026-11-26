@@ -324,9 +324,21 @@ pub fn font_definitions() -> egui::FontDefinitions {
     fonts
 }
 
+/// Gives the context `fonts` through the framework runtime, which keeps its layout memory in step with them. The
+/// framework's chrome (the dock, the update dialogs) also draws in the signature and semibold families: signature
+/// takes the proportional faces and semibold TextureCraft's own semibold list. A family left out draws missing-glyph
+/// boxes.
+pub fn load_fonts(ctx: &egui::Context, mut fonts: egui::FontDefinitions) {
+    let proportional = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    let semibold = fonts.families.get(&FontFamily::Name(SEMIBOLD.into())).cloned().unwrap_or_else(|| proportional.clone());
+    fonts.families.insert(craft_ui::fonts::FontRef::signature().family(), proportional);
+    fonts.families.insert(FontFamily::Name(craft_ui::fonts::SEMIBOLD.into()), semibold);
+    craft_ui::fonts::load(ctx, fonts);
+}
+
 /// Install the fonts (once, at startup; the app applies the style from its settings).
 pub fn install(ctx: &egui::Context) {
-    ctx.set_fonts(font_definitions());
+    load_fonts(ctx, font_definitions());
 }
 
 /// Apply brightness `b` and `accent`: store the tokens for [`Tokens::get`] and style egui with
@@ -371,8 +383,18 @@ pub fn apply(ctx: &egui::Context, b: Brightness, accent: Accent) {
         v.selection.stroke = Stroke::new(1.0, t.text_strong);
         v.hyperlink_color = t.accent;
         let w = &mut v.widgets;
-        craft_ui::theme::WidgetPalette { noninteractive: t.panel, inactive: t.button, hovered: t.row_hover, active: t.tool_active, open: t.row_hover }
-            .apply_to(w, t.cr(), Stroke::new(1.0, t.text));
+        for (widget, fill) in [
+            (&mut w.noninteractive, t.panel),
+            (&mut w.inactive, t.button),
+            (&mut w.hovered, t.row_hover),
+            (&mut w.active, t.tool_active),
+            (&mut w.open, t.row_hover),
+        ] {
+            widget.bg_fill = fill;
+            widget.weak_bg_fill = fill;
+            widget.corner_radius = t.cr();
+            widget.fg_stroke = Stroke::new(1.0, t.text);
+        }
 
         // Hovered and pressed lettering, and `RichText::strong` (captions), in the strong colour
         w.hovered.fg_stroke.color = t.text_strong;

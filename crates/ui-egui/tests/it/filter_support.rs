@@ -29,7 +29,10 @@ pub(crate) fn app_with(filter: &str, target: &str, height: f32) -> (Harness<'sta
     execute(&mut session, "layer.select", &json!({"layer": layer["layer"]})).unwrap();
     session.target = StackTarget::Effect(effect);
 
-    let mut harness = Harness::builder().with_size(egui::vec2(WINDOW_WIDTH, height)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(WINDOW_WIDTH, height))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     (harness, effect)
