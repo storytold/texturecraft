@@ -3,3 +3,4 @@
 *.ico binary
 *.icns binary
 *.ps1 text eol=crlf
+*.tcraft binary

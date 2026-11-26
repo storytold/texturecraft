@@ -9,7 +9,10 @@ fn harness() -> Harness<'static, TextureCraftApp> {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     texturecraft_engine::execute(&mut session, "mask.add.white", &serde_json::Value::Null).unwrap();
     session.target = StackTarget::Mask;
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.run_steps(4);
 
     harness

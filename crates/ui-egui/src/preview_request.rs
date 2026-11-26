@@ -19,11 +19,19 @@ pub struct PreviewRequest {
 }
 
 impl PreviewRequest {
-    /// Render the asset, baking the orb on first use for smart masks and smart materials
+    /// Render the asset, baking the orb on first use for smart masks, generators and smart materials
     /// Unknown assets and failed bakes return None
     pub fn render(&self, shape: &mut OrbShape) -> Option<ColorImage> {
         match &self.preview {
             ShelfPreview::SmartMask(id) => Some(mask_preview_image(self.size_px, &shape.get()?.mask(id, self.size_px)?)),
+            ShelfPreview::Generator(kind) => Some(mask_preview_image(self.size_px, &shape.get()?.generator(*kind, self.size_px)?)),
+            ShelfPreview::Curvature { mode, solo } => {
+                let generator = ShelfPreview::curvature_generator(*mode, *solo);
+                Some(mask_preview_image(self.size_px, &shape.get()?.generator_of(generator, self.size_px)?))
+            }
+            ShelfPreview::GeneratorSet { generator, images } => {
+                Some(mask_preview_image(self.size_px, &shape.get()?.generator_reading(generator.as_ref().clone(), images, self.size_px)?))
+            }
             ShelfPreview::SmartMaterial(id) => Some(material_preview_image(self.size_px, &shape.get()?.material(id, self.size_px)?)),
             preview => preview.image(self.size_px),
         }

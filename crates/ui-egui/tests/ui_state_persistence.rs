@@ -13,7 +13,7 @@ fn app(storage: &MemoryStorage, render: bool) -> Harness<'static, TextureCraftAp
     // Existing viewport controls lack accessible names; these tests check persistence and rendering
     let builder = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_accessibility_check(false);
     let builder = if render { builder.wgpu() } else { builder };
-    builder.build_eframe(|context| {
+    builder.with_context_setup(texturecraft_ui_egui::framework::install_headless).build_eframe(|context| {
         let mut creation = eframe::CreationContext::_new_kittest(context.egui_ctx.clone());
         creation.storage = Some(storage);
         creation.wgpu_render_state = context.wgpu_render_state.clone();

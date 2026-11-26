@@ -1,8 +1,10 @@
 //! Software updates on the desktop: the check at start, Help > Check for Updates and the update
-//! prompt. An update that is ready starts its install helper when the app is dropped at exit.
+//! prompt, as craft-update's dialogs on the app's [`DialogHost`](craft_ui::dialog::DialogHost). An
+//! update that is ready starts its install helper when the app is dropped at exit.
 
+use craft_ui::dialog::DialogResult;
+use craft_update::stack_dialogs::{CheckChoice, UpdateCheckDialog};
 use craft_update::updater::{Action, Status, Updater};
-use craft_update::{CheckResultDialog, CheckResultResponse};
 
 use crate::TextureCraftApp;
 
@@ -22,12 +24,19 @@ impl Default for Runtime {
 impl TextureCraftApp {
     /// Whether the app asks for a newer release when it starts (off until the desktop app turns it on).
     pub fn set_startup_update_check(&mut self, on: bool) {
-        self.updates_rt.startup_check = on;
+        // A Nightly install is updated by ArtCraft Launcher with the rest of the suite, never by
+        // the app: an in-app update would replace a copy the Launcher believes it manages.
+        self.updates_rt.startup_check = on && crate::os_window::stable_services_allowed();
     }
 }
 
-/// Help > Check for Updates: the next frame starts a check that reports its outcome.
+/// Help > Check for Updates: the next frame starts a check that reports its outcome. In a Nightly
+/// build the Launcher owns updates, so it says so instead of checking.
 pub(crate) fn request_check(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    if !crate::os_window::stable_services_allowed() {
+        app.toast(crate::i18n::tr("TextureCraft Nightly is updated by ArtCraft Launcher."), false);
+        return;
+    }
     app.updates_rt.check_requested = true;
     ctx.request_repaint();
 }
@@ -45,11 +54,14 @@ fn holds_keyboard(status: &Status, prompt_open: bool) -> bool {
 }
 
 pub(crate) fn tick(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    if !crate::os_window::stable_services_allowed() {
+        return;
+    }
     let rt = &mut app.updates_rt;
     if std::mem::take(&mut rt.check_requested) {
-        rt.updater.check_now(ctx);
+        rt.updater.check_now();
     } else if rt.startup_check {
-        rt.updater.check_at_start(ctx);
+        rt.updater.check_at_start();
     }
     rt.updater.tick(ctx);
 }
@@ -64,24 +76,47 @@ fn result_window_shows(status: &Status, prompt_open: bool) -> bool {
 /// Whether an update may install and close the app: the project has no unsaved changes and no
 /// stroke, bake or resize is running.
 fn safe_to_close(app: &TextureCraftApp) -> bool {
-    !app.session.modified && !app.session.stroke_active() && app.bake.is_none() && app.resize.is_none()
+    !app.session.modified && !app.session.stroke_active() && app.bake.is_none() && app.resize.is_none() && app.high_poly_job.is_none()
 }
 
+/// One pass of the update flow, before the dialog host runs: answers the result dialog closed in
+/// the last pass, drives the update prompt, and keeps the result dialog open and current while the
+/// updater has something to report.
 pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let safe = safe_to_close(app);
-    match app.updates_rt.updater.show_if(ctx, safe) {
+    // Answered before the dialog is kept open below, so a dismissed outcome does not open again at once
+    match app.framework_dialogs.take::<UpdateCheckDialog>() {
+        Some(DialogResult::Ok(CheckChoice::CheckNow | CheckChoice::CheckAgain)) => app.updates_rt.check_requested = true,
+        // The next `run` asks the window to close once it is safe to
+        Some(DialogResult::Ok(CheckChoice::RestartToUpdate)) => app.updates_rt.updater.restart_to_update(),
+        Some(DialogResult::Ok(CheckChoice::Update)) => {
+            app.updates_rt.updater.request_install(safe);
+        }
+        Some(DialogResult::Ok(CheckChoice::Download)) => ctx.open_url(egui::OpenUrl::new_tab(crate::UPDATE_APP.releases_url())),
+        // Closing the dialog dismisses the outcome it showed
+        Some(_) => app.updates_rt.updater.dismiss_status(),
+        None => {}
+    }
+    match app.updates_rt.updater.run(&mut app.framework_dialogs, safe) {
         Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
         Action::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-        Action::None => {}
+        _ => {}
     }
-    let rt = &mut app.updates_rt;
-    if result_window_shows(rt.updater.status(), rt.updater.prompt_open()) {
-        match CheckResultDialog::new(&crate::UPDATE_APP, env!("CARGO_PKG_VERSION")).show(ctx, rt.updater.status()) {
-            CheckResultResponse::None => {}
-            CheckResultResponse::Close => rt.updater.dismiss_status(),
-            CheckResultResponse::CheckAgain => rt.check_requested = true,
-            CheckResultResponse::RestartToUpdate => rt.updater.restart_to_update(),
-        }
+    let updater = &app.updates_rt.updater;
+    let shows = result_window_shows(updater.status(), updater.prompt_open());
+    let (status, installing, message) = (updater.status().clone(), updater.is_installing(), updater.status_message());
+    let dialogs = &mut app.framework_dialogs;
+    if shows && !dialogs.is_open::<UpdateCheckDialog>() {
+        dialogs.open(UpdateCheckDialog::new(env!("CARGO_PKG_VERSION")));
+    } else if !shows && dialogs.is_open::<UpdateCheckDialog>() {
+        dialogs.cancel::<UpdateCheckDialog>(ctx);
+        // Hidden for the prompt, not dismissed: the outcome shows again after it
+        let _ = dialogs.take::<UpdateCheckDialog>();
+    }
+    if let Some(dialog) = dialogs.get_mut::<UpdateCheckDialog>() {
+        dialog.set_status(status);
+        dialog.set_installing(installing);
+        dialog.set_message(message);
     }
 }
 
@@ -123,10 +158,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("texturecraft-updates-{}-{test}", std::process::id()));
         let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
         session.modified = modified;
-        let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1600.0, 960.0))
+            .with_context_setup(crate::framework::install_headless)
+            .build_eframe(|cc| TextureCraftApp::new(cc, session));
         h.state_mut().updates_rt.updater =
             Updater::new(&crate::UPDATE_APP, "0.0.1").with_source(ask).with_paths(Paths::under(&root)).with_pins_path(root.join("pins.json"));
-        h.state_mut().ui.windows.start = false;
         h.run_steps(2);
         h
     }
@@ -140,16 +177,14 @@ mod tests {
             ..Default::default()
         };
         h.state_mut().updates_rt.updater.offer(release);
+        // The offer reads on a thread whether this copy can install the release itself; a later frame's tick opens
+        // the prompt.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.state().updates_rt.updater.prompt_open() && std::time::Instant::now() < deadline {
+            h.run_steps(1);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         h.run_steps(2);
-    }
-
-    #[test]
-    fn default_runtime_is_idle() {
-        let rt = Runtime::default();
-        assert!(!rt.startup_check);
-        assert!(!rt.check_requested);
-        assert!(!rt.updater.prompt_open());
-        assert_eq!(rt.updater.status(), &Status::Idle);
     }
 
     #[test]
@@ -187,7 +222,7 @@ mod tests {
         let mut h = harness(false, "prompt", ask);
         offer(&mut h);
         assert!(h.state().updates_rt.updater.prompt_open());
-        h.get_by_label("LATER").click();
+        h.get_by_label("Later").click();
         h.run_steps(2);
         assert!(!h.state().updates_rt.updater.prompt_open());
     }
@@ -203,7 +238,7 @@ mod tests {
         h.key_press(egui::Key::F8);
         h.step();
         assert_eq!(h.state().ui.mode, Mode::Painting, "the prompt holds the keyboard");
-        h.get_by_label("LATER").click();
+        h.get_by_label("Later").click();
         h.run_steps(2);
         assert!(!crate::docking::input_blocked(h.state(), &h.ctx));
         h.key_press(egui::Key::F8);
@@ -226,7 +261,7 @@ mod tests {
         h.key_press(egui::Key::Backspace);
         h.step();
         assert_eq!(points(&h), 2, "the prompt holds the keyboard");
-        h.get_by_label("LATER").click();
+        h.get_by_label("Later").click();
         h.run_steps(2);
         h.key_press(egui::Key::Backspace);
         h.step();
@@ -263,9 +298,13 @@ mod tests {
         assert!(!safe_to_close(h.state()), "unsaved changes");
         h.state_mut().session.modified = false;
 
-        h.state_mut().bake = Some(crate::BakeJob { queue: Vec::new(), current: None, total: 0 });
+        h.state_mut().bake = Some(crate::BakeJob { queue: Vec::new(), current: None, total: 0, mesh_id: 0, only: None });
         assert!(!safe_to_close(h.state()), "a bake");
         h.state_mut().bake = None;
+
+        h.state_mut().load_high_polys(["missing-high.obj".to_owned()]);
+        assert!(!safe_to_close(h.state()), "an accepted high-poly import is still pending");
+        h.state_mut().high_poly_job = None;
 
         h.state_mut().resize = Some(crate::ResizeJob { progress: Arc::new(Progress::new()), rx: channel().1 });
         assert!(!safe_to_close(h.state()), "a resize");
@@ -275,6 +314,7 @@ mod tests {
         texturecraft_engine::execute(session, "layer.add.paint", &serde_json::Value::Null).unwrap();
         session.modified = false;
         session.begin_stroke_uv(Vec2::new(0.5, 0.5), 1.0).unwrap();
+
         assert!(!safe_to_close(h.state()), "a stroke");
         h.state_mut().session.cancel_stroke();
         assert!(safe_to_close(h.state()));

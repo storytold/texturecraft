@@ -1,0 +1,12 @@
+mod generator_custom_grunge;
+mod generator_dripping_rust;
+mod generator_fixture;
+mod generator_grayscale_conversion;
+mod generator_micro_details;
+mod generator_sections;
+mod generator_texture;
+mod generator_three_d_distance;
+mod generator_uv_border_distance;
+mod generator_uv_checker;
+mod generator_uv_random_color;
+mod surface_point;

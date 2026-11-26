@@ -19,7 +19,10 @@ fn harness() -> Harness<'static, TextureCraftApp> {
     }
 
     session.view = ViewMode::UvChecker;
-    let mut harness = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1400.0, 900.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.mode = Mode::Baking;
     harness.run_steps(3);
     harness
@@ -125,9 +128,12 @@ fn a_ready_result_waits_for_the_map_stream_to_close() {
     result_sender.send(Ok(output)).unwrap();
     let app = harness.state_mut();
     app.start_bake(vec![0]);
+    let mesh_id = app.session.mesh_id;
     app.bake = Some(BakeJob {
         queue: Vec::new(),
         total: 1,
+        mesh_id,
+        only: None,
         current: Some(RunningBake {
             set_index: 0,
             progress: Arc::new(Progress::new()),
@@ -173,12 +179,37 @@ fn an_invalid_set_does_not_start_a_partial_bake_or_change_the_view() {
     let revision = app.session.revision;
     let history_steps = app.session.history_labels().len();
 
-    app.start_bake(vec![0, invalid_set]);
+    for only in [None, Some(MAPS[1])] {
+        if let Some(map) = only {
+            app.start_bake_of(vec![0, invalid_set], Some(map));
+        } else {
+            app.start_bake(vec![0, invalid_set]);
+        }
 
-    assert!(app.bake.is_none(), "validate every set before queuing any work");
-    assert!(!app.session.bake_preview_active());
-    assert_eq!(app.session.view, view);
-    assert_eq!(app.session.revision, revision);
-    assert_eq!(app.session.history_labels().len(), history_steps);
-    assert!(app.toasts.iter().any(|toast| toast.error && toast.text.contains(&expected_error)));
+        assert!(app.bake.is_none(), "validate every set before queuing any work");
+        assert!(!app.session.bake_preview_active());
+        assert_eq!(app.session.view, view);
+        assert_eq!(app.session.revision, revision);
+        assert_eq!(app.session.history_labels().len(), history_steps);
+        assert!(app.toasts.iter().any(|toast| toast.error && toast.text.contains(&expected_error)));
+    }
+}
+
+#[test]
+fn a_rows_quick_bake_bakes_that_map_alone_and_keeps_the_others() {
+    let mut harness = harness();
+    harness.state_mut().start_bake(vec![0]);
+    run_to_the_end(&mut harness);
+    let before = harness.state().session.doc.baked[&0].maps.clone();
+
+    harness.state_mut().session.doc.project.texture_sets[0].bake.maps.select([]);
+    harness.state_mut().start_bake_of(vec![0], Some(MAPS[1]));
+    assert_eq!(harness.state().session.view, ViewMode::MeshMap(MAPS[1]), "the preview shows the one map");
+    run_to_the_end(&mut harness);
+
+    let after = &harness.state().session.doc.baked[&0].maps;
+    assert_eq!(after.keys().collect::<Vec<_>>(), before.keys().collect::<Vec<_>>(), "the other maps stay");
+    for map in MAPS {
+        assert_eq!(!std::sync::Arc::ptr_eq(&after[&map], &before[&map]), map == MAPS[1], "{map:?}");
+    }
 }
