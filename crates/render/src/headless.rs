@@ -145,15 +145,13 @@ pub mod serial {
         static HELD: Cell<u32> = const { Cell::new(0) };
     }
 
-    /// One turn; the first one a thread takes waits for the device of another thread to go.
-    pub struct Turn {
-        first: bool,
-    }
+    /// One turn; the first one a thread takes waits for the device of another thread to go, and
+    /// the thread's last one to drop, in any order, lets the next thread's device in.
+    pub struct Turn(());
 
     impl Turn {
         pub fn take() -> Turn {
-            let first = HELD.get() == 0;
-            if first {
+            if HELD.get() == 0 {
                 let mut busy = BUSY.lock().unwrap_or_else(PoisonError::into_inner);
                 while *busy {
                     busy = FREED.wait(busy).unwrap_or_else(PoisonError::into_inner);
@@ -161,14 +159,15 @@ pub mod serial {
                 *busy = true;
             }
             HELD.set(HELD.get() + 1);
-            Turn { first }
+            Turn(())
         }
     }
 
     impl Drop for Turn {
         fn drop(&mut self) {
-            HELD.set(HELD.get().saturating_sub(1));
-            if self.first {
+            let held = HELD.get().saturating_sub(1);
+            HELD.set(held);
+            if held == 0 {
                 *BUSY.lock().unwrap_or_else(PoisonError::into_inner) = false;
                 FREED.notify_all();
             }

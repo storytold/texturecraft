@@ -542,6 +542,12 @@ pub(super) fn whole_set(filter: NeighbourhoodFilter, _resolution: u32) -> bool {
     }
 }
 
+/// Whether the stage moves every texel by the whole set's mean (Color Match's Average): its
+/// whole-set pass reduces over its field, so that field must be the whole set, not a stripe
+pub(crate) fn reads_whole_set_mean(filter: NeighbourhoodFilter) -> bool {
+    filter.kind == COLOR_MATCH && filter.words[0] & COLOR_MATCH_AVERAGE != 0
+}
+
 /// Encodes a P5 stage with passes of its own; false lets the apply pass run.
 pub(super) fn encode(
     (gpu, pipelines): (&NeighbourhoodGpu, &Pipelines),

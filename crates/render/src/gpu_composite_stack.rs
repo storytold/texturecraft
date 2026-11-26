@@ -192,6 +192,17 @@ pub(super) fn attach_distance_map(effect: &Effect, op: &mut Operation, inputs: &
 /// tile settings, from the input of the effect's filter that reads a Tile Generator.
 pub(super) fn bind_input_tiles(effect: &Effect, sources: &mut [Operation], patterns: &mut TilePatterns) {
     let EffectKind::Filter(filter) = &effect.kind else { return };
+    // Color Match registers its Input and its Image Input in this order: each with its own tiles
+    if let Filter::ColorMatch(_) = filter {
+        let (_, texel_inputs) = crate::gpu_neighbourhood::gather::bind_inputs(effect, filter);
+        for (op, (input, _)) in sources.iter_mut().zip(texel_inputs) {
+            let source = effect.input(&input);
+            if matches!(source, Source::Procedural { .. }) {
+                bind_tile_source(op, Some(&source), patterns);
+            }
+        }
+        return;
+    }
     let Some(source) = ImageInput::of(filter).iter().map(|input| effect.input(input)).find(|source| matches!(source, Source::Procedural { .. })) else {
         return;
     };
@@ -627,6 +638,12 @@ mod tests {
         cases.push(vec![compare(CompareOp::LesserThan, 0.7, BlendMode::Multiply, 0.8)]);
         cases.push(vec![compare(CompareOp::WithinTolerance, 0.7, BlendMode::Disable, 0.8)]);
         cases.push(vec![invert.clone(), compare(CompareOp::GreaterThan, 0.5, BlendMode::Screen, 0.9), invert.clone()]);
+        // The constant on the left: its authored order
+        let mut constant_first = compare(CompareOp::LesserThan, 0.5, BlendMode::Normal, 1.0);
+        if let EffectKind::Compare { left, right, .. } = &mut constant_first.kind {
+            (*left, *right) = (CompareSource::Constant, CompareSource::ThisMask);
+        }
+        cases.push(vec![constant_first]);
         for effects in cases {
             let label = format!("{effects:?}");
             let (project, pixels, owner) = ramp_mask_layer(effects);

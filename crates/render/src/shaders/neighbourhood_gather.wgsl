@@ -102,7 +102,7 @@ var<private> gather_shift: vec2<f32> = vec2(0.0);
 // The home position of the texel at absolute position `point`, which sets gather_shift
 fn gather_begin(point: vec2<f32>) -> vec2<f32> {
     let local = vec2<i32>(point) - field_origin();
-    gather_shift = vec2<f32>(copy_of(local) * (params.bounds.zw - params.bounds.xy));
+    gather_shift = vec2<f32>(periodic_copy(local) * (params.bounds.zw - params.bounds.xy));
     return point - gather_shift;
 }
 
