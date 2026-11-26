@@ -1,9 +1,10 @@
 //! Where a symmetry copy of a stamp comes from
 
+use serde::{Deserialize, Serialize};
 use texturecraft_geom::glam::{Mat3, Vec3};
 
 /// The map from a symmetry copy back to its source stamp: a copy paints where its source would be painted
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StampSource {
     /// The point the symmetry maps turn and mirror about
     pub origin: Vec3,

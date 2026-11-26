@@ -5,11 +5,11 @@ use std::collections::BTreeSet;
 
 use rayon::prelude::*;
 
-use texturecraft_geom::glam::Vec3;
+use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, NO_TRI, UvGBuffer};
 use texturecraft_texel::{TILE, TileImage, from_u16, to_u16};
 
-use crate::brush::Shape;
+use crate::brush::{Shape, StampBlending};
 use crate::pickup::Pickup;
 use crate::stamp_source::StampSource;
 use crate::stroke::Stamp;
@@ -28,19 +28,33 @@ pub struct StrokeCanvas {
     pub limit: Option<(TileImage, bool)>,
     /// Clone and smudge: the channel values the stroke carries.
     pub pickup: Option<Pickup>,
+    stamp_blending: StampBlending,
     /// The stamp being added: `(x, y, alpha)` per texel (reused between stamps).
     texels: Vec<(u32, u32, f32)>,
 }
 
 impl StrokeCanvas {
     pub fn new(width: u32, height: u32) -> StrokeCanvas {
-        StrokeCanvas { alpha: TileImage::new(width, height, 1), dirty: BTreeSet::new(), recent: BTreeSet::new(), limit: None, pickup: None, texels: Vec::new() }
+        StrokeCanvas {
+            alpha: TileImage::new(width, height, 1),
+            dirty: BTreeSet::new(),
+            recent: BTreeSet::new(),
+            limit: None,
+            pickup: None,
+            stamp_blending: StampBlending::Normal,
+            texels: Vec::new(),
+        }
+    }
+
+    pub fn with_stamp_blending(mut self, stamp_blending: StampBlending) -> Self {
+        self.stamp_blending = stamp_blending;
+        self
     }
 
     /// Start over when the canvas is not the size of `gbuf`.
     fn fit(&mut self, gbuf: &UvGBuffer) {
         if (self.alpha.width(), self.alpha.height()) != (gbuf.width, gbuf.height) {
-            *self = StrokeCanvas::new(gbuf.width, gbuf.height);
+            *self = StrokeCanvas::new(gbuf.width, gbuf.height).with_stamp_blending(self.stamp_blending);
         }
     }
 
@@ -52,7 +66,7 @@ impl StrokeCanvas {
 
     /// Blend the gathered stamp texels (stamp center `center` in texels) into the stroke: the
     /// quick mask scales them, then the pickup deposits its values or the alpha accumulates
-    /// ("over": `m = a + m·(1 − a)`).
+    /// with the brush's stamp blending mode.
     fn add_stamp(&mut self, center: [f32; 2], source: Option<StampSource>) {
         let mut texels = std::mem::take(&mut self.texels);
         if let Some((mask, invert)) = &self.limit {
@@ -62,11 +76,11 @@ impl StrokeCanvas {
             }
         }
         let painted = match &mut self.pickup {
-            Some(p) => p.stamp(&mut self.alpha, &texels, center, source),
+            Some(p) => p.stamp(&mut self.alpha, &texels, center, source, self.stamp_blending),
             None => {
                 for &(x, y, a) in &texels {
                     let m = from_u16(self.alpha.get(x, y)[0]);
-                    self.alpha.set(x, y, &[to_u16(a + m * (1.0 - a))]);
+                    self.alpha.set(x, y, &[to_u16(self.stamp_blending.accumulate(m, a))]);
                 }
                 true
             }
@@ -173,9 +187,6 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 
 /// Accumulate `stamps` into `canvas` ("over": `m = a + m·(1 − a)`).
 pub fn rasterize(canvas: &mut StrokeCanvas, context: &RasterCtx, stamps: &[Stamp]) {
-    // Broad-phase padding for rotated stamp footprints
-    const STAMP_QUERY_PADDING: f32 = 1.42;
-
     // Keep small batches serial to avoid scheduling overhead
     const PARALLEL_TRIANGLE_THRESHOLD: usize = 16;
 
@@ -196,7 +207,7 @@ pub fn rasterize(canvas: &mut StrokeCanvas, context: &RasterCtx, stamps: &[Stamp
             continue;
         }
 
-        let extent = Vec3::splat(stamp.radius * stamp.depth.max(1.0) * STAMP_QUERY_PADDING);
+        let extent = stamp.world_extent();
         triangles.clear();
         context.bvh.query_box(stamp.center - extent, stamp.center + extent, |triangle| triangles.push(triangle));
 
@@ -247,10 +258,7 @@ fn scan_triangle(
         .cross(*position_c - *position_a)
         .try_normalize()
         .map(|normal| stamp.source.map_or(normal, |source| source.direction(normal)));
-    let x0 = (uv_a.x.min(uv_b.x).min(uv_c.x) * width as f32).floor().max(0.0) as u32;
-    let x1 = ((uv_a.x.max(uv_b.x).max(uv_c.x) * width as f32).ceil().max(0.0) as u32).min(width);
-    let y0 = (uv_a.y.min(uv_b.y).min(uv_c.y) * height as f32).floor().max(0.0) as u32;
-    let y1 = ((uv_a.y.max(uv_b.y).max(uv_c.y) * height as f32).ceil().max(0.0) as u32).min(height);
+    let (x0, y0, x1, y1) = uv_texel_bounds([*uv_a, *uv_b, *uv_c], (width, height));
 
     // Stamp radius in texels on this triangle: texel area over world area
     let uv_area = (*uv_b - *uv_a).perp_dot(*uv_c - *uv_a).abs() * width as f32 * height as f32;
@@ -319,6 +327,21 @@ fn scan_triangle(
     (center.1 < f32::MAX || !texels.is_empty()).then_some((texels, center))
 }
 
+fn uv_texel_bounds([a, b, c]: [Vec2; 3], (width, height): (u32, u32)) -> (u32, u32, u32, u32) {
+    let size = Vec2::new(width as f32, height as f32);
+    let low = (a.min(b).min(c) * size).floor().max(Vec2::ZERO).as_uvec2();
+    let high = (a.max(b).max(c) * size).ceil().max(Vec2::ZERO).min(size).as_uvec2();
+    (low.x, low.y, high.x, high.y)
+}
+
+/// Maximum texels the world brush scans for this candidate triangle.
+pub fn triangle_scan_texels(mesh: &Mesh, triangle: u32, size: (u32, u32)) -> u64 {
+    let Some([a, b, c]) = mesh.tri(triangle as usize) else { return 0 };
+    let (Some(a), Some(b), Some(c)) = (mesh.uvs.get(a), mesh.uvs.get(b), mesh.uvs.get(c)) else { return 0 };
+    let (x0, y0, x1, y1) = uv_texel_bounds([*a, *b, *c], size);
+    u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0))
+}
+
 /// Stroke alpha covering whole triangles (polygon fill): every texel of `tris` gets alpha 1.
 pub fn fill_triangles(canvas: &mut StrokeCanvas, gbuf: &UvGBuffer, tris: &BTreeSet<u32>) {
     fill_coverage(canvas, gbuf, |_, t| if tris.contains(&t) { 1.0 } else { 0.0 });
@@ -384,7 +407,7 @@ mod tests {
             eye: camera.eye(),
             backface_culling: false,
             angle_fade: (89.0, 90.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
         let stamp = Stamp {
             center: Vec3::new(0.0, 0.03, 0.0),
@@ -429,7 +452,7 @@ mod tests {
             eye: camera.eye(),
             backface_culling: true,
             angle_fade: (89.0, 90.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
         let point = Vec3::ZERO;
         let to_eye = (camera.eye() - point).normalize();
@@ -460,7 +483,7 @@ mod tests {
             eye: camera.eye(),
             backface_culling: true,
             angle_fade: (89.0, 90.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
         let point = Vec3::new(1.0, 0.0, 0.0);
         let to_eye = (camera.eye() - point).normalize();
@@ -486,7 +509,7 @@ mod tests {
             eye: camera.eye(),
             backface_culling: false,
             angle_fade: (89.0, 90.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
         let to_eye = -camera.forward();
         let behind = context.eye + to_eye;
@@ -548,7 +571,7 @@ mod tests {
             eye: camera.eye(),
             backface_culling: culling,
             angle_fade: (89.0, 90.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
         let stamp =
             Stamp { center, normal: Vec3::Y, tangent: Vec3::X, bitangent: Vec3::Z, radius, flow: 1.0, hardness: 0.9, depth: 1.0, seed: 0, source: None };
@@ -677,7 +700,7 @@ mod tests {
             eye: camera.eye(),
             backface_culling: false,
             angle_fade: (89.0, 90.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
 
         // A silhouette normal is perpendicular to the direction from the surface to the eye
@@ -747,7 +770,7 @@ mod tests {
             eye: Vec3::new(0.0, 5.0, 0.0),
             backface_culling: true,
             angle_fade: (70.0, 85.0),
-            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            shape: Shape::new(crate::BrushAlpha::Round, None, None, Default::default()),
         };
         let stamp = Stamp {
             center: Vec3::ZERO,

@@ -81,13 +81,29 @@ fn area(lo: Vec3, hi: Vec3) -> f32 {
 
 impl Bvh {
     pub fn new(mesh: &Mesh) -> Bvh {
+        Self::build(mesh, None)
+    }
+
+    /// Build a BVH for only the selected triangles, retaining their original mesh indices.
+    pub fn new_filtered(mesh: &Mesh, include: impl Fn(usize) -> bool) -> Bvh {
+        Self::build(mesh, Some(&include))
+    }
+
+    fn build(mesh: &Mesh, include: Option<&dyn Fn(usize) -> bool>) -> Bvh {
         let triangle_count = mesh.triangle_count();
-        let mut tris = Vec::with_capacity(triangle_count);
+        let mut tris = Vec::with_capacity(if include.is_some() { 0 } else { triangle_count });
+        let mut original_indices = Vec::new();
 
         for triangle in 0..triangle_count {
+            if include.is_some_and(|include| !include(triangle)) {
+                continue;
+            }
             let Some([a, b, c]) = mesh.tri(triangle) else { continue };
             let position = |i: usize| mesh.positions.get(i).copied().unwrap_or(Vec3::ZERO);
             tris.push([position(a), position(b), position(c)]);
+            if include.is_some() {
+                original_indices.push(triangle as u32);
+            }
         }
 
         let mut order: Vec<u32> = (0..tris.len() as u32).collect();
@@ -223,6 +239,11 @@ impl Bvh {
         }
 
         let tris = order.iter().map(|t| tris[*t as usize]).collect();
+        if include.is_some() {
+            for triangle in &mut order {
+                *triangle = original_indices[*triangle as usize];
+            }
+        }
         Bvh { nodes, tris, order }
     }
 
@@ -380,6 +401,14 @@ impl Bvh {
 
     /// Call `f` with every triangle (original index) whose bounds overlap the box.
     pub fn query_box(&self, lo: Vec3, hi: Vec3, mut f: impl FnMut(u32)) {
+        self.query_box_until(lo, hi, |id| {
+            f(id);
+            true
+        });
+    }
+
+    /// Search triangles overlapping the box. Returns false if the callback stops the search.
+    pub fn query_box_until(&self, lo: Vec3, hi: Vec3, mut f: impl FnMut(u32) -> bool) -> bool {
         let mut stack = vec![0u32];
         while let Some(i) = stack.pop() {
             let Some(n) = self.nodes.get(i as usize) else { continue };
@@ -391,8 +420,8 @@ impl Bvh {
                     let (Some(t), Some(o)) = (self.tris.get(k), self.order.get(k)) else { continue };
                     let tlo = t[0].min(t[1]).min(t[2]);
                     let thi = t[0].max(t[1]).max(t[2]);
-                    if !(thi.cmplt(lo).any() || tlo.cmpgt(hi).any()) {
-                        f(*o);
+                    if !(thi.cmplt(lo).any() || tlo.cmpgt(hi).any()) && !f(*o) {
+                        return false;
                     }
                 }
             } else {
@@ -400,6 +429,7 @@ impl Bvh {
                 stack.push(n.first + 1);
             }
         }
+        true
     }
 }
 

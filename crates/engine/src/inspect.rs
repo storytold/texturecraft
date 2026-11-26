@@ -280,6 +280,7 @@ pub fn texture_set(session: &Session, index: usize) -> Value {
 
 /// The whole session
 pub fn session(session: &Session) -> Value {
+    let memory = session.memory();
     let texture_set = session.ts();
     json!({
         "projectOpen": session.project_open,
@@ -302,7 +303,8 @@ pub fn session(session: &Session) -> Value {
         "display": session.doc.project.display,
         "swatches": session.doc.project.swatches,
         "history": { "undo": session.undo_label(), "redo": session.redo_label(), "depth": session.history_labels().len() },
-        "memoryBytes": session.memory().total(),
+        "memoryBytes": memory.total(),
+        "geometryBytes": memory.geometry,
         "pendingTiles": session.pending_tiles(),
     })
 }

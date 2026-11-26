@@ -53,16 +53,21 @@ pub fn screen_point(view_proj: Mat4, position: Vec3, size: Vec2) -> Option<Vec2>
 impl EyeDepth {
     /// Rasterize `mesh` seen by `camera` into a `width × height` buffer (sizes capped at [`MAX_SIZE`]), without [`EyeDepth::triangle`].
     pub fn render(mesh: &Mesh, camera: &OrbitCamera, width: u32, height: u32) -> EyeDepth {
-        Self::rasterize(mesh, camera, width, height, false)
+        Self::render_filtered(mesh, camera, width, height, |_| true)
+    }
+
+    /// Render the camera's depth using only the mesh triangles accepted by `include`.
+    pub fn render_filtered(mesh: &Mesh, camera: &OrbitCamera, width: u32, height: u32, include: impl Fn(usize) -> bool) -> EyeDepth {
+        Self::rasterize(mesh, camera, width, height, false, include)
     }
 
     /// [`EyeDepth::render`] that also records the nearest triangle per pixel in [`EyeDepth::triangle`].
     pub fn render_with_triangles(mesh: &Mesh, camera: &OrbitCamera, width: u32, height: u32) -> EyeDepth {
-        Self::rasterize(mesh, camera, width, height, true)
+        Self::rasterize(mesh, camera, width, height, true, |_| true)
     }
 
     /// The eye-distance buffer, plus the nearest triangle per pixel when `record_triangles` is set.
-    fn rasterize(mesh: &Mesh, camera: &OrbitCamera, width: u32, height: u32, record_triangles: bool) -> EyeDepth {
+    fn rasterize(mesh: &Mesh, camera: &OrbitCamera, width: u32, height: u32, record_triangles: bool, include: impl Fn(usize) -> bool) -> EyeDepth {
         // Capping storage dimensions must not change the camera's projection
         let projection = camera.proj(width.max(1) as f32 / height.max(1) as f32);
         let view = camera.view();
@@ -89,6 +94,9 @@ impl EyeDepth {
         // Bin each triangle into the bands of rows it covers
         let mut bands: Vec<Vec<u32>> = vec![Vec::new(); (height as usize).div_ceil(BAND)];
         for triangle in 0..mesh.triangle_count() {
+            if !include(triangle) {
+                continue;
+            }
             let Some([first, second, third]) = mesh.tri(triangle) else { continue };
             let (Some(Some(first)), Some(Some(second)), Some(Some(third))) = (screen.get(first), screen.get(second), screen.get(third)) else { continue };
 

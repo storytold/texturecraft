@@ -75,6 +75,7 @@ pub(crate) fn one_set_document(src_set: &TextureSet, name: &str) -> Document {
         bake_paint: BTreeMap::new(),
         project,
         pixels: PixelStore::default(),
+        stroke_replays: Default::default(),
         baked: BTreeMap::new(),
         resources: BTreeMap::new(),
     }
@@ -102,6 +103,7 @@ impl Session {
         let snapshot = texturecraft_formats::ProjectFile::<Arc<Vec<u8>>> {
             project: mini.project,
             pixels: mini.pixels,
+            stroke_replay: None,
             baked: BTreeMap::new(),
             mesh: None,
             mesh_uvs: None,
@@ -144,6 +146,7 @@ impl Session {
             bake_paint: BTreeMap::new(),
             project: project_file.project,
             pixels: project_file.pixels,
+            stroke_replays: Default::default(),
             baked: BTreeMap::new(),
             resources,
         };

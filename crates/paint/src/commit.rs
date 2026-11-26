@@ -139,7 +139,7 @@ fn fill_from(dst: &mut Vec<u16>, from: Option<&[u16]>, empty: &[u16]) {
 }
 
 /// What a pre-blended tile was blended with, besides the stroke alpha.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct BlendKey {
     value: Vec<f32>,
     image: Option<(Weak<ImageRes>, (u32, u32))>,
@@ -169,7 +169,7 @@ impl PartialEq for BlendKey {
 }
 
 /// One destination tile prepared while the stroke is drawn.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct StagedTile {
     /// The layer tile it was copied from (None: the layer had no tile there).
     from: Option<TileData>,
@@ -275,6 +275,19 @@ impl Staging {
         self.images.entry(None).or_default().stage(pixels.masks.get(&effect), 2, &b, src);
     }
 
+    /// Copy only the destination tiles the live viewport is about to show.
+    pub fn snapshot(&self, tiles: &BTreeSet<(u32, u32)>) -> Self {
+        let images = self
+            .images
+            .iter()
+            .map(|(channel, image)| {
+                let tiles = tiles.iter().filter_map(|tile| image.tiles.get(tile).map(|data| (*tile, data.clone()))).collect();
+                (*channel, StagedImage { key: image.key.clone(), tiles })
+            })
+            .collect();
+        Self { images }
+    }
+
     fn take(&mut self, key: Option<Channel>) -> Option<StagedImage> {
         self.images.remove(&key)
     }
@@ -282,7 +295,7 @@ impl Staging {
 
 /// The channels a layer commit writes: the painted ones, or every painted channel of the layer
 /// when erasing (only those in `values` when it is not empty).
-fn commit_channels(pixels: &PixelStore, layer: LayerId, values: &BTreeMap<Channel, [f32; 3]>, erase: bool) -> Vec<Channel> {
+pub fn commit_channels(pixels: &PixelStore, layer: LayerId, values: &BTreeMap<Channel, [f32; 3]>, erase: bool) -> Vec<Channel> {
     if erase {
         let painted: BTreeSet<Channel> = pixels.layers.keys().filter(|(id, _)| *id == layer).map(|(_, c)| *c).collect();
         painted.into_iter().filter(|c| values.is_empty() || values.contains_key(c)).collect()

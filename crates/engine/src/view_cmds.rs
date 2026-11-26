@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 use texturecraft_core::project::ENVIRONMENTS;
-use texturecraft_core::{BakedMap, Channel, EffectKind, EnvAlignment, Filter, Project, ShadowMode, ToneMapping};
+use texturecraft_core::{BakedMap, Channel, EnvAlignment, ShadowMode, ToneMapping};
 
 use crate::commands::{CommandSpec, always, bad, boolp, can_redo, can_undo, color_param, f32p, strp, u64p, vec3};
 use crate::frame_target::FrameTarget;
@@ -312,7 +312,7 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
     }
 
     let scatter_color = color_param("display.set", p, "scatterColor")?;
-    let (environment_before, rotation_before) = (s.doc.project.display.environment.clone(), s.doc.project.display.env_rotation);
+    let (environment_before, rotation_before_degrees) = (s.doc.project.display.environment.clone(), s.doc.project.display.env_rotation);
     let settings = &mut s.doc.project.display;
     if let Some(picked) = environment {
         settings.environment = picked;
@@ -381,24 +381,27 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
         s.camera.fov = s.doc.project.display.fov;
     }
 
-    // Baked Lighting Environment lights with the viewport environment: the layers it lights composite again when that turns or changes
-    let display = &s.doc.project.display;
-    if (display.environment.as_str(), display.env_rotation) != (environment_before.as_str(), rotation_before) && lit_by_environment(&s.doc.project) {
-        for cache in &mut s.caches {
-            cache.invalidate_all();
-        }
-    }
+    relight_environment(s, &environment_before, rotation_before_degrees);
     s.revision = s.revision.wrapping_add(1);
     Ok(serde_json::to_value(&s.doc.project.display).unwrap_or(Value::Null))
 }
 
-/// Whether a layer's content has a Baked Lighting Environment
-fn lit_by_environment(project: &Project) -> bool {
-    project
-        .layers
-        .values()
-        .flat_map(|layer| layer.content_effects.iter())
-        .any(|effect| matches!(effect.kind, EffectKind::Filter(Filter::EnvironmentLighting { .. })))
+/// After the viewport environment changed from `environment_before` turned
+/// `rotation_before_degrees` (`display.set`, the Display Settings panel, Shift+right-drag in the
+/// viewport): the texture sets whose layers Baked Lighting Environment lights with it composite
+/// again when it turned or changed; the others keep their material.
+pub fn relight_environment(s: &mut Session, environment_before: &str, rotation_before_degrees: f32) {
+    let display = &s.doc.project.display;
+    if (display.environment.as_str(), display.env_rotation) == (environment_before, rotation_before_degrees) {
+        return;
+    }
+
+    let project = &s.doc.project;
+    for (texture_set_index, cache) in s.caches.iter_mut().enumerate() {
+        if texturecraft_compose::eval::lit_by_environment(project, texture_set_index) {
+            cache.invalidate_all();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -408,6 +411,37 @@ mod tests {
 
     fn sphere_session() -> Session {
         Session::new_project("t", texturecraft_geom::primitives::sphere(1.0, 16, 8), "builtin:sphere", None, 128).unwrap()
+    }
+
+    /// The environment relights the layers Baked Lighting Environment lights, only when it turned
+    /// or changed: the panel and the viewport's Shift+right-drag call this after `display.set`'s edit
+    #[test]
+    fn a_changed_environment_relights_only_the_layers_lit_by_it() {
+        let mut s = sphere_session();
+        execute(&mut s, "layer.add.fill", &json!({})).unwrap();
+        let revisions = |s: &Session| s.caches.iter().map(|cache| cache.material_revision).collect::<Vec<_>>();
+        let turn = |s: &mut Session, degrees: f32| {
+            let (environment, rotation) = (s.doc.project.display.environment.clone(), s.doc.project.display.env_rotation);
+            s.doc.project.display.env_rotation += degrees;
+            relight_environment(s, &environment, rotation);
+        };
+        assert!(!s.caches.is_empty());
+
+        let unlit = revisions(&s);
+        turn(&mut s, 30.0);
+        assert_eq!(revisions(&s), unlit, "nothing is lit by the environment");
+
+        execute(&mut s, "effect.add.filter", &json!({"target": "content", "filter": "bakedLightingEnvironment"})).unwrap();
+        let lit = revisions(&s);
+        turn(&mut s, 0.0);
+        assert_eq!(revisions(&s), lit, "the same environment");
+        turn(&mut s, 30.0);
+        let turned = revisions(&s);
+        assert!(turned.iter().zip(&lit).all(|(after, before)| after != before), "a turned environment");
+        let (environment, rotation) = (s.doc.project.display.environment.clone(), s.doc.project.display.env_rotation);
+        s.doc.project.display.environment = "Night".into();
+        relight_environment(&mut s, &environment, rotation);
+        assert!(revisions(&s).iter().zip(&turned).all(|(after, before)| after != before), "another environment");
     }
 
     #[test]

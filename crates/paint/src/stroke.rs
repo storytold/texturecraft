@@ -1,6 +1,7 @@
 //! From pointer samples to stamps: picking, lazy mouse, spacing along the surface, stamp
 //! frames, jitter and symmetry.
 
+use serde::{Deserialize, Serialize};
 use texturecraft_geom::glam::{Mat3, Quat, Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera, surface_at};
 use texturecraft_texel::noise::pcg3d;
@@ -30,10 +31,15 @@ pub struct SurfaceHit {
 
 /// Pick the mesh at a viewport pixel (origin top-left).
 pub fn pick(ctx: &PickCtx, screen: Vec2) -> Option<SurfaceHit> {
+    pick_filtered(ctx, screen, &|_| true)
+}
+
+/// Pick the closest triangle accepted by `include` at a viewport pixel (origin top-left).
+pub fn pick_filtered(ctx: &PickCtx, screen: Vec2, include: &dyn Fn(u32) -> bool) -> Option<SurfaceHit> {
     let vp = ctx.viewport.max(Vec2::ONE);
     let ndc = Vec2::new(screen.x / vp.x * 2.0 - 1.0, 1.0 - screen.y / vp.y * 2.0);
     let ray = ctx.camera.ray(ndc, vp.x / vp.y);
-    let hit = ctx.bvh.closest(ray.origin, ray.dir, f32::MAX)?;
+    let hit = ctx.bvh.closest_filtered(ray.origin, ray.dir, f32::MAX, include)?;
     let s = surface_at(ctx.mesh, hit.tri, hit.u, hit.v)?;
     Some(SurfaceHit { pos: s.pos, nrm: s.nrm, tri: hit.tri, uv: s.uv, material: ctx.mesh.material_of(hit.tri as usize).unwrap_or(0), screen })
 }
@@ -52,7 +58,7 @@ const HALF_TURN_DEGREES: f32 = 180.0;
 const MIN_JITTERED_SIZE: f32 = 0.05;
 
 /// One brush dab in world space
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stamp {
     pub center: Vec3,
     pub normal: Vec3,
@@ -67,6 +73,16 @@ pub struct Stamp {
     pub seed: u32,
     /// A symmetry copy's way back to its source: it paints where the source would, mirrored
     pub source: Option<StampSource>,
+}
+
+impl Stamp {
+    /// World-space half-extents of the volume tested by the stamp rasterizers.
+    pub fn world_extent(&self) -> Vec3 {
+        // Project the tangent-plane disk of radius sqrt(2) and the normal slab onto each world axis.
+        let squared = self.tangent * self.tangent + self.bitangent * self.bitangent;
+        let planar = Vec3::new(squared.x.sqrt(), squared.y.sqrt(), squared.z.sqrt());
+        (planar * 1.42 + self.normal.abs() * self.depth) * self.radius
+    }
 }
 
 /// An in-progress stroke.

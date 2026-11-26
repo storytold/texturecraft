@@ -136,6 +136,10 @@ alone) and `alphaInvert` (swaps paint and no paint inside the stamp square). The
 procedural, library and imported alphas alike and are returned by `tool.brush` with the other
 values. The alpha's rotation is the brush `angle`.
 
+`tool.brush {stampBlending}` controls coverage where stamps overlap within a stroke.
+`normal` (default) composites each stamp over the existing coverage, `lighten` keeps the strongest
+stamp at each texel, and `add` sums the coverage up to full coverage. Brush presets store this mode.
+
 Bake mode applies an edit in Common Settings or Mesh Map Settings to the texture sets sharing that
 group's settings: Common Settings, and each map's settings, are shared by any set of texture sets
 (at first every set shares them). Each set keeps its own enabled mesh-map checkboxes and Include in
@@ -232,7 +236,7 @@ keeps its state in a throwaway file.
 | `ping` | | `"pong"` |
 | `command.run` | `{id, params?}` | the command's JSON result |
 | `command.list` | `{filter?}` | `[{id, label, menu, shortcut, params, enabled}]` |
-| `session.inspect` | | project, mesh, texture sets, layer stack, tool, camera, display, history |
+| `session.inspect` | | project, mesh, texture sets, layer stack, tool, camera, display, history, `memoryBytes` (paint, composites, band cache and UV geometry), `geometryBytes` (UV lookup, covered tiles and materialized display padding) |
 | `ui.inspect` | | UI state, viewport rect, fps, bake progress (`baking`, 0..1), the running bake's stage (`bakeStatus`, e.g. "Baking Ambient Occlusion (2/4)") and live preview (`bakePreview`, see *Live bake preview*), toasts, `titleBar` (who draws the title bar this run: `app`, `integrated` on macOS, or `system`) |
 | `ui.menu.list` | | the menu catalog: `{menu, submenu, label, id, shortcut, implemented, enabled, checked}` |
 | `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window; `ui.resetUi` opens its question; `file.exportMesh` opens the Mesh Export Options prompt, whose Export asks for the file; `ui.view.export` opens the right bar's Export panel). `{"id": "ui.layout.apply", "name": "<layout>"}` switches to a legacy named panel layout (still accessible through assigned shortcuts) (panels only; mode, zoom and wireframes stay) and errors when no layout has that name. `ui.layout.save` still saves the active mode; `ui.layout.save.painting`, `ui.layout.save.rendering` and `ui.layout.save.baking` ask where to save only that mode's panels and view arrangement as a JSON file (without preferences or recent projects); loading preserves the other modes, `ui.layout.load` asks for one to load ("Load UI Layout"); `ui.toolbar.docks` and `ui.toolbar.tools` show or hide the right bar and the painting tools; the disabled Snooze Autosave and Resources Updater buttons stay visible when Tools is off; `ui.view.renderer` toggles the Renderer Settings panel (Rendering Mode only). `{"id": "ui.layout.swap"}` swaps the 3D and 2D views of the split layout (F4) |

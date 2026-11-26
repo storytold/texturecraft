@@ -2,17 +2,25 @@
 //! and the material picker. The UI, CLI and agents all go through these.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use texturecraft_compose::{MaskGray, PaintTarget};
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, Source};
 use texturecraft_geom::glam::Vec2;
+use texturecraft_geom::{Bvh, Mesh, OrbitCamera};
 use texturecraft_paint::{
     CommitSource, EyeDepth, PickCtx, Pickup, PickupMode, RasterCtx, Shape, Staging, Stroke, StrokeCanvas, SurfaceHit, commit_layer, commit_mask, pick,
-    rasterize,
+    pick_filtered, rasterize,
 };
+use texturecraft_texel::{TILE, TILE_AREA};
 
-use crate::session::{ActiveStroke, CloneFrom, QUICK_MASK_STROKE_LABEL, Session, StackTarget, Tool, history_label, stroke_template};
-use crate::uv_stroke_state::UvStrokeState;
+use crate::brush_device::{BrushTiles, DeviceStroke, DeviceStrokePreview, ProjectedTiles};
+use crate::session::{
+    ActiveStroke, CloneFrom, DisplayStrokeEnd, QUICK_MASK_STROKE_LABEL, ReleasedDab, Session, StackTarget, Tool, history_label, next_mesh_id, stroke_template,
+};
+use crate::stroke_replay::{PaintPlacement, RecordedPaint, StrokeReplays, WorldPaint, record_sample, record_uv_dabs};
+use crate::uv_stroke_state::{UV_STAMP_BATCH, UvStrokeState};
 use crate::uv_symmetry::UvMirror;
 use crate::{EngineError, Result};
 
@@ -22,39 +30,100 @@ pub const BRUSH_PATTERN_SIZE: f32 = 0.1;
 /// Brush size floor for the pattern scale
 const MIN_PATTERN_BRUSH_SIZE: f32 = 0.0005;
 
-/// Shortest distance between 2D view stamps, so a stamp with no radius (a pen at zero pressure) can't stall a stroke.
-const MIN_UV_STAMP_STEP: f32 = 1e-5;
+/// Limit CPU-side storage for projected color to one readback batch.
+const PROJECTION_READBACK_BATCH: usize = 128;
 
-/// 2D view stamps rasterized together, bounding the memory of one batch.
-const UV_STAMP_BATCH: usize = 4096;
+/// The view inputs used to classify occlusion when a world-space brush stroke began.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StrokeView {
+    pub(crate) camera: OrbitCamera,
+    pub(crate) size: (u32, u32),
+    hidden_materials: BTreeSet<usize>,
+}
 
-/// Covers a UV diagonal at the minimum step (about 142k stamps), including light pen pressure, while bounding hostile coordinates
-const MAX_UV_STAMPS_PER_SAMPLE: usize = 150_000;
+pub(crate) struct StrokeVisibility {
+    mesh_id: u64,
+    view: StrokeView,
+    bvh: Arc<Bvh>,
+    depth: Arc<EyeDepth>,
+}
+
+/// Material lookup in mesh order, with the same first range taking priority as `Mesh::material_of`.
+fn visible_triangle_mask(mesh: &Mesh, hidden_materials: &BTreeSet<usize>) -> Vec<bool> {
+    let mut shown = vec![!hidden_materials.contains(&0); mesh.triangle_count()];
+    for submesh in mesh.submeshes.iter().rev() {
+        let start = submesh.start.div_ceil(3) as usize;
+        let end = (submesh.start.saturating_add(submesh.count).div_ceil(3) as usize).min(shown.len());
+        if let Some(range) = shown.get_mut(start..end) {
+            range.fill(!hidden_materials.contains(&submesh.material));
+        }
+    }
+    shown
+}
+
+impl StrokeView {
+    fn capture(camera: OrbitCamera, viewport: Vec2, sets: &[texturecraft_core::TextureSet]) -> Self {
+        let size = ((viewport.x / 2.0).max(64.0) as u32, (viewport.y / 2.0).max(64.0) as u32);
+        let mut hidden_materials = BTreeSet::new();
+        // The viewport uses the last texture set mapped to each mesh material.
+        for set in sets {
+            if set.visible {
+                hidden_materials.remove(&set.material);
+            } else {
+                hidden_materials.insert(set.material);
+            }
+        }
+        Self { camera, size, hidden_materials }
+    }
+
+    /// Identical triangle selection for cursor rays, exact occlusion and camera depth.
+    pub(crate) fn visibility(&self, mesh: &Mesh, full_bvh: &Arc<Bvh>, previous: Option<(&Self, &Arc<Bvh>)>) -> (Arc<Bvh>, EyeDepth) {
+        let (width, height) = self.size;
+        if self.hidden_materials.is_empty() {
+            (full_bvh.clone(), EyeDepth::render(mesh, &self.camera, width, height))
+        } else {
+            let shown = visible_triangle_mask(mesh, &self.hidden_materials);
+            let include = |triangle| shown.get(triangle).copied().unwrap_or(false);
+            let existing = previous.filter(|(view, _)| self.hidden_materials == view.hidden_materials);
+            let bvh = existing.map_or_else(|| Arc::new(Bvh::new_filtered(mesh, include)), |(_, bvh)| bvh.clone());
+            (bvh, EyeDepth::render_filtered(mesh, &self.camera, width, height, include))
+        }
+    }
+
+    pub(crate) fn hidden_count(&self) -> usize {
+        self.hidden_materials.len()
+    }
+}
 
 impl Session {
-    /// Camera visibility for a stroke at `viewport` (cached until the camera, size or mesh change).
-    fn eye_depth(&mut self, viewport: Vec2) -> std::sync::Arc<EyeDepth> {
-        let size = ((viewport.x / 2.0).max(64.0) as u32, (viewport.y / 2.0).max(64.0) as u32);
-        if let Some((cam, sz, mesh, depth)) = &self.depth_cache
-            && *cam == self.camera
-            && *sz == size
-            && *mesh == self.mesh_id
-        {
-            return depth.clone();
+    fn stroke_visibility(&mut self, viewport: Vec2) -> (Arc<Bvh>, Arc<EyeDepth>) {
+        let view = StrokeView::capture(self.camera, viewport, &self.doc.project.texture_sets);
+        let cached = self.stroke_visibility.as_ref().filter(|scene| scene.mesh_id == self.mesh_id);
+        if let Some(scene) = cached.filter(|scene| scene.view == view) {
+            return (scene.bvh.clone(), scene.depth.clone());
         }
-        let depth = std::sync::Arc::new(EyeDepth::render(&self.mesh, &self.camera, size.0, size.1));
-        self.depth_cache = Some((self.camera, size, self.mesh_id, depth.clone()));
-        depth
+        let (bvh, depth) = view.visibility(&self.mesh, &self.bvh, cached.map(|scene| (&scene.view, &scene.bvh)));
+        let depth = Arc::new(depth);
+        self.stroke_visibility = Some(StrokeVisibility { mesh_id: self.mesh_id, view, bvh: bvh.clone(), depth: depth.clone() });
+        (bvh, depth)
     }
 
     pub fn pick(&self, screen: Vec2, viewport: Vec2) -> Option<SurfaceHit> {
         let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &self.camera, viewport };
-        pick(&ctx, screen)
+        let sets = &self.doc.project.texture_sets;
+        if sets.iter().all(|set| set.visible) {
+            pick(&ctx, screen)
+        } else {
+            pick_filtered(&ctx, screen, &|triangle| {
+                let material = self.mesh.material_of(triangle as usize).unwrap_or(0);
+                sets.iter().rfind(|set| set.material == material).is_none_or(|set| set.visible)
+            })
+        }
     }
 
     /// The texture set that paints mesh material `material` (a [`SurfaceHit::material`])
     pub fn texture_set_of_material(&self, material: usize) -> Option<usize> {
-        self.doc.project.texture_sets.iter().position(|t| t.material == material)
+        self.doc.project.texture_sets.iter().rposition(|t| t.material == material)
     }
 
     /// The texture set of the surface under viewport pixel `screen`
@@ -272,9 +341,14 @@ impl Session {
             return Err(EngineError::Other(msg.into()));
         }
 
-        let depth = (!uv_mode).then(|| self.eye_depth(viewport));
+        let (bvh, depth) = if uv_mode {
+            (self.bvh.clone(), None)
+        } else {
+            let (bvh, depth) = self.stroke_visibility(viewport);
+            (bvh, Some(depth))
+        };
         let stroke = Stroke::new(&self.tool.brush, &self.mesh);
-        let mut canvas = StrokeCanvas::new(size.0, size.1);
+        let mut canvas = StrokeCanvas::new(size.0, size.1).with_stamp_blending(stroke.settings.stamp_blending);
         if !quick_mask {
             canvas.limit = self.stroke_limit(ts, size);
         }
@@ -331,22 +405,92 @@ impl Session {
             let on_mask = matches!(target, Some(PaintTarget::Mask(_)));
             history_label(stroke_template(tool, on_mask), &self.stroke_layer_name())
         };
+        let settings = &stroke.settings;
+        let image_alpha = settings.alpha_image.as_ref().and_then(|name| self.images.get(name)).cloned();
+        let library_alpha = if image_alpha.is_none() { settings.library_alpha_image() } else { None };
+
+        // Resolved once: staging, both previews and the commit paint this gray
+        let mask_gray = self.mask_gray();
+
+        // A replay repaints one recorded gray, so a mask stroke painting a mask image is not recorded
+        let can_record = matches!(tool, Tool::Paint | Tool::Eraser)
+            && stencil.is_none()
+            && canvas.limit.is_none()
+            && canvas.pickup.is_none()
+            && !settings.symmetry.any()
+            && settings.alpha_image.is_none()
+            && !matches!((target, &mask_gray), (Some(PaintTarget::Mask(_)), MaskGray::Image { .. }))
+            && target.is_some_and(|target| StrokeReplays::can_record(&self.doc.project, target, ts));
+        let replay = if !can_record {
+            None
+        } else if uv_mode {
+            Some(PaintPlacement::Uv { samples: Vec::new(), dabs: Some(Vec::new()) })
+        } else {
+            self.stroke_visibility
+                .as_ref()
+                .zip(self.doc.project.texture_sets.get(ts))
+                .map(|(scene, set)| PaintPlacement::World { world: WorldPaint { view: scene.view.clone(), dabs: Vec::new(), material: set.material } })
+        };
+
+        // A 3D view projection without a stencil was refused above; the 2D view paints without one. A path repaints its curve as a stroke
+        let gpu_tool = matches!(tool, Tool::Paint | Tool::Projection | Tool::Path) || erase;
+        // Symmetry copies reach the device with the stamps (a 3D copy carries its source for visibility); an Eraser with particles stays on the CPU
+        let device = if gpu_tool
+            && canvas.pickup.is_none()
+            && !(erase && settings.particles.enabled)
+            && let Some(backend) = &self.brush_device
+            && let Some(cache) = self.caches.get(ts)
+            && backend.surface.ptr_eq(&std::sync::Arc::downgrade(&cache.gbuf))
+        {
+            let surface = crate::brush_device::BrushSurface {
+                mesh: self.mesh.clone(),
+                bvh: bvh.clone(),
+                uv: cache.gbuf.clone(),
+                material: self.doc.project.texture_set(ts)?.material,
+                depth: depth.clone(),
+                settings: settings.clone(),
+                alpha_image: image_alpha.clone(),
+                stencil: stencil.clone(),
+                limit: canvas.limit.clone(),
+            };
+            match backend.device.start(surface) {
+                Ok(device) => Some(device),
+                Err(error) => {
+                    self.log.performance(format!("GPU brush could not start: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if device.is_some() {
+            let detail = if stencil.is_some() { "stroke coverage, stencil sampling and live paint" } else { "stroke coverage and live paint" };
+            self.log.performance(format!("Brush: GPU ({detail})"));
+        }
         self.stroke = Some(ActiveStroke {
+            display_id: next_mesh_id(),
+            display_tiles: BTreeSet::new(),
             ts,
             target,
             stroke,
+            image_alpha,
+            library_alpha,
             canvas,
+            bvh,
             depth,
             uv: uv_mode.then(UvStrokeState::default),
             camera: self.camera,
             viewport,
             values,
-            mask_gray: self.mask_gray(),
+            mask_gray,
             erase,
             stencil,
             before,
             label,
             staging: Staging::default(),
+            device,
+            device_uv_stamps: Vec::new(),
+            replay,
         });
         Ok(())
     }
@@ -379,18 +523,6 @@ impl Session {
                 Ok(Some((PickupMode::Clone { offset: [0; 2] }, offset)))
             }
             _ => Ok(None),
-        }
-    }
-
-    /// The brush shape: the alpha image when one is set and loaded, else the library alpha when
-    /// one is set, else the procedural alpha.
-    fn shape<'a>(images: &'a texturecraft_compose::ImageStore, b: &texturecraft_paint::BrushSettings) -> Shape<'a> {
-        Shape {
-            alpha: b.alpha,
-            image: b.alpha_image.as_ref().and_then(|n| images.get(n)).map(|i| &**i),
-            library: b.alpha_library.as_deref().and_then(texturecraft_paint::alphas::find).map(|a| a.image()),
-            params: b.alpha_params,
-            level: 0,
         }
     }
 
@@ -447,58 +579,45 @@ impl Session {
         let Some(active) = self.stroke.as_mut() else { return };
         let Some(progress) = active.uv.as_mut() else { return };
         let Some(cache) = self.caches.get_mut(active.ts) else { return };
+        record_sample(&mut active.replay, uv, pressure);
 
         let settings = &active.stroke.settings;
-        let radius = settings.uv_stamp_radius(pressure);
-        let step = (settings.spacing * 2.0 * radius).max(MIN_UV_STAMP_STEP);
-
-        // Follow path: turn the stamp with the stroke direction (y up on screen, v grows down)
-        let angle = match progress.last {
-            Some(previous) if settings.follow_path && uv != previous => settings.angle + (previous.y - uv.y).atan2(uv.x - previous.x).to_degrees() - 90.0,
-            _ => settings.angle,
-        };
-
-        // The first sample is one stamp; a later one stamps every `step` along the segment from the previous
-        let (start, segment, mut distance) = match progress.last.replace(uv) {
-            None => (uv, Vec2::ZERO, 0.0),
-
-            // Pressure can shrink the step below the carry from the preceding sample
-            Some(previous) => (previous, uv - previous, (step - progress.carry).max(0.0)),
-        };
-        let length = segment.length();
-        let shape = Self::shape(&self.images, settings);
+        let shape = Shape::new(settings.alpha, active.image_alpha.as_deref(), active.library_alpha.as_deref(), settings.alpha_params);
 
         // The copies of each dab: the Clone tool's pickup offset is fixed, so it paints none
         let material = self.doc.project.texture_sets.get(active.ts).map(|t| t.material).unwrap_or(0);
         let mirror = (self.tool.tool != Tool::Clone)
             .then(|| UvMirror::new(&settings.symmetry, active.stroke.center(), &self.mesh, &self.bvh, &cache.gbuf, material))
             .flatten();
-        let mut batch = Vec::new();
-        let mut stamped = 0;
-        while distance <= length && stamped < MAX_UV_STAMPS_PER_SAMPLE {
-            let batch_size = UV_STAMP_BATCH.min(MAX_UV_STAMPS_PER_SAMPLE - stamped);
-            batch.clear();
-            while distance <= length && batch.len() < batch_size {
-                let center = start + segment * (distance / length.max(f32::MIN_POSITIVE));
-                let seed = progress.stamps.wrapping_add((stamped + batch.len()) as u32);
-                batch.push(texturecraft_paint::UvStamp { center, radius, angle, flow: settings.flow, hardness: settings.hardness, seed, source: None });
-                distance += step;
-            }
-
-            stamped += batch.len();
+        progress.sample(settings, uv, pressure, |batch| {
+            record_uv_dabs(&mut active.replay, batch);
             if let Some(mirror) = &mirror {
                 for index in 0..batch.len() {
                     if let Some(stamp) = batch.get(index).copied() {
-                        mirror.add_copies(&stamp, &mut batch);
+                        mirror.add_copies(&stamp, batch);
                     }
                 }
             }
-            texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, &batch);
-        }
-
-        // At most one step, so a segment cut off at the stamp limit can't push the next one's stamps backwards
-        progress.carry = (length - (distance - step)).min(step);
-        progress.stamps = progress.stamps.wrapping_add(stamped as u32);
+            if let Some(device) = &mut active.device {
+                active.device_uv_stamps.extend(batch.iter().copied());
+                match device.append_uv(batch) {
+                    Ok(tiles) => {
+                        active.display_tiles.extend(&tiles);
+                        active.canvas.dirty.extend(tiles);
+                    }
+                    Err(error) => {
+                        active.device = None;
+                        active.display_tiles.append(&mut active.canvas.dirty);
+                        self.log.performance(format!("GPU brush switched to CPU: {error}"));
+                        for stamps in std::mem::take(&mut active.device_uv_stamps).chunks(UV_STAMP_BATCH) {
+                            texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, stamps);
+                        }
+                    }
+                }
+            } else {
+                texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, batch);
+            }
+        });
         self.stroke_painted();
     }
 
@@ -507,7 +626,7 @@ impl Session {
         let Some(st) = self.stroke.as_mut() else { return false };
         let Some(cache) = self.caches.get_mut(st.ts) else { return false };
         let material = self.doc.project.texture_sets.get(st.ts).map(|t| t.material).unwrap_or(0);
-        let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &st.camera, viewport: st.viewport };
+        let ctx = PickCtx { mesh: &self.mesh, bvh: &st.bvh, camera: &st.camera, viewport: st.viewport };
         let stamps = st.stroke.add(&ctx, screen, pressure);
         let hit = st.stroke.last_hit().is_some();
         if stamps.is_empty() {
@@ -515,16 +634,35 @@ impl Session {
         }
         let rctx = RasterCtx {
             mesh: &self.mesh,
-            bvh: &self.bvh,
+            bvh: &st.bvh,
             gbuf: &cache.gbuf,
             material,
             depth: st.depth.as_deref(),
             eye: st.camera.eye(),
             backface_culling: st.stroke.settings.backface_culling,
             angle_fade: st.stroke.settings.angle_fade,
-            shape: Self::shape(&self.images, &st.stroke.settings),
+            shape: Shape::new(st.stroke.settings.alpha, st.image_alpha.as_deref(), st.library_alpha.as_deref(), st.stroke.settings.alpha_params),
         };
-        rasterize(&mut st.canvas, &rctx, &stamps);
+        if let Some(device) = &mut st.device {
+            match device.append_world(&stamps) {
+                Ok(tiles) => {
+                    st.display_tiles.extend(&tiles);
+                    st.canvas.dirty.extend(tiles);
+                    if st.target.is_none() {
+                        self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
+                    }
+                    return hit;
+                }
+                Err(error) => {
+                    st.device = None;
+                    st.display_tiles.append(&mut st.canvas.dirty);
+                    self.log.performance(format!("GPU brush switched to CPU: {error}"));
+                    rasterize(&mut st.canvas, &rctx, &st.stroke.stamps);
+                }
+            }
+        } else {
+            rasterize(&mut st.canvas, &rctx, &stamps);
+        }
         self.stroke_painted();
         hit
     }
@@ -543,20 +681,191 @@ impl Session {
         let gbuf = self.caches.get(ts).map(|c| c.gbuf.clone());
         let pixels = &self.doc.pixels;
         let mut staging = std::mem::take(&mut stroke.staging);
-        with_commit_source(stroke, gbuf.as_deref(), &self.mesh, &recent, |src| match paint_target {
+        with_commit_source(stroke, gbuf.as_deref(), &self.mesh, &recent, None, |src| match paint_target {
             PaintTarget::Layer(id) => staging.stage_layer(pixels, id, &stroke.values, &src),
             PaintTarget::Mask(effect) => staging.stage_mask(pixels, effect, &stroke.mask_gray, &src),
         });
         stroke.staging = staging;
-        self.mark_painted(ts, target, recent);
+        stroke.display_tiles.extend(recent.iter().copied());
+        self.mark_painted(ts, target, recent, false);
     }
 
     pub fn stroke_active(&self) -> bool {
         self.stroke.is_some()
     }
 
+    pub fn stroke_texture_set(&self) -> Option<usize> {
+        self.stroke.as_ref().map(|stroke| stroke.ts)
+    }
+
+    pub fn stroke_mask_owner(&self) -> Option<LayerId> {
+        let Some(PaintTarget::Mask(effect)) = self.stroke.as_ref()?.target else { return None };
+        self.doc.project.effect(effect).map(|(layer, _)| layer)
+    }
+
+    /// The live material compositor uses the device's coverage directly while the stroke is active.
+    pub fn device_stroke(&self) -> Option<DeviceStrokePreview<'_>> {
+        let stroke = self.stroke.as_ref()?;
+
+        // The gray resolved when the stroke began: one value, or an image's gray per texel
+        let mask_value = match &stroke.mask_gray {
+            MaskGray::Value(value) => value.clamp(0.0, 1.0),
+            MaskGray::Image { .. } => 0.0,
+        };
+        Some(DeviceStrokePreview {
+            ts: stroke.ts,
+            target: stroke.target?,
+            values: &stroke.values,
+            mask_value,
+            mask_image: stroke.mask_gray.image_name(),
+            opacity: stroke.stroke.settings.opacity,
+            erase: stroke.erase,
+            stroke: stroke.device.as_deref()?,
+        })
+    }
+
+    /// Finish the GPU coverage when committing or switching to a CPU-only preview.
+    pub fn materialize_device_stroke(&mut self, preview_fallback: Option<&str>) {
+        let _ = self.take_device_stroke(preview_fallback);
+    }
+
+    fn take_device_stroke(&mut self, preview_fallback: Option<&str>) -> Option<Box<dyn DeviceStroke>> {
+        let stroke = self.stroke.as_mut()?;
+        let device = stroke.device.take()?;
+        let valid = match device.read_alpha(&stroke.canvas.dirty) {
+            Ok(alpha) => {
+                stroke.canvas.dirty = alpha.allocated().collect();
+                stroke.canvas.alpha = alpha;
+                true
+            }
+            Err(error) => {
+                stroke.display_tiles.append(&mut stroke.canvas.dirty);
+                self.log.performance(format!("GPU stroke readback failed, replaying stroke on CPU: {error}"));
+                let cache = self.caches.get(stroke.ts)?;
+                let settings = &stroke.stroke.settings;
+                let shape = Shape::new(settings.alpha, stroke.image_alpha.as_deref(), stroke.library_alpha.as_deref(), settings.alpha_params);
+                if stroke.uv.is_some() {
+                    for stamps in stroke.device_uv_stamps.chunks(UV_STAMP_BATCH) {
+                        texturecraft_paint::rasterize_uv(&mut stroke.canvas, &cache.gbuf, shape, stamps);
+                    }
+                } else {
+                    let context = RasterCtx {
+                        mesh: &self.mesh,
+                        bvh: &stroke.bvh,
+                        gbuf: &cache.gbuf,
+                        material: self.doc.project.texture_sets.get(stroke.ts).map_or(0, |set| set.material),
+                        depth: stroke.depth.as_deref(),
+                        eye: stroke.camera.eye(),
+                        backface_culling: stroke.stroke.settings.backface_culling,
+                        angle_fade: stroke.stroke.settings.angle_fade,
+                        shape,
+                    };
+                    rasterize(&mut stroke.canvas, &context, &stroke.stroke.stamps);
+                }
+                false
+            }
+        };
+        stroke.device_uv_stamps.clear();
+        stroke.display_tiles.extend(&stroke.canvas.dirty);
+        stroke.canvas.recent.extend(&stroke.canvas.dirty);
+        if let Some(reason) = preview_fallback {
+            self.log.performance(format!("Brush: CPU ({reason})"));
+            self.stroke_painted();
+        }
+        valid.then_some(device)
+    }
+
+    /// Identity and tiles of a supported live stroke since the display last drew it, on its own
+    /// texture set or another one it feeds. A pickup (clone, smudge, brush material) shows
+    /// through [`Session::display_stroke_pixels`].
+    pub fn pending_display_stroke(&self, ts: usize) -> Option<(u64, &BTreeSet<(u32, u32)>)> {
+        let stroke = self.stroke.as_ref()?;
+        let tiles = &stroke.display_tiles;
+        let can_preview = stroke.stencil.is_none() || stroke.device.is_some();
+        (self.stroke_feeds(ts) && stroke.target.is_some() && can_preview).then_some((stroke.display_id, tiles))
+    }
+
+    /// Whether texture set `ts` shows the active stroke live: the set it paints, or another set of
+    /// the same size drawing the painted layer (an instance), whose texels are the same pixels. A
+    /// stencil is sampled at the painted set's surface, which another set's texels do not share.
+    fn stroke_feeds(&self, ts: usize) -> bool {
+        self.stroke.as_ref().is_some_and(|stroke| self.feeds(stroke, ts))
+    }
+
+    /// Whether `stroke` shows live on texture set `ts` (see [`Session::stroke_feeds`]).
+    fn feeds(&self, stroke: &ActiveStroke, ts: usize) -> bool {
+        if stroke.ts == ts {
+            return true;
+        }
+
+        if stroke.stencil.is_some() {
+            return false;
+        }
+
+        let size = |set: usize| self.caches.get(set).map(|cache| cache.size);
+        let same_size = size(ts).is_some() && size(ts) == size(stroke.ts);
+        same_size && stroke.target.is_some_and(|target| self.doc.project.sets_drawing(self.paint_owner(target)).contains(&ts))
+    }
+
+    /// Copy-on-write material pixels for display. The staged blends are the same tiles the
+    /// completed stroke will install. The live viewport does not change the document or Undo.
+    pub fn display_stroke_pixels(&self, ts: usize, texel_bounds: Option<([u32; 2], [u32; 2])>) -> Option<texturecraft_compose::PixelStore> {
+        self.pending_display_stroke(ts)?;
+        let stroke = self.stroke.as_ref()?;
+        if stroke.device.is_some() {
+            return None;
+        }
+        let tiles_in_bounds;
+        let touched = if let Some((min, max)) = texel_bounds {
+            tiles_in_bounds = stroke
+                .canvas
+                .dirty
+                .iter()
+                .copied()
+                .filter(|&(x, y)| {
+                    let (x, y) = (x * TILE, y * TILE);
+                    x >= min[0] && x < max[0] && y >= min[1] && y < max[1]
+                })
+                .collect();
+            &tiles_in_bounds
+        } else {
+            &stroke.canvas.dirty
+        };
+        let size = (stroke.canvas.alpha.width(), stroke.canvas.alpha.height());
+        let mut pixels = self.doc.pixels.clone();
+        let mut staging = stroke.staging.snapshot(touched);
+        with_commit_source(stroke, None, &self.mesh, touched, None, |source| match stroke.target {
+            Some(PaintTarget::Layer(id)) => commit_layer(&mut pixels, id, size, &stroke.values, source, &mut staging),
+            Some(PaintTarget::Mask(id)) => commit_mask(&mut pixels, id, size, &stroke.mask_gray, source, &mut staging),
+            None => {}
+        });
+        Some(pixels)
+    }
+
+    pub fn clear_display_stroke_tiles(&mut self) {
+        if let Some(stroke) = self.stroke.as_mut() {
+            stroke.display_tiles.clear();
+        }
+    }
+
+    pub fn finished_display_stroke(&self, ts: usize, id: u64, previous_revision: u64) -> Option<&BTreeSet<(u32, u32)>> {
+        let end = self.display_stroke_end.as_ref()?;
+        let revision = self.caches.get(ts)?.material_revision;
+        let own = end.ts == ts && end.previous_revision == previous_revision && end.revision == revision;
+        let fed = end.fed.contains(&(ts, previous_revision, revision));
+        (end.id == id && (own || fed)).then_some(&end.tiles)
+    }
+
+    /// The texture sets other than its own that `stroke` feeds, with their material revisions.
+    fn fed_revisions(&self, stroke: &ActiveStroke) -> Vec<(usize, u64)> {
+        let fed = |&(set, _): &(usize, &crate::session::SetCache)| set != stroke.ts && self.feeds(stroke, set);
+        self.caches.iter().enumerate().filter(fed).map(|(set, cache)| (set, cache.material_revision)).collect()
+    }
+
     /// Commit the active stroke (one undo step).
     pub fn end_stroke(&mut self) -> Result<()> {
+        let device = self.take_device_stroke(None);
+        let brush_tile = self.tile_demand(None).brush;
         let Some(mut stroke) = self.stroke.take() else { return Ok(()) };
         let size = (stroke.canvas.alpha.width(), stroke.canvas.alpha.height());
         if stroke.canvas.dirty.is_empty() {
@@ -568,23 +877,56 @@ impl Session {
         let gbuf = self.caches.get(stroke.ts).map(|c| c.gbuf.clone());
         let mesh = self.mesh.clone();
         let mut staging = std::mem::take(&mut stroke.staging);
-        match stroke.target {
-            Some(PaintTarget::Layer(id)) => {
-                let pixels = &mut self.doc.pixels;
-                with_commit_source(&stroke, gbuf.as_deref(), &mesh, &stroke.canvas.dirty, |src| {
-                    commit_layer(pixels, id, size, &stroke.values, src, &mut staging)
+        let Some(target) = stroke.target else {
+            with_commit_source(&stroke, gbuf.as_deref(), &mesh, &stroke.canvas.dirty, None, |src| self.commit_quick_mask(stroke.ts, size, src));
+            return Ok(());
+        };
+        let pixels = &mut self.doc.pixels;
+        let mut commit = |tiles: &BrushTiles, projection: Option<&ProjectedTiles>| {
+            with_commit_source(&stroke, gbuf.as_deref(), &mesh, tiles, projection, |src| match target {
+                PaintTarget::Layer(id) => commit_layer(pixels, id, size, &stroke.values, src, &mut staging),
+                PaintTarget::Mask(eid) => commit_mask(pixels, eid, size, &stroke.mask_gray, src, &mut staging),
+            });
+        };
+        if let Some(device) = device.as_deref().filter(|_| stroke.stencil.is_some()) {
+            let tiles: Vec<_> = stroke.canvas.dirty.iter().copied().collect();
+            let mut gpu_readback = Some(device);
+            for batch in tiles.chunks(PROJECTION_READBACK_BATCH) {
+                let tiles: BrushTiles = batch.iter().copied().collect();
+                let projection = gpu_readback.and_then(|device| match device.read_projection(&tiles) {
+                    Ok(samples) if tiles.iter().all(|tile| samples.get(tile).is_some_and(|data| data.len() == TILE_AREA)) => Some(samples),
+                    Ok(_) => {
+                        self.log.performance("GPU stencil readback missed tiles, sampling remaining tiles on CPU");
+                        gpu_readback = None;
+                        None
+                    }
+                    Err(error) => {
+                        self.log.performance(format!("GPU stencil readback failed, sampling remaining tiles on CPU: {error}"));
+                        gpu_readback = None;
+                        None
+                    }
                 });
+                commit(&tiles, projection.as_ref());
             }
-            Some(PaintTarget::Mask(eid)) => {
-                let pixels = &mut self.doc.pixels;
-                with_commit_source(&stroke, gbuf.as_deref(), &mesh, &stroke.canvas.dirty, |src| {
-                    commit_mask(pixels, eid, size, &stroke.mask_gray, src, &mut staging)
-                });
+        } else {
+            commit(&stroke.canvas.dirty, None);
+        }
+        let fed_before = self.fed_revisions(&stroke);
+
+        // A layer stroke paints channel values, and a mask stroke painting an image is never recorded
+        let mask_value = match &stroke.mask_gray {
+            MaskGray::Value(value) => value.clamp(0.0, 1.0),
+            MaskGray::Image { .. } => 0.0,
+        };
+        let operation = stroke.replay.take().map(|mut placement| {
+            if let PaintPlacement::World { world } = &mut placement {
+                world.dabs = std::mem::take(&mut stroke.stroke.stamps);
             }
-            None => {
-                with_commit_source(&stroke, gbuf.as_deref(), &mesh, &stroke.canvas.dirty, |src| self.commit_quick_mask(stroke.ts, size, src));
-                return Ok(());
-            }
+            RecordedPaint { settings: stroke.stroke.settings.clone(), placement, values: stroke.values.clone(), mask_value, erase: stroke.erase }
+        });
+        let material = self.doc.project.texture_sets.get(stroke.ts).map_or(0, |set| set.material);
+        if self.doc.stroke_replays.commit(target, operation, &stroke.before.pixels, &self.doc.pixels, &self.mesh, material) {
+            self.note_raster_paint();
         }
         self.undo.push((stroke.label.clone(), stroke.before));
         if self.undo.len() > crate::session::MAX_HISTORY {
@@ -593,19 +935,45 @@ impl Session {
         self.redo.clear();
         self.mark_modified();
 
+        let previous_revision = self.caches.get(stroke.ts).map_or(0, |cache| cache.material_revision);
         // Recompute committed tiles at low priority because the live preview already shows them
         self.mark_settle(stroke.ts, stroke.target, stroke.canvas.dirty.iter().copied());
+        let revision_of = |set: usize| self.caches.get(set).map_or(0, |cache| cache.material_revision);
+        let fed = fed_before.into_iter().map(|(set, before)| (set, before, revision_of(set))).collect();
+        if let Some(cache) = self.caches.get_mut(stroke.ts) {
+            self.display_stroke_end = Some(DisplayStrokeEnd {
+                id: stroke.display_id,
+                ts: stroke.ts,
+                previous_revision,
+                revision: cache.material_revision,
+                tiles: stroke.display_tiles,
+                fed,
+            });
+            cache.finished_dab = brush_tile
+                .filter(|tile| stroke.canvas.dirty.contains(tile) && (cache.dirty.contains(tile) || cache.upload.contains(tile) || cache.settle.contains(tile)))
+                .map(ReleasedDab::new);
+        }
         Ok(())
     }
 
     /// Abandon the active stroke (Esc).
     pub fn cancel_stroke(&mut self) {
         if let Some(st) = self.stroke.take() {
-            self.mark_painted(st.ts, st.target, st.canvas.dirty.iter().copied());
+            let fed = self.fed_revisions(&st).into_iter().map(|(set, revision)| (set, revision, revision)).collect();
+            self.mark_painted(st.ts, st.target, st.canvas.dirty.iter().copied(), false);
             if st.target.is_none() {
                 self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
             }
             self.doc = st.before;
+            // A paint effect created by the stroke can get the same ID on a different owner.
+            for cache in &mut self.caches {
+                cache.invalidate_paint_margin();
+            }
+            if let Some(cache) = self.caches.get(st.ts) {
+                let revision = cache.material_revision;
+                self.display_stroke_end =
+                    Some(DisplayStrokeEnd { id: st.display_id, ts: st.ts, previous_revision: revision, revision, tiles: st.canvas.dirty, fed });
+            }
         }
     }
 
@@ -632,6 +1000,7 @@ impl Session {
         for q in points.iter().skip(1) {
             self.continue_stroke_uv(*q, 1.0);
         }
+        self.materialize_device_stroke(None);
         let tiles = self.stroke_tiles();
         self.end_stroke()?;
         Ok(tiles)
@@ -694,9 +1063,7 @@ impl Session {
         let (width, height) = (cache.size.0 as f32, cache.size.1 as f32);
         let (x, y) = ((hit.uv.x * width).clamp(0.0, width - 1.0) as u32, (hit.uv.y * height).clamp(0.0, height - 1.0) as u32);
 
-        let tile = (x / texturecraft_texel::TILE, y / texturecraft_texel::TILE);
-        let source = self.document_composite(texture_set, &[tile]).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
-        Ok(source.channels.keys().map(|&channel| (channel, source.value(channel, x, y))).collect())
+        self.document_sample(texture_set, x, y).ok_or_else(|| EngineError::Other("texture set not ready".into()))
     }
 
     /// The stroke canvas alpha of the active stroke (for overlays and tests).
@@ -745,9 +1112,16 @@ fn with_commit_source<R>(
     gbuf: Option<&texturecraft_geom::UvGBuffer>,
     mesh: &texturecraft_geom::Mesh,
     tiles: &BTreeSet<(u32, u32)>,
+    projection: Option<&ProjectedTiles>,
     f: impl FnOnce(CommitSource) -> R,
 ) -> R {
     let stencil_fn = |x: u32, y: u32| -> Option<([f32; 3], f32)> {
+        if let Some(projection) = projection {
+            let tile = projection.get(&(x / TILE, y / TILE))?;
+            let i = ((y % TILE) * TILE + x % TILE) as usize;
+            let &[r, g, b, a] = tile.get(i)?;
+            return Some(([r, g, b], a));
+        }
         let g = gbuf?;
         let p = g.surface(mesh, (y * g.width + x) as usize)?.pos;
         st.stencil.as_ref()?.sample_world(p)

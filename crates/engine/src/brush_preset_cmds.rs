@@ -423,7 +423,9 @@ mod tests {
         assert!(!dir.join("Scratchy.tcbrush").exists());
 
         // Legacy files and invalid files share the brush folder
-        run(&mut test_session, "brush.preset.save", json!({"path": dir.join("Old style.tcbrush").to_str().unwrap()})).unwrap();
+        let mut old_brush = serde_json::to_value(&test_session.tool.brush).unwrap();
+        old_brush.as_object_mut().unwrap().remove("stamp_blending");
+        std::fs::write(dir.join("Old style.tcbrush"), serde_json::to_vec(&old_brush).unwrap()).unwrap();
         std::fs::write(dir.join("broken.tcbrush"), b"{ nope").unwrap();
         std::fs::write(dir.join("Chalk.tcbrush"), serde_json::to_vec(&BrushSettings::default()).unwrap()).unwrap();
 
@@ -434,6 +436,7 @@ mod tests {
         assert_eq!(names(&fresh), ["Ink pen", "Old style"]);
         assert!((fresh.brush_presets.list[0].brush.size - test_session.tool.brush.size).abs() < 1e-6);
         assert!(fresh.brush_presets.list[0].channels.is_some() && fresh.brush_presets.list[1].channels.is_none());
+        assert_eq!(fresh.brush_presets.list[1].brush.stamp_blending, texturecraft_paint::StampBlending::Normal);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -444,7 +447,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         let mut source = session();
         source.load_brush_presets(directory.clone());
-        source.tool.brush = BrushSettings { size: 0.08, flow: 0.3, hardness: 0.7, ..BrushSettings::default() };
+        source.tool.brush =
+            BrushSettings { size: 0.08, flow: 0.3, hardness: 0.7, stamp_blending: texturecraft_paint::StampBlending::Add, ..BrushSettings::default() };
         source.tool.enabled = [Channel::Roughness].into_iter().collect();
         run(&mut source, "brush.preset.store", json!({"name": "Ink"})).unwrap();
         let bare_path = directory.join("bare.tcbrush");
@@ -458,6 +462,7 @@ mod tests {
             run(&mut destination, "brush.preset.load", json!({"path": path})).unwrap();
 
             assert_eq!(destination.tool.brush.flow, source.tool.brush.flow);
+            assert_eq!(destination.tool.brush.stamp_blending, source.tool.brush.stamp_blending);
             assert_eq!(destination.tool.brush.hardness, source.tool.brush.hardness);
             assert_eq!(destination.tool.brush.size, 0.15);
             assert_eq!(destination.tool.enabled, [Channel::BaseColor].into_iter().collect());
