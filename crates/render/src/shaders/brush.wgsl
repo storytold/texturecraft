@@ -158,8 +158,11 @@ fn library_alpha(local: vec2<f32>, radius: f32) -> f32 {
     let side = i32(textureDimensions(tip, mip).x);
     let p = (local * vec2(0.5, -0.5) + 0.5) * f32(side) - 0.5;
     if any(p <= vec2(-1.0)) || any(p >= vec2(f32(side))) { return 0.0; }
-    let corner = vec2<i32>(floor(p));
-    let t = fract(p);
+    // The weights from the same floor as the texels: llvmpipe may fuse the multiply-add for one of
+    // floor and fract and round it for the other, which reads the next texel at full weight
+    let cell = floor(p);
+    let corner = vec2<i32>(cell);
+    let t = clamp(p - cell, vec2(0.0), vec2(1.0));
     let top = mix(tip_texel(corner, side, mip), tip_texel(corner + vec2(1, 0), side, mip), t.x);
     let bottom = mix(tip_texel(corner + vec2(0, 1), side, mip), tip_texel(corner + vec2(1, 1), side, mip), t.x);
     return mix(top, bottom, t.y);
@@ -175,8 +178,10 @@ fn image_alpha(local: vec2<f32>) -> f32 {
     let p = local * vec2(max(1.0 / aspect, 1.0), max(aspect, 1.0));
     if !all(abs(p) <= vec2(1.0)) { return 0.0; }
     let grid = (p * vec2(0.5, -0.5) + 0.5) * vec2<f32>(size) - 0.5;
-    let at = vec2<i32>(floor(grid));
-    let t = fract(grid);
+    // The weights from the same floor as the texels (library_alpha)
+    let cell = floor(grid);
+    let at = vec2<i32>(cell);
+    let t = clamp(grid - cell, vec2(0.0), vec2(1.0));
     let top = mix(wrapped_tip_texel(at, size), wrapped_tip_texel(at + vec2(1, 0), size), t.x);
     let bottom = mix(wrapped_tip_texel(at + vec2(0, 1), size), wrapped_tip_texel(at + vec2(1, 1), size), t.x);
     let rgba = mix(top, bottom, t.y);
