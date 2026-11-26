@@ -77,7 +77,7 @@ pub(crate) fn adjusted(kind: GeneratorKind, section: &SectionParameters, signal:
         value = if kind == GeneratorKind::AmbientOcclusion {
             GeneratorGlobal { balance, ..GeneratorGlobal::default() }.apply(value)
         } else {
-            value.powf(BALANCE_POWER_BASE.powf(2.0 * balance - 1.0))
+            value.powf(balance_power(balance))
         };
     }
 
@@ -89,6 +89,11 @@ pub(crate) fn adjusted(kind: GeneratorKind, section: &SectionParameters, signal:
     }
 
     if section.invert { 1.0 - value } else { value }
+}
+
+/// The power a balance (0..1) raises the signal to: 1/25 at 0, 1 at 0.5, 25 at 1
+pub(crate) fn balance_power(balance: f32) -> f32 {
+    BALANCE_POWER_BASE.powf(2.0 * balance - 1.0)
 }
 
 /// `value` with its range narrowed around the middle by `contrast` (1 a step just above the middle)

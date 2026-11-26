@@ -8,10 +8,16 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Other crates' tests: `Headless::for_tests` shares one device and its compiled pipelines per
+# process on software adapters, as the render crate's own tests do
+test-support = []
+
 [dependencies]
 texturecraft-core = { workspace = true }
 texturecraft-texel = { workspace = true }
 texturecraft-geom = { workspace = true }
+texturecraft-paint = { workspace = true }
 texturecraft-compose = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
@@ -30,3 +36,5 @@ wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 image = { workspace = true }
+# The version wgpu uses: checks the composite and neighbourhood WGSL and its GLSL output without an adapter
+naga = { version = "30.0.1", features = ["wgsl-in", "glsl-out"] }

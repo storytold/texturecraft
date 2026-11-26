@@ -3,6 +3,7 @@
 use serde_json::json;
 use texturecraft_engine::core::Channel;
 use texturecraft_engine::geom::primitives;
+use texturecraft_engine::texel::TILE;
 use texturecraft_engine::{Session, execute};
 
 /// Texture size: 1e-4 UV is 0.0256 texels
@@ -102,4 +103,102 @@ fn decreasing_pressure_does_not_stamp_behind_a_turn() {
 
     assert!(red_at(&session, 0.33, 0.55), "the new segment is painted");
     assert!(!red_at(&session, 0.33, 0.45), "a smaller step must not stamp behind the turn");
+}
+
+/// A black mask on a white fill, with a paint effect below its blur.
+fn blurred_mask_session() -> Session {
+    let mut s = Session::new_project("mask cache", primitives::plane(1.0, 1), "builtin:plane", None, RESOLUTION).unwrap();
+    let layer = execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap()["layer"].clone();
+    execute(&mut s, "mask.add.black", &json!({})).unwrap();
+    let paint = execute(&mut s, "effect.add.paint", &json!({"target": "mask"})).unwrap()["effect"].clone();
+    execute(&mut s, "effect.add.filter", &json!({"target": "mask", "filter": "blur", "radius": 32})).unwrap();
+    execute(&mut s, "layer.select", &json!({"layer": layer, "target": paint})).unwrap();
+    execute(&mut s, "tool.brush", &json!({"size": 2.0, "hardness": 100})).unwrap();
+    s.update();
+    s
+}
+
+#[test]
+fn swapping_mask_gray_mid_stroke_keeps_the_stroke_gray_and_the_dab_priority() {
+    let mut session = Session::new_project("Mask stroke", primitives::plane(1.0, 1), "builtin:plane", None, RESOLUTION).unwrap();
+    execute(&mut session, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap();
+    execute(&mut session, "mask.add.white", &json!({})).unwrap();
+    session.tool.mask_value = 1.0;
+    session.update();
+    session.take_uploads(0);
+
+    session.begin_stroke_uv([0.5, 0.5].into(), 1.0).unwrap();
+    let (id, tiles) = session.pending_display_stroke(0).unwrap();
+    let center = RESOLUTION / 2 / TILE;
+    let tile = (center, center);
+    assert!(tiles.contains(&tile));
+    session.update();
+    session.take_uploads(0);
+    session.clear_display_stroke_tiles();
+    assert!(session.pending_display_stroke(0).unwrap().1.is_empty());
+
+    // A stroke paints the gray it began with: staging, previews and the commit read one gray
+    execute(&mut session, "tool.swapMaskValue", &json!({})).unwrap();
+    assert!(session.pending_display_stroke(0).unwrap().1.is_empty(), "a new gray leaves the stroke's coverage as it is");
+    session.continue_stroke_uv([0.6, 0.5].into(), 1.0);
+    session.continue_stroke_uv([0.5, 0.5].into(), 1.0);
+    assert!(session.pending_display_stroke(0).unwrap().1.contains(&tile));
+    session.update();
+    session.take_uploads(0);
+    let revision = session.caches[0].material_revision;
+    session.end_stroke().unwrap();
+
+    assert!(session.finished_display_stroke(0, id, revision).unwrap().contains(&tile), "the commit refreshes the last displayed dab");
+    let mask = session.doc.pixels.masks.values().next().expect("the stroke persists");
+    let [value, coverage] = mask.get(RESOLUTION / 2, RESOLUTION / 2)[..2].try_into().unwrap();
+    assert!(coverage > 0 && value == coverage, "the stroke keeps painting white: {value} of {coverage}");
+    assert!(session.caches[0].settle.contains(&tile));
+    assert!(session.caches[0].dirty.is_empty() && session.caches[0].upload.is_empty(), "only the settle queue holds the released dab");
+    let demand = session.tile_demand(None);
+    assert!(demand.has_brush());
+    session.caches[0].dirty.insert((0, 0));
+    session.caches[0].chunk = 1;
+    let clock = std::cell::Cell::new(0.0);
+    session.update_for_view(1.0, || clock.replace(clock.get() + 1.0), demand);
+    assert!(session.caches[0].upload.contains(&tile), "the first slice prepares the released dab");
+    assert!(session.caches[0].dirty.contains(&(0, 0)), "unrelated work waits for the brush");
+}
+
+#[test]
+fn filtered_stroke_refreshes_the_neighbour_on_preview_cancel_commit_and_history() {
+    use texturecraft_engine::compose::Composite;
+    fn compare_full(s: &mut Session, phase: &str) -> Composite {
+        s.update();
+        let incremental = s.caches[0].composite.clone();
+        let cache = &mut s.caches[0];
+        let warm = std::mem::take(&mut cache.below);
+        cache.below.budget = 0;
+        cache.invalidate_all();
+        s.update();
+        s.caches[0].below = warm;
+        assert!(s.caches[0].composite == incremental, "{phase}: incremental output differs from a full evaluation");
+        incremental
+    }
+
+    let mut s = blurred_mask_session();
+    s.begin_stroke_uv([0.8, 0.8].into(), 1.0).unwrap();
+    s.end_stroke().unwrap();
+    s.update();
+    let baseline = s.caches[0].composite.clone();
+    let uv = [60.5 / RESOLUTION as f32, 32.5 / RESOLUTION as f32].into();
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    assert_eq!(s.stroke_tiles(), 1, "the brush itself stays inside one tile");
+    let live = compare_full(&mut s, "live");
+    assert_ne!(live.value(Channel::BaseColor, 64, 32), baseline.value(Channel::BaseColor, 64, 32));
+    s.cancel_stroke();
+    assert!(compare_full(&mut s, "cancel") == baseline);
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    s.end_stroke().unwrap();
+    let committed = compare_full(&mut s, "commit");
+    s.undo().unwrap();
+    assert!(!s.caches[0].dirty.contains(&(3, 3)), "undo leaves distant tiles alone");
+    assert!(compare_full(&mut s, "undo") == baseline);
+    s.redo().unwrap();
+    assert!(!s.caches[0].dirty.contains(&(3, 3)), "redo leaves distant tiles alone");
+    assert!(compare_full(&mut s, "redo") == committed);
 }

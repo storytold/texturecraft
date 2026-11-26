@@ -6,7 +6,7 @@
 //! everything the cached part reads; any change to it empties the cache, so results are always
 //! identical to a full evaluation.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Weak};
 
@@ -203,6 +203,11 @@ impl StackKey {
     /// changed (same set, roots, layers, baked maps and images; the same images by id, channel
     /// and size). None when anything else differs: the caller recomposites everything.
     pub fn changed_tiles(&self, other: &StackKey) -> Option<BTreeSet<(u32, u32)>> {
+        self.changed_paint(other).map(|targets| targets.into_values().flatten().collect())
+    }
+
+    /// Changed source tiles grouped by the paint target whose filter stack reads them.
+    pub fn changed_paint(&self, other: &StackKey) -> Option<BTreeMap<PaintTarget, BTreeSet<(u32, u32)>>> {
         if self.set != other.set
             || self.roots != other.roots
             || self.layers != other.layers
@@ -218,7 +223,7 @@ impl StackKey {
         }
 
         let size = self.set.size();
-        let mut changed = BTreeSet::new();
+        let mut changed = BTreeMap::new();
         for ((left_id, left_channel, left_image), (right_id, right_channel, right_image)) in self.pixels.iter().zip(&other.pixels) {
             let (left_image, right_image) = (&left_image.0, &right_image.0);
             let same_shape = left_id == right_id
@@ -227,8 +232,7 @@ impl StackKey {
                 && left_image.height() == right_image.height()
                 && left_image.comps() == right_image.comps();
 
-            // Image tiles are composite tiles only when the grids coincide
-            if !same_shape || (left_image.width(), left_image.height()) != size {
+            if !same_shape {
                 return None;
             }
 
@@ -236,6 +240,11 @@ impl StackKey {
                 continue;
             }
 
+            // Unchanged resampled instances do not constrain the grid of another target.
+            if (left_image.width(), left_image.height()) != size {
+                return None;
+            }
+            let target = if left_channel.is_some() { PaintTarget::Layer(*left_id) } else { PaintTarget::Mask(*left_id) };
             for tile_y in 0..left_image.tiles_y() {
                 for tile_x in 0..left_image.tiles_x() {
                     let equal = match (left_image.tile_handle(tile_x, tile_y), right_image.tile_handle(tile_x, tile_y)) {
@@ -244,7 +253,7 @@ impl StackKey {
                         _ => false,
                     };
                     if !equal {
-                        changed.insert((tile_x, tile_y));
+                        changed.entry(target).or_insert_with(BTreeSet::new).insert((tile_x, tile_y));
                     }
                 }
             }
@@ -358,6 +367,12 @@ impl BelowCache {
         self.bytes = 0;
         self.key = None;
         self.held = None;
+    }
+
+    /// A parked material can reuse its bands later. Look-ahead fields belong to the old pass.
+    pub fn finish_pass(&mut self) {
+        self.held = None;
+        self.ahead.clear();
     }
 
     pub fn bytes(&self) -> usize {

@@ -1,7 +1,7 @@
 use std::io::{Cursor, Write};
 
 use serde_json::json;
-use texturecraft_engine::{Session, execute, geom::primitives};
+use texturecraft_engine::{LogLevel, Session, execute, geom::primitives};
 use zip::{ZipWriter, write::SimpleFileOptions};
 
 #[test]
@@ -30,9 +30,19 @@ fn recovered_project_opens_with_a_warning_in_the_session_log() {
     std::fs::write(&path, &bytes).unwrap();
     execute(&mut original, "file.open", &json!({"path": path})).unwrap();
 
-    // The same entries, logged at another time
-    let entries = |log: &texturecraft_engine::SessionLog| log.iter().map(|entry| (entry.level, entry.line())).collect::<Vec<_>>();
+    // Both entry points report the same recovery messages. The archive timing has
+    // a different label for path opens, and elapsed times vary between runs.
+    let entries = |log: &texturecraft_engine::SessionLog| {
+        log.iter().filter(|entry| entry.source != "Performance").map(|entry| (entry.level, entry.line())).collect::<Vec<_>>()
+    };
     assert_eq!(entries(&original.log), entries(&recovered.log));
+    for (log, archive_message) in [(&original.log, "CPU project archive read and decoded in "), (&recovered.log, "CPU project archive decoded in ")] {
+        let timings: Vec<_> = log.iter().filter(|entry| entry.source == "Performance").collect();
+        assert_eq!(timings.len(), 2);
+        assert!(timings[0].message.starts_with(archive_message));
+        assert!(timings[1].message.starts_with("CPU project setup:"));
+        assert_eq!(log.last().map(|entry| entry.level), Some(LogLevel::Warning), "the recovery warning stays visible in the status bar");
+    }
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     std::fs::remove_file(path).unwrap();
 }

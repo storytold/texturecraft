@@ -2,17 +2,17 @@
 
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
-use texturecraft_compose::{
-    BakedMaps, BelowCache, Composite, PaintTarget, PixelStore, StackKey, StrokePreview, covered_tiles, pad_tiles, stack_reads_neighbours,
-};
+use texturecraft_compose::{BakedMaps, BelowCache, Composite, PaintTarget, PixelStore, StackKey, StrokePreview, covered_tiles};
 use texturecraft_core::{Channel, Layer, LayerId, LayerKind, Project, TextureSet};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera, UvGBuffer};
 use texturecraft_paint::{BrushSettings, EyeDepth, Stroke, StrokeCanvas};
-use texturecraft_texel::DilationMap;
+use texturecraft_texel::TILE;
 
+pub use crate::display_padding::DisplayPadding;
 use crate::fill_mode::FillMode;
 pub use crate::stencil_look::StencilLook;
 use crate::{EngineError, Result};
@@ -35,12 +35,33 @@ pub struct Document {
     pub bake_meshes: crate::BakeMeshes,
 }
 
+/// A released dab keeps priority until its display upload is sent.
+#[derive(Clone)]
+pub struct ReleasedDab {
+    tile: (u32, u32),
+    uploaded: Arc<AtomicBool>,
+}
+
+impl ReleasedDab {
+    pub(crate) fn new(tile: (u32, u32)) -> Self {
+        Self { tile, uploaded: Arc::default() }
+    }
+
+    pub(crate) fn pending_tile(&self) -> Option<(u32, u32)> {
+        (!self.uploaded.load(Ordering::Acquire)).then_some(self.tile)
+    }
+
+    pub fn acknowledge_upload(&self) {
+        self.uploaded.store(true, Ordering::Release);
+    }
+}
+
 /// Derived per-texture-set data (rebuilt when the mesh or resolution changes).
 pub struct SetCache {
     /// Texels across and down (`TextureSet::size`).
     pub size: (u32, u32),
     pub gbuf: Arc<UvGBuffer>,
-    pub dilation: Arc<DilationMap>,
+    pub dilation: DisplayPadding,
     pub covered_tiles: Arc<Vec<(u32, u32)>>,
     pub composite: Composite,
     /// Tiles to recomposite.
@@ -50,40 +71,129 @@ pub struct SetCache {
     pub settle: BTreeSet<(u32, u32)>,
     /// Tiles whose display textures must be re-uploaded.
     pub upload: BTreeSet<(u32, u32)>,
+    /// A dab released before its first display upload.
+    pub(crate) finished_dab: Option<ReleasedDab>,
     /// Bumps on every composite change (thumbnails, exports, caches).
     pub revision: u64,
+    /// Changes when this set's material inputs change, independently of CPU display work.
+    pub material_revision: u64,
     /// Everything but the layer being edited, per tile (repaints evaluate only that layer).
     pub below: BelowCache,
     /// Tiles per composite chunk that fit the last frame's budget (0: not measured yet).
     pub chunk: usize,
+    /// Invalidated when the document stack is synchronized.
+    paint_margin: Option<(PaintTarget, Option<u32>)>,
 }
 
 impl SetCache {
     pub(crate) fn new(mesh: &Mesh, ts: &TextureSet) -> SetCache {
         let (w, h) = ts.size();
-        let gbuf = UvGBuffer::new(mesh, ts.material, w, h);
-
-        // Padding stays inside each UV tile
-        let dilation = DilationMap::in_blocks(&gbuf.coverage_mask(), w, h, Some(DISPLAY_PADDING), ts.block_resolution());
+        let gbuf = Arc::new(UvGBuffer::new(mesh, ts.material, w, h));
+        // Padding stays inside each UV tile.
         let covered = covered_tiles(&gbuf);
+        let dilation = DisplayPadding::new(&gbuf, !covered.is_empty(), ts.block_resolution());
         let all: BTreeSet<(u32, u32)> = texturecraft_compose::all_tiles(w, h).into_iter().collect();
         SetCache {
             size: (w, h),
-            gbuf: Arc::new(gbuf),
-            dilation: Arc::new(dilation),
+            gbuf,
+            dilation,
             covered_tiles: Arc::new(covered),
             composite: Composite { block_scales: ts.block_scales(), ..Composite::with_size(&ts.channel_list(), w, h) },
-            dirty: all.clone(),
+            dirty: all,
             settle: BTreeSet::new(),
-            upload: all,
+            upload: BTreeSet::new(),
+            finished_dab: None,
             revision: 0,
+            material_revision: 0,
             below: BelowCache::default(),
             chunk: 0,
+            paint_margin: None,
+        }
+    }
+
+    /// Replay a lost or recreated GPU texture. Tiles still awaiting composition will be
+    /// queued with their finished pixels by update_tiles.
+    pub fn queue_ready_uploads(&mut self) {
+        let (cols, rows) = (self.size.0.div_ceil(TILE), self.size.1.div_ceil(TILE));
+        if self.dirty.len() < cols as usize * rows as usize {
+            self.upload.extend((0..cols).flat_map(|x| (0..rows).map(move |y| (x, y))).filter(|t| !self.dirty.contains(t)));
+        }
+    }
+
+    /// Drain one upload slice, giving the brush and visible UVs first use of it.
+    pub fn take_upload_batch(&mut self, limit: usize, demand: crate::TileDemand) -> Vec<(u32, u32)> {
+        if self.upload.len() <= limit {
+            std::mem::take(&mut self.upload).into_iter().collect()
+        } else {
+            let mut tiles = demand.take(&mut self.upload, limit);
+            tiles.extend((tiles.len()..limit).filter_map(|_| self.upload.pop_first()));
+            tiles
+        }
+    }
+
+    /// Carry this receipt with the scene so a lost render callback leaves the dab pending.
+    pub fn released_dab_in(&self, tiles: &[(u32, u32)]) -> Option<ReleasedDab> {
+        let dab = self.finished_dab.as_ref()?;
+        tiles.contains(&dab.pending_tile()?).then(|| dab.clone())
+    }
+
+    fn queue_painted(
+        &mut self,
+        project: &Project,
+        ts: usize,
+        target: PaintTarget,
+        tiles: &[(u32, u32)],
+        queue: impl FnOnce(&mut Self) -> &mut BTreeSet<(u32, u32)>,
+    ) {
+        if tiles.is_empty() {
+            return;
+        }
+        let margin = match self.paint_margin {
+            Some((cached, margin)) if cached == target => margin,
+            _ => {
+                let margin = texturecraft_compose::eval::painted_tile_margin(project, ts, target);
+                self.paint_margin = Some((target, margin));
+                margin
+            }
+        };
+        let covered = Arc::clone(&self.covered_tiles);
+        let (width, height) = self.size;
+        let queue = queue(self);
+        match margin {
+            Some(0) => queue.extend(tiles.iter().copied()),
+            Some(radius) => {
+                let (last_x, last_y) = (width.saturating_sub(1) / TILE, height.saturating_sub(1) / TILE);
+                let mut add_rect = |(left, top): (u32, u32), (right, bottom): (u32, u32)| {
+                    let left = left.saturating_sub(radius);
+                    let right = right.saturating_add(radius).min(last_x);
+                    for row in top.saturating_sub(radius)..=bottom.saturating_add(radius).min(last_y) {
+                        // Covered tiles are sorted by row, then column.
+                        let start = covered.partition_point(|&(tx, ty)| (ty, tx) < (row, left));
+                        queue.extend(covered[start..].iter().take_while(|&&(tx, ty)| ty == row && tx <= right).copied());
+                    }
+                };
+                // Coalesce expensive, overlapping halos without scanning distant atlas tiles.
+                let diameter = (radius as usize).saturating_mul(2).saturating_add(1);
+                if diameter.saturating_mul(diameter).saturating_mul(tiles.len()) >= covered.len() {
+                    let bounds = tiles.iter().fold(((last_x, last_y), (0, 0)), |((l, t), (r, b)), &(x, y)| ((l.min(x), t.min(y)), (r.max(x), b.max(y))));
+                    add_rect(bounds.0, bounds.1);
+                } else {
+                    for &tile in tiles {
+                        add_rect(tile, tile);
+                    }
+                }
+            }
+            None => queue.extend(covered.iter().copied()),
         }
     }
 
     pub fn invalidate_all(&mut self) {
+        self.material_revision = self.material_revision.wrapping_add(1);
         self.dirty.extend(self.covered_tiles.iter().copied());
+    }
+
+    pub(crate) fn invalidate_paint_margin(&mut self) {
+        self.paint_margin = None;
     }
 }
 
@@ -345,7 +455,20 @@ pub enum StackTarget {
     Effect(LayerId),
 }
 
+/// Work left in the viewport after a stroke committed or was cancelled.
+pub(crate) struct DisplayStrokeEnd {
+    pub id: u64,
+    pub ts: usize,
+    pub previous_revision: u64,
+    pub revision: u64,
+    pub tiles: BTreeSet<(u32, u32)>,
+    /// The other texture sets the stroke fed: set, revision before and revision after.
+    pub fed: Vec<(usize, u64, u64)>,
+}
+
 pub(crate) struct ActiveStroke {
+    pub display_id: u64,
+    pub display_tiles: BTreeSet<(u32, u32)>,
     pub ts: usize,
     /// None: the stroke edits the quick mask.
     pub target: Option<PaintTarget>,
@@ -368,6 +491,8 @@ pub(crate) struct ActiveStroke {
     pub label: String,
     /// The commit's destination tiles, copied as the stroke reaches them.
     pub staging: texturecraft_paint::Staging,
+    pub device: Option<Box<dyn crate::brush_device::DeviceStroke>>,
+    pub device_uv_stamps: Vec<texturecraft_paint::UvStamp>,
 }
 
 /// A stroke visibility buffer and what it was rendered for: camera, size, mesh id.
@@ -416,6 +541,7 @@ pub fn stroke_template(tool: Tool, on_mask: bool) -> &'static str {
 }
 
 pub struct Session {
+    pub brush_device: Option<crate::brush_device::BrushBackend>,
     pub doc: Document,
     pub mesh: Arc<Mesh>,
     /// Unique per loaded mesh and UV layout (GPU caches compare it).
@@ -436,6 +562,9 @@ pub struct Session {
     pub(crate) merge_edits: bool,
     pub tool: ToolState,
     pub active_set: usize,
+    /// Last material composited as active and the previous one whose bands may still be warm.
+    cache_active: usize,
+    cache_previous: Option<usize>,
     /// Selected layer per texture set.
     pub selected: BTreeMap<usize, LayerId>,
     /// Layers selected together with the selected one (Shift+click, Ctrl+click), per texture set.
@@ -454,6 +583,7 @@ pub struct Session {
     /// Viewport size (pixels) used by scripted strokes.
     pub viewport: Vec2,
     pub(crate) stroke: Option<ActiveStroke>,
+    pub(crate) display_stroke_end: Option<DisplayStrokeEnd>,
     /// Layer clipboard: a document snapshot and the copied layer (or effect).
     pub clipboard: Option<(Document, LayerId)>,
     /// Channel blending copied from an effect (see [`crate::effect_blending_cmds`])
@@ -521,6 +651,7 @@ impl Session {
         let selected = doc.project.texture_sets.iter().enumerate().filter_map(|(index, texture_set)| texture_set.stack.last().map(|id| (index, *id))).collect();
 
         Ok(Session {
+            brush_device: None,
             doc,
             mesh_id: next_mesh_id(),
             project_id: next_mesh_id(),
@@ -534,6 +665,8 @@ impl Session {
             merge_edits: false,
             tool: ToolState::default(),
             active_set: 0,
+            cache_active: 0,
+            cache_previous: None,
             selected,
             multi: BTreeMap::new(),
             target: StackTarget::Content,
@@ -545,6 +678,7 @@ impl Session {
             bake_preview: None,
             viewport: Vec2::new(1280.0, 800.0),
             stroke: None,
+            display_stroke_end: None,
             clipboard: None,
             blending_clipboard: None,
             images: Default::default(),
@@ -836,22 +970,14 @@ impl Session {
                 continue;
             }
 
-            // Neighbourhood readers require a full recomposite after painted pixels change
-            let changed_tiles = match (&before, &after) {
-                (Some(before), Some(after))
-                    if !stack_reads_neighbours(&self.doc.project, texture_set_index)
-                        && !stack_reads_neighbours(&previous_document.project, texture_set_index) =>
-                {
-                    before.changed_tiles(after)
-                }
-                _ => None,
-            };
-            match changed_tiles {
-                Some(changed_tiles) => {
-                    // covered_tiles is emitted in row order
-                    cache
-                        .dirty
-                        .extend(changed_tiles.into_iter().filter(|tile| cache.covered_tiles.binary_search_by_key(&(tile.1, tile.0), |&(x, y)| (y, x)).is_ok()));
+            match before.as_ref().zip(after.as_ref()).and_then(|(before, after)| before.changed_paint(after)) {
+                Some(changes) => {
+                    cache.material_revision = cache.material_revision.wrapping_add(1);
+                    for (target, changed) in changes {
+                        let tiles: Vec<_> =
+                            changed.into_iter().filter(|&(x, y)| cache.covered_tiles.binary_search_by_key(&(y, x), |&(tx, ty)| (ty, tx)).is_ok()).collect();
+                        cache.queue_painted(&self.doc.project, texture_set_index, target, &tiles, |c| &mut c.dirty);
+                    }
                 }
                 None => cache.invalidate_all(),
             }
@@ -905,6 +1031,8 @@ impl Session {
         for (i, ts) in sets.iter().enumerate() {
             match self.caches.get_mut(i) {
                 Some(c) if c.size == ts.size() => {
+                    c.invalidate_paint_margin();
+                    c.finished_dab = None;
                     let (want, scales) = (ts.channel_list(), ts.block_scales());
                     if c.composite.channels.keys().copied().collect::<Vec<_>>() != want || c.composite.block_scales != scales {
                         c.composite = Composite { block_scales: scales, ..Composite::with_size(&want, c.size.0, c.size.1) };
@@ -1044,6 +1172,53 @@ impl Session {
     /// goes first; settling tiles (see [`SetCache::settle`]) get at most [`SETTLE_BUDGET_MS`]
     /// of a finite budget, after the dirty ones.
     pub fn update_for(&mut self, budget_ms: f64, clock: impl Fn() -> f64) -> bool {
+        self.update_for_view(budget_ms, clock, crate::TileDemand::default())
+    }
+
+    /// Budgeted display update with the same tile demand used by the viewport uploader.
+    pub fn update_for_view(&mut self, budget_ms: f64, clock: impl Fn() -> f64, demand: crate::TileDemand) -> bool {
+        self.update_for_view_where(budget_ms, clock, demand, |_| true)
+    }
+
+    /// Maintain CPU display caches for the sets the viewport is composing on the CPU.
+    pub fn update_for_view_where(&mut self, budget_ms: f64, clock: impl Fn() -> f64, demand: crate::TileDemand, include: impl Fn(usize) -> bool) -> bool {
+        let active = self.ts();
+        if active != self.cache_active {
+            // A third material replaces the previously parked one, even when the
+            // interactive slice ends before the compositor visits that texture set.
+            if let Some(displaced) = self.cache_previous.filter(|&ts| ts != active)
+                && let Some(cache) = self.caches.get_mut(displaced)
+            {
+                cache.below.clear();
+            }
+            self.cache_previous = Some(self.cache_active);
+            if let Some(cache) = self.caches.get_mut(self.cache_active) {
+                cache.below.finish_pass();
+            }
+            self.cache_active = active;
+        }
+        let changed = self.update_tiles(budget_ms, clock, active, demand, include);
+        if let Some(previous) = self.cache_previous.filter(|&ts| self.caches.get(ts).is_some_and(|c| !c.below.is_empty())) {
+            // Retaining an idle material spends only the remainder of the normal band
+            // budget. The active material always gets first use of that budget.
+            let allowance = self.caches.get(active).map_or(0, |c| c.below.limit());
+            // Instances in other sets can have live bands of their own.
+            let spare = self
+                .caches
+                .iter()
+                .enumerate()
+                .filter(|(ts, _)| *ts != previous)
+                .fold(allowance, |remaining, (_, cache)| remaining.saturating_sub(cache.below.bytes()));
+            if let Some(cache) = self.caches.get_mut(previous)
+                && cache.below.bytes() > spare
+            {
+                cache.below.clear();
+            }
+        }
+        changed
+    }
+
+    fn update_tiles(&mut self, budget_ms: f64, clock: impl Fn() -> f64, active: usize, demand: crate::TileDemand, include: impl Fn(usize) -> bool) -> bool {
         let start = clock();
         let initial_chunk_size = if budget_ms.is_finite() { rayon::current_num_threads().clamp(1, CHUNK) } else { CHUNK };
 
@@ -1069,12 +1244,21 @@ impl Session {
             self.set_solo(None);
         }
         let solo_view = if self.pending_tiles() > 0 { self.solo_view() } else { None };
-        let active = self.ts();
         let order = std::iter::once(active).chain((0..self.caches.len()).filter(|ts| *ts != active));
         let mut mesh_bounds = None;
         let mut changed = false;
-        for ts in order {
+        for ts in order.filter(|&ts| include(ts)) {
             let Some(cache) = self.caches.get_mut(ts) else { continue };
+            if ts == active
+                && budget_ms.is_finite()
+                && let Some(brush) = demand.brush
+                && cache.settle.remove(&brush)
+            {
+                cache.dirty.insert(brush);
+            }
+            if Some(ts) == self.cache_previous && cache.dirty.is_empty() && cache.settle.is_empty() && !cache.below.is_empty() {
+                continue;
+            }
             cache.below.set_hot(hot);
             cache.below.pass = cache.dirty.len() + cache.settle.len();
 
@@ -1093,7 +1277,12 @@ impl Session {
                     cache.dirty.extend(next_chunk(&mut cache.settle, chunk.min(initial_chunk_size)));
                 }
                 let chunk_started = clock();
-                let tiles = next_chunk(&mut cache.dirty, chunk);
+                let mut tiles = if ts == active && budget_ms.is_finite() { demand.take(&mut cache.dirty, chunk) } else { Vec::new() };
+                if tiles.is_empty() {
+                    tiles = next_chunk(&mut cache.dirty, chunk);
+                } else if tiles.len() < chunk {
+                    tiles.extend(next_chunk(&mut cache.dirty, chunk - tiles.len()));
+                }
                 for tile in &tiles {
                     cache.settle.remove(tile);
                 }
@@ -1124,7 +1313,7 @@ impl Session {
                 );
 
                 // The composited tiles and the neighbours their padding reached change
-                let padded = pad_tiles(&mut cache.composite, &cache.dilation, &tiles);
+                let padded = cache.dilation.apply_to_tiles(&mut cache.composite, &tiles);
                 cache.upload.extend(tiles.iter().copied().chain(padded));
                 cache.revision = cache.revision.wrapping_add(1);
                 changed = true;
@@ -1167,36 +1356,46 @@ impl Session {
 
     /// Mark `tiles` of texture set `ts` dirty after painting `target`, and the same tiles of
     /// other sets of that size drawing it through an instance.
-    pub(crate) fn mark_painted(&mut self, ts: usize, target: Option<PaintTarget>, tiles: impl IntoIterator<Item = (u32, u32)>) {
-        self.mark_tiles(ts, target, tiles, |c| &mut c.dirty);
+    pub(crate) fn mark_painted(&mut self, ts: usize, target: Option<PaintTarget>, tiles: impl IntoIterator<Item = (u32, u32)>, changed_document: bool) {
+        self.mark_tiles(ts, target, tiles, false, changed_document);
     }
 
     /// [`Session::mark_painted`] for the tiles of a committed stroke: they settle at low
     /// priority (see [`SetCache::settle`]).
     pub(crate) fn mark_settle(&mut self, ts: usize, target: Option<PaintTarget>, tiles: impl IntoIterator<Item = (u32, u32)>) {
-        self.mark_tiles(ts, target, tiles, |c| &mut c.settle);
+        self.mark_tiles(ts, target, tiles, true, true);
     }
 
-    fn mark_tiles(
-        &mut self,
-        ts: usize,
-        target: Option<PaintTarget>,
-        tiles: impl IntoIterator<Item = (u32, u32)>,
-        set: impl Fn(&mut SetCache) -> &mut BTreeSet<(u32, u32)>,
-    ) {
+    fn mark_tiles(&mut self, ts: usize, target: Option<PaintTarget>, tiles: impl IntoIterator<Item = (u32, u32)>, settle: bool, changed_document: bool) {
         let size = self.caches.get(ts).map(|c| c.size);
-        let sets = target.map(|t| self.doc.project.sets_drawing(self.paint_owner(t))).unwrap_or_default();
+        let Some(target) = target else { return };
+        let sets = self.doc.project.sets_drawing(self.paint_owner(target));
         let tiles: Vec<(u32, u32)> = tiles.into_iter().collect();
         for (i, c) in self.caches.iter_mut().enumerate() {
-            if i == ts || (sets.contains(&i) && Some(c.size) == size) {
-                set(c).extend(tiles.iter().copied());
+            if i != ts && !sets.contains(&i) {
+                continue;
+            }
+            if Some(c.size) == size {
+                if changed_document {
+                    c.material_revision = c.material_revision.wrapping_add(1);
+                }
+                c.queue_painted(&self.doc.project, i, target, &tiles, |c| if settle { &mut c.settle } else { &mut c.dirty });
+            } else if settle || changed_document {
+                // Resampled instances first see paint when its source pixels are committed (a
+                // settled stroke, or a document edit such as a path repaint)
+                c.invalidate_all();
             }
         }
     }
 
     /// Drain tiles needing upload for texture set `ts`.
     pub fn take_uploads(&mut self, ts: usize) -> Vec<(u32, u32)> {
-        self.caches.get_mut(ts).map(|c| std::mem::take(&mut c.upload).into_iter().collect()).unwrap_or_default()
+        let Some(cache) = self.caches.get_mut(ts) else { return Vec::new() };
+        let tiles = cache.take_upload_batch(usize::MAX, crate::TileDemand::default());
+        if let Some(dab) = cache.released_dab_in(&tiles) {
+            dab.acknowledge_upload();
+        }
+        tiles
     }
 
     /// `f` on the compositor inputs of texture set `ts` (without a live stroke; None for a set
@@ -1218,10 +1417,11 @@ impl Session {
         })
     }
 
-    /// Grayscale RGBA8 of layer `id`'s mask at `size²` for the mask view (None without a mask).
-    pub fn mask_view_rgba(&self, id: LayerId, size: u32) -> Option<Vec<u8>> {
+    /// Grayscale RGBA8 of layer `id`'s mask at `extent` (width, height) for the mask view (None
+    /// without a mask).
+    pub fn mask_view_rgba(&self, id: LayerId, extent: (u32, u32)) -> Option<Vec<u8>> {
         let (ts, _, _) = self.doc.project.locate(id)?;
-        let gray = self.with_inputs(ts, |inp| texturecraft_compose::mask_image(inp, id, size))?;
+        let gray = self.with_inputs(ts, |inp| texturecraft_compose::mask_image_sized(inp, id, extent))?;
         Some(gray.iter().flat_map(|g| [*g, *g, *g, 255]).collect())
     }
 
@@ -1286,10 +1486,20 @@ impl Session {
     }
 
     /// Bytes held by painted layer pixels, the composites of every texture set and their
-    /// hot-layer caches.
+    /// hot-layer caches, UV geometry and display padding.
     pub fn memory(&self) -> Memory {
         let composites = self.caches.iter().flat_map(|c| c.composite.channels.values()).map(texturecraft_texel::TileImage::bytes).sum();
-        Memory { pixels: self.doc.pixels.bytes(), composites, cache: self.caches.iter().map(|c| c.below.bytes()).sum() }
+        let geometry = self
+            .caches
+            .iter()
+            .map(|c| {
+                c.gbuf.tri.capacity() * size_of::<u32>()
+                    + c.gbuf.bary.capacity() * size_of::<[f32; 2]>()
+                    + c.covered_tiles.capacity() * size_of::<(u32, u32)>()
+                    + c.dilation.bytes()
+            })
+            .sum();
+        Memory { pixels: self.doc.pixels.bytes(), composites, cache: self.caches.iter().map(|c| c.below.bytes()).sum(), geometry }
     }
 }
 
@@ -1299,11 +1509,12 @@ pub struct Memory {
     pub pixels: usize,
     pub composites: usize,
     pub cache: usize,
+    pub geometry: usize,
 }
 
 impl Memory {
     pub fn total(self) -> usize {
-        self.pixels + self.composites + self.cache
+        self.pixels.saturating_add(self.composites).saturating_add(self.cache).saturating_add(self.geometry)
     }
 }
 
@@ -1416,7 +1627,7 @@ pub(crate) fn uv_layout(t: &TextureSet) -> (usize, Vec<(u32, f32)>) {
     (t.material, t.uv_tiles.iter().map(|u| (*u, t.tile_scale(*u))).collect())
 }
 
-fn next_mesh_id() -> u64 {
+pub(crate) fn next_mesh_id() -> u64 {
     static NEXT_MESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT_MESH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }

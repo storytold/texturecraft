@@ -3,8 +3,14 @@
 //! [`texturecraft_compose::solo_project`]); the document, the undo history, saving, exporting and
 //! baking never see it.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
-use texturecraft_core::{LayerId, Project};
+use texturecraft_compose::{Composite, composite_tiles};
+use texturecraft_core::{Channel, LayerId, Project};
+use texturecraft_geom::NO_TRI;
+use texturecraft_texel::TILE;
 
 use crate::commands::{CommandSpec, always, bad, boolp, layer_param};
 use crate::{Result, Session, cmd};
@@ -67,21 +73,46 @@ impl Session {
         texturecraft_compose::solo_project(&self.doc.project, solo.layer, solo.ignore_mask)
     }
 
-    /// Sample document pixels while solo keeps its own composite in the viewport cache.
-    pub(crate) fn document_composite(&self, ts: usize, tiles: &[(u32, u32)]) -> Option<std::borrow::Cow<'_, texturecraft_compose::Composite>> {
-        use std::borrow::Cow;
-        use texturecraft_compose::{Composite, composite_tiles, pad_tiles};
+    /// Sample the document even when the viewport has a soloed layer or owns the result on GPU.
+    pub(crate) fn document_composite(&self, ts: usize, tiles: &[(u32, u32)]) -> Option<Cow<'_, Composite>> {
+        self.read_composite(ts, tiles, true)
+    }
 
+    /// Sample a surface hit without building an atlas-wide padding map for a covered texel.
+    pub(crate) fn document_sample(&self, ts: usize, x: u32, y: u32) -> Option<BTreeMap<Channel, [f32; 3]>> {
         let cache = self.caches.get(ts)?;
-        if self.solo.is_none() {
+        let needs_padding = cache.gbuf.tri.get((y * cache.size.0 + x) as usize) == Some(&NO_TRI);
+        let (x, y) = if needs_padding { cache.dilation.source_for_sample(x, y).unwrap_or((x, y)) } else { (x, y) };
+        let composite = self.read_composite(ts, &[(x / TILE, y / TILE)], false)?;
+        Some(composite.channels.keys().map(|&channel| (channel, composite.value(channel, x, y))).collect())
+    }
+
+    fn read_composite(&self, ts: usize, tiles: &[(u32, u32)], pad_output: bool) -> Option<Cow<'_, Composite>> {
+        let cache = self.caches.get(ts)?;
+        let document_in_solo = self.solo.is_some();
+        if !document_in_solo && cache.dirty.is_empty() && cache.settle.is_empty() {
+            return Some(Cow::Borrowed(&cache.composite));
+        }
+        let pending = if document_in_solo {
+            Cow::Borrowed(tiles)
+        } else {
+            Cow::Owned(tiles.iter().copied().filter(|tile| cache.dirty.contains(tile) || cache.settle.contains(tile)).collect())
+        };
+        if pending.is_empty() && !document_in_solo {
             return Some(Cow::Borrowed(&cache.composite));
         }
 
         self.with_inputs(ts, |inputs| {
-            let set = inputs.project.texture_sets.get(ts)?;
-            let mut output = Composite { block_scales: inputs.block_scales.clone(), ..Composite::with_size(&set.channel_list(), cache.size.0, cache.size.1) };
-            composite_tiles(inputs, &mut output, tiles);
-            pad_tiles(&mut output, &cache.dilation, tiles);
+            let mut output = if document_in_solo {
+                let set = inputs.project.texture_sets.get(ts)?;
+                Composite { block_scales: inputs.block_scales.clone(), ..Composite::with_size(&set.channel_list(), cache.size.0, cache.size.1) }
+            } else {
+                cache.composite.clone()
+            };
+            composite_tiles(inputs, &mut output, &pending);
+            if pad_output {
+                cache.dilation.apply_to_tiles(&mut output, &pending);
+            }
             Some(Cow::Owned(output))
         })
     }

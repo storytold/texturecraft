@@ -22,6 +22,7 @@ pub mod eval;
 mod fabric;
 mod field_cache;
 mod field_cache_key;
+pub mod field_recipe;
 pub mod fill_copies;
 pub mod fill_copy;
 mod fill_depth;
@@ -29,6 +30,7 @@ mod fill_place;
 pub mod frame_placement;
 mod fur_lock;
 mod generator_maps;
+pub mod generator_terms;
 mod grunge_pattern;
 mod held_fields;
 mod histogram_scan;
@@ -69,16 +71,25 @@ mod wear_scan;
 mod working_field;
 
 pub use below::{BelowCache, StackKey};
-pub use display::{DisplayKind, kinds_for, tile_bytes};
+pub use display::{DisplayKind, display_tile_bytes, kinds_for, tile_bytes};
 pub use effect_histogram::EffectHistogram;
 pub use eval::{
     BLOCK, Composite, Inputs, MASK_CHANNEL, PaintTarget, Stencil, StrokePreview, all_tiles, compare_histograms, composite_tiles, composite_tiles_cached,
-    composite_tiles_with_projectors, covered_tiles, effect_histogram, flatten_layer, mask_at, mask_image, mask_texels, mask_values, pad_tiles,
-    stack_reads_neighbours,
+    composite_tiles_with_projectors, covered_tiles, effect_histogram, flatten_layer, mask_at, mask_image, mask_image_sized, mask_texels, mask_values,
+    pad_tiles, stack_reads_neighbours,
 };
 pub use mask_gray::MaskGray;
 pub use pattern_context::PatternContext;
 pub use projector_depth_cache::ProjectorDepthCache;
 pub use solo::solo_project;
 pub use store::{BakedMaps, ImageRes, ImageStore, PixelStore};
+
+/// The raw distance transforms of the distance filters (Bevel, Bevel Smooth, Directional
+/// Distance), so the GPU compositor's tests can compare its distances exactly. Not a stable API.
+#[doc(hidden)]
+pub mod distance_test_hooks {
+    pub use crate::distance_envelope::DistanceEnvelope;
+    pub use crate::shape_distance::{edge_distances, trail_distances};
+}
 pub use thumb::{THUMB_TEXELS, ThumbImage, ThumbTarget};
+pub use tile_pattern::{TileLayout, prepare_tile_layout};

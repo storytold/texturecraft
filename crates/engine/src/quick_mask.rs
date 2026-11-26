@@ -27,6 +27,14 @@ pub struct QuickMask {
     pub revision: u64,
 }
 
+/// Live brush coverage for the temporary mask (never written into document layers).
+pub struct QuickMaskStroke<'a> {
+    pub alpha: &'a TileImage,
+    pub device: Option<&'a dyn crate::brush_device::DeviceStroke>,
+    pub opacity: f32,
+    pub erase: bool,
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("viewport.quickMask", "Enable quick mask", ["Viewport"], Some("Y"), "{enabled?: bool} — toggles when omitted", always, enable),
@@ -86,7 +94,7 @@ fn invert(session: &mut Session, _: &Value) -> Result<Value> {
 
 impl Session {
     /// The quick mask of texture set `ts` at `size` (empty when never painted).
-    fn quick_mask_image(&self, ts: usize, (w, h): (u32, u32)) -> TileImage {
+    pub fn quick_mask_image(&self, ts: usize, (w, h): (u32, u32)) -> TileImage {
         match self.quick_mask.masks.get(&ts) {
             Some(m) if (m.width(), m.height()) == (w, h) => m.clone(),
             Some(m) => m.resampled(w, h, &[0]),
@@ -107,6 +115,12 @@ impl Session {
         commit_coverage(&mut mask, src);
         self.quick_mask.masks.insert(ts, mask);
         self.quick_mask.revision = self.quick_mask.revision.wrapping_add(1);
+    }
+
+    /// Active quick-mask stroke for the viewport's selected texture set.
+    pub fn quick_mask_stroke(&self, ts: usize) -> Option<QuickMaskStroke<'_>> {
+        let stroke = self.stroke.as_ref().filter(|stroke| stroke.ts == ts && stroke.target.is_none())?;
+        Some(QuickMaskStroke { alpha: &stroke.canvas.alpha, device: stroke.device.as_deref(), opacity: stroke.stroke.settings.opacity, erase: stroke.erase })
     }
 
     /// RGBA8 overlay of texture set `ts` while editing the quick mask (`size²` stretched over

@@ -1,7 +1,7 @@
 //! TextureCraft desktop app.
 //!
 //! Usage: `texturecraft [project.tcraft | mesh.glb] [--control <port>] [--empty] [--version]`
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -385,6 +385,10 @@ fn main() {
     let persistence_path = no_prefs_path.clone().or_else(|| storage_dir().map(|dir| dir.join("app.ron")));
     let ui_file = no_prefs_path.as_ref().map(|path| path.with_extension("json")).or_else(|| storage_dir().map(|folder| folder.join("ui.json")));
     if let Some(file) = &ui_file {
+        let log = if persistence_path.is_some() { file.with_extension("performance.log") } else { file.with_file_name("performance.log") };
+        texturecraft_engine::log::set_performance_log_path(log);
+    }
+    if let Some(file) = &ui_file {
         let _ = ui_state_store::FILE.set(file.clone());
     }
     let prefs = saved_prefs(ui_file.as_deref(), persistence_path.as_deref());
@@ -493,7 +497,7 @@ fn append_line(file: &std::path::Path, msg: &str) -> bool {
 }
 
 /// An error that ends the app: printed, logged, and (with `dialog`) shown in a message box, since
-/// a Windows release build has no console and would otherwise close without a word.
+/// the Windows desktop app has no console and would otherwise close without a word.
 fn fatal(msg: &str, dialog: bool) {
     eprintln!("texturecraft: {msg}");
     let log = error_log().filter(|f| append_line(f, msg));

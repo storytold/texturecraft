@@ -190,6 +190,23 @@ fn polygon_fill_and_color_picker() {
 }
 
 #[test]
+fn color_picker_reads_material_before_cpu_tiles_are_composited() {
+    use texturecraft_engine::geom::glam::Vec2;
+
+    let mut s = session();
+    let cpu_revision = s.caches[0].revision;
+    let center = Vec2::new(200.0, 200.0);
+    assert!(s.color_pick(center, s.viewport).unwrap()[&Channel::BaseColor][1] > 0.4);
+    execute(&mut s, "layer.add.fill", &json!({"color": [0.9, 0.1, 0.05]})).unwrap();
+
+    let picked = s.color_pick(center, s.viewport).unwrap()[&Channel::BaseColor];
+
+    assert!(picked[0] > 0.8 && picked[1] < 0.2, "{picked:?}");
+    assert_eq!(s.tool.values[&Channel::BaseColor], picked);
+    assert_eq!(s.caches[0].revision, cpu_revision, "a pick leaves viewport updates on the chosen backend");
+}
+
+#[test]
 fn color_at_reads_the_surface_without_changing_the_brush() {
     let mut s = session();
     execute(&mut s, "tool.material", &json!({"channel": "roughness", "value": 0.9})).unwrap();
@@ -771,6 +788,47 @@ fn committed_strokes_settle_to_the_full_composite() {
     assert_eq!(full(&mut s), original);
 }
 
+#[test]
+fn cancelling_a_mask_stroke_does_not_reuse_its_paint_margin() {
+    use texturecraft_engine::StackTarget;
+    use texturecraft_engine::core::LayerId;
+    use texturecraft_engine::geom::glam::Vec2;
+
+    let mut s = Session::new_project("t", primitives::plane(1.0, 1), "builtin:plane", None, 256).unwrap();
+    execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+    let plain = s.selected_layer().unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+    let blurred = s.selected_layer().unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let filter = execute(&mut s, "effect.add.filter", &json!({"filter": "blur", "radius": 32.0})).unwrap();
+    let filter = LayerId(filter["effect"].as_u64().unwrap());
+    s.tool.brush.size = 0.01;
+    s.tool.mask_value = 1.0;
+    s.update();
+
+    let uv = Vec2::new(58.0 / 256.0, 96.0 / 256.0);
+    execute(&mut s, "layer.select", &json!({"layer": plain.0})).unwrap();
+    s.target = StackTarget::Mask;
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    s.update();
+    s.cancel_stroke();
+    s.update();
+
+    execute(&mut s, "layer.select", &json!({"layer": blurred.0})).unwrap();
+    s.target = StackTarget::Effect(filter);
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    assert_eq!(s.stroke_tiles(), 1, "the brush stays on one side of the tile boundary");
+    s.end_stroke().unwrap();
+    s.update();
+    let incremental = s.caches[0].composite.clone();
+
+    let recomposited = full(&mut s);
+    assert!(recomposited.value(Channel::BaseColor, 64, 96)[0] > 0.5, "the blur reaches the neighbouring tile");
+    assert_eq!(incremental.value(Channel::BaseColor, 64, 96), recomposited.value(Channel::BaseColor, 64, 96));
+    assert!(incremental == recomposited, "the complete cache matches a full recomposite");
+}
+
 /// A resize prepared from a snapshot and applied later matches the command, keeps edits made
 /// while it ran, and undoes in one step.
 #[test]
@@ -862,7 +920,7 @@ fn undo_recomposites_only_changed_tiles() {
 }
 
 #[test]
-fn undo_with_a_blur_above_recomposites_everything() {
+fn undo_keeps_a_stroke_local_when_a_different_layer_has_a_blur() {
     use texturecraft_engine::geom::glam::Vec2;
     let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 2048).unwrap();
     s.viewport = Vec2::new(400.0, 400.0);
@@ -874,7 +932,21 @@ fn undo_with_a_blur_above_recomposites_everything() {
     execute(&mut s, "tool.stroke", &json!({"points": [[150, 160], [170, 170]]})).unwrap();
     s.update();
     let stroke = |s: &mut Session| drop(execute(s, "tool.stroke", &json!({"points": [[150, 200], [190, 210]]})).unwrap());
-    check_undo_redo(&mut s, stroke, None);
+    let mut plain = painted_set();
+    stroke(&mut plain);
+    stroke(&mut s);
+    plain.update();
+    s.update();
+    for command in ["edit.undo", "edit.redo"] {
+        execute(&mut plain, command, &Value::Null).unwrap();
+        execute(&mut s, command, &Value::Null).unwrap();
+        assert!(!plain.caches[0].dirty.is_empty());
+        assert_eq!(s.caches[0].dirty, plain.caches[0].dirty, "{command}: the unrelated blur adds no tiles");
+        plain.update();
+        s.update();
+        let incremental = s.caches[0].composite.clone();
+        assert_eq!(incremental, full(&mut s));
+    }
 }
 
 #[test]
@@ -1099,6 +1171,100 @@ fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
     execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"baseColor": {"opacity": 2.0}, "roughness": {"opacity": -1.0}}})).unwrap();
 
     assert_eq!((read(&s)[&Channel::BaseColor].opacity, read(&s)[&Channel::Roughness].opacity), (1.0, 0.0), "opacity is clamped");
+}
+
+#[test]
+fn uniform_uv_sets_do_not_materialize_padding_until_explicitly_read() {
+    use texturecraft_engine::{Solo, texel::DilationMap};
+    for uv_scale in [1.0, 0.0, 0.5] {
+        let mut mesh = primitives::plane(1.0, 1);
+        for uv in &mut mesh.uvs {
+            *uv *= uv_scale;
+        }
+        let mut session = Session::new_project("padding", mesh, "builtin:plane", None, 128).unwrap();
+        session.update();
+        let layer = session.selected_layer().unwrap();
+        session.set_solo(Some(Solo { layer, ignore_mask: false }));
+        session.update();
+        let options = texturecraft_engine::file_cmds::export_options(&session, &json!({"format": "png"}), "test").unwrap();
+        session.export_files(&[0], &options).unwrap();
+        let before = session.memory().total();
+        let coverage = session.caches[0].gbuf.coverage_mask();
+        let oracle = DilationMap::in_blocks(&coverage, 128, 128, Some(texturecraft_engine::session::DISPLAY_PADDING), 128);
+        assert_eq!(session.caches[0].dilation.src, oracle.src);
+        let added = session.memory().total() - before;
+        let expected = if uv_scale == 0.5 { 0 } else { 128 * 128 * size_of::<u32>() };
+        assert_eq!(added, expected, "dense padding allocation for UV scale {uv_scale}");
+    }
+}
+
+#[test]
+fn a_budgeted_slice_composites_the_brush_then_the_visible_uv_before_the_backlog() {
+    use texturecraft_engine::geom::glam::Vec2;
+    let mut s = Session::new_project("demand", primitives::plane(1.0, 1), "builtin:plane", None, 512).unwrap();
+    execute(&mut s, "tool.material", &json!({"channel":"baseColor","color":[1.0,0.0,0.0]})).unwrap();
+    let uv = Vec2::splat(0.9375);
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    let visible = [Vec2::new(0.5, 0.75), Vec2::new(0.625, 0.875)];
+    s.take_uploads(0);
+    s.caches[0].chunk = 1;
+    s.update_for_view(0.0, || 0.0, s.tile_demand(Some(visible)));
+    assert_eq!(s.take_uploads(0), [(7, 7)]);
+    let value = s.caches[0].composite.value(Channel::BaseColor, 480, 480);
+    assert!(value[0] > value[1]);
+    s.end_stroke().unwrap();
+    s.update_for_view(0.0, || 0.0, s.tile_demand(Some(visible)));
+    assert_eq!(s.take_uploads(0), [(7, 7)], "the released dab gets the first slice");
+    s.update_for_view(0.0, || 0.0, s.tile_demand(Some(visible)));
+    assert_eq!(s.take_uploads(0), [(4, 6)], "the visible UV comes first once the dab upload is acknowledged");
+    s.update();
+    let result = s.caches[0].composite.clone();
+    assert_eq!(result, full(&mut s));
+
+    // A 3D stroke supplies the atlas UV from its existing surface hit.
+    let screen = Vec2::splat(128.0);
+    let viewport = Vec2::splat(256.0);
+    let hit = s.pick(screen, viewport).unwrap();
+    let tile = ((hit.uv.x * 512.0) as u32 / 64, (hit.uv.y * 512.0) as u32 / 64);
+    assert_ne!(tile, (0, 0));
+    assert!(s.begin_stroke(screen, viewport, 1.0).unwrap());
+    s.caches[0].invalidate_all();
+    s.take_uploads(0);
+    s.caches[0].chunk = 1;
+    s.update_for_view(0.0, || 0.0, s.tile_demand(None));
+    assert_eq!(s.take_uploads(0), [tile]);
+}
+
+#[test]
+fn switching_materials_reuses_idle_bands_within_the_active_budget() {
+    let mut s = Session::new_project("bands", primitives::crate_scene(), "builtin:crate", None, 128).unwrap();
+    let source = s.selected[&1];
+    execute(&mut s, "layer.instance", &json!({"layer":source.0, "ts":2})).unwrap();
+    execute(&mut s, "textureSet.select", &json!({"ts":0})).unwrap();
+    execute(&mut s, "layer.add.fill", &json!({"color":[0.1,0.3,0.7]})).unwrap();
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    s.update();
+    let bytes = s.caches[0].below.bytes();
+    assert!(bytes > 0);
+    let select = |s: &mut Session, ts| {
+        execute(s, "textureSet.select", &json!({"ts": ts})).unwrap();
+        s.update();
+    };
+    select(&mut s, 1);
+    assert_eq!(s.caches[0].below.bytes(), bytes);
+    select(&mut s, 0);
+    assert_eq!(s.caches[0].below.bytes(), bytes);
+    // The parked set alone would fit. A third set drawing an instance of
+    // material one's selected layer also earns bands from this pass.
+    s.caches[1].below.budget = bytes + s.caches[1].below.bytes();
+    s.caches[2].invalidate_all();
+    select(&mut s, 1);
+    assert!(s.caches[2].below.bytes() > 0);
+    assert_eq!(s.caches[0].below.bytes(), 0);
+    select(&mut s, 0);
+    s.caches[0].invalidate_all();
+    s.update();
+    assert_eq!(s.caches[0].composite.clone(), full(&mut s));
 }
 
 #[test]

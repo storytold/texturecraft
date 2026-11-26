@@ -46,7 +46,7 @@ fn island_values(inp: &Inputs, value_of: impl Fn(u32) -> f32) -> HashMap<u32, f3
 }
 
 /// An island's gray: the mean of a random color's channels, or of the gradient's color at a random point
-fn random_gray(random: &UvRandomColorParameters, seed: u32, island: u32) -> f32 {
+pub fn random_gray(random: &UvRandomColorParameters, seed: u32, island: u32) -> f32 {
     let island = island as i32;
     let color = if random.custom_gradient {
         random.at(cell_hash(island, 0, 0, seed)).unwrap_or([0.0; 3])
@@ -57,19 +57,19 @@ fn random_gray(random: &UvRandomColorParameters, seed: u32, island: u32) -> f32 
 }
 
 /// Checker squares across one grid tile, and grid lines across one square (fitted)
-const SQUARES_PER_GRID_TILE: f32 = 4.0;
-const MINOR_LINES_PER_SQUARE: f32 = 4.0;
+pub const SQUARES_PER_GRID_TILE: f32 = 4.0;
+pub const MINOR_LINES_PER_SQUARE: f32 = 4.0;
 
 /// The dark squares are the light color times this, on its sRGB-encoded values (fitted)
-const DARK_SQUARE_SHADE: f32 = 0.7128;
+pub const DARK_SQUARE_SHADE: f32 = 0.7128;
 
 /// What a full-opacity minor and major grid line multiply the color by (fitted)
-const MINOR_LINE_SHADE: f32 = 0.8465;
-const MAJOR_LINE_SHADE: f32 = 0.4230;
+pub const MINOR_LINE_SHADE: f32 = 0.8465;
+pub const MAJOR_LINE_SHADE: f32 = 0.4230;
 
 /// Texels of a 2K UV tile a grid line lies within of its square's edge, and the border's width per unit of UV Borders Width (fitted: 0.2 is 3 texels)
-const LINE_HALF_WIDTH_2K: f32 = 1.0;
-const BORDER_TEXELS_PER_WIDTH_2K: f32 = 15.0;
+pub const LINE_HALF_WIDTH_2K: f32 = 1.0;
+pub const BORDER_TEXELS_PER_WIDTH_2K: f32 = 15.0;
 
 /// The saturation and value random island colors are picked within (measured)
 const RANDOM_SATURATION: std::ops::RangeInclusive<f32> = 0.06..=0.57;
@@ -160,16 +160,17 @@ fn island_colors(inp: &Inputs, seed: u32) -> HashMap<u32, [f32; 3]> {
         .iter()
         .enumerate()
         .flat_map(|(island, triangles)| {
-            let island = island as i32;
-            let within = |range: &std::ops::RangeInclusive<f32>, random: f32| range.start() + (range.end() - range.start()) * random;
-            let color = hsv_to_rgb(
-                cell_hash(island, 0, 1, seed),
-                within(&RANDOM_SATURATION, cell_hash(island, 1, 1, seed)),
-                within(&RANDOM_VALUE, cell_hash(island, 2, 1, seed)),
-            );
+            let color = island_color(seed, island as u32);
             triangles.iter().map(move |triangle| (*triangle, color))
         })
         .collect()
+}
+
+/// UV island `island`'s random light sRGB-encoded color
+pub fn island_color(seed: u32, island: u32) -> [f32; 3] {
+    let island = island as i32;
+    let within = |range: &std::ops::RangeInclusive<f32>, random: f32| range.start() + (range.end() - range.start()) * random;
+    hsv_to_rgb(cell_hash(island, 0, 1, seed), within(&RANDOM_SATURATION, cell_hash(island, 1, 1, seed)), within(&RANDOM_VALUE, cell_hash(island, 2, 1, seed)))
 }
 
 /// A color from its hue (in turns), saturation and value

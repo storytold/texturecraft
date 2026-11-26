@@ -24,7 +24,19 @@ const LATIN: Faces = &[("Inter", "Regular"), ("Inter", "SemiBold")];
 /// (family, style) pairs of a manifest.
 type Faces = &'static [(&'static str, &'static str)];
 
+/// Bytes each thread of this crate's test executables reserves for its stack when it asks for
+/// none, on Windows (MSVC): Mesa's lavapipe, which the Windows CI gate renders with, runs the
+/// composite shaders on its own threads, which get the executable's default of 1 MiB there and
+/// overflow it on the larger programs (Linux gives them 8 MiB). As in texturecraft-render's
+/// build script; this library crate links no other executable.
+const THREAD_STACK_RESERVE: u32 = 8 * 1024 * 1024;
+
 fn main() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_os == "windows" && target_env == "msvc" {
+        println!("cargo::rustc-link-arg=/STACK:{THREAD_STACK_RESERVE}");
+    }
     i18n_build::embed();
     println!("cargo::rerun-if-env-changed=CRAFT_FONTS_DIR");
     println!("cargo::rerun-if-env-changed=CRAFT_FONTS_REQUIRED");

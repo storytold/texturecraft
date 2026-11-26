@@ -74,7 +74,7 @@ const HEIGHT_RELIEF: f32 = 1.0 / 32.0;
 const ENVIRONMENT_HEIGHT_UNIT: f32 = 4.0;
 
 /// What a live stroke paints into.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PaintTarget {
     /// A paint layer's channels.
     Layer(LayerId),
@@ -574,6 +574,41 @@ pub fn stack_reads_neighbours(project: &Project, texture_set_index: usize) -> bo
         neighbourhood(&layer.content_effects, NEIGHBOUR_PROBE_RESOLUTION).is_some()
             || layer.mask.as_ref().is_some_and(|mask| neighbourhood(&mask.effects, NEIGHBOUR_PROBE_RESOLUTION).is_some())
     })
+}
+
+/// Conservative output halo in tiles for an edit to painted pixels. Without anchors each
+/// filtered field reads its own effect stack. Linked filtered fields use whole-set
+/// invalidation until their combined dependency range is known.
+pub fn painted_tile_margin(project: &Project, ts: usize, target: PaintTarget) -> Option<u32> {
+    let set = project.texture_sets.get(ts)?;
+    let (width, height) = set.size();
+    let resolution = set.block_resolution();
+    let (PaintTarget::Layer(id) | PaintTarget::Mask(id)) = target;
+    let owner = project.effect(id).map_or(id, |(owner, _)| owner);
+    let mut max_reach = 0;
+    for layer in project.render_tree(&set.stack).iter().filter_map(|id| project.layers.get(id)) {
+        // Anchor reads, Compare masks and lighting by the layer's material (its other channels
+        // over the stack below) read the stack below at the same texel
+        let lit = layer.content_effects.iter().any(|effect| effect.visible && lights_material(&effect.kind));
+        if layer.reads_stack() || lit {
+            return (!stack_reads_neighbours(project, ts)).then_some(0);
+        }
+        if owner == layer.id {
+            let effects = match target {
+                PaintTarget::Layer(_) => layer.content_effects.as_slice(),
+                PaintTarget::Mask(_) => layer.mask.as_ref().map_or(&[][..], |mask| mask.effects.as_slice()),
+            };
+            // A wrapping filter reads past the set's edges from the far side: an edit near one
+            // edge changes the opposite one, which no margin around the edit holds
+            if neighbourhood_filters(effects, resolution, None).any(|(index, _, _)| wraps(effects, index)) {
+                return None;
+            }
+            max_reach = neighbourhood_filters(effects, resolution, None)
+                .map(|(_, radius, op)| filter_reach(radius, op, width.max(height), width.max(height)).1)
+                .fold(0u32, u32::saturating_add);
+        }
+    }
+    Some(max_reach.div_ceil(TILE))
 }
 
 /// A neighbourhood radius that reaches the whole set ([`filter_extent`] caps it at the set's longest side)
@@ -1596,6 +1631,11 @@ fn unpad(data: &[f32], comps: usize, (w, h): (usize, usize), (pad_x, pad_y): (us
 /// A neighbourhood filter's radius in whole texels and how many texels around a texel it reads
 fn filter_extent(radius: f32, op: Op, inputs: &Inputs) -> (u32, u32) {
     let longest_side = inputs.gbuf.width.max(inputs.gbuf.height);
+    filter_reach(radius, op, longest_side, inputs.tile_grid().map_or(longest_side, |_| inputs.tile_res()))
+}
+
+/// [`filter_extent`] for a set whose longest side is `longest_side`, where a repeated sampled source can reach `tile_reach` texels
+fn filter_reach(radius: f32, op: Op, longest_side: u32, tile_reach: u32) -> (u32, u32) {
     // Clamped so a hostile radius can't overflow the region arithmetic
     let radius_texels = radius.round().clamp(1.0, longest_side as f32) as u32;
 
@@ -1614,11 +1654,8 @@ fn filter_extent(radius: f32, op: Op, inputs: &Inputs) -> (u32, u32) {
         Op::SourceSlopeBlur(slope) => Some(slope.source),
         _ => None,
     };
-    let source_reach = if tiled_source.is_some_and(|source| source.mode != WarpSourceMode::DefaultNoise && source.tiling_factor() != 1.0) {
-        inputs.tile_grid().map_or(longest_side, |_| inputs.tile_res())
-    } else {
-        0
-    };
+    let source_reach =
+        if tiled_source.is_some_and(|source| source.mode != WarpSourceMode::DefaultNoise && source.tiling_factor() != 1.0) { tile_reach } else { 0 };
 
     (radius_texels, (reach + moved).max(source_reach))
 }
@@ -2367,7 +2404,7 @@ fn fields_of(inp: &EvaluationInputs, channels: &[Channel], (list, around): (&[La
         }
 
         if !layer.is_group() && neighbourhood(&layer.content_effects, working_width).is_some() {
-            for channel in channels.iter().filter(|channel| layer.channels.contains_key(channel)) {
+            for channel in field_channel_order(layer, channels).iter().filter(|channel| layer.channels.contains_key(channel)) {
                 let mut key = FieldKey::content(id, *channel, place.offset);
                 if place.instance != 0 {
                     let reads_anchor = matches!(&layer.kind, LayerKind::Fill(fill) if fill.sources.get(channel).is_some_and(|source| source.reads_anchor(None)))
@@ -2394,6 +2431,29 @@ fn fields_of(inp: &EvaluationInputs, channels: &[Channel], (list, around): (&[La
     }
 
     out
+}
+
+/// The order a layer's content fields are built in: the set's channels, with Height before Normal
+/// when a Height To Normal reads the layer's Height (its Normal stage reads the Height's field),
+/// and Base Color last when it is lit by the layer's material (a stage after the lighting reads
+/// the other channels' fields, see `lit_prefix`)
+fn field_channel_order(layer: &Layer, channels: &[Channel]) -> Vec<Channel> {
+    let mut ordered = channels.to_vec();
+    let reads_height = layer.content_effects.iter().any(|effect| effect.visible && matches!(effect.kind, EffectKind::Filter(Filter::HeightToNormal(_))));
+    if let (true, Some(normal), Some(height)) =
+        (reads_height, ordered.iter().position(|&channel| channel == Channel::Normal), ordered.iter().position(|&channel| channel == Channel::Height))
+        && height > normal
+    {
+        let moved = ordered.remove(height);
+        ordered.insert(normal, moved);
+    }
+
+    let lit = layer.content_effects.iter().any(|effect| effect.visible && lights_material(&effect.kind));
+    if let (true, Some(base_color)) = (lit, ordered.iter().position(|&channel| channel == Channel::BaseColor)) {
+        let moved = ordered.remove(base_color);
+        ordered.push(moved);
+    }
+    ordered
 }
 
 /// Store a filtered mask once per transform, or per draw when it reads the stack.
@@ -4299,8 +4359,11 @@ impl<'a, 'b> Texel<'a, 'b> {
             && sa > 0.0
         {
             if p.erase {
-                val = val.map(|v| v * (1.0 - sa));
-                cov *= 1.0 - sa;
+                // As the commit erases: every painted channel, or the listed ones when any are
+                if p.values.is_empty() || Channel::ALL.get(c.ch).is_some_and(|ch| p.values.contains_key(ch)) {
+                    val = val.map(|v| v * (1.0 - sa));
+                    cov *= 1.0 - sa;
+                }
             } else if let Some(ch) = Channel::ALL.get(c.ch)
                 && let Some(pval) = p.values.get(ch)
             {
@@ -4976,8 +5039,14 @@ pub fn mask_texels(inputs: &Inputs, id: LayerId) -> Option<Vec<f32>> {
 /// Keep preview tiles at 8 bits instead of retaining the export's full float atlas
 /// Returns None without an enabled mask or when the pixel count exceeds the supported range
 pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
-    let size = size.max(1);
-    let pixel_count = usize::try_from(size.checked_mul(size)?).ok()?;
+    mask_image_sized(inputs, id, (size, size))
+}
+
+/// [`mask_image`] at `extent` (width, height): output texel (x, y) shows the set's texel
+/// (x · width / extent width, y · height / extent height)
+pub fn mask_image_sized(inputs: &Inputs, id: LayerId, extent: (u32, u32)) -> Option<Vec<u8>> {
+    let (columns, rows) = (extent.0.max(1), extent.1.max(1));
+    let pixel_count = usize::try_from(columns.checked_mul(rows)?).ok()?;
     let projectors = ProjectorDepthCache::default();
     let inputs = &mut EvaluationInputs::new(inputs, &projectors);
     let mask = layer_mask(inputs.project, id).filter(|mask| mask.enabled)?;
@@ -4990,8 +5059,8 @@ pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
     prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
 
     let fields = evaluation_fields(inputs, &channels, &coordinates);
-    if size <= width.min(height) && (width != size || height != size) {
-        return Some(downsample_mask(inputs, id, mask, &channels, &fields, size));
+    if columns <= width && rows <= height && (width, height) != (columns, rows) {
+        return Some(downsample_mask(inputs, id, mask, &channels, &fields, (columns, rows)));
     }
 
     let width_usize = width as usize;
@@ -5012,19 +5081,19 @@ pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
         }
     });
 
-    if width == size && height == size {
+    if (width, height) == (columns, rows) {
         return Some(atlas);
     }
 
     let mut output = Vec::new();
     output.try_reserve_exact(pixel_count).ok()?;
     output.resize(pixel_count, 0);
-    for y in 0..size {
-        for x in 0..size {
-            let sample_x = (u64::from(x) * u64::from(width) / u64::from(size)) as u32;
-            let sample_y = (u64::from(y) * u64::from(height) / u64::from(size)) as u32;
+    for y in 0..rows {
+        for x in 0..columns {
+            let sample_x = (u64::from(x) * u64::from(width) / u64::from(columns)) as u32;
+            let sample_y = (u64::from(y) * u64::from(height) / u64::from(rows)) as u32;
             if let Some(value) = atlas.get(sample_y as usize * width_usize + sample_x as usize)
-                && let Some(destination) = output.get_mut((y * size + x) as usize)
+                && let Some(destination) = output.get_mut((y * columns + x) as usize)
             {
                 *destination = *value;
             }
@@ -5034,20 +5103,21 @@ pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
 }
 
 /// Sample a smaller mask image directly into disjoint output row groups
-fn downsample_mask(inputs: &EvaluationInputs, id: LayerId, mask: &Mask, channels: &[Channel], fields: &Fields, size: u32) -> Vec<u8> {
+fn downsample_mask(inputs: &EvaluationInputs, id: LayerId, mask: &Mask, channels: &[Channel], fields: &Fields, extent: (u32, u32)) -> Vec<u8> {
     let (width, height) = (inputs.gbuf.width, inputs.gbuf.height);
-    let source_at = |pixel, span| ((u64::from(pixel) * u64::from(span)) / u64::from(size)) as u32;
-    let first_output = |source, span| (u64::from(source) * u64::from(size)).div_ceil(u64::from(span)).min(u64::from(size)) as u32;
-    let mut output = vec![0; size as usize * size as usize];
+    let (columns, row_count) = extent;
+    let source_at = |pixel, span, size| ((u64::from(pixel) * u64::from(span)) / u64::from(size)) as u32;
+    let first_output = |source, span, size| (u64::from(source) * u64::from(size)).div_ceil(u64::from(span)).min(u64::from(size)) as u32;
+    let mut output = vec![0; columns as usize * row_count as usize];
     let mut destination = output.as_mut_slice();
     let mut bands = Vec::with_capacity(height.div_ceil(TILE) as usize);
 
     // Partition rows by the tile that contains each row's source texels
     for tile_y in 0..height.div_ceil(TILE) {
-        let first_row = first_output(tile_y * TILE, height);
-        let past_row = first_output((tile_y + 1) * TILE, height);
+        let first_row = first_output(tile_y * TILE, height, row_count);
+        let past_row = first_output((tile_y + 1) * TILE, height, row_count);
         if past_row > first_row {
-            let (rows, rest) = destination.split_at_mut((past_row - first_row) as usize * size as usize);
+            let (rows, rest) = destination.split_at_mut((past_row - first_row) as usize * columns as usize);
             bands.push((tile_y, first_row, past_row, rows));
             destination = rest;
         }
@@ -5055,18 +5125,18 @@ fn downsample_mask(inputs: &EvaluationInputs, id: LayerId, mask: &Mask, channels
 
     bands.into_par_iter().for_each(|(tile_y, first_row, past_row, rows)| {
         for tile_x in 0..width.div_ceil(TILE) {
-            let first_column = first_output(tile_x * TILE, width);
-            let past_column = first_output((tile_x + 1) * TILE, width);
+            let first_column = first_output(tile_x * TILE, width, columns);
+            let past_column = first_output((tile_x + 1) * TILE, width, columns);
             if first_column == past_column {
                 continue;
             }
 
             let offsets = (first_row..past_row).flat_map(|row| {
-                let y = source_at(row, height) % TILE;
-                (first_column..past_column).map(move |column| (y * TILE + source_at(column, width) % TILE) as usize)
+                let y = source_at(row, height, row_count) % TILE;
+                (first_column..past_column).map(move |column| (y * TILE + source_at(column, width, columns) % TILE) as usize)
             });
             let texels = mask_tile(inputs, id, mask, channels, fields, (tile_x, tile_y), offsets);
-            let pixels = rows.chunks_exact_mut(size as usize).flat_map(|row| &mut row[first_column as usize..past_column as usize]);
+            let pixels = rows.chunks_exact_mut(columns as usize).flat_map(|row| &mut row[first_column as usize..past_column as usize]);
             for (pixel, (_, value)) in pixels.zip(texels) {
                 *pixel = (value * 255.0 + 0.5) as u8;
             }
@@ -5474,6 +5544,12 @@ pub fn flatten_layer(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Opti
     Some(out.into_iter().flatten().collect())
 }
 
+/// Whether texture set `texture_set_index` lights a visible layer with the viewport environment
+/// (Baked Lighting Environment): its material changes when the environment turns or changes.
+pub fn lit_by_environment(project: &Project, texture_set_index: usize) -> bool {
+    project.texture_set(texture_set_index).is_ok_and(|set| uses_environment(project, &set.stack, 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5791,6 +5867,115 @@ mod tests {
         assert!(close(out.value(Channel::BaseColor, 5, 5), [0.0, 0.0, 0.0]));
     }
 
+    /// Height To Normal reads its layer's Height after the Height's own neighbourhood stages,
+    /// whatever order the set lists Normal and Height in.
+    #[test]
+    fn height_to_normal_reads_the_blurred_height_in_any_channel_order() {
+        let normals = |height_first: bool, blurred: bool| {
+            let mut f = fixture();
+            if height_first {
+                let channels = &mut f.project.texture_sets[0].channels;
+                let height = channels.iter().position(|(channel, _)| *channel == Channel::Height).unwrap();
+                let entry = channels.remove(height);
+                channels.insert(0, entry);
+            }
+            let id = f.project.alloc_id();
+            let channels = [Channel::Normal, Channel::Height];
+            let mut layer = Layer::new(id, "Paint", LayerKind::Paint, &channels);
+            if blurred {
+                let mut blur = Effect::new(f.project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 160.0, wrap: false }));
+                blur.off_channels.insert(Channel::Normal);
+                layer.content_effects.push(blur);
+            }
+            layer.content_effects.push(Effect::new(f.project.alloc_id(), EffectKind::Filter(Filter::HeightToNormal(HeightToNormal::LIBRARY))));
+            f.project.insert_layer(0, layer, None, false).unwrap();
+
+            // A step in the height: only the blurred step slopes away from the edge
+            for y in 0..64 {
+                for x in 0..64 {
+                    f.pixels.layer_mut(id, Channel::Normal, (64, 64)).set(x, y, &[to_u16(0.5), to_u16(0.5), u16::MAX, u16::MAX]);
+                    let height = if x >= 32 { 0.4 } else { 0.0 };
+                    f.pixels.layer_mut(id, Channel::Height, (64, 64)).set(x, y, &[to_u16_signed(height), u16::MAX]);
+                }
+            }
+            let out = run(&f, None);
+            (24..40).map(|x| out.value(Channel::Normal, x, 20)).collect::<Vec<_>>()
+        };
+
+        let (default_order, height_first) = (normals(false, true), normals(true, true));
+
+        assert_eq!(default_order, height_first, "the Normal stage reads the blurred Height in the default order too");
+        assert_ne!(height_first, normals(true, false), "the blur changes the normal");
+    }
+
+    /// Lighting before a Base Color stage (`lit_prefix`) reads its layer's material after the
+    /// material's own neighbourhood stages (a Blur on Metallic, Roughness, Normal and Height),
+    /// whatever order the set lists Base Color in.
+    #[test]
+    fn lighting_before_a_stage_reads_the_blurred_material_in_any_channel_order() {
+        use texturecraft_core::StylizedLighting;
+
+        let stylized = Filter::BakedLighting {
+            azimuth: 30.0,
+            elevation: 50.0,
+            light: 1.0,
+            ambient: 1.0,
+            occlusion: 0.0,
+            stylized: Some(Box::new(StylizedLighting::library())),
+        };
+        let environment = Filter::EnvironmentLighting {
+            horizontal: 0.0,
+            vertical: 0.0,
+            exposure: 0.0,
+            height_intensity: 1.0,
+            ambient_occlusion: 1.0,
+            specular_occlusion: 1.0,
+        };
+        let lit = |lighting: &Filter, base_color_last: bool, blurred: bool| {
+            let mut f = fixture();
+            if base_color_last {
+                let channels = &mut f.project.texture_sets[0].channels;
+                let base_color = channels.iter().position(|(channel, _)| *channel == Channel::BaseColor).unwrap();
+                let entry = channels.remove(base_color);
+                channels.push(entry);
+            }
+            let id = f.project.alloc_id();
+            let channels = [Channel::BaseColor, Channel::Metallic, Channel::Roughness, Channel::Normal, Channel::Height];
+            let mut layer = Layer::new(id, "Paint", LayerKind::Paint, &channels);
+            let on = |filter: Filter, only: &[Channel], f: &mut Fixture| {
+                let mut effect = Effect::new(f.project.alloc_id(), EffectKind::Filter(filter));
+                effect.off_channels = channels.into_iter().filter(|channel| !only.contains(channel)).collect();
+                effect
+            };
+            if blurred {
+                layer.content_effects.push(on(Filter::Blur { radius: 160.0, wrap: false }, &channels[1..], &mut f));
+            }
+            layer.content_effects.push(on(lighting.clone(), &[Channel::BaseColor], &mut f));
+            layer.content_effects.push(on(Filter::Blur { radius: 4.0, wrap: false }, &[Channel::BaseColor], &mut f));
+            f.project.insert_layer(0, layer, None, false).unwrap();
+
+            // Steps in the material: only the blurred steps change it away from the edge
+            for y in 0..64 {
+                for x in 0..64 {
+                    let right = x >= 32;
+                    f.pixels.layer_mut(id, Channel::BaseColor, (64, 64)).set(x, y, &[to_u16(0.6), to_u16(0.45), to_u16(0.3), u16::MAX]);
+                    f.pixels.layer_mut(id, Channel::Metallic, (64, 64)).set(x, y, &[to_u16(if right { 1.0 } else { 0.0 }), u16::MAX]);
+                    f.pixels.layer_mut(id, Channel::Roughness, (64, 64)).set(x, y, &[to_u16(if right { 0.2 } else { 0.8 }), u16::MAX]);
+                    f.pixels.layer_mut(id, Channel::Normal, (64, 64)).set(x, y, &[to_u16(0.5), to_u16(0.5), u16::MAX, u16::MAX]);
+                    f.pixels.layer_mut(id, Channel::Height, (64, 64)).set(x, y, &[to_u16_signed(if right { 0.4 } else { 0.0 }), u16::MAX]);
+                }
+            }
+            let out = run(&f, None);
+            (24..40).map(|x| out.value(Channel::BaseColor, x, 20)).collect::<Vec<_>>()
+        };
+
+        for lighting in [stylized, environment] {
+            let base_color_last = lit(&lighting, true, true);
+            assert_eq!(lit(&lighting, false, true), base_color_last, "{lighting:?}: the default order reads the blurred material too");
+            assert_ne!(base_color_last, lit(&lighting, true, false), "{lighting:?}: the blur changes the lit base color");
+        }
+    }
+
     #[test]
     fn paint_layers_unpremultiply_and_preview_and_masks() {
         let mut f = fixture();
@@ -5826,6 +6011,38 @@ mod tests {
         f.project.layer_mut(id).unwrap().mask = Some(Mask::new(MaskBackground::Black));
         let out = run(&f, None);
         assert!(close(out.value(Channel::BaseColor, 3, 3), [0.5; 3]));
+    }
+
+    /// A live erase previews the channels its commit erases: the listed ones, or every painted one.
+    #[test]
+    fn a_live_erase_previews_only_the_channels_it_erases() {
+        let mut f = fixture();
+        let id = f.project.alloc_id();
+        f.project.insert_layer(0, Layer::new(id, "Paint", LayerKind::Paint, &[Channel::BaseColor, Channel::Height]), None, false).unwrap();
+        f.pixels.layer_mut(id, Channel::BaseColor, (64, 64)).set(4, 3, &[to_u16(0.8), 0, 0, to_u16(1.0)]);
+        f.pixels.layer_mut(id, Channel::Height, (64, 64)).set(4, 3, &[to_u16_signed(0.6), to_u16(1.0)]);
+        let mut alpha = TileImage::new(64, 64, 1);
+        alpha.set(4, 3, &[to_u16(1.0)]);
+        let erase = |values: BTreeMap<Channel, [f32; 3]>| StrokePreview {
+            target: PaintTarget::Layer(id),
+            alpha: alpha.clone(),
+            opacity: 1.0,
+            erase: true,
+            values,
+            mask_gray: MaskGray::Value(1.0),
+            stencil: None,
+            carried: BTreeMap::new(),
+            carried_mask: None,
+        };
+        let before = run(&f, None);
+
+        let height_only = run(&f, Some(&erase(BTreeMap::from([(Channel::Height, [0.0; 3])]))));
+        let every_channel = run(&f, Some(&erase(BTreeMap::new())));
+
+        let (color, height) = (before.value(Channel::BaseColor, 4, 3), before.value(Channel::Height, 4, 3));
+        assert!(close(height_only.value(Channel::BaseColor, 4, 3), color), "an unlisted channel keeps its paint");
+        assert!(!close(height_only.value(Channel::Height, 4, 3), height), "a listed channel is erased");
+        assert!(!close(every_channel.value(Channel::BaseColor, 4, 3), color), "with none listed every painted channel is erased");
     }
 
     #[test]
