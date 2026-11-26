@@ -158,6 +158,7 @@ pub(crate) fn uv_tile_radios(ui: &mut Ui, enabled: bool, disabled_hint: &str) {
 
 /// Import settings ▸ Auto-unwrap and its options. Meshes without UVs are always unwrapped, so the
 /// box is ticked; turning it off and the options are not available yet.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn auto_unwrap_row(ui: &mut Ui) {
     check_row(
         ui,

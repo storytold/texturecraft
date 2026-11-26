@@ -454,7 +454,6 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
     let (rect, row) = ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click_and_drag());
     row.widget_info(|| egui::WidgetInfo::selected(egui::Role::ListItem, true, highlighted, &layer.name));
 
-    // Background, folder lines, the selected rows' accent edge and the colour tag
     let painter = ui.painter().clone();
 
     // The active layer gets the strong tint; the other selected rows the plain selected shade
@@ -550,14 +549,21 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
     if !thumb_box(ui, app, thumbnail, ThumbTarget::Content { layer: layer.id, channel }, !layer.visible) {
         content_glyph(&painter, &tokens, thumbnail, layer);
     }
+
     let content_label = tr("Select the layer content");
     let content_response = ui.interact(thumbnail, ui.scope_id().with(("content", layer.id.0)), Sense::click()).on_hover_text(content_label);
     painter.rect_stroke(thumbnail, THUMBNAIL_ROUNDING, target_stroke(&tokens, content_target), egui::StrokeKind::Outside);
     if content_response.clicked() {
         let modifiers = ui.input(|input| input.modifiers);
         click_layer(app, modifiers, layer.id.0, Some("content"));
+
+        if !modifiers.alt && matches!(app.session.view, texturecraft_engine::ViewMode::Mask(_)) {
+            app.run("viewport.view", json!({"mode": "material"}));
+        }
     }
+
     thumbnail_context_menu(ui, &content_response, content_label, &layer.name, content_target, |ui| layer_context_menu(app, ui, layer, true));
+
     x = thumbnail.right() + THUMBNAIL_SPACING;
 
     // An instance draws its source's content, blending and (unless it has its own) mask
@@ -574,9 +580,29 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
 
     // Mask thumbnail, selectable on its own; or the slot that adds one
     let mask_rect;
-    if let Some((mask_enabled, mask_background, mask_effect_count)) = mask {
+    if let Some((mut mask_enabled, mask_background, mask_effect_count)) = mask {
         let mask_target = selected && !targets_content(app);
         mask_rect = Rect::from_min_size(pos2(x, rect.center().y - thumbnail_size * 0.5), vec2(thumbnail_size, thumbnail_size));
+        let mask_label = tr("Select the mask (Alt+click: show it in the viewport, Shift+click: switch it on or off)");
+        let mask_response = ui.interact(mask_rect, ui.scope_id().with(("mask", layer.id.0)), Sense::click()).on_hover_text(mask_label);
+        if mask_response.clicked() {
+            let modifiers = ui.input(|input| input.modifiers);
+            if modifiers.shift && !modifiers.alt {
+                if app.run("mask.toggle", json!({"layer": layer.id.0})).is_some() {
+                    mask_enabled = !mask_enabled;
+                    mask_response.request_focus();
+                }
+            } else {
+                app.run("layer.select", json!({"layer": layer.id.0, "target": "mask"}));
+
+                if modifiers.alt {
+                    let showing = app.session.view == texturecraft_engine::ViewMode::Mask(layer.id);
+                    let view = if showing { json!({"mode": "material"}) } else { json!({"mode": "mask", "layer": layer.id.0}) };
+                    app.run("viewport.view", view);
+                }
+            }
+        }
+
         if !thumb_box(ui, app, mask_rect, ThumbTarget::Mask { layer: layer.id }, !layer.visible || !mask_enabled) {
             let white = mask_background == texturecraft_engine::core::MaskBackground::White;
             painter.rect_filled(mask_rect, THUMBNAIL_ROUNDING, Color32::from_gray(if white { WHITE_MASK_GRAY } else { BLACK_MASK_GRAY }));
@@ -594,17 +620,10 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         if !mask_enabled {
             painter.line_segment([mask_rect.left_top(), mask_rect.right_bottom()], Stroke::new(HIDDEN_STRIKE_WIDTH, tokens.danger));
         }
-        let mask_label = tr("Select the mask (Alt+click: show it in the viewport)");
-        let mask_response = ui.interact(mask_rect, ui.scope_id().with(("mask", layer.id.0)), Sense::click()).on_hover_text(mask_label);
-        if mask_response.clicked() {
-            app.run("layer.select", json!({"layer": layer.id.0, "target": "mask"}));
-            if ui.input(|input| input.modifiers.alt) {
-                let showing = app.session.view == texturecraft_engine::ViewMode::Mask(layer.id);
-                let view = if showing { json!({"mode": "material"}) } else { json!({"mode": "mask", "layer": layer.id.0}) };
-                app.run("viewport.view", view);
-            }
-        }
+
         thumbnail_context_menu(ui, &mask_response, mask_label, &layer.name, mask_target, |ui| mask_management_menu(app, ui, layer, true));
+        ui.ctx().accesskit_node_builder(mask_response.id, |node| node.set_description(if mask_enabled { tr("Mask on") } else { tr("Mask off") }));
+
         if app.session.view == texturecraft_engine::ViewMode::Mask(layer.id) {
             painter.rect_stroke(
                 mask_rect.expand(HIGHLIGHT_OUTSET),
@@ -627,6 +646,7 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         egui::Popup::menu(&slot).show(|ui| crate::layer_toolbar::mask_slot_menu(app, ui, layer, picker));
         crate::layer_toolbar::bitmap_picker(app, &row, picker, layer.id);
     }
+
     x = mask_rect.right() + THUMBNAIL_GAP;
 
     // Name (or rename editor) with the quieter subtitle under it

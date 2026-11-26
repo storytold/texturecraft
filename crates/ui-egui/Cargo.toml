@@ -37,6 +37,7 @@ craft-ui = { workspace = true, features = ["native-windows"] }
 craft-update = { workspace = true }
 # Native file dialogs (file_dialogs.rs); the browser build has none.
 craft-dialogs = { workspace = true }
+tempfile = "3"
 # Whether the app runs in a real window, where an eyedropper pick may take clicks outside it (screen_pick).
 raw-window-handle = "0.6"
 

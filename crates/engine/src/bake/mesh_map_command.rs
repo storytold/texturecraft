@@ -93,6 +93,14 @@ pub fn set_gpu_raytracing(enabled: bool) {
 
 /// The tracer a bake starting now uses: the installed one while GPU raytracing is on, else none (the CPU)
 fn chosen_tracer(installed: Option<&Arc<dyn Tracer>>, enabled: bool) -> Option<Arc<dyn Tracer>> {
+    // The coverage build bakes on the CPU, the fallback every GPU failure takes anyway. Its tests run on
+    // a headless runner, and the bake's GPU device is created on a worker thread there: tearing that
+    // GL context down crashes the test process at exit (a wgpu-hal GLES `BadDisplay` panic, or a
+    // SIGSEGV in the driver), which took a different test down on every run. The compute shaders are
+    // never line-covered, so nothing is lost.
+    if cfg!(coverage) {
+        return None;
+    }
     installed.filter(|_| enabled).cloned()
 }
 
@@ -917,7 +925,9 @@ mod gpu_raytracing_tests {
     fn bakes_use_the_installed_gpu_tracer_only_while_gpu_raytracing_is_on() {
         let installed: Arc<dyn Tracer> = Arc::new(NamedTracer);
 
-        assert_eq!(chosen_tracer(Some(&installed), true).map(|tracer| tracer.name()), Some("gpu".to_string()));
+        // A coverage build keeps every bake on the CPU: its headless runner has no GPU to bake on
+        let gpu = (!cfg!(coverage)).then(|| "gpu".to_string());
+        assert_eq!(chosen_tracer(Some(&installed), true).map(|tracer| tracer.name()), gpu, "on casts the rays on the GPU");
         assert!(chosen_tracer(Some(&installed), false).is_none(), "off keeps the rays on the CPU");
         assert!(chosen_tracer(None, true).is_none(), "no installed tracer bakes on the CPU");
     }

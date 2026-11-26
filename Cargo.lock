@@ -5317,6 +5317,7 @@ dependencies = [
  "skera",
  "skrifa 0.48.0",
  "sys-locale",
+ "tempfile",
  "texturecraft-engine",
  "texturecraft-render",
  "wasm-bindgen",

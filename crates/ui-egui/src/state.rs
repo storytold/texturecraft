@@ -301,6 +301,9 @@ pub struct NewProject {
     /// Import settings > Import cameras: keep the cameras stored in the mesh file
     #[serde(default = "import_cameras_default")]
     pub import_cameras: bool,
+    /// Import settings > Rebuild mesh UVs.
+    #[serde(default)]
+    pub rebuild_uvs: bool,
     /// Color management as chosen in the window (the project is always created as Legacy)
     #[serde(skip)]
     pub color_management: crate::project_form::ColorManagement,
@@ -338,6 +341,7 @@ impl Default for NewProject {
             template: default_template(),
             normal_format: None,
             import_cameras: true,
+            rebuild_uvs: false,
             color_management: crate::project_form::ColorManagement::Legacy,
             baked_maps: Vec::new(),
         }

@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use texturecraft_core::{NormalFormat, PROJECT_EXT};
 use texturecraft_core::{Project, TextureSet};
 use texturecraft_formats::PlannedFile;
+use texturecraft_formats::mesh_import::{MeshUvSource, import_mesh_geometry};
 use texturecraft_formats::{ExportInput, ExportOptions, ExportedFile, FileFormat, MapOverride, Padding, ProjectFile};
+use texturecraft_geom::glam::Vec2;
 use texturecraft_geom::{Mesh, primitives};
 use web_time::Instant;
 
@@ -27,7 +29,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New project from a mesh file",
             [],
             None,
-            "{mesh: path to .glb/.gltf/.fbx/.dae/.usd/.usda/.usdc/.usdz/.abc/.obj/.ply/.stl, resolution?: 2048, name?, uvTiles?: bool (UDIM; default: when the UVs leave tile 1001), template?: project template name, importCameras?: bool (default true: keep the cameras stored in the file)}",
+            "{mesh: path to .glb/.gltf/.fbx/.dae/.usd/.usda/.usdc/.usdz/.abc/.obj/.ply/.stl, resolution?: 2048, name?, uvTiles?: bool (UDIM; default: when the UVs leave tile 1001), rebuildUvs?: bool (default false: auto-unwrap where needed), template?: project template name, importCameras?: bool (default true: keep the cameras stored in the file)}",
             always,
             new_from_mesh
         ),
@@ -102,10 +104,13 @@ fn leaf_of(name: &str) -> String {
 }
 
 /// Read the project's stored mesh `bytes` (extension `ext`) under the name it was imported
-/// with, so its unnamed parts keep their names (and the geometry masks that use them).
-fn read_stored_mesh(project: &Project, ext: &str, bytes: &[u8]) -> Result<texturecraft_formats::ImportedMesh> {
-    let stem = std::path::Path::new(&project.mesh_file).file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or("mesh");
-    texturecraft_formats::import_mesh_bytes(&format!("{stem}.{ext}"), bytes).map_err(fe)
+/// with, so its unnamed parts keep their names (and the geometry masks that use them). A saved
+/// UV layout replaces the file's UVs and the automatic unwrap.
+fn read_stored_mesh(project: &Project, ext: &str, bytes: &[u8], saved_layout: Option<&[Vec2]>) -> Result<Mesh> {
+    let stem = std::path::Path::new(&project.mesh_file).file_stem().and_then(|stem| stem.to_str()).filter(|stem| !stem.is_empty()).unwrap_or("mesh");
+    let file_name = format!("{stem}.{ext}");
+
+    import_mesh_geometry(&file_name, bytes, saved_layout.map_or(MeshUvSource::FromFile, MeshUvSource::Saved)).map_err(fe)
 }
 
 impl Session {
@@ -164,11 +169,16 @@ impl Session {
 
     /// [`Session::from_mesh_bytes`] with a UV tile mode (see [`Session::new_project_tiled`]).
     pub fn from_mesh_bytes_tiled(file_name: &str, bytes: &[u8], resolution: u32, name: &str, uv_tiles: Option<bool>) -> Result<Session> {
-        Self::from_mesh_source(file_name, Cow::Borrowed(bytes), resolution, name, uv_tiles)
+        Self::from_mesh_bytes_with_uvs(file_name, bytes, resolution, name, uv_tiles, false)
     }
 
-    fn from_mesh_source(file_name: &str, bytes: Cow<'_, [u8]>, resolution: u32, name: &str, uv_tiles: Option<bool>) -> Result<Session> {
-        let imported = texturecraft_formats::import_mesh_bytes(file_name, &bytes).map_err(fe)?;
+    /// Create a project with an explicit choice to rebuild the imported mesh's UVs.
+    pub fn from_mesh_bytes_with_uvs(file_name: &str, bytes: &[u8], resolution: u32, name: &str, uv_tiles: Option<bool>, rebuild_uvs: bool) -> Result<Session> {
+        Self::from_mesh_source(file_name, Cow::Borrowed(bytes), resolution, name, uv_tiles, rebuild_uvs)
+    }
+
+    fn from_mesh_source(file_name: &str, bytes: Cow<'_, [u8]>, resolution: u32, name: &str, uv_tiles: Option<bool>, rebuild_uvs: bool) -> Result<Session> {
+        let imported = texturecraft_formats::mesh_import::import_mesh_bytes_with_uvs(file_name, &bytes, rebuild_uvs).map_err(fe)?;
         let extension = ext_of(file_name);
         let mut session = Session::new_project_tiled(name, imported.mesh, &format!("mesh.{extension}"), None, resolution, uv_tiles)?;
 
@@ -177,6 +187,7 @@ impl Session {
         source.shrink_to_fit();
         session.mesh_source = Some((extension, source));
         session.doc.project.mesh_file = leaf_of(file_name);
+        session.doc.project.mesh_rebuild_uvs = rebuild_uvs;
         session.doc.project.cameras = imported.cameras;
 
         session.log.warnings("Importer", imported.report.warnings);
@@ -205,38 +216,49 @@ impl Session {
         Ok(session)
     }
 
-    pub fn from_project_file(pf: ProjectFile) -> Result<Session> {
+    pub fn from_project_file(project_file: ProjectFile) -> Result<Session> {
         let start = Instant::now();
-        let mesh = match (&pf.mesh, pf.project.mesh.strip_prefix("builtin:")) {
+        project_file.validate_mesh_uvs().map_err(fe)?;
+
+        let mesh = match (&project_file.mesh, project_file.project.mesh.strip_prefix("builtin:")) {
             (_, Some(id)) => primitives::builtin(id).ok_or_else(|| EngineError::Other(format!("unknown built-in mesh `{id}`")))?,
-            (Some((ext, bytes)), None) => read_stored_mesh(&pf.project, ext, bytes)?.mesh,
+            (Some((ext, bytes)), None) => read_stored_mesh(&project_file.project, ext, bytes, project_file.mesh_uvs.as_deref())?,
             (None, None) => return Err(EngineError::Other("the project has no mesh".into())),
         };
 
-        check_materials(&pf.project, &mesh)?;
-        let source = pf.mesh.clone();
-        let resources = pf.resources.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
+        // Mesh construction consumed the layout data, so release it before building session caches
+        drop(project_file.mesh_uvs);
+        check_materials(&project_file.project, &mesh)?;
+        let resources = project_file.resources.into_iter().map(|(name, bytes)| (name, Arc::new(bytes))).collect();
         let mesh_time = Instant::now();
-        let mut s = Session::new(
-            Document { bake_meshes: Default::default(), bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, baked: pf.baked, resources },
+
+        let mut session = Session::new(
+            Document {
+                bake_meshes: Default::default(),
+                bake_paint: Default::default(),
+                project: project_file.project,
+                pixels: project_file.pixels,
+                baked: project_file.baked,
+                resources,
+            },
             mesh,
-            source,
+            project_file.mesh,
         )?;
 
         let cache_time = Instant::now();
-        s.sync_images();
-        s.load_bake_meshes(pf.high_poly, pf.cage);
-        s.load_bake_paint(pf.bake_paint);
-        s.log.performance(format!(
+        session.sync_images();
+        session.load_bake_meshes(project_file.high_poly, project_file.cage);
+        session.load_bake_paint(project_file.bake_paint);
+        session.log.performance(format!(
             "CPU project setup: mesh {} ms, UV and mesh indexes {} ms, resources {} ms ({} texture sets)",
             mesh_time.duration_since(start).as_millis(),
             cache_time.duration_since(mesh_time).as_millis(),
             cache_time.elapsed().as_millis(),
-            s.caches.len()
+            session.caches.len()
         ));
-        s.log.warnings("Project", pf.warnings);
+        session.log.warnings("Project", project_file.warnings);
 
-        Ok(s)
+        Ok(session)
     }
 
     /// The project with independently owned resource bytes.
@@ -248,6 +270,11 @@ impl Session {
     /// A save snapshot that shares immutable resource payloads with the document.
     pub fn project_snapshot(&self) -> ProjectFile<Arc<Vec<u8>>> {
         self.project_with_resources(self.doc.resources.clone())
+    }
+
+    /// The layout a project with rebuilt mesh UVs saves, so reopening it never runs the unwrapper.
+    fn saved_uv_layout(&self) -> Option<Vec<Vec2>> {
+        (self.doc.project.mesh_rebuild_uvs && self.mesh_source.is_some()).then(|| texturecraft_formats::mesh_import::corner_uvs(&self.source))
     }
 
     fn project_with_resources<Resource>(&self, resources: BTreeMap<String, Resource>) -> ProjectFile<Resource> {
@@ -268,11 +295,15 @@ impl Session {
         pixels.masks.retain(|id, img| size_of(*id) == Some((img.width(), img.height())));
 
         let (high_poly, cage) = self.saved_bake_meshes();
+        let mut project = self.doc.project.clone();
+        project.format_version = project.save_format_version();
+
         ProjectFile {
-            project: self.doc.project.clone(),
+            project,
             pixels,
             baked: self.doc.baked.clone(),
             mesh: self.mesh_source.clone(),
+            mesh_uvs: self.saved_uv_layout(),
             high_poly,
             cage,
             bake_paint: self.saved_bake_paint(),
@@ -542,7 +573,7 @@ mod native {
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{absolute, open_path, read_mesh};
 
-/// `file.new {mesh, name?, resolution?, uvTiles?, template?, importCameras?}`: a new project from the
+/// `file.new {mesh, name?, resolution?, uvTiles?, rebuildUvs?, template?, importCameras?}`: a new project from the
 /// mesh file `mesh`, remembering its path for Reimport mesh.
 #[cfg(not(target_arch = "wasm32"))]
 fn new_from_mesh(session: &mut Session, params: &Value) -> Result<Value> {
@@ -553,9 +584,11 @@ fn new_from_mesh(session: &mut Session, params: &Value) -> Result<Value> {
     let resolution = u64p(params, "resolution").or(template.as_ref().map(|template| u64::from(template.resolution))).unwrap_or(DEFAULT_RESOLUTION_PX);
     let name = strp(params, "name").map(str::to_string).unwrap_or_else(|| stem_of(path));
     let uv_tiles = crate::commands::boolp(params, "uvTiles");
+    let rebuild_uvs = crate::commands::boolp(params, "rebuildUvs").unwrap_or(false);
     let mesh_file = native::read_mesh("file.new", path)?;
 
-    let mut next = Session::from_mesh_source(&mesh_file.name, Cow::Owned(mesh_file.bytes), u32::try_from(resolution).unwrap_or(0), &name, uv_tiles)?;
+    let mut next =
+        Session::from_mesh_source(&mesh_file.name, Cow::Owned(mesh_file.bytes), u32::try_from(resolution).unwrap_or(0), &name, uv_tiles, rebuild_uvs)?;
     next.doc.project.mesh_path = native::absolute(path);
     next.log.warnings("Importer", mesh_file.warnings);
     if crate::commands::boolp(params, "importCameras") == Some(false) {
@@ -618,9 +651,11 @@ fn reimport(s: &mut Session, p: &Value) -> Result<Value> {
 fn change_mesh(s: &mut Session, p: &Value) -> Result<Value> {
     let path = native::path_param(p, "path", "file.changeMesh")?;
     let file = native::read_mesh("file.changeMesh", path)?;
-    let reply = s.reimport_mesh(Some(file), crate::commands::boolp(p, "preserveStrokes").unwrap_or(true))?;
-    // Only after the swap succeeded: Reimport mesh and Save keep following the new file.
+    let reply = s.replace_mesh(Some(file), crate::commands::boolp(p, "preserveStrokes").unwrap_or(true), false)?;
+
+    // Keep following the original path if the swap fails
     s.doc.project.mesh_path = native::absolute(path);
+
     Ok(reply)
 }
 
@@ -631,16 +666,24 @@ impl Session {
         Some(self.doc.project.mesh_path.as_str()).filter(|m| !m.is_empty() && std::path::Path::new(m).is_file())
     }
 
-    /// Replace the mesh with `file` (or re-read the project's own copy), keeping the project when the new mesh fits it; `preserve_strokes` moves painted pixels with the surface; replies `{preserved?}`
+    /// Replace the mesh with `file` or re-read the project's own copy.
+    /// With `preserve_strokes`, painted pixels follow the surface. The reply includes
+    /// `preserved` when preservation was requested.
     pub fn reimport_mesh(&mut self, file: Option<texturecraft_formats::MeshFile>, preserve_strokes: bool) -> Result<Value> {
-        let (mesh, source, warnings, mesh_file) = match file {
-            Some(f) => {
-                let m = texturecraft_formats::import_mesh_bytes(&f.name, &f.bytes).map_err(fe)?.mesh;
-                (m, Some((ext_of(&f.name), f.bytes)), f.warnings, leaf_of(&f.name))
+        self.replace_mesh(file, preserve_strokes, self.doc.project.mesh_rebuild_uvs)
+    }
+
+    fn replace_mesh(&mut self, file: Option<texturecraft_formats::MeshFile>, preserve_strokes: bool, rebuild_uvs: bool) -> Result<Value> {
+        let (mesh, replacement_source, warnings, mesh_file) = match file {
+            Some(file) => {
+                let mesh = import_mesh_geometry(&file.name, &file.bytes, MeshUvSource::from_rebuild_setting(rebuild_uvs)).map_err(fe)?;
+                (mesh, Some((ext_of(&file.name), file.bytes)), file.warnings, leaf_of(&file.name))
             }
             None => match &self.mesh_source {
                 Some((ext, bytes)) => {
-                    (read_stored_mesh(&self.doc.project, ext, bytes)?.mesh, self.mesh_source.clone(), Vec::new(), self.doc.project.mesh_file.clone())
+                    let layout = self.saved_uv_layout();
+                    let mesh = read_stored_mesh(&self.doc.project, ext, bytes, layout.as_deref())?;
+                    (mesh, None, Vec::new(), self.doc.project.mesh_file.clone())
                 }
                 None => return Err(bad("file.reimportMesh", "built-in meshes can't be reimported; give `path`")),
             },
@@ -648,12 +691,13 @@ impl Session {
 
         check_materials(&self.doc.project, &mesh)?;
         let mut doc = self.doc.clone();
-        if let Some((ext, _)) = &source {
+        if let Some((ext, _)) = replacement_source.as_ref().or(self.mesh_source.as_ref()) {
             doc.project.mesh = format!("mesh.{ext}");
             doc.project.mesh_file = mesh_file;
+            doc.project.mesh_rebuild_uvs = rebuild_uvs;
         }
 
-        let mut next = Session::new(doc, mesh, source)?;
+        let mut next = Session::new(doc, mesh, replacement_source)?;
         next.log.warnings("Importer", warnings);
         next.path = self.path.clone();
         next.sync_images();
@@ -664,6 +708,7 @@ impl Session {
             next.doc.bake_meshes.cage = None;
             next.log.warn("Project", "the cage mesh was dropped: the low-poly mesh changed");
         }
+
         if self.doc.bake_paint.keys().any(|(_, target)| *target == texturecraft_core::BakePaintTarget::Skew) && self.source.uvs != next.source.uvs {
             next.log.warn("Project", "the skew map is laid over the old UV layout; check it in Bake mode");
         }
@@ -671,6 +716,12 @@ impl Session {
         next.modified = true;
         next.project_id = self.project_id;
         let preserved = preserve_strokes.then(|| crate::preserve::preserve_strokes(self, &mut next));
+
+        // Keep the stored source in the current session until reimport succeeds
+        if next.mesh_source.is_none() {
+            next.mesh_source = self.mesh_source.take();
+        }
+
         self.switch_to(next);
         Ok(preserved.map_or(Value::Null, |n| json!({ "preserved": n })))
     }

@@ -131,14 +131,48 @@ fn the_usage_defaults_to_undefined_and_the_choice_reaches_the_import() {
     add(&mut h, &[png(&dir, "plain.png"), png(&dir, "brush.png"), png(&dir, "sky.png")]);
     assert_eq!(combos(&h, "undefined").count(), 3);
 
+    click(&mut h, "brush.png");
     choose_usage(&mut h, 1, "alpha");
+
+    h.get_by_label("plain.png").click_modifiers(egui::Modifiers::SHIFT);
+    h.run_steps(3);
+    assert_eq!(h.state().ui.windows.import_resources.as_ref().unwrap().selected.len(), 2);
+
     choose_usage(&mut h, 1, "environment");
+
+    assert_eq!(combos(&h, "undefined").count(), 1, "editing an unselected row keeps the selected images' usages");
+
     click(&mut h, "Import");
 
     assert_eq!(resources(&h), ["brush.png", "plain.png", "sky.png"]);
     let project = &h.state().session.doc.project;
     assert_eq!(project.display.environment_resource(), Some("sky.png"), "the environment usage lights the scene");
     assert_eq!(h.state().session.tool.brush.alpha_image.as_deref(), Some("brush.png"), "the alpha usage sets the brush alpha");
+}
+
+#[test]
+fn choosing_a_usage_updates_the_selected_images() {
+    let dir = TempDir::new("import-resources-multi-usage");
+    let mut h = app();
+    invoke(&mut h);
+    add(&mut h, &[png(&dir, "one.png"), png(&dir, "two.png"), dir.join("material.TCMAT"), dir.join("coat.MTLX"), png(&dir, "three.png")]);
+    choose_usage(&mut h, 1, "alpha");
+
+    click(&mut h, "one.png");
+    h.get_by_label("coat.MTLX").click_modifiers(egui::Modifiers::SHIFT);
+    h.run_steps(3);
+    combos(&h, "All files (5)").next().expect("the filter dropdown").click();
+    h.run_steps(3);
+    h.get_by_label("undefined (4)").click();
+    h.run_steps(3);
+
+    assert_eq!(h.state().ui.windows.import_resources.as_ref().unwrap().selected.len(), 4);
+    assert!(h.query_by_label("two.png").is_none(), "the selected image with a different usage is filtered out");
+
+    choose_usage(&mut h, 0, "texture");
+
+    let rows = &h.state().ui.windows.import_resources.as_ref().unwrap().rows;
+    assert_eq!(rows.iter().map(|row| row.usage.name()).collect::<Vec<_>>(), ["texture", "texture", "undefined", "undefined", "undefined"]);
 }
 
 #[test]
@@ -211,7 +245,7 @@ fn the_engine_command_still_imports_a_path_with_an_optional_prefix() {
 #[test]
 fn a_materialx_document_imports_as_a_layer() {
     let dir = TempDir::new("import-resources-materialx");
-    let file = dir.join("paint.mtlx");
+    let file = dir.join("paint.MTLX");
     std::fs::write(
         &file,
         r#"<?xml version="1.0"?>
