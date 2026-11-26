@@ -104,7 +104,7 @@ fn p2_slot_color(record: u32, texel: LayerTexel, position: vec3<f32>, normal: ve
     *found = true;
     let operation = srgb[record + P2_SLOT_OPERATION];
     if operation != 0u {
-        return fill_value(layers[operation - 1u], texel.uv, texel.surface).rgb;
+        return generator_read(operation);
     }
     let uv = texel.uv;
     let image_word = srgb[record + P2_SLOT_IMAGE];
@@ -215,10 +215,33 @@ fn generator_grunge(effect: Operation, texel: LayerTexel, position: vec3<f32>, n
         let gray = select(P2_CUSTOM_GRUNGE_MID_GRAY, luminance(rgb), found);
         return p2_float(record, P2_GRUNGE_GAIN) * (gray - P2_CUSTOM_GRUNGE_MID_GRAY);
     }
-    var value = fill_value(layers[srgb[record + P2_GRUNGE_PATTERN] - 1u], texel.uv, texel.surface).x;
+    var value = generator_read(srgb[record + P2_GRUNGE_PATTERN]).x;
     let breakup = srgb[record + P2_GRUNGE_BREAKUP];
     if breakup != 0u {
-        value *= 1.0 - P2_BREAKUP_DEPTH + P2_BREAKUP_DEPTH * fill_value(layers[breakup - 1u], texel.uv, texel.surface).x;
+        value *= 1.0 - P2_BREAKUP_DEPTH + P2_BREAKUP_DEPTH * generator_read(breakup).x;
     }
     return (value - p2_float(record, P2_GRUNGE_MEAN)) / p2_float(record, P2_GRUNGE_SPREAD);
+}
+
+// The source operations the generator's texture and grunge read, for generator_read_sources (the
+// generator opcodes with a P2 record in uv.w alone: opcode 47 keeps other values there)
+fn p2_source_ops(effect: Operation, count: u32) -> u32 {
+    if effect.ids.y > 46u || effect.uv.w == 0.0 {
+        return count;
+    }
+    var added = count;
+    let texture = p2_word(effect, 2u);
+    if texture != 0u {
+        added = generator_add_read(srgb[texture + P2_SLOT_OPERATION], added);
+    }
+    let grunge = p2_word(effect, 3u);
+    if grunge != 0u {
+        if srgb[grunge + P2_GRUNGE_MODE] != 0u {
+            added = generator_add_read(srgb[grunge + P2_GRUNGE_SLOT + P2_SLOT_OPERATION], added);
+        } else {
+            added = generator_add_read(srgb[grunge + P2_GRUNGE_PATTERN], added);
+            added = generator_add_read(srgb[grunge + P2_GRUNGE_BREAKUP], added);
+        }
+    }
+    return added;
 }

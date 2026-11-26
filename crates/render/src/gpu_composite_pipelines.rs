@@ -69,6 +69,8 @@ impl Features {
                     features.curvature = true;
                 }
                 features.generator_p2 |= op.uv[3] != 0.0;
+                // P1's replaced inputs and P2's slots and grunge read source operations
+                features.sampled_generator_inputs |= kind < 47 && ((op.effects[2] != 0 && op.ext[0] != 0) || op.uv[3] != 0.0);
                 if let Some(source) = op.effects[3].checked_sub(1).and_then(|index| program.operations.get(index as usize)) {
                     features.sampled_generator_inputs |= source.ids[1] != 0;
                 }
@@ -128,17 +130,17 @@ impl Features {
             include(
                 self.generator_p2 && supports_curvature,
                 include_str!("shaders/generator_p2.wgsl"),
-                "fn generator_micro(effect: Operation, pixel: vec2<u32>, baked: vec3<f32>) -> vec3<f32> { return baked; }\n                 fn generator_texture(effect: Operation, texel: LayerTexel, signal: f32, position: vec3<f32>, normal: vec3<f32>) -> f32 { return signal; }\n                 fn generator_grunge(effect: Operation, texel: LayerTexel, position: vec3<f32>, normal: vec3<f32>) -> f32 { return 0.0; }",
+                "fn generator_micro(effect: Operation, pixel: vec2<u32>, baked: vec3<f32>) -> vec3<f32> { return baked; }\n                 fn generator_texture(effect: Operation, texel: LayerTexel, signal: f32, position: vec3<f32>, normal: vec3<f32>) -> f32 { return signal; }\n                 fn generator_grunge(effect: Operation, texel: LayerTexel, position: vec3<f32>, normal: vec3<f32>) -> f32 { return 0.0; }\n                 fn p2_source_ops(effect: Operation, count: u32) -> u32 { return count; }",
             ),
             include(
                 self.sampled_generator_inputs,
-                "fn generator_source_value(index: u32, texel: LayerTexel) -> f32 {\n                     return fill_value(layers[index], texel.uv, texel.surface).x;\n                 }",
-                "fn generator_source_value(index: u32, texel: LayerTexel) -> f32 { return layers[index].low.x; }",
+                "fn generator_source_value(index: u32, texel: LayerTexel) -> vec3<f32> {\n                     return fill_value(layers[index], texel.uv, texel.surface).xyz;\n                 }",
+                "fn generator_source_value(index: u32, texel: LayerTexel) -> vec3<f32> { return layers[index].low.xyz; }",
             ),
             include(
                 self.generator_controls,
                 include_str!("shaders/generator_p1.wgsl"),
-                "fn p1_generator_ramp(effect: Operation, texel: LayerTexel) -> f32 { return 0.0; }\n                 fn p1_finish_signal(effect: Operation, ramp: f32) -> f32 { return ramp; }",
+                "fn p1_generator_ramp(effect: Operation, texel: LayerTexel) -> f32 { return 0.0; }\n                 fn p1_finish_signal(effect: Operation, ramp: f32) -> f32 { return ramp; }\n                 fn p1_source_ops(op: Operation, count: u32) -> u32 { return count; }",
             ),
             include(
                 self.p3b_fields && supports_fields,

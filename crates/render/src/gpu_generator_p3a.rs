@@ -150,7 +150,6 @@ mod tests {
     use texturecraft_geom::{Mesh, primitives};
     use texturecraft_texel::TILE;
 
-    use crate::gpu_composite::CompositeProgram;
     use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, headless};
     use crate::headless::Headless;
 

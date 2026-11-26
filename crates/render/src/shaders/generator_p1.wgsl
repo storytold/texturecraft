@@ -40,12 +40,26 @@ fn p1_param(op: Operation, index: u32) -> f32 {
     return bitcast<f32>(srgb[op.ext.x + index]);
 }
 
-// The operation's sources read once, in one loop, so the driver inlines one fill_value
+// The operation's sources (replaced inputs) for generator_read_sources, which reads every source
+// of a generator at one fill_value call site
+fn p1_source_ops(op: Operation, count: u32) -> u32 {
+    if op.ids.y > 46u || op.ext.x == 0u {
+        return count;
+    }
+    var added = count;
+    let sources = min(p1_word(op, P1_SOURCE_COUNT), P1_MAX_SOURCES);
+    for (var i = 0u; i < sources; i++) {
+        added = generator_add_read(op.effects.z + i, added);
+    }
+    return added;
+}
+
+// The operation's sources as generator_read_sources read them
 fn p1_sources(op: Operation, texel: LayerTexel) -> array<vec4<f32>, 2> {
     var values = array<vec4<f32>, 2>(vec4(0.0), vec4(0.0));
     let count = min(p1_word(op, P1_SOURCE_COUNT), P1_MAX_SOURCES);
     for (var i = 0u; i < count; i++) {
-        values[i] = fill_value(layers[op.effects.z - 1u + i], texel.uv, texel.surface);
+        values[i] = vec4(generator_read(op.effects.z + i), 0.0);
     }
     return values;
 }

@@ -14,10 +14,11 @@ const P3A_MISSING_IMAGE: u32 = 0xffffffffu;
 const P3A_MIN_SCAN_WIDTH: f32 = 1.1920929e-7;
 const P3A_MIN_BALANCED_RANGE: f32 = 1e-6;
 
-fn generator_p3a_ramp(effect: Operation, texel: LayerTexel) -> f32 {
+// `input` is the replaced input in effects.w, read once by generator_ramp
+fn generator_p3a_ramp(effect: Operation, texel: LayerTexel, input: vec3<f32>) -> f32 {
     switch effect.procedural.x {
         case P3A_DISTANCE: {
-            let from_point = length(p3a_uniform_position(effect, texel) - effect.low.xyz);
+            let from_point = length(p3a_uniform_position(effect, texel, input) - effect.low.xyz);
             let radius = effect.high.x;
             let gradient = select(0.0, clamp(1.0 - from_point / radius, 0.0, 1.0), radius > 0.0);
             return p3a_histogram_scan(gradient, effect.high.y, effect.high.z);
@@ -27,12 +28,12 @@ fn generator_p3a_ramp(effect: Operation, texel: LayerTexel) -> f32 {
             let length_squared = dot(span, span);
             var along = 0.0;
             if length_squared > P3A_MIN_GRADIENT_LENGTH_SQUARED {
-                along = dot(p3a_uniform_position(effect, texel) - effect.low.xyz, span) / length_squared;
+                along = dot(p3a_uniform_position(effect, texel, input) - effect.low.xyz, span) / length_squared;
             }
             return p3a_balanced(clamp(along, 0.0, 1.0), effect.uv.z, effect.uv.w);
         }
         case P3A_GRAYSCALE: {
-            return p3a_grayscale(effect, texel);
+            return p3a_grayscale(effect, texel, input);
         }
         default: {
             return 0.0;
@@ -40,16 +41,11 @@ fn generator_p3a_ramp(effect: Operation, texel: LayerTexel) -> f32 {
     }
 }
 
-// The replaced input in effects.w, as the CPU's Texel::source reads it
-fn p3a_input(effect: Operation, texel: LayerTexel) -> vec3<f32> {
-    return fill_value(layers[effect.effects.w - 1u], texel.uv, texel.surface).xyz;
-}
-
 // The Position input, else the surface position across the mesh's bounds scaled evenly: the
 // longest side spans 0..1 around 0.5 (uniform_position_input in eval.rs; 0.5 where uncovered)
-fn p3a_uniform_position(effect: Operation, texel: LayerTexel) -> vec3<f32> {
+fn p3a_uniform_position(effect: Operation, texel: LayerTexel, input: vec3<f32>) -> vec3<f32> {
     if effect.effects.w != 0u {
-        return p3a_input(effect, texel);
+        return input;
     }
     return texel.surface.position * effect.uv.x + 0.5;
 }
@@ -90,7 +86,7 @@ fn p3a_balanced(value: f32, balance: f32, contrast: f32) -> f32 {
 
 // The image tiled and turned about the UV square's centre, made gray, balanced and contrasted
 // (Texel::grayscale_conversion)
-fn p3a_grayscale(effect: Operation, texel: LayerTexel) -> f32 {
+fn p3a_grayscale(effect: Operation, texel: LayerTexel, input: vec3<f32>) -> f32 {
     let centred = udim_mesh_uv(texel.uv) - 0.5;
     let turned = vec2(centred.x * effect.high.x - centred.y * effect.high.y, centred.x * effect.high.y + centred.y * effect.high.x);
     let at = turned * effect.high.z + 0.5;
@@ -101,7 +97,7 @@ fn p3a_grayscale(effect: Operation, texel: LayerTexel) -> f32 {
             rgb = material_image_at(image, at).rgb;
         }
     } else if effect.effects.w != 0u {
-        rgb = p3a_input(effect, texel);
+        rgb = input;
     }
     return p3a_balanced(clamp(p3a_gray(u32(effect.high.w), rgb), 0.0, 1.0), effect.uv.z, effect.uv.w);
 }

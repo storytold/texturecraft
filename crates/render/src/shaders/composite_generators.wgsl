@@ -1,4 +1,10 @@
 fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
+    // Every source the generator reads, at one call site (generator_read_sources)
+    generator_read_sources(effect, texel);
+    var input = vec3(0.0);
+    if effect.effects.w != 0u {
+        input = generator_read(effect.effects.w);
+    }
     // P1: the wear, section and light controls (generator_p1.wgsl)
     if effect.ids.y <= 46u && effect.ext.x != 0u {
         return p1_generator_ramp(effect, texel);
@@ -8,16 +14,15 @@ fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
         if effect.procedural.x >= 5u {
             return p3b_field_ramp(effect, texel.pixel);
         }
-        return generator_p3a_ramp(effect, texel);
+        return generator_p3a_ramp(effect, texel, input);
     }
     let surface = texel.surface;
     var baked = texel.baked;
     if effect.effects.w != 0u {
-        let input = generator_source_value(effect.effects.w - 1u, texel);
         switch effect.ids.y {
-            case 40u, 43u: { baked.y = input; }
-            case 41u, 44u: { baked.x = input; }
-            case 42u: { baked.z = input; }
+            case 40u, 43u: { baked.y = input.x; }
+            case 41u, 44u: { baked.x = input.x; }
+            case 42u: { baked.z = input.x; }
             default: {}
         }
     }
@@ -79,4 +84,46 @@ fn finish_generator(effect: Operation, ramp: f32) -> f32 {
         }
     }
     return clamp(select(value, 1.0 - value, effect.ids.w != 0u) + effect.projection.y, 0.0, 1.0);
+}
+
+// The most sources one generator reads: P1's replaced inputs, or an earlier or P3a input, and
+// P2's texture slot and grunge (its pattern and breakup, or its custom slot)
+const GENERATOR_MAX_READS: u32 = 6u;
+var<private> generator_read_ops: array<u32, 6>;
+var<private> generator_read_values: array<vec3<f32>, 6>;
+var<private> generator_read_count: u32 = 0u;
+
+// Read every source operation `effect` reads in one loop: the driver inlines fill_value at each
+// call site, and with anchor reads more copies overflow lavapipe's shader stack
+fn generator_read_sources(effect: Operation, texel: LayerTexel) {
+    var count = 0u;
+    if effect.effects.w != 0u {
+        generator_read_ops[count] = effect.effects.w;
+        count++;
+    }
+    count = p1_source_ops(effect, count);
+    count = p2_source_ops(effect, count);
+    generator_read_count = min(count, GENERATOR_MAX_READS);
+    for (var i = 0u; i < generator_read_count; i++) {
+        generator_read_values[i] = generator_source_value(generator_read_ops[i] - 1u, texel);
+    }
+}
+
+// Append source operation `op` (index plus one) to the reads, unless the table is full
+fn generator_add_read(op: u32, count: u32) -> u32 {
+    if op == 0u || count >= GENERATOR_MAX_READS {
+        return count;
+    }
+    generator_read_ops[count] = op;
+    return count + 1u;
+}
+
+// What source operation `op` (index plus one) read at this texel (generator_read_sources)
+fn generator_read(op: u32) -> vec3<f32> {
+    for (var i = 0u; i < generator_read_count; i++) {
+        if generator_read_ops[i] == op {
+            return generator_read_values[i];
+        }
+    }
+    return vec3(0.0);
 }
