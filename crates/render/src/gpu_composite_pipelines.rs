@@ -26,6 +26,8 @@ struct Features {
     color_selection: bool,
     // P3b: a generator reads a whole-map field (gpu_generator_p3b.rs)
     p3b_fields: bool,
+    // P2: a generator reads Micro Details (gpu_generator_p2.rs)
+    generator_p2: bool,
     // The GPU port packages' WGSL files compiled in full (gpu_composite_packages.rs)
     packages: ShaderFlags,
 }
@@ -66,6 +68,7 @@ impl Features {
                     features.generator_controls = true;
                     features.curvature = true;
                 }
+                features.generator_p2 |= op.uv[3] != 0.0;
                 if let Some(source) = op.effects[3].checked_sub(1).and_then(|index| program.operations.get(index as usize)) {
                     features.sampled_generator_inputs |= source.ids[1] != 0;
                 }
@@ -116,6 +119,16 @@ impl Features {
                 self.curvature,
                 include_str!("shaders/composite_curvature_detail.wgsl"),
                 "fn generator_curvature(effect: Operation, pixel: vec2<u32>, finest: f32, mode: u32, micro: f32) -> f32 { return 0.0; }",
+            ),
+            include(
+                self.generator_p2 && self.curvature && supports_curvature,
+                include_str!("shaders/generator_p2_levels_read.wgsl"),
+                "fn generator_level_at(effect: Operation, pixel: vec2<u32>, level: u32) -> f32 { return curvature_level_at(pixel, level); }",
+            ),
+            include(
+                self.generator_p2 && supports_curvature,
+                include_str!("shaders/generator_p2.wgsl"),
+                "fn generator_micro(effect: Operation, pixel: vec2<u32>, baked: vec3<f32>) -> vec3<f32> { return baked; }\n                 fn generator_texture(effect: Operation, texel: LayerTexel, signal: f32, position: vec3<f32>, normal: vec3<f32>) -> f32 { return signal; }\n                 fn generator_grunge(effect: Operation, texel: LayerTexel, position: vec3<f32>, normal: vec3<f32>) -> f32 { return 0.0; }",
             ),
             include(
                 self.sampled_generator_inputs,
@@ -366,6 +379,7 @@ mod tests {
             material_anchors: true,
             color_selection: true,
             p3b_fields: true,
+            generator_p2: true,
             packages: ShaderFlags::ALL,
         });
         variants

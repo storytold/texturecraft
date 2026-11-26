@@ -66,6 +66,19 @@ fn generator_bounds_position(op: Operation, texel: LayerTexel) -> vec3<f32> {
     return clamp(op.low.xyz + texel.surface.position * op.high.xyz, vec3(0.0), vec3(1.0));
 }
 
+// The generator's world normal (Texel::generator_input_color of World Normal): World Space
+// Normals' input, else the stored world normal when baked, else the surface's
+fn p1_normal(op: Operation, texel: LayerTexel, sources: array<vec4<f32>, 2>) -> vec3<f32> {
+    let own_input = p1_word(op, P1_MODEL) == P1_SECTION && p1_word(op, P1_PARAMETERS + 17u) == 3u && p1_word(op, P1_ROLES) != 0u;
+    if own_input {
+        return p1_role(op, sources, 0u, vec4(0.0)).xyz * 2.0 - 1.0;
+    }
+    if bake_has(BAKED_WORLD_NORMAL) && udim_bake_valid(texel.pixel) {
+        return bitcast<vec3<f32>>(baked_block_at(texel.pixel, 1u).yzw) * 2.0 - 1.0;
+    }
+    return texel.surface.normal;
+}
+
 // The generator's Position input, else the position across the mesh's bounds
 fn p1_position(op: Operation, texel: LayerTexel, sources: array<vec4<f32>, 2>, role: u32) -> vec3<f32> {
     if p1_word(op, P1_ROLES + role) != 0u {
@@ -82,20 +95,19 @@ fn p1_generator_ramp(op: Operation, texel: LayerTexel) -> f32 {
         case 1u: { value = p1_wear(op, texel, sources); }
         case 3u: { value = p1_light(op, texel, sources); }
         default: {
+            // The section adjusts in the second of two stages (from the first's field), after its one
+            // stage (in p1_finish_signal), or here; P2's texture blends over the adjusted signal
             let flags = p1_word(op, P1_FLAGS);
-            if (flags & P1_TWO_STAGES) != 0u {
-                // The second stage adjusts the first's field before its global blur
-                if generator_second_stage {
-                    let second = mask_base(layers[params.filter_stage.z]) - 1u + op.spatial.y - 1u;
-                    // P2: the generator's texture blends over the adjusted signal here too
-                    return p1_adjusted(op, filter_value(second - (flags >> P1_STAGE_DISTANCE_SHIFT), texel.pixel).x);
-                }
-                return p1_section_signal(op, texel, sources);
+            var adjust = (flags & P1_LATE_ADJUST) == 0u;
+            if (flags & P1_TWO_STAGES) != 0u && generator_second_stage {
+                let second = mask_base(layers[params.filter_stage.z]) - 1u + op.spatial.y - 1u;
+                value = filter_value(second - (flags >> P1_STAGE_DISTANCE_SHIFT), texel.pixel).x;
+            } else {
+                value = p1_section_signal(op, texel, sources);
+                adjust = adjust && (flags & P1_TWO_STAGES) == 0u;
             }
-            value = p1_section_signal(op, texel, sources);
-            if (flags & P1_LATE_ADJUST) == 0u {
-                value = p1_adjusted(op, value);
-                // P2: the generator's texture blends over the adjusted signal here
+            if adjust {
+                value = generator_texture(op, texel, p1_adjusted(op, value), generator_bounds_position(op, texel), p1_normal(op, texel, sources));
             }
         }
     }
@@ -107,7 +119,7 @@ fn p1_finish_signal(op: Operation, ramp: f32) -> f32 {
     if op.ids.y > 46u || op.ext.x == 0u || (p1_word(op, P1_FLAGS) & P1_LATE_ADJUST) == 0u {
         return ramp;
     }
-    // P2: the generator's texture blends over the adjusted signal here too
+    // A texture runs a second stage instead (gpu_generator_p1.rs), so none blends here
     return p1_adjusted(op, ramp);
 }
 
@@ -115,12 +127,13 @@ fn p1_finish_signal(op: Operation, ramp: f32) -> f32 {
 fn p1_wear(op: Operation, texel: LayerTexel, sources: array<vec4<f32>, 2>) -> f32 {
     let base = P1_PARAMETERS;
     let variant = p1_word(op, base);
-    let curvature = p1_role(op, sources, 0u, vec4(texel.baked.y)).x - 0.5;
-    let occlusion = p1_role(op, sources, 1u, vec4(texel.baked.x)).x;
+    // The inputs with what P2's micro details add
+    let read = vec3(p1_role(op, sources, 1u, vec4(texel.baked.x)).x, p1_role(op, sources, 0u, vec4(texel.baked.y)).x, texel.baked.z);
+    let inputs = generator_micro(op, texel.pixel, read);
+    let curvature = inputs.y - 0.5;
+    let occlusion = inputs.x;
     let blurred = p1_blurred_curvature(op, texel.pixel, curvature);
-
-    // P2: generator_grunge(...) plugs in here; P1 composes only without grunge (its term is 0)
-    let grunge = 0.0;
+    let grunge = generator_grunge(op, texel, generator_bounds_position(op, texel), p1_normal(op, texel, sources));
 
     let level = p1_param(op, base + 4u);
     let contrast = p1_param(op, base + 5u);
@@ -187,12 +200,12 @@ fn p1_blurred_curvature(op: Operation, pixel: vec2<u32>, curvature: f32) -> f32 
         if !curvature_level_present(narrower_level) {
             return curvature;
         }
-        narrower = curvature_level_at(bake_pixel, narrower_level);
+        narrower = generator_level_at(op, bake_pixel, narrower_level);
     }
     if !curvature_level_present(wider_level) {
         return curvature;
     }
-    let wider = curvature_level_at(bake_pixel, wider_level);
+    let wider = generator_level_at(op, bake_pixel, wider_level);
     return narrower + (wider - narrower) * weight;
 }
 
@@ -203,14 +216,14 @@ fn p1_section_signal(op: Operation, texel: LayerTexel, sources: array<vec4<f32>,
     switch p1_word(op, base + 17u) {
         case 0u: {
             let replaced = p1_word(op, P1_ROLES) != 0u;
-            let finest = p1_role(op, sources, 0u, vec4(texel.baked.y)).x;
+            let finest = generator_micro(op, texel.pixel, vec3(1.0, p1_role(op, sources, 0u, vec4(texel.baked.y)).x, 1.0)).y;
             var detail = op;
             detail.uv.x = p1_param(op, base + 6u);
             detail.effects.w = select(0u, 1u, replaced);
             return generator_curvature(detail, texel.pixel, finest, p1_word(op, base + 7u), 0.0);
         }
         case 1u: {
-            return p1_role(op, sources, 0u, vec4(texel.baked.x)).x;
+            return generator_micro(op, texel.pixel, vec3(p1_role(op, sources, 0u, vec4(texel.baked.x)).x, 0.5, 1.0)).x;
         }
         case 2u: {
             return p1_axes_signal(op, p1_position(op, texel, sources, 0u));

@@ -21,7 +21,9 @@ fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
             default: {}
         }
     }
-    let detail = select(0u, u32(effect.uv.y), enable_curvature_detail);
+    // P2: what the generator's micro details add to its curvature and occlusion
+    baked = generator_micro(effect, texel.pixel, baked);
+    let detail =select(0u, u32(effect.uv.y), enable_curvature_detail);
     var micro = 0.0;
     if enable_anchor_reads && effect.effects.z != 0u {
         let height = value(layers[effect.effects.z - 1u], texel.uv, surface).x;

@@ -282,8 +282,10 @@ mod tests {
         patterned.inputs.insert(BakedMap::Position, clouds());
 
         // Wear, light and section controls come before a kind's own (P1's paths)
-        let without_grunge = WearParameters::defaults(GeneratorKind::EdgeWear).map(|wear| WearParameters { grunge_amount: 0.0, ..wear });
-        let worn = Generator { wear: without_grunge, ..with_controls(GeneratorKind::ThreeDDistance, KindControls::Distance(distance)) };
+        let worn = Generator {
+            wear: WearParameters::defaults(GeneratorKind::EdgeWear),
+            ..with_controls(GeneratorKind::ThreeDDistance, KindControls::Distance(distance))
+        };
         let lit = Generator { light: LightParameters::defaults(GeneratorKind::Direction), ..Generator::new(GeneratorKind::ThreeDLinearGradient) };
         let section =
             SectionParameters { invert: true, brightness: -0.3, ..neutral_section([AxisLayer { invert: false, blend: AxisBlend::Add, weight: 1.0 }; 3]) };
@@ -390,14 +392,5 @@ mod tests {
         for (label, generator, baked) in cases {
             assert_generator_matches(&mut gpu, &mesh, &baked, (generator, BlendMode::Normal, 1.0), Tolerance::POINT, label);
         }
-    }
-
-    /// A kind's wear controls with grunge stay on the CPU until the grunge is on the GPU (P2)
-    #[test]
-    fn controls_the_gpu_does_not_evaluate_compose_on_the_cpu() {
-        let worn = Generator { wear: texturecraft_core::WearParameters::defaults(GeneratorKind::EdgeWear), ..Generator::new(GeneratorKind::ThreeDDistance) };
-        let (project, _) = generator_project(worn, BlendMode::Normal, 1.0);
-        let compiled = CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None);
-        assert_eq!(compiled.err(), Some("A mask generator uses CPU compositing."));
     }
 }

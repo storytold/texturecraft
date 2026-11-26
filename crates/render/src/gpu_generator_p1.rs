@@ -17,7 +17,7 @@ use texturecraft_core::{
     AxisBlend, BakedMap, ChannelKind, Filter, Generator, GeneratorKind, LightParameters, Projection, Sampling, SectionParameters, Source, WearParameters,
 };
 
-use super::{FIRST_GENERATOR, NeighbourhoodFilter, Operation, ProceduralInputs, TilePatterns, bind_tile_source, source_operation};
+use super::{FIRST_GENERATOR, NeighbourhoodFilter, Operation, ProceduralInputs, TilePatterns, bind_tile_source, generator_p2, source_operation};
 
 /// The opcode of the last kind with an earlier model; opcodes from FIRST_GENERATOR to it carry the controls
 const LAST_CONTROLS_OPCODE: u32 = FIRST_GENERATOR + 6;
@@ -59,7 +59,7 @@ pub(super) fn takes(generator: &Generator) -> bool {
 }
 
 /// The wear controls the CPU computes with: the generator's own, Fiber Glass Edge Wear's defaults without them
-fn wear_controls(generator: &Generator) -> Option<WearParameters> {
+pub(super) fn wear_controls(generator: &Generator) -> Option<WearParameters> {
     generator.wear.or_else(|| WearParameters::defaults(generator.kind).filter(|_| generator.kind == GeneratorKind::FiberGlassEdgeWear))
 }
 
@@ -99,6 +99,17 @@ pub(super) fn operation(generator: &Generator, inputs: &mut ProceduralInputs, pa
         late_adjust = section_words(generator, &section, &mut words, &mut sources, inputs)?;
     }
 
+    // P2: a triplanar texture or custom grunge reads the generator's world normal: its baked one,
+    // or its World Normal input where that is the signal's own input (World Space Normals)
+    let texture = generator.texture_in_use().is_some();
+    if texture || wear.is_some_and(|wear| wear.custom_grunge) {
+        let own_normal = wear.is_none() && generator.light.is_none() && generator.kind == GeneratorKind::WorldSpaceNormals;
+        if generator.inputs.contains_key(&BakedMap::WorldNormal) && !own_normal {
+            return None;
+        }
+        inputs.read_bake_rows();
+    }
+
     let (first_source, count) = push_sources(&sources, inputs, patterns)?;
     words[SOURCE_COUNT_WORD] = count;
     let global = generator.applied_global();
@@ -110,6 +121,15 @@ pub(super) fn operation(generator: &Generator, inputs: &mut ProceduralInputs, pa
         ..Operation::zeroed()
     };
 
+    // P2: the micro details, texture and grunge, and the micro curvature's detail sizes where the generator reads detail sizes
+    let reads_levels = !generator.inputs.contains_key(&BakedMap::Curvature)
+        && match wear {
+            Some(wear) => generator_terms::wear_levels_in_use(generator.kind, &wear).contains(&true),
+            None if generator.light.is_some() => false,
+            None => generator.kind == GeneratorKind::Curvature && generator.detail_in_use().is_some_and(|detail| detail.blurred_sizes_in_use().contains(&true)),
+        };
+    op.uv[3] = generator_p2::generator_record(generator, reads_levels, inputs)?;
+
     // The CPU's region path: blurs and reduced resolutions need neighbours
     let section_blur = generator.section_controls().is_some_and(|section| {
         SectionParameters::has_blur(generator.kind) && section.blur.clamp(*SectionParameters::BLUR_RANGE.start(), *SectionParameters::BLUR_RANGE.end()) > 0.0
@@ -119,8 +139,9 @@ pub(super) fn operation(generator: &Generator, inputs: &mut ProceduralInputs, pa
     // Each UV tile scale's stage; the section adjusts between two stages where a global blur follows cells or the section blur
     let stages: Vec<_> =
         std::iter::once(inputs.resolution).chain(inputs.levels.iter().copied()).map(|resolution| stage(generator, resolution, inputs)).collect();
-    let two_stages = stages.iter().any(|(late, _, global_blur, _)| *late && global_blur.is_some());
+    // A texture blends over the adjusted signal at the texel, so a late adjustment runs in a second stage too
     let late = stages.iter().any(|(late, ..)| *late);
+    let two_stages = stages.iter().any(|(late, _, global_blur, _)| *late && global_blur.is_some()) || (late && texture);
     let first: Vec<_> = if two_stages {
         stages.iter().map(|&(_, section_blur, _, cell)| (section_blur, cell)).collect()
     } else {
@@ -219,11 +240,6 @@ fn wear_words<'a>(
         GeneratorKind::Dirt => 2,
         _ => 0,
     };
-
-    // P2: the grunge (its own pattern or a custom one) plugs in at `generator_grunge`; without it the grunge term is 0
-    if wear.grunge_amount != 0.0 {
-        return None;
-    }
 
     words[MODEL_WORD] = WEAR;
     role_word(words, sources, input(generator, BakedMap::Curvature, 0));
@@ -347,7 +363,7 @@ mod tests {
     use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
     use texturecraft_core::{
         AxisBlend, AxisLayer, BakedMap, Channel, Effect, EffectKind, Fill, Generator, GeneratorKind, Layer, LayerKind, LightParameters, Mask, MaskBackground,
-        Project, SectionParameters, Source, TextureSet, WearParameters,
+        Procedural, ProceduralKind, Project, SectionParameters, Source, TextureLayer, TextureSet, WearParameters,
     };
     use texturecraft_geom::{Mesh, primitives};
 
@@ -412,6 +428,12 @@ mod tests {
     }
 
     #[allow(clippy::unwrap_used)] // A test helper: the wear kinds have defaults
+    /// Clouds between 0.1 and 0.9, for a slot holding a pattern
+    fn clouds() -> Source {
+        let pattern = Procedural { scale: 3.7, seed: 19, ..Procedural::new(ProceduralKind::Clouds) };
+        Source::Procedural { pattern, low: [0.1; 3], high: [0.9; 3], ramp: Vec::new() }
+    }
+
     fn wear(kind: GeneratorKind, change: impl FnOnce(&mut WearParameters)) -> Generator {
         let mut wear = WearParameters { grunge_amount: 0.0, ..WearParameters::defaults(kind).unwrap() };
         change(&mut wear);
@@ -432,8 +454,9 @@ mod tests {
         Generator { light: Some(light), ..Generator::new(GeneratorKind::Direction) }
     }
 
-    /// The three wear kinds through their levels around each sigma (the map itself, the first
-    /// levels, the widest two), the masking's eased low end, a hard step, replaced inputs and cells
+    /// The three wear kinds with their grunge (in UV, triplanar, custom image and pattern slots), and
+    /// through their levels around each sigma (the map itself, the first levels, the widest two),
+    /// the masking's eased low end, a hard step, replaced inputs and cells
     #[test]
     fn wear_controls_match_the_cpu() {
         let mesh = Arc::new(primitives::sphere(1.0, 16, 8));
@@ -443,7 +466,25 @@ mod tests {
         replaced.resolution.factor = -2;
         replaced.invert = true;
         replaced.offset = -0.15;
+
+        // P2's grunge: each kind's own pattern (in UV and triplanar), and custom grunge slots holding an image or a pattern
+        let with_grunge = |kind: GeneratorKind, change: fn(&mut WearParameters)| {
+            let mut generator = Generator::new(kind);
+            if let Some(wear) = generator.wear.as_mut() {
+                change(wear);
+            }
+            generator
+        };
+        let mut custom_image = with_grunge(GeneratorKind::EdgeWear, |wear| wear.custom_grunge = true);
+        custom_image.grunge = Some(Source::image("Input"));
+        let mut custom_pattern = with_grunge(GeneratorKind::Dirt, |wear| (wear.custom_grunge, wear.triplanar) = (true, true));
+        custom_pattern.grunge = Some(clouds());
         let cases = [
+            ("Metal edge wear with its grunge", Generator::new(GeneratorKind::EdgeWear), Tolerance::POINT),
+            ("Dirt with its grunge", Generator::new(GeneratorKind::Dirt), Tolerance::POINT),
+            ("Fiber glass with its triplanar grunge", with_grunge(GeneratorKind::FiberGlassEdgeWear, |wear| wear.triplanar = true), Tolerance::POINT),
+            ("custom grunge image", custom_image, Tolerance::BILINEAR),
+            ("custom grunge pattern, triplanar", custom_pattern, Tolerance::POINT),
             ("Metal edge wear", wear(GeneratorKind::EdgeWear, |_| {}), Tolerance::POINT),
             (
                 "smooth edges, light masking",
@@ -472,7 +513,8 @@ mod tests {
     }
 
     /// Curvature, Ambient Occlusion and Position on their section controls: each adjustment, the
-    /// adjustment before a global blur and after the section blur or cells, the axes and the inputs
+    /// adjustment before a global blur and after the section blur or cells, the axes and the
+    /// inputs, and P2's texture (an image in UV, a triplanar pattern after cells)
     #[test]
     fn section_controls_match_the_cpu() {
         let mesh = Arc::new(primitives::sphere(1.0, 16, 8));
@@ -494,7 +536,24 @@ mod tests {
         cells_blurred.global.blur = 0.3;
         let mut replaced_position = section(GeneratorKind::Position, |section| section.axes = [axis(false, AxisBlend::Normal, 1.0); 3]);
         replaced_position.inputs.insert(BakedMap::Position, Source::image("Input"));
+        // P2's texture over the adjusted signal: an image in UV, a pattern from the three axes after cells (a second stage)
+        let texture = |source: Source, triplanar: bool| TextureLayer {
+            enabled: true,
+            source: Some(source),
+            opacity: 0.7,
+            scale: 2.0,
+            contrast: 0.3,
+            triplanar,
+            ..TextureLayer::default()
+        };
+        let mut textured = section(GeneratorKind::Curvature, |section| section.contrast = 0.2);
+        textured.texture = Some(Box::new(texture(Source::image("Input"), false)));
+        let mut textured_cells = section(GeneratorKind::AmbientOcclusion, |section| section.balance = 0.4);
+        textured_cells.texture = Some(Box::new(texture(clouds(), true)));
+        textured_cells.resolution.factor = -2;
         let cases = [
+            ("Curvature with an image texture", textured, Tolerance::BILINEAR),
+            ("Ambient Occlusion cells with a triplanar pattern texture", textured_cells, Tolerance::NEIGHBOURHOOD),
             ("Curvature", section(GeneratorKind::Curvature, |section| (section.brightness, section.contrast) = (0.3, 0.4)), Tolerance::POINT),
             ("Curvature replaced", replaced_curvature, Tolerance::POINT),
             ("Ambient Occlusion balanced", balanced, Tolerance::POINT),
