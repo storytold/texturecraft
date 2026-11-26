@@ -22,6 +22,7 @@ use crate::color_picker::{ColorPick, SwatchEdit};
 use crate::dock::{anchors_below, project_effect_anchors_below, with};
 use crate::fill_panel::{FillKey, fill_key};
 use crate::i18n::{n_, tr};
+use crate::material_choice::MaterialChoice;
 use crate::material_orb::material_orb;
 use crate::orb_material::OrbMaterial;
 use crate::pattern_panel::tile_generator_sections;
@@ -86,8 +87,8 @@ pub(crate) fn material_section(app: &mut TextureCraftApp, sheet: &mut PropertySh
     let link = fill.link.as_deref().zip(base.get("layer").and_then(Value::as_u64)).map(|(link, layer)| (link, LayerId(layer)));
     let mode_id = sheet.ui.make_persistent_id(("material_mode", salt));
 
-    // A fill opens on the side that made it: a material (linked or built-in) on Material, separate sources on Channels
-    let made_whole = link.is_some() || fill.material.is_some();
+    // A fill opens on the side that made it: a material (linked, built-in or anchor) on Material, separate sources on Channels
+    let made_whole = link.is_some() || fill.material.is_some() || whole_anchor(fill, on).is_some();
     let mode = sheet.ui.data(|data| data.get_temp::<usize>(mode_id)).unwrap_or(if made_whole { MATERIAL_MODE } else { CHANNELS_MODE });
     let modes = MODES.map(tr);
     if let Some(picked) = sheet.orb_switch(&orb, &modes, mode) {
@@ -112,7 +113,7 @@ pub(crate) fn material_section(app: &mut TextureCraftApp, sheet: &mut PropertySh
                 crate::dock::open_link_in_materialcraft(app, layer, link);
             }
         }
-        None if mode == MATERIAL_MODE => whole_material_card(app, sheet, fill, base, &look, salt),
+        None if mode == MATERIAL_MODE => whole_material_card(app, sheet, fill, base, &look, on, reader),
         _ => {
             for channel in channels.into_iter().filter(|channel| on.contains(channel)) {
                 source_card(app, sheet, fill.source(channel), base, SourceSlot::Channel(channel), reader, false);
@@ -524,20 +525,56 @@ fn material_card(app: &mut TextureCraftApp, sheet: &mut PropertySheet<'_>, link:
     sheet.close_card();
 }
 
-/// The Material side of a fill without a linked material: one card holding the built-in material its sources came from (the row lists every plain material, × returns the channels to their defaults)
-fn whole_material_card(app: &mut TextureCraftApp, sheet: &mut PropertySheet<'_>, fill: &Fill, base: &Value, look: &OrbMaterial, salt: FillKey) {
+/// If every active channel reads its own channel from the same anchor point, returns that anchor
+fn whole_anchor(fill: &Fill, on: &[Channel]) -> Option<LayerId> {
+    let first = *on.first()?;
+    let Source::Anchor { anchor, channel, .. } = fill.source(first) else { return None };
+    if channel != first {
+        return None;
+    }
+
+    on.iter()
+        .all(|&slot| matches!(fill.source(slot), Source::Anchor { anchor: candidate, channel: read, .. } if candidate == anchor && read == slot))
+        .then_some(anchor)
+}
+
+/// The Material side of a fill without a linked material: one card holding the built-in material or anchor its sources came from (× returns the channels to their defaults)
+fn whole_material_card(
+    app: &mut TextureCraftApp,
+    sheet: &mut PropertySheet<'_>,
+    fill: &Fill,
+    base: &Value,
+    look: &OrbMaterial,
+    on: &[Channel],
+    reader: LayerId,
+) {
+    let salt = fill_key(base);
     let tokens = Tokens::get(sheet.ui.ctx());
     let held = fill.material.as_deref().and_then(find);
-    let name = held.map_or_else(|| tr("None"), |material| tr(material.label));
-    let slot = sheet.slot(&|painter, rect| material_orb(painter, rect, look, &tokens, ("card", salt)), name, tr("Material"), None, held.is_some(), false);
+    let held_anchor = held.is_none().then(|| whole_anchor(fill, on)).flatten();
+    let name = if let Some(material) = held {
+        tr(material.label)
+    } else if let Some(anchor) = held_anchor {
+        app.session.doc.project.effect(anchor).map_or_else(|| tr("None"), |(_, effect)| effect.name.as_str())
+    } else {
+        tr("None")
+    };
+    let has_choice = held.is_some() || held_anchor.is_some();
+    let slot = sheet.slot(&|painter, rect| material_orb(painter, rect, look, &tokens, ("card", salt)), name, tr("Material"), None, has_choice, false);
     let popup = sheet.ui.make_persistent_id(("material_picker", salt));
     if slot.pick.clicked() {
         resource_picker::toggle(sheet.ui.ctx(), popup);
     }
-    let current = held.map(|material| material.id);
-    let picked = resource_picker::show(&slot.pick, popup, &mut app.thumbs, current.as_ref(), current.is_some(), material_tabs);
-    if let Some(id) = picked.filter(|id| Some(*id) != current) {
-        app.run("layer.fill.material", with(base, json!({"material": id})));
+    let current = held.map(|material| MaterialChoice::Material(material.id)).or_else(|| held_anchor.map(MaterialChoice::Anchor));
+    let effect = base.get("effect").and_then(Value::as_u64).map(LayerId);
+    let tabs = || material_tabs(&app.session.doc.project, reader, effect);
+    let picked = resource_picker::show(&slot.pick, popup, &mut app.thumbs, current.as_ref(), current.is_some(), tabs);
+    if let Some(choice) = picked.filter(|choice| Some(*choice) != current) {
+        let params = match choice {
+            MaterialChoice::Material(id) => json!({"material": id}),
+            MaterialChoice::Anchor(anchor) => json!({"anchor": anchor.0}),
+        };
+        app.run("layer.fill.material", with(base, params));
     }
     if slot.clear {
         app.run("layer.fill.material", with(base, json!({"material": null})));
@@ -545,18 +582,34 @@ fn whole_material_card(app: &mut TextureCraftApp, sheet: &mut PropertySheet<'_>,
     sheet.close_card();
 }
 
-/// The material picker's one tab: every plain material's preview ball, grouped under its shelf category in library order
-fn material_tabs() -> Vec<PickerTab<&'static str>> {
-    let mut groups: Vec<PickerGroup<&'static str>> = Vec::new();
+/// The material picker's tabs: plain built-in materials in library order and anchor points below the fill
+fn material_tabs(project: &texturecraft_engine::core::Project, reader: LayerId, effect: Option<LayerId>) -> Vec<PickerTab<MaterialChoice>> {
+    let mut groups: Vec<PickerGroup<MaterialChoice>> = Vec::new();
     for material in whole_materials() {
-        let item = ResourcePickerItem { id: material.id, label: tr(material.label).to_owned(), caption: None, picture: TilePicture::Material(material.id) };
+        let item = ResourcePickerItem {
+            id: MaterialChoice::Material(material.id),
+            label: tr(material.label).to_owned(),
+            caption: None,
+            picture: TilePicture::Material(material.id),
+        };
         let header = Some(tr(material.category));
         match groups.iter_mut().find(|group| group.header == header) {
             Some(group) => group.items.push(item),
             None => groups.push(PickerGroup { header, items: vec![item] }),
         }
     }
-    vec![PickerTab { icon: ic::SPHERE, name: tr("Materials"), groups }]
+    let anchors = match effect {
+        Some(effect) => project_effect_anchors_below(project, reader, effect),
+        None => anchors_below(project, reader),
+    };
+    let anchor_items = anchors
+        .into_iter()
+        .map(|(anchor, label)| ResourcePickerItem { id: MaterialChoice::Anchor(anchor), label, caption: None, picture: TilePicture::Glyph(ic::ANCHOR) })
+        .collect();
+    vec![
+        PickerTab { icon: ic::SPHERE, name: tr("Materials"), groups },
+        PickerTab { icon: ic::ANCHOR, name: tr("Anchor points"), groups: vec![PickerGroup { header: None, items: anchor_items }] },
+    ]
 }
 
 /// Channels mapping: which of the material's outputs each channel that is on reads

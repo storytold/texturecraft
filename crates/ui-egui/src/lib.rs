@@ -84,6 +84,7 @@ mod mask_fill_panel;
 mod mask_paint_panel;
 mod mask_preview_image;
 mod mask_source_choice;
+mod material_choice;
 mod material_orb;
 mod material_preview_image;
 pub mod menus;

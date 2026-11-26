@@ -23,6 +23,7 @@ pub mod effect_clipboard;
 pub mod file_cmds;
 pub mod fill_alpha;
 pub mod fill_hit_test;
+mod fill_material_choice;
 pub mod fill_material_cmds;
 pub mod fill_mode;
 pub mod fill_reset_cmds;

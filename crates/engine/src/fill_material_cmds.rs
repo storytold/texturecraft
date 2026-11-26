@@ -3,9 +3,10 @@
 use std::collections::BTreeMap;
 
 use serde_json::Value;
-use texturecraft_core::{Channel, EffectKind, Fill, LayerKind, Project, Source};
+use texturecraft_core::{Channel, EffectKind, Fill, LayerId, LayerKind, Project, Source};
 
-use crate::commands::{CommandSpec, bad, has_layer, strp};
+use crate::commands::{CommandSpec, bad, has_layer, strp, u64p};
+use crate::fill_material_choice::FillMaterialChoice;
 use crate::layer_cmds::{FillTarget, fill_mut, fill_target};
 use crate::materials::{Builder, MATERIALS, SmartMaterial, build, find};
 use crate::{EngineError, Result, Session, cmd};
@@ -19,7 +20,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Set fill material",
         [],
         None,
-        "{layer? | effect?: content fill effect id, material: built-in material id (not a smart material) | null (back to the channels' defaults)} — sets every channel the material writes, turns those channels on and the others off; the projection stays; linked fills are rejected",
+        "{layer? | effect?: content fill effect id, material?: built-in material id (not a smart material) | null (back to the channels' defaults), anchor?: anchor effect id} — sets every channel the material writes (or links every enabled channel to `anchor`), turns those channels on and the others off; the projection stays; linked fills are rejected",
         has_layer,
         set_material
     )]
@@ -32,65 +33,115 @@ pub fn whole_materials() -> impl Iterator<Item = &'static SmartMaterial> {
 
 fn set_material(session: &mut Session, params: &Value) -> Result<Value> {
     let target = fill_target(session, params, CMD)?;
-    let material = material_param(params)?;
+    let choice = choice_param(params)?;
     let set = target_set(session, target)?;
-    if holds(session, target, set, material)? {
+    if holds(session, target, set, choice)? {
         return Ok(Value::Null);
     }
 
-    let Some(found) = material else {
-        session.edit("Clear fill material", |session| {
-            let edited = fill_mut(session, target)?;
-            edited.material = None;
-            match target {
-                // A fill effect changes a channel while it has a source: its channels stay on, at their defaults
-                FillTarget::Effect(_) => edited.sources.iter_mut().for_each(|(channel, source)| *source = Source::uniform_of(*channel)),
-                FillTarget::Layer(_) | FillTarget::Mask(_) => edited.sources.clear(),
-            }
-            Ok(())
-        })?;
-        return Ok(Value::Null);
-    };
-
-    session.edit(&format!("Set fill material {}", found.label), |session| {
-        let channels = session.doc.project.texture_set(set)?.channel_list();
-        let sources = material_sources(&mut session.doc.project, &channels, found)?;
-        let edited = fill_mut(session, target)?;
-        edited.sources = sources;
-        edited.material = Some(found.id.to_string());
-
-        let written: Vec<Channel> = edited.sources.keys().copied().collect();
-        if let FillTarget::Layer(id) = target {
-            let layer = session.doc.project.layer_mut(id)?;
-            layer.channels.retain(|channel, _| written.contains(channel));
-            for channel in written {
-                layer.channels.entry(channel).or_default();
-            }
+    match choice {
+        FillMaterialChoice::Clear => {
+            session.edit("Clear fill material", |session| {
+                let edited = fill_mut(session, target)?;
+                edited.material = None;
+                match target {
+                    // A fill effect changes a channel while it has a source: its channels stay on, at their defaults
+                    FillTarget::Effect(_) => edited.sources.iter_mut().for_each(|(channel, source)| *source = Source::uniform_of(*channel)),
+                    FillTarget::Layer(_) | FillTarget::Mask(_) => edited.sources.clear(),
+                }
+                Ok(())
+            })?;
         }
-        Ok(())
-    })?;
+        FillMaterialChoice::Material(found) => {
+            session.edit(&format!("Set fill material {}", found.label), |session| {
+                let channels = session.doc.project.texture_set(set)?.channel_list();
+                let sources = material_sources(&mut session.doc.project, &channels, found)?;
+                let edited = fill_mut(session, target)?;
+                edited.sources = sources;
+                edited.material = Some(found.id.to_string());
+
+                let written: Vec<Channel> = edited.sources.keys().copied().collect();
+                if let FillTarget::Layer(id) = target {
+                    let layer = session.doc.project.layer_mut(id)?;
+                    layer.channels.retain(|channel, _| written.contains(channel));
+                    for channel in written {
+                        layer.channels.entry(channel).or_default();
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        FillMaterialChoice::Anchor(anchor) => {
+            let reader = match target {
+                FillTarget::Layer(id) => id,
+                FillTarget::Effect(effect) | FillTarget::Mask(effect) => {
+                    session.doc.project.effect(effect).map(|(owner, _)| owner).ok_or_else(|| bad(CMD, format!("no effect {}", effect.0)))?
+                }
+            };
+            let channels = active_channels(session, target, set)?;
+            let mut linked = BTreeMap::new();
+            for channel in channels {
+                linked.insert(channel, crate::mask_cmds::anchor_source(session, CMD, reader, anchor, channel)?);
+            }
+            let anchor_name = session.doc.project.effect(anchor).map(|(_, effect)| effect.name.clone()).unwrap_or_default();
+            session.edit(&format!("Link fill to {anchor_name}"), |session| {
+                let edited = fill_mut(session, target)?;
+                edited.material = None;
+                edited.sources.extend(linked);
+                Ok(())
+            })?;
+        }
+    }
     Ok(Value::Null)
 }
 
-/// The `material` param: a plain built-in material, or `None` for null
-fn material_param(params: &Value) -> Result<Option<&'static SmartMaterial>> {
-    match params.get("material") {
-        Some(Value::Null) => Ok(None),
-        Some(_) => {
-            let id = strp(params, "material").ok_or_else(|| bad(CMD, "`material` is a material id or null"))?;
-            let found = find(id).ok_or_else(|| bad(CMD, format!("unknown material `{id}`")))?;
-            if found.smart {
-                return Err(bad(CMD, format!("`{}` is a smart material (a folder of layers): add it from the shelf with material.apply", found.id)));
-            }
+/// The `material` or `anchor` param: one built-in material, one anchor point, or `Clear` for null
+fn choice_param(params: &Value) -> Result<FillMaterialChoice> {
+    if params.get("material").is_some() && params.get("anchor").is_some() {
+        return Err(bad(CMD, "give `material` or `anchor`, not both"));
+    }
 
-            Ok(Some(found))
+    if let Some(material) = params.get("material") {
+        if material.is_null() {
+            return Ok(FillMaterialChoice::Clear);
         }
-        None => Err(bad(CMD, "`material` is required: a material id or null")),
+
+        let id = strp(params, "material").ok_or_else(|| bad(CMD, "`material` is a material id or null"))?;
+        let found = find(id).ok_or_else(|| bad(CMD, format!("unknown material `{id}`")))?;
+        if found.smart {
+            return Err(bad(CMD, format!("`{}` is a smart material (a folder of layers): add it from the shelf with material.apply", found.id)));
+        }
+
+        return Ok(FillMaterialChoice::Material(found));
+    }
+
+    if params.get("anchor").is_some() {
+        let id = u64p(params, "anchor").ok_or_else(|| bad(CMD, "`anchor` is an anchor effect id"))?;
+        return Ok(FillMaterialChoice::Anchor(LayerId(id)));
+    }
+
+    Err(bad(CMD, "`material` or `anchor` is required"))
+}
+
+/// Channels active on `target` when linking an anchor in Material mode
+fn active_channels(session: &Session, target: FillTarget, set: usize) -> Result<Vec<Channel>> {
+    match target {
+        FillTarget::Layer(id) => Ok(session.doc.project.layer(id)?.channels.keys().copied().collect()),
+        FillTarget::Effect(id) => {
+            let Some((_, effect)) = session.doc.project.effect(id) else {
+                return Err(bad(CMD, format!("no effect {}", id.0)));
+            };
+            let EffectKind::Material(fill) = &effect.kind else {
+                return Err(bad(CMD, "not a content fill effect"));
+            };
+            if fill.sources.is_empty() { Ok(session.doc.project.texture_set(set)?.channel_list()) } else { Ok(fill.sources.keys().copied().collect()) }
+        }
+        FillTarget::Mask(_) => Err(bad(CMD, "a mask fill has one grayscale source and no channels or material")),
     }
 }
 
-/// Whether the fill at `target` (in texture set `set`) already holds `material` whole (or, for `None`, no material and its channels' defaults), so setting it changes nothing
-fn holds(session: &Session, target: FillTarget, set: usize, material: Option<&SmartMaterial>) -> Result<bool> {
+/// Whether the fill at `target` (in texture set `set`) already holds `choice` whole, so setting it changes nothing
+fn holds(session: &Session, target: FillTarget, set: usize, choice: FillMaterialChoice) -> Result<bool> {
     let (fill, layer_channels) = match target {
         FillTarget::Layer(id) => {
             let layer = session.doc.project.layer(id)?;
@@ -107,22 +158,33 @@ fn holds(session: &Session, target: FillTarget, set: usize, material: Option<&Sm
         return Err(bad(CMD, "a linked material cannot be replaced with this command"));
     }
 
-    if fill.material.as_deref() != material.map(|found| found.id) {
-        return Ok(false);
-    }
-
-    // Turning a channel off keeps the material name, so compare every source on content effects
-    Ok(match (material, layer_channels) {
-        (Some(_), Some(channels)) => channels.len() == fill.sources.len() && fill.sources.keys().all(|channel| channels.contains_key(channel)),
-        (Some(found), None) => {
-            let channels = session.doc.project.texture_set(set)?.channel_list();
-
-            // The recipe allocates a layer ID, but comparing its sources must leave the project alone
-            let mut scratch = Project::new("", "");
-            fill.sources == material_sources(&mut scratch, &channels, found)?
+    Ok(match choice {
+        FillMaterialChoice::Clear => {
+            fill.material.is_none()
+                && match layer_channels {
+                    Some(_) => fill.sources.is_empty(),
+                    None => fill.sources.iter().all(|(channel, source)| *source == Source::uniform_of(*channel)),
+                }
         }
-        (None, Some(_)) => fill.sources.is_empty(),
-        (None, None) => fill.sources.iter().all(|(channel, source)| *source == Source::uniform_of(*channel)),
+        FillMaterialChoice::Material(found) => {
+            fill.material.as_deref() == Some(found.id)
+                && match layer_channels {
+                    Some(channels) => channels.len() == fill.sources.len() && fill.sources.keys().all(|channel| channels.contains_key(channel)),
+                    None => {
+                        let channels = session.doc.project.texture_set(set)?.channel_list();
+
+                        // The recipe allocates a layer ID, but comparing its sources must leave the project alone
+                        let mut scratch = Project::new("", "");
+                        fill.sources == material_sources(&mut scratch, &channels, found)?
+                    }
+                }
+        }
+        FillMaterialChoice::Anchor(anchor) => {
+            let channels = active_channels(session, target, set)?;
+            fill.material.is_none()
+                && !channels.is_empty()
+                && channels.into_iter().all(|channel| fill.sources.get(&channel) == Some(&Source::Anchor { anchor, channel, ramp: Vec::new() }))
+        }
     })
 }
 
