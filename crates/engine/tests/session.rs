@@ -536,8 +536,7 @@ fn a_panic_inside_an_edit_restores_the_document() {
     assert_eq!(s.history_labels(), history, "no undo step was recorded");
 }
 
-/// A command that fails leaves the document and history as they were (AGENTS rule 5: commands
-/// are atomic).
+/// A command that fails leaves the document and history as they were (commands are atomic).
 #[test]
 fn failed_commands_leave_the_document_unchanged() {
     let hostile = [
@@ -554,7 +553,10 @@ fn failed_commands_leave_the_document_unchanged() {
             continue; // slow (bakes); covered elsewhere
         }
         for p in &hostile {
-            let mut s = session();
+            let mut s = session_at(MIN_RESOLUTION);
+            for texture_set in &mut s.doc.project.texture_sets {
+                texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R64;
+            }
             let (before, history) = (s.doc.clone(), s.history_labels());
             if execute(&mut s, spec.id, p).is_err() && (!same_document(&s.doc, &before) || s.history_labels() != history) {
                 offenders.push(format!("{} {p}", spec.id));
