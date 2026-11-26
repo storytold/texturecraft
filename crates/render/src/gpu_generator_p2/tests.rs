@@ -233,14 +233,14 @@ fn a_micro_height_read_from_an_anchor_matches_the_cpu() {
 fn anchor_reader(project: &mut Project, anchor: LayerId) -> Layer {
     let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.9, 0.6, 0.3]))]), ..Default::default() };
     let mut layer = Layer::new(project.alloc_id(), "Micro", LayerKind::Fill(fill), &[Channel::BaseColor]);
-    let micro = MicroDetails {
+    let micro = MicroDetails::defaults(GeneratorKind::Curvature).map(|defaults| MicroDetails {
         enabled: true,
         normal: false,
         height_source: Some(Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() }),
-        ..MicroDetails::defaults(GeneratorKind::Curvature).unwrap()
-    };
+        ..defaults
+    });
     let mut mask = Mask::new(MaskBackground::Black);
-    let generator = Generator { micro: Some(Box::new(micro)), ..earlier_generator(GeneratorKind::Curvature) };
+    let generator = Generator { micro: micro.map(Box::new), ..earlier_generator(GeneratorKind::Curvature) };
     mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
     layer.mask = Some(mask);
     layer
