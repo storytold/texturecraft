@@ -198,29 +198,36 @@ fn sample_file(with_tri: bool) -> Vec<u8> {
 #[test]
 fn imports_polymesh_through_xforms_with_face_sets_uvs_and_normals() {
     let raw = read(&sample_file(true)).unwrap();
-    let mut names: Vec<(&str, &str)> = raw.groups.iter().map(|(m, p, _)| (m.as_str(), p.as_str())).collect();
+    let mut names: Vec<(&str, &str)> = raw.groups.iter().map(|(material, part, _)| (material.as_str(), part.as_str())).collect();
     names.sort();
+
     assert_eq!(names, vec![("Default", "tri"), ("left", "strip"), ("right", "strip")], "meshes take their transform's name");
     assert_eq!(raw.triangle_count(), 5);
-    // UVs exist only on the strip, so the whole mesh is unwrapped (with a warning).
+
+    // UVs exist only on the strip, so the whole mesh is unwrapped with a warning
     assert!(raw.uvs.is_none() && !raw.warnings.is_empty());
-    // World positions: scaled by 2, then translated.
+
+    // World positions are scaled first and then translated
     let (lo, hi) = raw.positions.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), p| (lo.min(*p), hi.max(*p)));
     assert_eq!((lo, hi), (Vec3::new(0.0, 0.0, 3.0), Vec3::new(5.0, 4.0, 5.0)));
-    // Clockwise Alembic faces become counter-clockwise: the strip faces +Z.
-    for (m, _, tris) in &raw.groups {
-        if m == "Default" {
+
+    // Clockwise Alembic faces are reversed so the strip faces +Z
+    for (material, _, triangles) in &raw.groups {
+        if material == "Default" {
             continue;
         }
-        for t in tris.chunks(3) {
+
+        for t in triangles.chunks(3) {
             let p = |i: u32| raw.positions[i as usize];
             assert!((p(t[1]) - p(t[0])).cross(p(t[2]) - p(t[0])).z > 0.0);
         }
     }
-    let mesh = finish(raw).unwrap().mesh;
+
+    let mesh = finish(raw, false).unwrap().mesh;
     assert_eq!(mesh.materials.len(), 3);
-    // The strip alone keeps its indexed face-varying UVs: u = x / 2 in the file's own space.
-    let strip = finish(read(&sample_file(false)).unwrap()).unwrap();
+
+    // The strip alone keeps its indexed face-varying UVs with u = x / 2 in local space
+    let strip = finish(read(&sample_file(false)).unwrap(), false).unwrap();
     assert!(!strip.report.uvs_generated);
     for (p, uv) in strip.mesh.positions.iter().zip(&strip.mesh.uvs) {
         let local = (*p - Vec3::new(1.0, 2.0, 3.0)) / 2.0;
@@ -318,21 +325,23 @@ fn hdf5_and_garbage_are_clear_errors() {
 #[test]
 fn truncated_and_corrupted_files_never_panic() {
     let bytes = sample_file(true);
-    for n in (0..bytes.len()).step_by(3) {
-        let _ = read(&bytes[..n]);
+    for end in (0..bytes.len()).step_by(3) {
+        let _ = read(&bytes[..end]);
     }
+
     let mut rng = 0x9e37_79b9_7f4a_7c15u64;
     for _ in 0..4000 {
-        let mut b = bytes.clone();
+        let mut corrupted = bytes.clone();
         for _ in 0..4 {
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
-            let i = (rng % b.len() as u64) as usize;
-            b[i] = (rng >> 32) as u8;
+            let i = (rng % corrupted.len() as u64) as usize;
+            corrupted[i] = (rng >> 32) as u8;
         }
-        if let Ok(raw) = read(&b) {
-            let _ = finish(raw);
+
+        if let Ok(raw) = read(&corrupted) {
+            let _ = finish(raw, false);
         }
     }
 }

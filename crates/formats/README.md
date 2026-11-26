@@ -145,7 +145,8 @@ Built-in presets (each one lists the public specification its packing follows in
 ```rust
 pub struct ProjectFile {
     pub project: Project, pub pixels: PixelStore, pub baked: BTreeMap<usize, BakedMaps>,
-    pub mesh: Option<(String /* ext */, Vec<u8>)>, pub thumbnail: Option<Vec<u8>>,
+    pub mesh: Option<(String /* ext */, Vec<u8>)>, pub mesh_uvs: Option<Vec<Vec2>>,
+    pub thumbnail: Option<Vec<u8>>,
     pub warnings: Vec<String>, // Import warnings, never saved
 }
 pub fn save_project_bytes(pf: &ProjectFile) -> Result<Vec<u8>>;
@@ -162,12 +163,14 @@ pub fn project_open_limit_gib() -> u32;
 |---|---|
 | `project.json` | serde JSON of `Project` |
 | `mesh.<ext>` | the original mesh file bytes (absent for `builtin:<id>` meshes) |
+| `uv_layout.bin` | generated UVs for an explicitly rebuilt mesh (format 4) |
 | `pixels/layer_<id>_<channelId>.bin` | painted layer (or content paint effect) channel |
 | `pixels/mask_<id>.bin` | painted mask effect |
 | `baked/<ts>_<mapId>.bin` | baked mesh map of texture set `<ts>` |
 | `thumbnail.png` | optional, stored |
 
-`.bin`: header `TCTX`, version, width, height, components, tile count (u32 LE each), then per
+Paint and bake `.bin` entries use a `TCTX` header with version, width, height, components and tile
+count (u32 LE each), then per
 allocated 64×64 tile `tx`, `ty` (u32 LE) and the raw `u16` LE components (sparse, lossless).
 Baked maps: the same header with 0 tiles, then `width × height × components` f32 LE.
 
@@ -179,6 +182,10 @@ maps retain their working atlas layout.
 Project format version 3 stores baked bent normal maps in tangent space (OpenGL green, like the
 normal map). Version 2 and older files held them in world space: loading drops those maps, keeps
 the bake settings and warns that the Bent Normals map needs a re-bake.
+
+Project format version 4 saves rebuilt mesh UVs so reopening can use the same layout. The
+`uv_layout.bin` entry starts with `TCUV`, followed by the layout version and corner count (u32 LE).
+Each triangle corner has one little-endian f32 pair in imported index order.
 
 Loading runs `Project::validate`, refuses a newer `format_version` (`FormatError::NewerVersion`),
 checks every tile against its texture set's resolution and component count, rejects repeated or

@@ -104,6 +104,9 @@ egui-phosphor = { path = "vendor/egui-phosphor" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# cargo-llvm-cov always sets `cfg(coverage)`: a coverage build bakes on the CPU (texturecraft-engine
+# picks no GPU tracer there) and the cfg would otherwise trip unexpected_cfgs under -D warnings.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
 [workspace.lints.clippy]
 dbg_macro = "warn"

@@ -77,7 +77,12 @@ fn a_canceled_dialog_changes_nothing() {
 
 #[test]
 fn the_sample_picker_asks_to_save_only_after_a_path_is_chosen() {
+    let samples = super::temp_dir::TempDir::new("sample-picker");
     let mut h = harness(true);
+    let samples_folder = samples.join("Samples");
+    std::fs::create_dir(&samples_folder).unwrap();
+    std::fs::write(samples_folder.join("Material Ball.tcraft"), b"stand-in").unwrap();
+    h.state_mut().samples_folder = samples_folder;
     answer(&mut h, |_| Answer::Cancelled);
     invoke(&mut h, "project.sample");
     assert_eq!(h.state().file_dialogs.pending(), 1);

@@ -141,6 +141,8 @@ mod resource_picker;
 mod resource_picker_item;
 mod round_gizmo;
 mod running_bake;
+#[cfg(not(target_arch = "wasm32"))]
+mod sample_project;
 pub mod saved_search;
 mod screen_color_pick;
 pub mod screen_pick;
@@ -265,6 +267,9 @@ pub struct TextureCraftApp {
     pub session: Session,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) session_log_file: Option<session_log_file::SessionLogFile>,
+    /// The folder File > Open Sample Project starts in, under the data folder
+    #[cfg(not(target_arch = "wasm32"))]
+    pub samples_folder: std::path::PathBuf,
     viewport_mesh_bounds: viewport_mesh_bounds::ViewportMeshBounds,
     /// A smooth move to a saved camera in progress.
     camera_glide: Option<CameraGlide>,
@@ -425,6 +430,8 @@ impl TextureCraftApp {
             session,
             #[cfg(not(target_arch = "wasm32"))]
             session_log_file: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            samples_folder: std::path::PathBuf::new(),
             viewport_mesh_bounds: viewport_mesh_bounds::ViewportMeshBounds::default(),
             ui,
             ui_store,
@@ -500,6 +507,7 @@ impl TextureCraftApp {
         {
             // The first window of the process fixes it; a new folder applies on restart
             let _ = DATA_FOLDER.set(data_folder(&app.ui.prefs.data_folder));
+            app.samples_folder = user_dir(sample_project::SAMPLES_FOLDER);
 
             if cc.winit_window().is_some() {
                 match session_log_file::SessionLogFile::start(&crate::data_dir().join("logs")) {

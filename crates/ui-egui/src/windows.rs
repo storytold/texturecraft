@@ -542,17 +542,21 @@ pub(crate) fn import_materialx(app: &mut TextureCraftApp, path: &str) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn file_action(app: &mut TextureCraftApp, _ctx: &egui::Context, id: &str) -> bool {
     match id {
-        "file.open" | "project.sample" => {
-            let dialog = if id == "project.sample" {
-                FileDialog::open().title(tr("Open Sample Project")).filter(tr("TextureCraft project"), &[texturecraft_engine::core::PROJECT_EXT])
-            } else {
-                FileDialog::open().filter(tr("TextureCraft project or mesh"), crate::web_files::OPEN_EXTS)
-            };
-            app.ask_file(dialog, Bound::App, |app, paths| {
-                if let Some(path) = paths.first() {
-                    open_path(app, &path.display().to_string());
+        "file.open" => {
+            let dialog = FileDialog::open().filter(tr("TextureCraft project or mesh"), crate::web_files::OPEN_EXTS);
+            app.ask_file(dialog, Bound::App, open_picked);
+            true
+        }
+        "project.sample" => {
+            let dialog = FileDialog::open().title(tr("Open Sample Project")).filter(tr("TextureCraft project"), &[texturecraft_engine::core::PROJECT_EXT]);
+            let dialog = match crate::sample_project::install(&app.samples_folder) {
+                Ok(()) => dialog.directory(app.samples_folder.clone()),
+                Err(error) => {
+                    app.toast(trf("Could not prepare the sample project: {error}", &[("error", &error)]), true);
+                    dialog
                 }
-            });
+            };
+            app.ask_file(dialog, Bound::App, open_picked);
             true
         }
         "file.save" if app.session.path.is_some() => {
@@ -629,6 +633,14 @@ pub fn file_action(app: &mut TextureCraftApp, _ctx: &egui::Context, id: &str) ->
             true
         }
         _ => false,
+    }
+}
+
+/// Opens the project or mesh a file dialog picked
+#[cfg(not(target_arch = "wasm32"))]
+fn open_picked(app: &mut TextureCraftApp, paths: Vec<std::path::PathBuf>) {
+    if let Some(path) = paths.first() {
+        open_path(app, &path.display().to_string());
     }
 }
 

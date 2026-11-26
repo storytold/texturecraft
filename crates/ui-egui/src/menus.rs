@@ -179,6 +179,11 @@ pub fn enabled(app: &TextureCraftApp, id: &str) -> bool {
         return false;
     }
 
+    // A shortcut has no explicit layer to toggle
+    if id == "mask.toggle" && app.session.selected_layer().is_none() {
+        return false;
+    }
+
     if is_ui(id) {
         return app.session.project_open || !ui_needs_project(id);
     }

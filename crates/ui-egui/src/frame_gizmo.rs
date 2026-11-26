@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use texturecraft_engine::compose::axis_frame::{placed_from_axis, placing_moves_pattern};
 use texturecraft_engine::compose::frame_placement::folded;
 use texturecraft_engine::compose::pattern::{decal_axes, decal_corners};
-use texturecraft_engine::core::{Decal, EffectKind, Fill, LayerId, LayerKind, Projection};
+use texturecraft_engine::core::{Decal, EffectKind, Fill, LayerId, LayerKind, Projection, Source};
 use texturecraft_engine::geom::glam::Vec3;
 
 use crate::TextureCraftApp;
@@ -61,12 +61,17 @@ const MIN_SIDE_STRETCH: f32 = 0.02;
 /// The least distance from the centre a resize drag measures from, so a press on the centre never divides by zero (points)
 pub(crate) const MIN_HANDLE_REACH: f32 = 1.0;
 
-impl FrameGizmo {
-    /// The frame as the 3D view shows it: none while the Projection row's eye hides the projection gizmos
-    pub(crate) fn shown(app: &TextureCraftApp, rect: Rect) -> Option<FrameGizmo> {
-        FrameGizmo::of(app, rect).filter(|_| app.session.doc.project.display.projection_gizmos)
+/// An unplaced axis planar can acquire a frame only if placing it preserves its pattern.
+fn placeable_projection<'a>(projection: &'a Projection, sources: impl Iterator<Item = &'a Source>) -> Option<&'a Projection> {
+    let unplaced = matches!(projection, Projection::Planar { placed: None, .. });
+    if unplaced && placing_moves_pattern(sources) {
+        return None;
     }
 
+    Some(projection)
+}
+
+impl FrameGizmo {
     /// The frame of the selected fill layer, or of the selected mask fill effect, with a planar or warp projection
     pub(crate) fn of(app: &TextureCraftApp, rect: Rect) -> Option<FrameGizmo> {
         use texturecraft_engine::StackTarget;
@@ -77,30 +82,24 @@ impl FrameGizmo {
 
         let layers = &app.session.doc.project;
         let selected = app.session.selected_layer()?;
-        let (layer, effect, projection, sources) = match app.session.target {
+        let (layer, effect, projection) = match app.session.target {
             StackTarget::Content => {
                 let layer = layers.content_layer(selected)?;
                 let LayerKind::Fill(Fill { projection, sources, .. }) = &layer.kind else { return None };
 
-                (layer.id, None, projection, sources.values().collect::<Vec<_>>())
+                (layer.id, None, placeable_projection(projection, sources.values())?)
             }
             StackTarget::Effect(effect) => {
-                // Only the selected layer's effective mask may supply a frame, including an instance's inherited mask
+                // An instance can show a frame from its inherited mask
                 let owner = layers.mask_owner(selected);
                 let mask = layers.layer(owner).ok()?.mask.as_ref()?;
                 let mask_effect = mask.effects.iter().find(|candidate| candidate.id == effect)?;
                 let EffectKind::Fill { projection, source, .. } = &mask_effect.kind else { return None };
 
-                (owner, Some(effect), projection, vec![source])
+                (owner, Some(effect), placeable_projection(projection, std::iter::once(source))?)
             }
             StackTarget::Mask => return None,
         };
-
-        // An axis planar reading a pattern keeps its axis (see [`placing_moves_pattern`]): it has no frame to move
-        let unplaced = matches!(projection, Projection::Planar { placed: None, .. });
-        if unplaced && placing_moves_pattern(sources.into_iter()) {
-            return None;
-        }
 
         let placed = placed_from_axis(projection, app.viewport_mesh_bounds.get(&app.session.mesh));
 
@@ -113,7 +112,7 @@ impl FrameGizmo {
         };
         let (origin, across, up, out) = decal_axes(&decal)?;
 
-        // The corners on screen: a warp's pulled ones, or the frame's own
+        // Warp corners can sit away from the frame corners
         let at = |[x, y]: [f32; 2]| project(app, rect, origin + across * x * decal.size[0] + up * y * decal.size[1]);
         let corners = match warp {
             Some([top_left, top_right, bottom_right, bottom_left]) => [at(top_left)?, at(top_right)?, at(bottom_right)?, at(bottom_left)?],
@@ -126,27 +125,14 @@ impl FrameGizmo {
         let sides = [0, 1, 2, 3].map(|side| corners[side].lerp(corners[(side + 1) % 4], 0.5));
         let center = project(app, rect, origin)?;
 
-        // Screen movement per world unit along each direction, and an arrow along each one not pointing at the camera
+        // Arrows use the same screen steps as the drag
         let reach = decal.size[0].max(decal.size[1]);
         let axes = [across, up, out];
         let steps = axes.map(|axis| Some((project(app, rect, origin + axis * reach)? - center) / reach.max(f32::MIN_POSITIVE)));
         let arrows = steps.map(|step| step.filter(|step| step.length() * reach > MIN_SCREEN_SPAN).map(|step| center + step.normalized() * ARROW));
 
-        // The turn ring, unless the frame is seen too near edge on to grab it
-        let ring = steps[0]
-            .zip(steps[1])
-            .filter(|(across_step, up_step)| {
-                across_step.length() > f32::EPSILON && solve(*across_step, *up_step, egui::Vec2::X).is_some() && ring_open(app, rect, center, out)
-            })
-            .and_then(|(step, _)| {
-                let radius = TURN_RING / step.length();
-                let last = (TURN_RING_POINTS - 1) as f32;
-                let points = (0..TURN_RING_POINTS).map(|index| {
-                    let (sin, cos) = (index as f32 / last * std::f32::consts::TAU).sin_cos();
-                    project(app, rect, origin + (across * cos + up * sin) * radius)
-                });
-                points.collect::<Option<Vec<_>>>()?.try_into().ok()
-            });
+        // The ring can still project when an arrow's endpoint is behind the camera
+        let ring = if ring_open(app, rect, center, out) { turn_ring(app, rect, center, origin, across, up) } else { None };
 
         Some(FrameGizmo { layer, effect, decal, warp, corners, sides, center, arrows, ring, origin, axes, steps })
     }
@@ -196,6 +182,49 @@ const MIN_RING_FACING: f32 = (SHAFT_WIDTH + SHAFT_HALO_EXTRA_WIDTH) / TURN_RING;
 /// Whether a turn ring round `axis`, centred on screen at `center`, is seen open enough to show and grab
 pub(crate) fn ring_open(app: &TextureCraftApp, rect: Rect, center: Pos2, axis: Vec3) -> bool {
     view_ray(app, rect, center).dir.dot(axis).abs() >= MIN_RING_FACING
+}
+
+/// Project a circle in the frame's plane whose longest screen reach is `TURN_RING` points.
+fn turn_ring(app: &TextureCraftApp, rect: Rect, center: Pos2, origin: Vec3, across: Vec3, up: Vec3) -> Option<[Pos2; TURN_RING_POINTS]> {
+    const RING_SEGMENTS: usize = TURN_RING_POINTS - 1;
+
+    let view_projection = app.session.camera.view_proj(rect.width() / rect.height().max(1.0));
+    let center_clip = view_projection * origin.extend(1.0);
+    let center_ndc = center_clip / center_clip.w;
+    let half_size = rect.size() * 0.5;
+
+    // The z component tracks how the perspective divisor changes per world unit
+    let screen_step = |axis: Vec3| {
+        let clip_step = (view_projection * axis.extend(0.0)) / center_clip.w;
+        let ndc_numerator = clip_step - center_ndc * clip_step.w;
+        Vec3::new(ndc_numerator.x * half_size.x, -ndc_numerator.y * half_size.y, clip_step.w)
+    };
+    let across_step = screen_step(across);
+    let up_step = screen_step(up);
+    let ring_steps: [Vec3; RING_SEGMENTS] = std::array::from_fn(|index| {
+        let (sin, cos) = (index as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU).sin_cos();
+        across_step * cos + up_step * sin
+    });
+
+    // Solve radius * length(xy) / (1 + radius * z) <= TURN_RING for every sample
+    let limiting_growth = ring_steps.iter().map(|step| step.truncate().length() - TURN_RING * step.z).fold(0.0, f32::max);
+    if !limiting_growth.is_finite() || limiting_growth <= f32::EPSILON {
+        return None;
+    }
+
+    let radius = TURN_RING / limiting_growth;
+    let mut ring = [center; TURN_RING_POINTS];
+    for (point, step) in ring.iter_mut().zip(ring_steps) {
+        let depth = 1.0 + radius * step.z;
+        if !depth.is_finite() || depth <= f32::EPSILON {
+            return None;
+        }
+
+        *point += vec2(step.x, step.y) * (radius / depth);
+    }
+    ring[RING_SEGMENTS] = ring[0];
+
+    Some(ring)
 }
 
 /// `delta` as a mix of screen steps `across_step` and `up_step` (None when they are parallel on screen)
@@ -676,6 +705,84 @@ pub(crate) mod tests {
         assert_eq!(corners, Projection::FRAME_CORNERS, "its corners stay where they are on the frame");
     }
 
+    /// The longest reach stays near the intended screen radius as the camera orbits.
+    #[test]
+    fn the_ring_keeps_its_screen_size_at_oblique_angles() {
+        const MAX_RING_SHARE: f32 = 1.25;
+        const MIN_RING_SHARE: f32 = 0.6;
+        const ORBIT_DEGREES: [f32; 6] = [0.0, 40.0, 60.0, 75.0, 80.0, 84.0];
+        const ZOOM_OUT_EXPONENT: f32 = 1.5;
+        const MAX_FORESHORTENED_ACROSS_TO_UP_RATIO: f32 = 0.4;
+
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for kind in ["planar", "warp"] {
+            let (mut harness, _) = fill_app(kind);
+            let mut foreshortened_shown = false;
+
+            // A distant view isolates the foreshortening
+            harness.state_mut().session.camera.zoom(-ZOOM_OUT_EXPONENT);
+            for degrees in ORBIT_DEGREES {
+                harness.state_mut().session.camera.set_angles(degrees.to_radians(), 0.0);
+                harness.run_steps(2);
+
+                let shown = gizmo(&harness);
+                let Some(ring) = shown.ring else { continue };
+                let reach = ring.iter().map(|at| at.distance(shown.center)).fold(0.0, f32::max);
+                let across_step = shown.steps[0].unwrap().length();
+                let up_step = shown.steps[1].unwrap().length();
+
+                assert!(
+                    (TURN_RING * MIN_RING_SHARE..=TURN_RING * MAX_RING_SHARE).contains(&reach),
+                    "{kind} orbited {degrees} degrees: the ring reaches {reach} points"
+                );
+
+                foreshortened_shown |= across_step < up_step * MAX_FORESHORTENED_ACROSS_TO_UP_RATIO;
+            }
+
+            assert!(foreshortened_shown, "{kind}: the ring was checked with the across direction foreshortened");
+        }
+    }
+
+    #[test]
+    fn the_ring_keeps_its_screen_size_when_the_oblique_frame_is_turning_near_the_camera() {
+        const FRAME_SIDE: f32 = 4.0;
+        const LARGE_FRAME_SIDE: f32 = 5.0;
+        const CAMERA_DISTANCE: f32 = 4.0;
+        const ORBIT_DEGREES: f32 = 65.0;
+        const EDGE_ON_ANGLE: f32 = std::f32::consts::FRAC_PI_2;
+        const MIN_RING_SHARE: f32 = 0.75;
+        const MAX_RING_SHARE: f32 = 1.25;
+
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for kind in ["planar", "warp"] {
+            let (mut harness, layer) = fill_app(kind);
+            let camera = &mut harness.state_mut().session.camera;
+            camera.distance = CAMERA_DISTANCE;
+            camera.set_angles(ORBIT_DEGREES.to_radians(), 0.0);
+
+            // Reverse the frame axes, then put a large frame's across step behind the camera
+            for (rotation_degrees, side) in [(-45.0, FRAME_SIDE), (135.0, FRAME_SIDE), (0.0, LARGE_FRAME_SIDE)] {
+                let size = [side; 2];
+                harness.state_mut().run("layer.decal.set", json!({"layer": layer.0, "size": size, "rotation": rotation_degrees})).unwrap();
+                harness.run_steps(2);
+
+                let shown = gizmo(&harness);
+                let ring = shown.ring.unwrap_or_else(|| panic!("{kind} turned {rotation_degrees} degrees: the oblique ring should show"));
+                let reach = ring.iter().map(|point| point.distance(shown.center)).fold(0.0, f32::max);
+
+                assert!(
+                    (TURN_RING * MIN_RING_SHARE..=TURN_RING * MAX_RING_SHARE).contains(&reach),
+                    "{kind} turned {rotation_degrees} degrees: the ring reaches {reach} points"
+                );
+            }
+
+            harness.state_mut().session.camera.set_angles(EDGE_ON_ANGLE, 0.0);
+            harness.run_steps(2);
+
+            assert!(gizmo(&harness).ring.is_none(), "{kind}: hide the ring when the frame is edge-on");
+        }
+    }
+
     /// Losing the focus mid-drag (Alt+Tab) ends a frame drag as a release does: one undo step, and moves after it (egui still has the button down) leave the frame alone
     #[test]
     fn losing_the_window_focus_ends_a_frame_drag() {
@@ -840,7 +947,7 @@ pub(crate) mod tests {
         click(&mut harness, eye.center());
 
         assert!(!harness.state().session.doc.project.display.projection_gizmos, "the eye hides the gizmos");
-        assert!(FrameGizmo::shown(harness.state(), harness.state().viewport_rect).is_none(), "the 3D view has no frame to draw or grab");
+        assert!(crate::projection_gizmo::ShownGizmo::of(harness.state(), harness.state().viewport_rect).is_none(), "the 3D view has no frame to draw or grab");
 
         let before = projection(&harness, layer);
         drag(&mut harness, shown.center, shown.center + vec2(30.0, 0.0), Modifiers::NONE);
