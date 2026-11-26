@@ -154,6 +154,7 @@ fn render_filter_preview(kind: EffectKind, size: usize, res: u32, shapes: bool) 
         block_scales: p.texture_set(0).map(|set| set.block_scales()).unwrap_or_default(),
         preview: None,
         images: &images,
+        graphs: texturecraft_compose::GraphStore::empty(),
         bounds: mesh.bounds(),
     };
     let mut out = texturecraft_compose::Composite::new(&CHANNELS, res);

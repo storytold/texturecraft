@@ -75,7 +75,9 @@ impl ProjectorOutline {
                 }
                 ProjectorOutline { lines, tip: None, center: place.world(place.local) }
             }
-            Projection::Planar { placed: Some(_), .. } | Projection::Warp { .. } | Projection::Uv { .. } | Projection::UvTile => return None,
+            Projection::Planar { placed: Some(_), .. } | Projection::Warp { .. } | Projection::Uv { .. } | Projection::UvTile | Projection::Placed(_) => {
+                return None;
+            }
         };
         let finite = outline.points().all(|point| point.is_finite()) && outline.center.is_finite();
         finite.then_some(outline)

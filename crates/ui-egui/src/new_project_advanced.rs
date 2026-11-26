@@ -188,6 +188,7 @@ fn create_project(app: &mut TextureCraftApp) -> bool {
             app.session.switch_to(next);
             app.pbr_import = None;
             app.resize = None;
+            app.queued_resize = None;
             app.layer_panel = Default::default();
             app.camera_glide = None;
             true

@@ -6,16 +6,17 @@
 //! everything the cached part reads; any change to it empties the cache, so results are always
 //! identical to a full evaluation.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Weak};
 
 use texturecraft_core::project::MAX_DEPTH;
-use texturecraft_core::{BakedMap, Channel, EffectKind, Filter, Layer, LayerId, LayerKind, Project, Source, TextureSet};
+use texturecraft_core::{BakedMap, Channel, CompositeRules, EffectKind, Filter, GraphInput, Layer, LayerId, LayerKind, Project, Source, TextureSet};
 use texturecraft_geom::Mesh;
 use texturecraft_texel::TileImage;
 
 use crate::eval::{Inputs, PaintTarget, lights_material};
+use crate::field_cache::SetFieldCache;
 use crate::held_fields::HeldFields;
 use crate::image_identity::ImageIdentity;
 use crate::store::{BakedMaps, ImageStore, PixelStore};
@@ -46,6 +47,9 @@ pub struct BelowCache {
     /// Tiles of the whole pass a caller splits into several composites (0: each composite is a
     /// pass). A pass larger than the cache records only what fits.
     pub pass: usize,
+    /// Whole-set fields of graph filters reading the stack, kept across composites (see
+    /// [`SetFieldCache`]). Not emptied with the tiles: they do not depend on the hot layer.
+    pub fields: SetFieldCache,
     /// Tiles the caller composites next in this pass, after those of the coming composite (empty: none, or a pass that is one
     /// composite). A stack with neighbourhood filters then filters the coming tiles and these at once and keeps the result for
     /// the composites that follow, instead of filtering each small chunk's surroundings again.
@@ -67,6 +71,7 @@ impl Default for BelowCache {
             budget: BELOW_BUDGET,
             levels: 1,
             pass: 0,
+            fields: SetFieldCache::default(),
             ahead: Vec::new(),
             held: None,
         }
@@ -98,6 +103,7 @@ pub(crate) struct Level {
 pub struct StackKey {
     /// The texture set without its name, description, stack and bake settings.
     set: TextureSet,
+    rules: CompositeRules,
     roots: Vec<LayerId>,
     /// The layers drawn, without names and other display-only fields.
     layers: Vec<Layer>,
@@ -122,7 +128,7 @@ impl StackKey {
     }
 
     /// The key of the layers in `render_tree` (and their effects), drawn as `roots` arrange them.
-    fn of_tree(
+    pub(crate) fn of_tree(
         project: &Project,
         pixels: &PixelStore,
         baked: &BakedMaps,
@@ -148,33 +154,37 @@ impl StackKey {
             })
             .collect();
 
-        let mut referenced_images = BTreeSet::new();
-        if !images.is_empty() {
-            let mut record_image_name = |name: &str| {
-                if let Some((name, _)) = images.get_key_value(name) {
-                    referenced_images.insert(name);
+        // Compare only referenced image origins. Looking up an origin does not decode its pixels.
+        let mut image_identities = BTreeMap::new();
+        let mut record_image_name = |name: &str| {
+            if let Some((name, origin)) = images.origin(name) {
+                image_identities.entry(name).or_insert_with(|| ImageIdentity::new(origin));
+            }
+        };
+        for layer in render_tree.iter().filter_map(|id| project.layers.get(id)) {
+            if let LayerKind::Fill(fill) = &layer.kind {
+                fill.sources.values().flat_map(Source::images).for_each(&mut record_image_name);
+            }
+            for effect in layer.mask.iter().flat_map(|mask| &mask.effects).chain(&layer.content_effects) {
+                // A filter's image inputs, also one its mode leaves unread: that only empties the cache more often
+                effect.inputs.values().flat_map(Source::images).for_each(&mut record_image_name);
+                match &effect.kind {
+                    EffectKind::Fill { source, .. } => source.images().into_iter().for_each(&mut record_image_name),
+                    EffectKind::Material(fill) => fill.sources.values().flat_map(Source::images).for_each(&mut record_image_name),
+                    EffectKind::Generator(generator) => generator.sources().flat_map(Source::images).for_each(&mut record_image_name),
+                    EffectKind::ColorSelection(selection) => selection.id_map.iter().for_each(|name| record_image_name(name)),
+                    _ => {}
                 }
-            };
-            for layer in render_tree.iter().filter_map(|id| project.layers.get(id)) {
-                if let LayerKind::Fill(fill) = &layer.kind {
-                    fill.sources.values().flat_map(Source::images).for_each(&mut record_image_name);
-                }
-                for effect in layer.mask.iter().flat_map(|mask| &mask.effects).chain(&layer.content_effects) {
-                    // A filter's image inputs, also one its mode leaves unread: that only empties the cache more often
-                    effect.inputs.values().flat_map(Source::images).for_each(&mut record_image_name);
-                    match &effect.kind {
-                        EffectKind::Fill { source, .. } => source.images().into_iter().for_each(&mut record_image_name),
-                        EffectKind::Material(fill) => fill.sources.values().flat_map(Source::images).for_each(&mut record_image_name),
-                        EffectKind::Generator(generator) => generator.sources().flat_map(Source::images).for_each(&mut record_image_name),
-                        EffectKind::ColorSelection(selection) => selection.id_map.iter().for_each(|name| record_image_name(name)),
-                        _ => {}
+            }
+            for graph in layer.graphs().into_iter().flat_map(|graph| graph.graphs()) {
+                for input in graph.inputs.values() {
+                    if let GraphInput::Image(name) = input {
+                        record_image_name(name);
                     }
                 }
             }
         }
-
-        let image_identities =
-            referenced_images.into_iter().filter_map(|name| images.get(name).map(|image| (name.clone(), ImageIdentity::new(image)))).collect();
+        let image_identities = image_identities.into_iter().map(|(name, identity)| (name.clone(), identity)).collect();
 
         let lit = render_tree
             .iter()
@@ -182,12 +192,13 @@ impl StackKey {
             .flat_map(|layer| layer.content_effects.iter())
             .any(|effect| matches!(effect.kind, EffectKind::Filter(Filter::EnvironmentLighting { .. })));
         let environment = lit.then(|| {
-            let image = project.display.environment_resource().and_then(|name| images.get(name)).map(ImageIdentity::new);
+            let image = project.display.environment_resource().and_then(|name| images.origin(name)).map(|(_, origin)| ImageIdentity::new(origin));
             (project.display.environment.clone(), project.display.env_rotation.to_bits(), image)
         });
 
         Some(StackKey {
             set,
+            rules: project.rules,
             roots,
             layers: render_tree.iter().filter_map(|id| project.layers.get(id)).map(render_view).collect(),
             pixels: pixel_handles,
@@ -203,7 +214,13 @@ impl StackKey {
     /// changed (same set, roots, layers, baked maps and images; the same images by id, channel
     /// and size). None when anything else differs: the caller recomposites everything.
     pub fn changed_tiles(&self, other: &StackKey) -> Option<BTreeSet<(u32, u32)>> {
+        self.changed_paint(other).map(|targets| targets.into_values().flatten().collect())
+    }
+
+    /// Changed source tiles grouped by the paint target whose filter stack reads them.
+    pub fn changed_paint(&self, other: &StackKey) -> Option<BTreeMap<PaintTarget, BTreeSet<(u32, u32)>>> {
         if self.set != other.set
+            || self.rules != other.rules
             || self.roots != other.roots
             || self.layers != other.layers
             || self.baked != other.baked
@@ -218,7 +235,7 @@ impl StackKey {
         }
 
         let size = self.set.size();
-        let mut changed = BTreeSet::new();
+        let mut changed = BTreeMap::new();
         for ((left_id, left_channel, left_image), (right_id, right_channel, right_image)) in self.pixels.iter().zip(&other.pixels) {
             let (left_image, right_image) = (&left_image.0, &right_image.0);
             let same_shape = left_id == right_id
@@ -227,8 +244,7 @@ impl StackKey {
                 && left_image.height() == right_image.height()
                 && left_image.comps() == right_image.comps();
 
-            // Image tiles are composite tiles only when the grids coincide
-            if !same_shape || (left_image.width(), left_image.height()) != size {
+            if !same_shape {
                 return None;
             }
 
@@ -236,6 +252,11 @@ impl StackKey {
                 continue;
             }
 
+            // Unchanged resampled instances do not constrain the grid of another target.
+            if (left_image.width(), left_image.height()) != size {
+                return None;
+            }
+            let target = if left_channel.is_some() { PaintTarget::Layer(*left_id) } else { PaintTarget::Mask(*left_id) };
             for tile_y in 0..left_image.tiles_y() {
                 for tile_x in 0..left_image.tiles_x() {
                     let equal = match (left_image.tile_handle(tile_x, tile_y), right_image.tile_handle(tile_x, tile_y)) {
@@ -244,7 +265,7 @@ impl StackKey {
                         _ => false,
                     };
                     if !equal {
-                        changed.insert((tile_x, tile_y));
+                        changed.entry(target).or_insert_with(BTreeSet::new).insert((tile_x, tile_y));
                     }
                 }
             }
@@ -255,7 +276,9 @@ impl StackKey {
 
 /// An image compared by tile identity: holding the clone keeps its tiles alive, and a tile
 /// rewritten since is a different allocation (copy-on-write), so pointer equality means the
-/// same pixels without reading them.
+/// same pixels without reading them. An image read lazily from the project file and unchanged
+/// since is the same as long as its source is (see [`TileImage::same_tiles`]): a key taken before
+/// its tiles were read stays equal after.
 #[derive(Debug)]
 struct Shared(TileImage);
 
@@ -277,15 +300,16 @@ impl PartialEq for Shared {
 }
 
 /// Ids of a layer's mask and content effects.
-fn effect_ids(l: &Layer) -> impl Iterator<Item = LayerId> + '_ {
+pub(crate) fn effect_ids(l: &Layer) -> impl Iterator<Item = LayerId> + '_ {
     l.mask.iter().flat_map(|m| m.effects.iter()).chain(l.content_effects.iter()).map(|e| e.id)
 }
 
-/// A layer as far as compositing is concerned (names, color tags and folding don't matter).
+/// A layer as far as compositing is concerned (names, color tags, folding and locks don't matter).
 fn render_view(l: &Layer) -> Layer {
     let mut l = l.clone();
     l.name.clear();
     l.color_tag = None;
+    l.lock = None;
     if let LayerKind::Group { collapsed, .. } = &mut l.kind {
         *collapsed = false;
     }
@@ -296,6 +320,9 @@ impl BelowCache {
     pub(crate) fn bind_mesh(&mut self, mesh: &Arc<Mesh>) {
         if !std::ptr::eq(self.mesh.as_ptr(), mesh.as_ref()) {
             self.clear();
+
+            // Whole-set fields are keyed by the stack only, so another mesh drops them too
+            self.fields.clear();
             self.borrowed_mesh_key = None;
             self.mesh = Arc::downgrade(mesh);
         }
@@ -330,6 +357,7 @@ impl BelowCache {
         let key = key.finish();
         if self.borrowed_mesh_key != Some(key) {
             self.clear();
+            self.fields.clear();
             self.mesh = Weak::new();
             self.borrowed_mesh_key = Some(key);
         }
@@ -358,6 +386,12 @@ impl BelowCache {
         self.bytes = 0;
         self.key = None;
         self.held = None;
+    }
+
+    /// A parked material can reuse its bands later. Look-ahead fields belong to the old pass.
+    pub fn finish_pass(&mut self) {
+        self.held = None;
+        self.ahead.clear();
     }
 
     pub fn bytes(&self) -> usize {
@@ -432,18 +466,27 @@ impl BelowCache {
     /// The path to the hot layer for `inp`: everything off the path is served from the cache.
     /// None when the hot layer is not drawn in the set (or drawn twice), when there is nothing
     /// to cache, or when the cached part could change (anchors read the stack, or it holds the
-    /// live stroke). Empties the cache when what the cached part reads changed.
+    /// live stroke, or effect layers start from it). Empties the cache when what the cached part reads changed.
     pub(crate) fn prepare(&mut self, inp: &Inputs) -> Option<Vec<Level>> {
         let hot = self.hot?;
         let project = inp.project;
+        // The stack values it keeps carry no coverage, which the measured blend rules read: such a project (an
+        // imported one) is composited whole.
+        if project.rules.blend.is_measured() {
+            return None;
+        }
         let set = project.texture_set(inp.ts).ok()?;
 
-        // Replaying cached colors would reuse the material below a lighting or validation effect
+        // Stack readers, effect layers and lighting or validation effects read the stack below them
+        let reads_below = |layer: &Layer| {
+            layer.reads_stack()
+                || Channel::ALL.iter().any(|channel| crate::eval::starts_from_below(layer, *channel))
+                || layer.content_effects.iter().any(|effect| effect.visible && lights_material(&effect.kind))
+        };
         if project
             .render_tree(&set.stack)
             .iter()
-            .filter_map(|id| project.layers.get(id))
-            .any(|layer| layer.reads_stack() || layer.content_effects.iter().any(|effect| effect.visible && lights_material(&effect.kind)))
+            .any(|id| project.layers.get(id).is_some_and(reads_below) || project.content_layer(*id).is_some_and(reads_below))
         {
             if self.key.is_some() {
                 self.clear();

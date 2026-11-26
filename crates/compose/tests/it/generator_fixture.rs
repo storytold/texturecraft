@@ -40,6 +40,7 @@ impl GeneratorFixture {
             block_scales: self.project.texture_sets[0].block_scales(),
             preview: None,
             images: &self.images,
+            graphs: texturecraft_compose::GraphStore::empty(),
             bounds: self.mesh.bounds(),
         };
         mask_at(&inputs, self.layer, texels).unwrap()

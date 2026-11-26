@@ -111,6 +111,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         let mut v = Vec::new();
         v.extend(crate::view_cmds::edit_specs());
         v.extend(crate::layer_cmds::specs());
+        v.extend(crate::graph_param_cmds::specs());
         v.extend(crate::fill_material_cmds::specs());
         v.extend(crate::fill_reset_cmds::specs());
         v.extend(crate::folder_cmds::specs());
@@ -151,6 +152,10 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::decal_cmds::specs());
         v.extend(crate::warp_cmds::specs());
         v.extend(crate::text_cmds::specs());
+        v.extend(crate::lock_cmds::specs());
+        v.extend(crate::import_cmds::specs());
+        v.extend(crate::import_library_cmds::specs());
+        v.extend(crate::verify_cmds::specs());
         v
     })
 }
@@ -162,6 +167,7 @@ fn works_without_project(id: &str) -> bool {
         id,
         "file.open"
             | "file.new"
+            | "file.importProject"
             | "project.new"
             | "project.sample"
             | "project.inspect"

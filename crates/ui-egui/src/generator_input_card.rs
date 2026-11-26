@@ -35,6 +35,7 @@ pub(crate) fn input_card(
         (Some(Source::Image { name, .. }), _) => trf("Image: {name}", &[("name", name)]),
         (Some(Source::Anchor { anchor, channel, .. }), _) => anchor_label(app, *anchor, *channel),
         (Some(Source::Procedural { .. }), _) => tr("Procedural").to_string(),
+        (Some(Source::Graph(graph)), _) => trf("Graph: {name}", &[("name", &graph.name)]),
     };
 
     let image = match source {
@@ -59,7 +60,7 @@ pub(crate) fn input_card(
             (Some(Source::Uniform(value)), _) => {
                 painter.rect_filled(rect, 0.0, gray(value[0]));
             }
-            (Some(Source::Anchor { .. } | Source::Procedural { .. }), _) => {
+            (Some(Source::Anchor { .. } | Source::Procedural { .. } | Source::Graph(_)), _) => {
                 painter.rect_filled(rect, 0.0, tokens.button);
                 let glyph = egui_phosphor::regular::ANCHOR;
                 painter.text(rect.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(GLYPH_SIZE), tokens.text_dim);
@@ -91,7 +92,7 @@ pub(crate) fn input_card(
     if response.pick.clicked() {
         resource_picker::toggle(sheet.ui.ctx(), popup);
     }
-    let current = source.map(|source| source_choice(&app.session, source));
+    let current = source.and_then(|source| source_choice(&app.session, source));
     let tabs = || {
         let anchors = if slot.takes_anchor() { project_effect_anchors_below(&app.session.doc.project, layer, LayerId(id)) } else { Vec::new() };
         let mut tabs = source_tabs(&app.session, &anchors, tokens.button, false);

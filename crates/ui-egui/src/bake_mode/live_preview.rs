@@ -187,7 +187,8 @@ fn take_finished(app: &mut TextureCraftApp, ctx: &egui::Context) {
         app.live_preview.learn_drag_size(running.target.map, running.size, seconds, app.ui.bake_visualization.map_preview_size);
     }
     if let Some(data) = output.maps.remove(&running.target.map) {
-        let streamed = StreamedMap { map: running.target.map, index: 0, total: 1, resolution: output.resolution, height: output.height, data: Arc::new(data) };
+        let streamed =
+            StreamedMap { map: running.target.map, index: 0, total: 1, resolution: output.resolution, height: output.height, data: Arc::new(data.into()) };
         app.session.bake_preview_map(running.target.set, streamed);
     }
 

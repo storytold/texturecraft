@@ -16,6 +16,8 @@ pub struct SaveTask {
     archive: ProjectFile<Arc<Vec<u8>>, Arc<Vec<u8>>>,
     bake_paint: BakePaintMaps,
     uv_source: Option<Arc<Mesh>>,
+    stroke_replays: crate::stroke_replay::StrokeReplays,
+    mesh: Arc<Mesh>,
 }
 
 impl Session {
@@ -28,6 +30,8 @@ impl Session {
             archive: self.capture_archive(self.doc.resources.clone(), Arc::clone),
             bake_paint: self.doc.bake_paint.clone(),
             uv_source: self.saved_uv_source().cloned(),
+            stroke_replays: self.doc.stroke_replays.clone(),
+            mesh: self.mesh.clone(),
         }
     }
 }
@@ -37,9 +41,11 @@ impl SaveTask {
     /// RAM allowance also happens here.
     pub fn run(mut self, progress: Option<&SaveProgress>) -> Result<SaveOutput> {
         let mut reservation = texturecraft_formats::RamReservation::for_save().map_err(fe)?;
-        prepare_archive(&mut self.archive, self.uv_source.as_deref(), &self.bake_paint);
+        prepare_archive(&mut self.archive, self.uv_source.as_deref(), &self.bake_paint, (&self.stroke_replays, &self.mesh));
         drop(self.uv_source);
         drop(self.bake_paint);
+        drop(self.stroke_replays);
+        drop(self.mesh);
 
         let path = Path::new(&self.target.path);
         match progress {

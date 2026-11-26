@@ -52,7 +52,7 @@ fn high_poly_meshes_drive_the_bake_and_round_trip() {
 
     execute(&mut session, "bake.run", &json!({ "resolution": 128, "maps": ["opacity"], "dilation": 0 })).unwrap();
     let baked = &session.doc.baked[&0];
-    let opacity = &baked.maps[&BakedMap::Opacity];
+    let opacity = baked.maps[&BakedMap::Opacity].to_f32();
     let covered = opacity.iter().filter(|v| **v > 0.99).count() as f32 / opacity.len() as f32;
     assert!((covered - 0.5).abs() < 0.08, "the high poly covers half the plane: {covered}");
 
@@ -80,7 +80,7 @@ fn high_poly_meshes_drive_the_bake_and_round_trip() {
     // Without high polys the bake falls back to the low poly
     execute(&mut session, "bake.run", &json!({ "resolution": 128, "maps": ["opacity"] })).unwrap();
 
-    assert!(session.doc.baked[&0].maps[&BakedMap::Opacity].iter().all(|v| *v == 1.0));
+    assert!(session.doc.baked[&0].maps[&BakedMap::Opacity].iter().all(|v| v == 1.0));
     let _ = std::fs::remove_dir_all(std::path::Path::new(&high).parent().unwrap());
 }
 
@@ -380,7 +380,7 @@ fn quadrants_png() -> Vec<u8> {
 
 /// Check the alpha at the center of each baked quadrant
 fn assert_opacity_quadrants(session: &Session) {
-    let opacity = &session.doc.baked[&0].maps[&BakedMap::Opacity];
+    let opacity = session.doc.baked[&0].maps[&BakedMap::Opacity].to_f32();
     for ((x, y), alpha) in [((32, 32), 255.0), ((96, 32), 128.0), ((32, 96), 64.0), ((96, 96), 32.0)] {
         let actual = opacity[y * 128 + x];
         assert!((actual - alpha / 255.0).abs() < 2e-3, "texel {x},{y}: {actual} vs {alpha}/255");
@@ -445,7 +445,7 @@ fn opacity_samples_a_textured_gltf_high_poly() {
     assert!(session.log.iter().any(|l| l.contains("1 base color textures")), "{:?}", session.log);
     execute(&mut session, "bake.run", &json!({ "resolution": 128, "maps": ["opacity"], "dilation": 0 })).unwrap();
     assert_opacity_quadrants(&session);
-    assert!(session.doc.baked[&0].maps[&BakedMap::Opacity].iter().all(|o| *o > 0.0), "the high poly covers the plane");
+    assert!(session.doc.baked[&0].maps[&BakedMap::Opacity].iter().all(|o| o > 0.0), "the high poly covers the plane");
 
     // The textures come back with the project
     let reloaded = Session::from_project_bytes(&session.to_project_bytes().unwrap()).unwrap();
@@ -521,7 +521,7 @@ fn opacity_samples_textures_next_to_a_high_poly() {
     assert!(session.log.iter().any(|l| l.contains("tex/painted color.png was not found")), "{:?}", session.log);
     execute(&mut session, "bake.run", &json!({ "resolution": 128, "maps": ["opacity"], "dilation": 0 })).unwrap();
 
-    assert!(session.doc.baked[&0].maps[&BakedMap::Opacity].iter().all(|opacity| *opacity == 1.0));
+    assert!(session.doc.baked[&0].maps[&BakedMap::Opacity].iter().all(|opacity| opacity == 1.0));
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -719,7 +719,7 @@ fn obj_submesh_id_separates_objects_with_the_same_name_and_material() {
     session.doc.project.texture_sets[0].bake.maps.id.parameters.source = IdColorSource::Submesh;
     execute(&mut session, "bake.run", &json!({"resolution":128,"maps":["id"],"dilation":0})).unwrap();
     let map = &session.doc.baked[&0].maps[&BakedMap::Id];
-    let pixel = |x: usize| &map[(100 * 128 + x) * 3..(100 * 128 + x) * 3 + 3];
+    let pixel = |x: usize| [0, 1, 2].map(|component| map.get((100 * 128 + x) * 3 + component).unwrap());
     assert_ne!(pixel(10), pixel(74));
 }
 

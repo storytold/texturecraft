@@ -86,6 +86,13 @@ pub(crate) fn copy_tree(src: &Document, id: LayerId, s: &mut Document, ts: usize
         }
     }
 
+    // the texts of the graphs the layer runs travel with it
+    for key in layer.graphs().into_iter().flat_map(|g| g.text_keys()) {
+        if let Some(text) = src.graphs.texts.get(key) {
+            s.graphs.texts.entry(key.to_string()).or_insert_with(|| text.clone());
+        }
+    }
+
     if let LayerKind::Group { children, .. } = &mut copy.kind {
         children.clear();
     }
@@ -238,14 +245,9 @@ impl Session {
     }
 }
 
-/// Resample every painted image of texture set `ts` to `size` (after a size change).
-pub(crate) fn resample_set(doc: &mut Document, ts: usize, size: (u32, u32)) {
-    map_set_images(doc, ts, |img, empty| fit(img, size, empty));
-}
-
 /// Replace every painted image of texture set `ts` (layers, content and mask paint effects) by
 /// `f(image, empty texel)`.
-pub(crate) fn map_set_images(doc: &mut Document, ts: usize, f: impl Fn(&TileImage, &[u16]) -> TileImage) {
+pub(crate) fn map_set_images(doc: &mut Document, ts: usize, mut f: impl FnMut(&TileImage, &[u16]) -> TileImage) {
     let ids: Vec<LayerId> = doc.project.walk(ts).into_iter().map(|(id, _)| id).collect();
     let effect_ids: Vec<LayerId> = ids
         .iter()

@@ -1,16 +1,13 @@
 //! A fill's Material section: the channel strip, the orb with the Material | Channels switch, then one slot card per channel that is on (Channels) or the fill's whole material (Material)
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use egui::{Color32, Painter, Rect};
 use egui_phosphor::regular as ic;
 use serde_json::{Value, json};
 use texturecraft_engine::Session;
-use texturecraft_engine::compose::ImageRes;
+use texturecraft_engine::compose::ImageStore;
 use texturecraft_engine::core::{
-    Channel, ChannelKind, CookResolution, Fill, LayerId, LinkParam, MaterialLink, NormalFormat, OutputResolution, Procedural, ProceduralKind, ResolutionMode,
-    Source,
+    Channel, ChannelKind, CookResolution, Fill, GraphRef, LayerId, LinkParam, MaterialLink, NormalFormat, OutputResolution, Procedural, ProceduralKind,
+    ResolutionMode, Source,
 };
 use texturecraft_engine::fill_material_cmds::whole_materials;
 use texturecraft_engine::materials::find;
@@ -21,7 +18,7 @@ use crate::TextureCraftApp;
 use crate::color_picker::{ColorPick, SwatchEdit};
 use crate::dock::{anchors_below, project_effect_anchors_below, with};
 use crate::fill_panel::{FillKey, fill_key};
-use crate::i18n::{n_, tr};
+use crate::i18n::{n_, tr, trf};
 use crate::material_orb::material_orb;
 use crate::orb_material::OrbMaterial;
 use crate::pattern_panel::tile_generator_sections;
@@ -114,7 +111,21 @@ pub(crate) fn material_section(app: &mut TextureCraftApp, sheet: &mut PropertySh
         }
         None if mode == MATERIAL_MODE => whole_material_card(app, sheet, fill, base, &look, salt),
         _ => {
-            for channel in channels.into_iter().filter(|channel| on.contains(channel)) {
+            let shown: Vec<Channel> = channels.into_iter().filter(|channel| on.contains(channel)).collect();
+
+            // A graph that feeds several channels shows its parameters once
+            let mut graphs: Vec<&GraphRef> = Vec::new();
+            for channel in &shown {
+                if let Some(graph) = fill.sources.get(channel).and_then(Source::graph)
+                    && !graphs.iter().any(|other| other.shares_parameters_with(graph))
+                {
+                    graphs.push(graph);
+                    let target = with(base, json!({"channel": channel.id()}));
+                    sheet.embed(|ui| ui.push_id(("graph", channel.id()), |ui| crate::graph_params::show(app, ui, &target, graph)));
+                }
+            }
+
+            for channel in shown {
                 source_card(app, sheet, fill.source(channel), base, SourceSlot::Channel(channel), reader, false);
             }
         }
@@ -125,7 +136,7 @@ pub(crate) fn material_section(app: &mut TextureCraftApp, sheet: &mut PropertySh
 const LINK_EDITABLE: bool = cfg!(not(target_arch = "wasm32"));
 
 /// What the orb shows instead of the whole material, following the Layers panel's channel list: the channel picked there alone (None: the whole material)
-fn channel_orb_look(ui: &UiState, fill: &Fill, on: &[Channel], images: &HashMap<String, Arc<ImageRes>>) -> Option<OrbMaterial> {
+fn channel_orb_look(ui: &UiState, fill: &Fill, on: &[Channel], images: &ImageStore) -> Option<OrbMaterial> {
     (!ui.layer_material_view).then(|| OrbMaterial::of_channel(fill, ui.layer_channel, on, images))
 }
 
@@ -174,6 +185,7 @@ pub(crate) fn source_line(app: &TextureCraftApp, source: &Source) -> String {
             let name = app.session.doc.project.effect(*anchor).map_or_else(|| tr("missing").to_owned(), |(_, effect)| effect.name.clone());
             format!("{} · {name}", tr("Anchor"))
         }
+        Source::Graph(graph) => trf("Graph: {name}", &[("name", &graph.name)]),
     }
 }
 
@@ -207,7 +219,7 @@ pub(crate) fn source_card(
     let current = source_choice(&app.session, &source);
 
     // From Uniform the picker opens at the top, not at its Uniform tile at the end
-    let reveal = current != SourceChoice::Uniform;
+    let reveal = current != Some(SourceChoice::Uniform);
     let uniform = match source {
         Source::Uniform(value) => value,
         _ => slot_of.default_value(),
@@ -222,8 +234,8 @@ pub(crate) fn source_card(
         };
         source_tabs(&app.session, &anchors, shown_color(uniform), true)
     };
-    let picked = resource_picker::show(&slot.pick, popup, &mut app.thumbs, Some(&current), reveal, tabs);
-    if let Some(choice) = picked.filter(|choice| *choice != current) {
+    let picked = resource_picker::show(&slot.pick, popup, &mut app.thumbs, current.as_ref(), reveal, tabs);
+    if let Some(choice) = picked.filter(|choice| current.as_ref() != Some(choice)) {
         pick_source(app, sheet.ui.ctx(), slot_of, choice, &set);
     }
     if slot.clear {
@@ -263,7 +275,7 @@ pub(crate) fn source_card(
         Source::Anchor { anchor, channel, .. } if slot_of == SourceSlot::Grayscale && !crate::dock::anchor_in_mask(app, anchor) => {
             anchor_channel_row(app, sheet, base, reader, channel);
         }
-        Source::Image { .. } | Source::Anchor { .. } => {}
+        Source::Image { .. } | Source::Anchor { .. } | Source::Graph(_) => {}
     }
     sheet.close_card();
 }
@@ -300,16 +312,17 @@ fn pick_source(app: &mut TextureCraftApp, ctx: &egui::Context, slot_of: SourceSl
     }
 }
 
-/// The picker's choice `source` is: a library alpha's image is its alpha
-pub(crate) fn source_choice(session: &Session, source: &Source) -> SourceChoice {
-    match source {
+/// The picker's choice `source` is: a library alpha's image is its alpha; a graph's output is none of the tiles
+pub(crate) fn source_choice(session: &Session, source: &Source) -> Option<SourceChoice> {
+    Some(match source {
         Source::Uniform(_) => SourceChoice::Uniform,
         Source::Procedural { pattern, .. } => SourceChoice::Procedural(pattern.kind),
         Source::Image { name, .. } => {
             session.library_alpha(name).map_or_else(|| SourceChoice::Image(name.clone()), |alpha| SourceChoice::Alpha(alpha.id.as_str()))
         }
         Source::Anchor { anchor, .. } => SourceChoice::Anchor(*anchor),
-    }
+        Source::Graph(_) => return None,
+    })
 }
 
 /// The source picker's tabs: Resources (Procedurals, Textures with Import... first, Alphas in their shelf groups, Uniform) and the stack's Anchor points
@@ -344,7 +357,7 @@ fn tile(id: SourceChoice, label: &str, caption: Option<&'static str>, picture: T
 /// A uniform source: the colour bar (a click opens the picker) or the gray ramp with its invert glyph
 fn uniform_rows(app: &mut TextureCraftApp, sheet: &mut PropertySheet<'_>, slot_of: SourceSlot, value: [f32; 3], set: &impl Fn(Value) -> Value) {
     let label = slot_of.name();
-    if slot_of.kind() == ChannelKind::Color {
+    if matches!(slot_of.kind(), ChannelKind::Color | ChannelKind::Data) {
         let pick = sheet.color_bar(label, value, app.picking_color, &app.session.doc.project.swatches);
         if let Some(color) = take_color_pick(app, pick) {
             app.run("layer.fill.set", set(json!({"color": color, "merge": pick.merge})));
@@ -441,7 +454,7 @@ fn procedural_rows(
             edit = edit.or(Some(("invert", json!(edited.invert), false)));
         }
         let ends = [("low", tr("Low"), low), ("high", tr("High"), high)];
-        if slot_of.kind() == ChannelKind::Color {
+        if matches!(slot_of.kind(), ChannelKind::Color | ChannelKind::Data) {
             for (key, label, value) in ends {
                 let pick = sheet.color_bar_led(label, value, app.picking_color, &app.session.doc.project.swatches);
                 if let Some(picked) = take_color_pick(app, pick) {
@@ -625,11 +638,11 @@ mod tests {
         let mut ui = UiState::default();
         let on = [Channel::BaseColor, Channel::Roughness];
 
-        let whole = OrbMaterial::of_fill(&Fill::default(), &on, &HashMap::new());
-        let starting = channel_orb_look(&ui, &Fill::default(), &on, &HashMap::new());
+        let whole = OrbMaterial::of_fill(&Fill::default(), &on, &ImageStore::default());
+        let starting = channel_orb_look(&ui, &Fill::default(), &on, &ImageStore::default());
         ui.layer_material_view = false;
         ui.layer_channel = Channel::Roughness;
-        let roughness = channel_orb_look(&ui, &Fill::default(), &on, &HashMap::new()).unwrap();
+        let roughness = channel_orb_look(&ui, &Fill::default(), &on, &ImageStore::default()).unwrap();
 
         assert!(starting.is_none(), "the list starts on Material: the whole material");
         assert_eq!(whole.alone(), None);

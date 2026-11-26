@@ -22,7 +22,7 @@ fn fixture() -> GeneratorFixture {
 
 /// A baked map of `map` holding `value` everywhere
 fn uniform_map(map: BakedMap, value: f32) -> BakedMaps {
-    BakedMaps { resolution: RES, maps: [(map, Arc::new(vec![value; (RES * RES) as usize * map.components()]))].into() }
+    BakedMaps { resolution: RES, maps: [(map, Arc::new(vec![value; (RES * RES) as usize * map.components()].into()))].into() }
 }
 
 /// Every covered texel with its world position and normal
@@ -165,7 +165,7 @@ fn occlusion_balance_is_linear_and_brightness_lerps() {
 fn section_blur_spreads_occlusion_across_a_step() {
     let mut fixture = fixture();
     let step: Vec<f32> = (0..RES * RES).map(|index| if index % RES < RES / 2 { 0.0 } else { 1.0 }).collect();
-    fixture.baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, Arc::new(step))].into() };
+    fixture.baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, Arc::new(step.into()))].into() };
     let row: Vec<(u32, u32)> = surface(&fixture).iter().map(|point| point.0).filter(|texel| texel.0.abs_diff(RES / 2) <= 2).collect();
     assert!(!row.is_empty());
 

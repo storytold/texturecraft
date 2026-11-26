@@ -8,6 +8,7 @@ use super::cached_bytes::CachedBytes;
 use super::layout_map::LayoutMap;
 use super::slot::Slot;
 use super::{AnchorHeights, CURVATURE_CACHE, by_blocks, curvature_term, layout};
+use crate::Texels;
 use crate::eval::Inputs;
 
 /// The curvature a generator's micro details add
@@ -15,7 +16,7 @@ pub struct MicroCurvature {
     /// What they add to the curvature input
     pub term: LayoutMap,
     /// The baked curvature with the term added, which the detail sizes blur
-    pub curvature: Arc<Vec<f32>>,
+    pub curvature: Arc<Texels>,
 }
 
 impl MicroCurvature {
@@ -35,8 +36,8 @@ impl MicroCurvature {
                 let normal = normal.as_ref().map(|normal| normal.in_block(origin, size));
                 curvature_term(micro, height.as_ref(), normal.as_ref(), block)
             });
-            let adjusted = curvature.par_iter().zip(term.par_iter()).map(|(curvature, term)| curvature + term).collect();
-            MicroCurvature { term: LayoutMap { data: term, size }, curvature: Arc::new(adjusted) }
+            let adjusted = curvature.to_f32().par_iter().zip(term.par_iter()).map(|(curvature, term)| curvature + term).collect();
+            MicroCurvature { term: LayoutMap { data: term, size }, curvature: Arc::new(Texels::F32(adjusted)) }
         }))
     }
 }

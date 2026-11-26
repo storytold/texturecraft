@@ -1,8 +1,8 @@
 //! Isolated folder evaluation with the original stack available for anchor inputs.
 
 use super::{
-    Channel, ChannelKind, Composite, EvaluationInputs, Inputs, LayerId, ProjectorDepthCache, Tape, Texel, all_tiles, evaluation_channels, evaluation_fields,
-    plan, tile_texels, to_u16, to_u16_signed,
+    Acc, Channel, ChannelKind, Composite, EvaluationInputs, Inputs, LayerId, ProjectorDepthCache, Tape, Texel, all_tiles, evaluation_channels,
+    evaluation_fields, plan, tile_texels, to_u16, to_u16_signed,
 };
 
 /// Composite one layer over channel defaults, keeping anchors from the stack below it.
@@ -24,7 +24,7 @@ pub(crate) fn composite_layer(inputs: &Inputs, layer: LayerId, channel: Channel)
         for (x, y, offset) in tile_texels(inputs.gbuf, tile_x, tile_y) {
             let mut texel = Texel::new(inputs, x, y, offset, 0.0);
             texel.anchors_below(&full_stack, (layer, 0));
-            let mut values = Channel::ALL.map(Channel::default_value);
+            let mut values = Acc::defaults();
             if let Some(mut backdrop) = texel.below {
                 // Evaluate masks against the real backdrop, then show only this folder's contribution
                 texel.tape = Tape::Record(std::mem::take(&mut recorded));

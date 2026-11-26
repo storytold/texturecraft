@@ -170,6 +170,7 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
 /// OK: the working copy becomes the settings in use.
 fn apply(app: &mut TextureCraftApp, draft: SettingsDraft) {
     let libraries_changed = draft.prefs.libraries != app.ui.prefs.libraries;
+    let render_ram_changed = draft.prefs.render_ram_percent != app.ui.prefs.render_ram_percent;
     let previous_autosave_minutes = app.ui.prefs.autosave_minutes;
 
     // Display Settings can change the texture resolution while this draft is open
@@ -185,6 +186,9 @@ fn apply(app: &mut TextureCraftApp, draft: SettingsDraft) {
         };
     }
     app.ui.prefs.apply_resource_limits();
+    if render_ram_changed {
+        app.ui.prefs.apply_graph_budget();
+    }
 
     // The shelf reads the saved materials of the locations again
     if libraries_changed {
@@ -401,6 +405,25 @@ fn general(
     });
 
     section(ui, n_("LAYER STACK OPTIONS"));
+    row(ui, tr("Layer compositing"), |ui, label| {
+        egui::ComboBox::from_id_salt("layer_compositor")
+            .width(CONTROL_WIDTH)
+            .selected_text(if prefs.gpu_compositing { tr("GPU (Automatic)") } else { tr("CPU") })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut prefs.gpu_compositing, true, tr("GPU (Automatic)"));
+                ui.selectable_value(&mut prefs.gpu_compositing, false, tr("CPU"));
+            })
+            .response
+            .labelled_by(label)
+            .on_hover_text(tr("GPU uses the CPU on unsupported devices or layer stacks. CPU forces software composition."));
+    });
+
+    row(ui, tr("Low-resolution material preview"), |ui, label| {
+        ui.checkbox(&mut prefs.material_start_preview, "").labelled_by(label).on_hover_text(tr(
+            "Show a quick preview while detailed CPU tiles are prepared after opening or resizing. Sets composited on the GPU skip it. Turn off to see the finished tiles as they arrive.",
+        ));
+    });
+
     ui.horizontal(|ui| {
         ui.add_space(12.0);
         ui.add_enabled_ui(false, |ui| {
@@ -552,6 +575,13 @@ fn general(
                 .labelled_by(label)
                 .on_hover_text(tr("0 % uses at least 1 %"));
             let budget_bytes = texturecraft_engine::formats::save_ram_budget(available_ram_bytes, prefs.save_ram_percent);
+            ui.label(format!("≈ {:.2} GiB", budget_bytes as f64 / (1_u64 << 30) as f64));
+        });
+        row(ui, tr("Max RAM for graph renders"), |ui, label| {
+            ui.add(egui::DragValue::new(&mut prefs.render_ram_percent).range(1..=100).suffix(" %"))
+                .labelled_by(label)
+                .on_hover_text(tr("Graph renders running at once share this part of the RAM; a render waits until the others leave room for it."));
+            let budget_bytes = texturecraft_engine::compose::graphs::budget::limit_for_percent(prefs.render_ram_percent);
             ui.label(format!("≈ {:.2} GiB", budget_bytes as f64 / (1_u64 << 30) as f64));
         });
     }

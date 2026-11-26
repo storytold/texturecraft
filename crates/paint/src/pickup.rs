@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use texturecraft_compose::eval::FlatTile;
 use texturecraft_compose::{Composite, MASK_CHANNEL, PaintTarget};
-use texturecraft_core::Channel;
+use texturecraft_core::{Channel, ChannelKind};
 use texturecraft_geom::{NO_TRI, UvGBuffer};
 use texturecraft_texel::{TILE, TILE_AREA, TileImage, from_u16, to_u16};
 
-use crate::StampSource;
 use crate::commit::{dec, enc};
+use crate::{StampBlending, StampSource};
 
 mod lane;
 mod pickup_snapshot;
@@ -193,8 +193,8 @@ impl Pickup {
     /// Smudge with symmetry: every copy of the stamp (told apart by its [`StampSource`]) drags
     /// its own trail. A copy reads the texture as it was when the stroke began plus what it
     /// deposited itself, never what another copy deposited, so copies where they overlap (at the
-    /// mirror plane) do not smear each other. Their deposits still blend into the stroke, later
-    /// copies over earlier ones.
+    /// mirror plane) do not smear each other. Their deposits combine according to the brush's
+    /// stamp blending mode.
     pub fn isolate_copies(&mut self) {
         self.isolated = true;
     }
@@ -202,7 +202,7 @@ impl Pickup {
     /// Blend one stamp's texels `(x, y, alpha)` (stamp center `center` in texels, `source` the
     /// symmetry copy it belongs to, None for the stroke itself) into the stroke `alpha` and the
     /// carried values. False when nothing was deposited: the first smudge stamp only picks up.
-    pub fn stamp(&mut self, alpha: &mut TileImage, texels: &[(u32, u32, f32)], center: [f32; 2], source: Option<StampSource>) -> bool {
+    pub fn stamp(&mut self, alpha: &mut TileImage, texels: &[(u32, u32, f32)], center: [f32; 2], source: Option<StampSource>, blending: StampBlending) -> bool {
         if texels.is_empty() {
             return false;
         }
@@ -264,9 +264,9 @@ impl Pickup {
             self.reads.push((x, y, a));
         }
         if let Some(l) = &mut lane {
-            deposit(&mut l.alpha, &mut l.values, &self.reads, &self.read_values);
+            deposit(&mut l.alpha, &mut l.values, &self.reads, &self.read_values, blending);
         }
-        deposit(alpha, &mut self.values, &self.reads, &self.read_values);
+        deposit(alpha, &mut self.values, &self.reads, &self.read_values, blending);
         let painted = !self.reads.is_empty();
         self.put_back(lane, painted)
     }
@@ -298,19 +298,100 @@ fn covered(gbuf: &UvGBuffer, x: u32, y: u32) -> bool {
 }
 
 /// Blend the texels `reads` `(x, y, alpha)` with their `read_values` (one entry per channel of
-/// `values`, in order) into `alpha` and `values` ("over").
-fn deposit(alpha: &mut TileImage, values: &mut BTreeMap<Channel, TileImage>, reads: &[(u32, u32, f32)], read_values: &[[f32; 3]]) {
+/// `values`, in order) into `alpha` and `values`.
+fn deposit(alpha: &mut TileImage, values: &mut BTreeMap<Channel, TileImage>, reads: &[(u32, u32, f32)], read_values: &[[f32; 3]], blending: StampBlending) {
     let n = values.len();
     for (i, &(x, y, a)) in reads.iter().enumerate() {
         let m = from_u16(alpha.get(x, y)[0]);
-        let m2 = a + m * (1.0 - a);
+        let (previous, stamp) = blending.weights(m, a);
+        let weight = previous + stamp;
         for (k, (c, img)) in values.iter_mut().enumerate() {
             let Some(src) = read_values.get(i * n + k) else { continue };
             let old = get(img, *c, x, y);
-            put(img, *c, x, y, std::array::from_fn(|j| (src[j] * a + old[j] * m * (1.0 - a)) / m2.max(1e-6)));
+            put(img, *c, x, y, std::array::from_fn(|j| (src[j] * stamp + old[j] * previous) / weight.max(1e-6)));
         }
-        alpha.set(x, y, &[to_u16(m2)]);
+        alpha.set(x, y, &[to_u16(weight)]);
     }
+}
+
+/// One smudge stamp laid in place on an image of premultiplied values and coverage (a paint layer's channel or a mask's
+/// paint effect, `kind` its values' encoding): each texel `(x, y, a)` the stamp reaches becomes
+/// `(1 − a)·itself + a·(the image at (x, y) + shift)`, values and coverage alike, read bilinearly (texel centres at
+/// half texels, nothing outside the image) before any texel changes. Coverage moves with the values, so smudging
+/// from an empty place thins what is there. `shift` is in texels: from the stamp to the place it draws from, the
+/// previous stamp's centre.
+///
+/// The rule of strokes replayed from an imported project (measured on the reference app's smudge); live smudging
+/// carries the values in the stroke instead ([`Pickup`]).
+pub fn smudge_in_place(image: &mut TileImage, kind: ChannelKind, texels: &[(u32, u32, f32)], shift: [f32; 2]) {
+    let comps = image.comps();
+    if comps == 0 || !shift.iter().all(|v| v.is_finite()) {
+        return;
+    }
+    let n = comps - 1;
+    let empty = empty_texel(kind, comps);
+    let mut moved = vec![0.0f32; texels.len() * comps];
+    let mut corner = vec![0.0f32; comps];
+    for (&(x, y, _), out) in texels.iter().zip(moved.chunks_exact_mut(comps)) {
+        let (px, py) = (x as f32 + shift[0], y as f32 + shift[1]);
+        let (x0, y0) = (px.floor(), py.floor());
+        let (fx, fy) = (px - x0, py - y0);
+        for (dx, dy, w) in [(0, 0, (1.0 - fx) * (1.0 - fy)), (1, 0, fx * (1.0 - fy)), (0, 1, (1.0 - fx) * fy), (1, 1, fx * fy)] {
+            if w <= 0.0 {
+                continue;
+            }
+            decoded(image, kind, x0 as i64 + dx, y0 as i64 + dy, &mut corner);
+            for (o, c) in out.iter_mut().zip(&corner) {
+                *o += c * w;
+            }
+        }
+    }
+    let mut here = vec![0.0f32; comps];
+    let mut mixed = vec![0u16; comps];
+    for (&(x, y, a), source) in texels.iter().zip(moved.chunks_exact(comps)) {
+        let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 0.0 };
+        if a <= 0.0 {
+            continue;
+        }
+        decoded(image, kind, i64::from(x), i64::from(y), &mut here);
+        for (k, m) in mixed.iter_mut().enumerate() {
+            let v = here.get(k).copied().unwrap_or(0.0) * (1.0 - a) + source.get(k).copied().unwrap_or(0.0) * a;
+            *m = if k < n { enc(kind, v) } else { to_u16(v) };
+        }
+        if x >= image.width() || y >= image.height() {
+            continue;
+        }
+        let o = ((y % TILE) * TILE + x % TILE) as usize * comps;
+        if let Some(t) = image.tile_mut(x / TILE, y / TILE, &empty)
+            && let Some(dst) = t.get_mut(o..o + comps)
+        {
+            dst.copy_from_slice(&mixed);
+        }
+    }
+}
+
+/// Texel `(x, y)` of an image of values and coverage, decoded into `out` (values then coverage); outside the image
+/// and in unallocated tiles it is empty.
+fn decoded(image: &TileImage, kind: ChannelKind, x: i64, y: i64, out: &mut [f32]) {
+    out.iter_mut().for_each(|v| *v = 0.0);
+    if x < 0 || y < 0 || x >= i64::from(image.width()) || y >= i64::from(image.height()) {
+        return;
+    }
+    let (x, y, comps) = (x as u32, y as u32, image.comps());
+    let Some(t) = image.tile(x / TILE, y / TILE) else { return };
+    let o = ((y % TILE) * TILE + x % TILE) as usize * comps;
+    let n = comps.saturating_sub(1);
+    for (k, v) in out.iter_mut().enumerate().take(comps) {
+        let raw = t.get(o + k).copied().unwrap_or(0);
+        *v = if k < n { dec(kind, raw) } else { from_u16(raw) };
+    }
+}
+
+/// One empty texel: zero values (in the channel's encoding) and zero coverage.
+fn empty_texel(kind: ChannelKind, comps: usize) -> Vec<u16> {
+    let mut t = vec![enc(kind, 0.0); comps.saturating_sub(1)];
+    t.push(0);
+    t
 }
 
 /// Largest side of a stamp's texel bounding box.
@@ -327,7 +408,7 @@ fn extent(texels: &[(u32, u32, f32)]) -> f32 {
 mod tests {
     use super::*;
     use texturecraft_geom::primitives;
-    use texturecraft_texel::{TILE, to_u16};
+    use texturecraft_texel::{TILE, to_u16, to_u16_signed};
 
     /// A 64² plane (fully covered) whose roughness is `f(x)`.
     fn setup(f: impl Fn(u32) -> f32) -> (Composite, Arc<UvGBuffer>) {
@@ -387,6 +468,7 @@ mod tests {
                 pixels: Default::default(),
                 baked: Default::default(),
                 images: Default::default(),
+                graphs: Default::default(),
             };
             let mut pickup = Pickup::from_snapshot(PickupMode::Clone { offset: [i64::from(TILE), 0] }, snapshot, gbuf.clone(), [Channel::Roughness]);
             let mut alpha = TileImage::new(size, size, 1);
@@ -394,7 +476,7 @@ mod tests {
             assert!(pickup.loaded.is_empty());
 
             for x in [8, 12, TILE + 8] {
-                assert!(pickup.stamp(&mut alpha, &[(x, 8, 1.0)], [x as f32, 8.0], None));
+                assert!(pickup.stamp(&mut alpha, &[(x, 8, 1.0)], [x as f32, 8.0], None, StampBlending::Normal));
                 let image = &pickup.values[&Channel::Roughness];
                 assert!((from_u16(image.get(x, 8)[0]) - expected).abs() < 1e-4);
                 assert_eq!(pickup.mask_values().is_some(), matches!(target, PaintTarget::Mask(_)));
@@ -410,13 +492,13 @@ mod tests {
         let (c, g) = setup(|x| if x < 32 { 0.9 } else { 0.1 });
         let mut p = Pickup::new(PickupMode::Clone { offset: [-30, 0] }, c, g, [Channel::Roughness]);
         let mut alpha = TileImage::new(TILE, TILE, 1);
-        assert!(p.stamp(&mut alpha, &disc(45, 32, 4), [45.0, 32.0], None));
+        assert!(p.stamp(&mut alpha, &disc(45, 32, 4), [45.0, 32.0], None, StampBlending::Normal));
         let v = get(&p.values[&Channel::Roughness], Channel::Roughness, 45, 32);
         assert!((v[0] - 0.9).abs() < 1e-3, "{v:?}");
         assert!(from_u16(alpha.get(45, 32)[0]) > 0.99);
 
         // Sources outside the image are skipped
-        assert!(!p.stamp(&mut alpha, &disc(5, 5, 2), [5.0, 5.0], None));
+        assert!(!p.stamp(&mut alpha, &disc(5, 5, 2), [5.0, 5.0], None, StampBlending::Normal));
     }
 
     #[test]
@@ -426,7 +508,7 @@ mod tests {
             let mut pickup = Pickup::new(PickupMode::Clone { offset }, composite, gbuf, [Channel::Roughness]);
             let mut alpha = TileImage::new(TILE, TILE, 1);
 
-            let painted = pickup.stamp(&mut alpha, &[(1, 1, 1.0)], [1.0, 1.0], None);
+            let painted = pickup.stamp(&mut alpha, &[(1, 1, 1.0)], [1.0, 1.0], None, StampBlending::Normal);
 
             assert!(!painted);
             assert_eq!(alpha.allocated_count(), 0);
@@ -450,14 +532,14 @@ mod tests {
         let flat = vec![(Channel::Roughness, (0, 0), data)];
         let mut p = Pickup::from_layer(PickupMode::Clone { offset: [-30, 0] }, &flat, (TILE, TILE), g.clone(), [Channel::Roughness]);
         let mut alpha = TileImage::new(TILE, TILE, 1);
-        assert!(p.stamp(&mut alpha, &disc(45, 32, 3), [45.0, 32.0], None));
+        assert!(p.stamp(&mut alpha, &disc(45, 32, 3), [45.0, 32.0], None, StampBlending::Normal));
         let v = get(&p.values[&Channel::Roughness], Channel::Roughness, 45, 32)[0];
         assert!((v - 0.8).abs() < 1e-3, "straight value: {v}");
         assert!((from_u16(alpha.get(45, 32)[0]) - 0.5).abs() < 1e-3, "the layer's coverage scales the stroke");
 
         // Reading the layer's empty right half deposits nothing
         let mut q = Pickup::from_layer(PickupMode::Clone { offset: [30, 0] }, &flat, (TILE, TILE), g, [Channel::Roughness]);
-        assert!(!q.stamp(&mut TileImage::new(TILE, TILE, 1), &disc(20, 32, 3), [20.0, 32.0], None), "the source is the empty half");
+        assert!(!q.stamp(&mut TileImage::new(TILE, TILE, 1), &disc(20, 32, 3), [20.0, 32.0], None, StampBlending::Normal), "the source is the empty half");
     }
 
     #[test]
@@ -465,15 +547,15 @@ mod tests {
         let (c, g) = setup(|x| if x < 20 { 1.0 } else { 0.0 });
         let mut p = Pickup::new(PickupMode::Smudge { strength: 1.0 }, c, g, [Channel::Roughness]);
         let mut alpha = TileImage::new(TILE, TILE, 1);
-        assert!(!p.stamp(&mut alpha, &disc(18, 32, 5), [18.0, 32.0], None), "the first stamp only picks up");
+        assert!(!p.stamp(&mut alpha, &disc(18, 32, 5), [18.0, 32.0], None, StampBlending::Normal), "the first stamp only picks up");
         for cx in 20..30 {
-            p.stamp(&mut alpha, &disc(cx, 32, 5), [cx as f32, 32.0], None);
+            p.stamp(&mut alpha, &disc(cx, 32, 5), [cx as f32, 32.0], None, StampBlending::Normal);
         }
         let v = get(&p.values[&Channel::Roughness], Channel::Roughness, 30, 32)[0];
         assert!(v > 0.5 && from_u16(alpha.get(30, 32)[0]) > 0.99, "white dragged to the right: {v}");
 
         // A jump larger than the stamp deposits nothing
-        assert!(!p.stamp(&mut alpha, &disc(50, 10, 3), [50.0, 10.0], None));
+        assert!(!p.stamp(&mut alpha, &disc(50, 10, 3), [50.0, 10.0], None, StampBlending::Normal));
     }
 
     /// Two copies smudging through the same texels: copy B drags exactly what it would alone.
@@ -495,9 +577,9 @@ mod tests {
             let (xa, xb) = (18.0 + i as f32, 46.0 - i as f32);
             for (pickup, alpha, copies) in [(&mut isolated, &mut alpha_isolated, true), (&mut alone, &mut alpha_alone, false)] {
                 if copies {
-                    pickup.stamp(alpha, &disc(xa as u32, 32, 5), [xa, 32.0], a);
+                    pickup.stamp(alpha, &disc(xa as u32, 32, 5), [xa, 32.0], a, StampBlending::Normal);
                 }
-                pickup.stamp(alpha, &disc(xb as u32, 32, 5), [xb, 32.0], b);
+                pickup.stamp(alpha, &disc(xb as u32, 32, 5), [xb, 32.0], b, StampBlending::Normal);
             }
         }
         let lane_b = isolated.lanes.iter().find(|l| l.source == b).expect("copy B has its lane");
@@ -509,5 +591,59 @@ mod tests {
         }
         assert!(!lane_differs, "copy B drags what it would drag alone");
         assert!(stroke_differs, "the stroke shows both copies where they overlap");
+    }
+
+    /// A 64² image of `comps` (values then coverage) whose left `edge` columns hold `value` at full coverage.
+    fn half(kind: ChannelKind, comps: usize, edge: u32, value: f32) -> TileImage {
+        let mut img = TileImage::new(TILE, TILE, comps);
+        for y in 0..TILE {
+            for x in 0..edge {
+                let mut px = vec![enc(kind, value); comps - 1];
+                px.push(to_u16(1.0));
+                img.set(x, y, &px);
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn smudging_in_place_moves_values_and_coverage_from_the_shifted_place() {
+        // values on the left 20 columns; a dab at x 20..24 drawing from 4 texels to its left takes them over
+        let mut img = half(ChannelKind::Scalar, 2, 20, 0.8);
+        let dab: Vec<(u32, u32, f32)> = (20..24).map(|x| (x, 32, 1.0)).collect();
+        smudge_in_place(&mut img, ChannelKind::Scalar, &dab, [-4.0, 0.0]);
+        let px = img.get(22, 32);
+        assert!((from_u16(px[0]) - 0.8).abs() < 1e-3 && from_u16(px[1]) > 0.999, "{px:?}");
+        // half strength, half a texel of shift: a bilinear read mixed with what was there
+        let mut img = half(ChannelKind::Scalar, 2, 20, 0.8);
+        smudge_in_place(&mut img, ChannelKind::Scalar, &[(20, 32, 0.5)], [-0.5, 0.0]);
+        let px = img.get(20, 32);
+        assert!((from_u16(px[1]) - 0.25).abs() < 1e-3, "coverage 0.5 · (0.5 · 1 + 0.5 · 0): {px:?}");
+        assert!((from_u16(px[0]) - 0.2).abs() < 1e-3, "premultiplied value: {px:?}");
+        // drawing from the empty right thins what is there
+        let mut img = half(ChannelKind::Scalar, 2, 20, 0.8);
+        smudge_in_place(&mut img, ChannelKind::Scalar, &[(19, 32, 0.75)], [10.0, 0.0]);
+        let px = img.get(19, 32);
+        assert!((from_u16(px[1]) - 0.25).abs() < 1e-3 && (from_u16(px[0]) - 0.2).abs() < 1e-3, "{px:?}");
+    }
+
+    #[test]
+    fn smudging_in_place_reads_before_it_writes_and_keeps_signed_empties_empty() {
+        // every texel of a row draws from its left neighbour: one dab moves the row by one, not all the way
+        let mut img = half(ChannelKind::Scalar, 2, 1, 1.0);
+        let dab: Vec<(u32, u32, f32)> = (1..10).map(|x| (x, 0, 1.0)).collect();
+        smudge_in_place(&mut img, ChannelKind::Scalar, &dab, [-1.0, 0.0]);
+        assert!(from_u16(img.get(1, 0)[1]) > 0.999);
+        assert_eq!(img.get(2, 0)[1], 0);
+        // a signed channel: an empty texel holds the encoded 0, unallocated tiles read as empty, and so do texels moved in
+        let mut img = TileImage::new(2 * TILE, TILE, 4);
+        smudge_in_place(&mut img, ChannelKind::Signed, &[(TILE + 3, 3, 1.0)], [-(TILE as f32), 0.0]);
+        assert_eq!(img.get(TILE + 3, 3), [to_u16_signed(0.0), to_u16_signed(0.0), to_u16_signed(0.0), 0]);
+        assert_eq!(img.get(TILE + 4, 3)[0], to_u16_signed(0.0), "a tile allocated by the dab starts empty");
+        // nothing changes for a shift that is no number
+        let mut img = half(ChannelKind::Scalar, 2, 20, 0.8);
+        let before = img.get(10, 10);
+        smudge_in_place(&mut img, ChannelKind::Scalar, &[(10, 10, 1.0)], [f32::NAN, 0.0]);
+        assert_eq!(img.get(10, 10), before);
     }
 }

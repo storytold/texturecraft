@@ -43,7 +43,7 @@ pub enum ShelfPreview {
     /// A brush preset's stroke along an S curve
     Brush(&'static BrushPreset),
     /// A brush preset file the user saved, its stroke along an S curve
-    SavedBrush { path: PathBuf, settings: Option<BrushSettings>, image: Option<Arc<ImageRes>> },
+    SavedBrush { path: PathBuf, settings: Option<Arc<BrushSettings>>, image: Option<Arc<ImageRes>> },
     /// An image resource by name
     Image(String, Arc<ImageRes>),
     /// A built-in lighting environment's panorama
@@ -89,7 +89,7 @@ impl ShelfPreview {
     /// Preview a brush saved only in the current session
     pub fn session_brush(name: &str, brush: &BrushSettings, images: &ImageStore) -> Self {
         let image = brush.alpha_image.as_ref().and_then(|image_name| images.get(image_name)).cloned();
-        ShelfPreview::SavedBrush { path: session_brush_path(name), settings: Some(brush.clone()), image }
+        ShelfPreview::SavedBrush { path: session_brush_path(name), settings: Some(Arc::new(brush.clone())), image }
     }
 
     /// Smart materials preview on the orb, plain materials on a sphere
@@ -154,7 +154,7 @@ pub(crate) fn session_brush_path(name: &str) -> PathBuf {
 
 /// A saved brush preset's settings; None when the file can't be read (or in the browser, which has no files)
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn read_saved_brush(path: &std::path::Path) -> Option<BrushSettings> {
+pub(crate) fn read_saved_brush(path: &std::path::Path) -> Option<Arc<BrushSettings>> {
     use std::io::Read as _;
 
     let mut bytes = Vec::new();
@@ -167,11 +167,11 @@ pub(crate) fn read_saved_brush(path: &std::path::Path) -> Option<BrushSettings> 
         .map(|preset| preset.brush)
         .or_else(|_| serde_json::from_slice::<BrushSettings>(&bytes))
         .ok()
-        .map(|settings| settings.sanitized())
+        .map(|settings| Arc::new(settings.sanitized()))
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn read_saved_brush(_: &std::path::Path) -> Option<BrushSettings> {
+pub(crate) fn read_saved_brush(_: &std::path::Path) -> Option<Arc<BrushSettings>> {
     None
 }
 
@@ -275,10 +275,10 @@ mod tests {
     fn saved_brush_preview_uses_its_project_image_alpha() {
         let settings = BrushSettings { alpha_image: Some("alpha.png".into()), ..BrushSettings::default() };
         let transparent = Arc::new(ImageRes::new(2, 2, vec![[1.0, 1.0, 1.0, 0.0]; 4], false));
-        let preview = ShelfPreview::SavedBrush { path: PathBuf::from("brush.tcbrush"), settings: Some(settings.clone()), image: Some(transparent) };
+        let preview = ShelfPreview::SavedBrush { path: PathBuf::from("brush.tcbrush"), settings: Some(Arc::new(settings.clone())), image: Some(transparent) };
 
         assert!(preview.image(64).is_some_and(|image| image.pixels.iter().all(|pixel| pixel.r() == 0)));
-        let missing = ShelfPreview::SavedBrush { path: PathBuf::from("brush.tcbrush"), settings: Some(settings), image: None };
+        let missing = ShelfPreview::SavedBrush { path: PathBuf::from("brush.tcbrush"), settings: Some(Arc::new(settings)), image: None };
         assert!(missing.image(64).is_none());
     }
 }

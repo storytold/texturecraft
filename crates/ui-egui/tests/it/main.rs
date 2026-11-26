@@ -49,6 +49,7 @@ mod help_menu_664;
 mod high_poly_loading;
 mod history_panel;
 mod import_resources;
+mod import_windows;
 mod inactive_set_hint;
 mod instance_properties;
 mod layer_blending_options;

@@ -225,7 +225,7 @@ fn projector_of(projection: &Projection) -> Option<&Projector> {
         | Projection::Spherical { projector, .. }
         | Projection::Cylindrical { projector, .. }
         | Projection::Warp { projector, .. } => Some(projector),
-        Projection::Uv { .. } | Projection::UvTile => None,
+        Projection::Uv { .. } | Projection::UvTile | Projection::Placed(_) => None,
     }
 }
 
@@ -332,7 +332,7 @@ fn placement_rows(
         | Projection::Spherical { uv, .. }
         | Projection::Cylindrical { uv, .. }
         | Projection::Warp { uv, .. } => (uv.tiling, uv.rotation, uv.offset, "uvOffset"),
-        Projection::UvTile => return,
+        Projection::UvTile | Projection::Placed(_) => return,
     };
 
     let link_id = sheet.ui.make_persistent_id(("fill_tiling_link", fill_key(base)));
@@ -453,7 +453,7 @@ fn world_rows(app: &mut TextureCraftApp, sheet: &mut PropertySheet<'_>, fill: &F
         | Projection::Planar { offset, .. }
         | Projection::Spherical { offset, .. }
         | Projection::Cylindrical { offset, .. } => Some(*offset),
-        Projection::Warp { .. } | Projection::Uv { .. } | Projection::UvTile => None,
+        Projection::Warp { .. } | Projection::Uv { .. } | Projection::UvTile | Projection::Placed(_) => None,
     };
     if let Some(offset) = offset {
         let mut fields = xyz_fields(offset, OFFSET_FIELD_SPEED, 2, "");

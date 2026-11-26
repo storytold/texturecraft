@@ -9,7 +9,7 @@ use texturecraft_engine::core::{
     BakedMap, BlendMode, Channel, ChannelBlend, Effect, EffectKind, Layer, LayerId, LayerKind, LinkParam, Project, Projection, Sampling, Source,
 };
 use texturecraft_engine::paint::alpha_params::MAX_ALPHA_CONTRAST;
-use texturecraft_engine::paint::{BrushAlpha, BrushSettings, alphas};
+use texturecraft_engine::paint::{BrushAlpha, BrushSettings, StampBlending};
 use texturecraft_engine::{CloneFrom, StackTarget, Tool};
 
 use crate::TextureCraftApp;
@@ -889,7 +889,7 @@ fn content_glyph(p: &egui::Painter, tk: &Tokens, thumb: Rect, layer: &Layer) {
             let c = match f.source(Channel::BaseColor) {
                 Source::Uniform(v) => v,
                 Source::Procedural { low, high, .. } => [(low[0] + high[0]) * 0.5, (low[1] + high[1]) * 0.5, (low[2] + high[2]) * 0.5],
-                Source::Image { .. } | Source::Anchor { .. } => [0.5; 3],
+                Source::Image { .. } | Source::Anchor { .. } | Source::Graph(_) => [0.5; 3],
             };
             crate::thumbs::paint_sphere(p, thumb.center(), thumb.width() * 0.34, c);
         }
@@ -1232,7 +1232,7 @@ fn geometry_tool_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     let ts = app.session.doc.project.locate(layer.id).map_or(app.session.ts(), |(ts, _, _)| ts);
     let parts = texturecraft_engine::set_cmds::parts(&app.session, ts);
     for part in &parts {
-        let on = layer.geometry_mask.as_ref().is_none_or(|m| m.contains(part));
+        let on = layer.geometry_mask.as_ref().is_none_or(|m| m.includes_part(part));
         ui.label(RichText::new(format!("{} {part}", if on { ic::EYE } else { ic::EYE_SLASH })).color(if on { tk.text } else { tk.text_dim }));
     }
     if ui.add_enabled(layer.geometry_mask.is_some(), egui::Button::new(tr("Show on all parts"))).clicked() {
@@ -1249,11 +1249,13 @@ fn geometry_mask_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
         return;
     }
     let lid = layer.id.0;
-    let shown = layer.geometry_mask.clone().unwrap_or_else(|| parts.clone());
+    let shown = layer.geometry_mask.as_ref().and_then(|m| m.parts()).unwrap_or(parts.as_slice());
+    // The mask holds one restriction: editing parts would replace a UV-tile one
+    let tiles_restricted = matches!(layer.geometry_mask, Some(texturecraft_engine::core::GeometryMask::UvTiles(_)));
     ui.menu_button(tr("Geometry mask"), |ui| {
         for part in &parts {
             let mut on = shown.contains(part);
-            if ui.checkbox(&mut on, part.as_str()).changed() {
+            if ui.add_enabled(!tiles_restricted, egui::Checkbox::new(&mut on, part.as_str())).changed() {
                 let next: Vec<&String> = parts.iter().filter(|q| if *q == part { on } else { shown.contains(q) }).collect();
                 let value = if next.len() == parts.len() { Value::Null } else { json!(next) };
                 app.run("layer.set", json!({"layer": lid, "geometryMask": value}));
@@ -1603,7 +1605,11 @@ pub(crate) fn texture_set_settings(app: &mut TextureCraftApp, ui: &mut Ui) {
 
         for (channel, format) in &set.channels {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(tr(channel.label())).strong());
+                let label = match set.channel_names.get(channel) {
+                    Some(name) => format!("{name} ({})", tr(channel.label())),
+                    None => tr(channel.label()).to_string(),
+                };
+                ui.label(RichText::new(label).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Base color can't be removed: its × room stays, so every format ends on one column
                     if *channel == Channel::BaseColor {
@@ -2438,7 +2444,7 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     ui.label(RichText::new(tr("Ctrl+Shift+right-drag: size and hardness in fine steps.")).size(HINT_TEXT_SIZE).color(Tokens::get(ui.ctx()).text_dim));
 
     // Each section's reset puts back only the fields it shows
-    let size_fields = |settings: &BrushSettings| (settings.size, settings.min_size, settings.screen_space);
+    let size_fields = |settings: &BrushSettings| (settings.size, settings.min_size, settings.min_flow, settings.screen_space);
     if section_with_reset(ui, "sec_size", tr("Size"), true, size_fields(brush) == size_fields(&defaults), |ui| {
         let mut size_percent = brush.size / MAX_BRUSH_SIZE * 100.0;
         if slider(ui, tr("Size"), &mut size_percent, 0.05..=100.0, 1).changed() {
@@ -2450,9 +2456,14 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
             brush.min_size = min_size_percent / 100.0;
         }
 
+        let mut min_flow_percent = brush.min_flow * 100.0;
+        if slider(ui, tr("Minimum flow (%)"), &mut min_flow_percent, 0.0..=100.0, 0).changed() {
+            brush.min_flow = min_flow_percent / 100.0;
+        }
+
         ui.checkbox(&mut brush.screen_space, tr("Size in screen space"));
     }) {
-        (brush.size, brush.min_size, brush.screen_space) = size_fields(&defaults);
+        (brush.size, brush.min_size, brush.min_flow, brush.screen_space) = size_fields(&defaults);
     }
 
     let flow_fields = |settings: &BrushSettings| (settings.flow, settings.opacity, settings.spacing);
@@ -2546,6 +2557,30 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
 
     *brush = brush.sanitized();
+    stamp_blending_section(app, ui);
+}
+
+fn stamp_blending_section(app: &mut TextureCraftApp, ui: &mut Ui) {
+    let current = app.session.tool.brush.stamp_blending;
+    let mut selected = current;
+    let at_default = current == StampBlending::default();
+    if section_with_reset(ui, "sec_stamp_blending", tr("Advanced Blending"), false, at_default, |ui| {
+        let label = |mode| match mode {
+            StampBlending::Normal => tr("Normal"),
+            StampBlending::Lighten => tr("Lighten (Maximum)"),
+            StampBlending::Add => tr("Linear dodge (Add)"),
+        };
+        egui::ComboBox::from_label(tr("Stamps Blending")).selected_text(label(current)).show_ui(ui, |ui| {
+            for mode in [StampBlending::Normal, StampBlending::Lighten, StampBlending::Add] {
+                ui.selectable_value(&mut selected, mode, label(mode));
+            }
+        });
+    }) {
+        selected = StampBlending::default();
+    }
+    if selected != current {
+        app.run("tool.brush", json!({"stampBlending": selected}));
+    }
 }
 
 /// One alpha in the picker: a 52×64 tile with the shape drawn by `paint` and a label.
@@ -2571,7 +2606,8 @@ fn alpha_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     });
     let brush = &app.session.tool.brush;
     let (current, image, hardness) = (brush.alpha, brush.alpha_image.clone(), brush.hardness);
-    let library = if image.is_none() { brush.alpha_library.as_deref().and_then(alphas::find) } else { None };
+    let library = if image.is_none() { brush.library_alpha() } else { None };
+    let library_params = brush.alpha_library_params.clone();
     let mut pick = None;
     let zone = ui.horizontal_wrapped(|ui| {
         for a in BrushAlpha::ALL {
@@ -2583,7 +2619,7 @@ fn alpha_section(app: &mut TextureCraftApp, ui: &mut Ui) {
 
         // The library alpha in use (picked from the shelf's Alphas tab)
         if let Some(a) = library {
-            let tex = app.thumbs.alpha(ui.ctx(), a);
+            let tex = app.thumbs.configured_alpha(ui.ctx(), a, &library_params);
             alpha_tile(ui, true, &a.label, |p, r| {
                 if let Some(t) = tex {
                     p.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
@@ -2610,15 +2646,20 @@ fn alpha_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
     ui.label(RichText::new(tr("More in Assets > Alphas: click one, or drag it here")).size(10.0).color(tk.text_dim));
     crate::shelf::drop_target(app, ui, &zone.response, crate::shelf::DropZone::Brush);
-    alpha_parameters(&mut app.session.tool.brush, ui);
+    alpha_parameters(app, ui);
     section(ui, "sec_text", tr("Text"), true, |ui| text_section(app, ui));
 }
 
-/// Hardness and the parameters every alpha shares, under a header whose reset puts them back
-fn alpha_parameters(brush: &mut BrushSettings, ui: &mut Ui) {
+/// Hardness, placement and generator controls for the current tip.
+fn alpha_parameters(app: &mut TextureCraftApp, ui: &mut Ui) {
+    let brush = &app.session.tool.brush;
     let defaults = BrushSettings::default();
-    let at_defaults = brush.hardness == defaults.hardness && brush.alpha_params == defaults.alpha_params;
+    let mut hardness = brush.hardness;
+    let mut params = brush.alpha_params;
+    let mut library_changes = serde_json::Map::new();
     let round = brush.alpha == BrushAlpha::Round && brush.alpha_image.is_none() && brush.alpha_library.is_none();
+    let options = brush.library_alpha().filter(|_| brush.alpha_image.is_none()).map(|alpha| alpha.options()).unwrap_or_default();
+    let at_defaults = hardness == defaults.hardness && params == defaults.alpha_params && (options.is_empty() || brush.alpha_library_params.is_empty());
     let percent_slider = |ui: &mut Ui, label: &str, value: &mut f32, min: f32, max: f32| {
         let mut percent = *value * 100.0;
         if slider(ui, label, &mut percent, min..=max, 0).changed() {
@@ -2627,19 +2668,36 @@ fn alpha_parameters(brush: &mut BrushSettings, ui: &mut Ui) {
     };
 
     let reset = section_with_reset(ui, "sec_alpha_params", tr("Parameters"), true, at_defaults, |ui| {
-        percent_slider(ui, tr("Hardness"), &mut brush.hardness, 0.0, 99.9);
-        percent_slider(ui, tr("Size X"), &mut brush.alpha_params.size_x, 5.0, 100.0);
-        percent_slider(ui, tr("Size Y"), &mut brush.alpha_params.size_y, 5.0, 100.0);
-
-        // Only the procedural Round shape has a roundness
-        ui.add_enabled_ui(round, |ui| percent_slider(ui, tr("Roundness"), &mut brush.alpha_params.roundness, 0.0, 100.0));
-        slider(ui, tr("Contrast"), &mut brush.alpha_params.contrast, 1.0..=MAX_ALPHA_CONTRAST, 2);
-        ui.checkbox(&mut brush.alpha_params.invert, tr("Invert"));
+        percent_slider(ui, tr("Hardness"), &mut hardness, 0.0, 99.9);
+        percent_slider(ui, tr("Size X"), &mut params.size_x, 5.0, 100.0);
+        percent_slider(ui, tr("Size Y"), &mut params.size_y, 5.0, 100.0);
+        slider(ui, tr("Alpha rotation"), &mut params.rotation, -360.0..=360.0, 0);
+        ui.add_enabled_ui(round, |ui| percent_slider(ui, tr("Roundness"), &mut params.roundness, 0.0, 100.0));
+        slider(ui, tr("Contrast"), &mut params.contrast, 1.0..=MAX_ALPHA_CONTRAST, 2);
+        ui.checkbox(&mut params.invert, tr("Invert"));
+        for option in options {
+            let mut value = option.value(&brush.alpha_library_params);
+            let decimals = if option.control.whole_number() { 0 } else { 2 };
+            if slider(ui, tr(option.label), &mut value, option.minimum..=option.maximum, decimals).changed() {
+                library_changes.insert(option.control.key().to_owned(), json!(value));
+            }
+        }
     });
     if reset {
-        (brush.hardness, brush.alpha_params) = (defaults.hardness, defaults.alpha_params);
+        (hardness, params) = (defaults.hardness, defaults.alpha_params);
+        library_changes.extend(options.iter().map(|option| (option.control.key().to_owned(), Value::Null)));
     }
-    *brush = brush.sanitized();
+    if hardness != brush.hardness || params != brush.alpha_params || !library_changes.is_empty() {
+        let mut patch = json!({
+            "hardness": hardness * 100.0, "alphaSizeX": params.size_x * 100.0, "alphaSizeY": params.size_y * 100.0,
+            "alphaRotation": params.rotation, "alphaRoundness": params.roundness * 100.0,
+            "alphaContrast": params.contrast, "alphaInvert": params.invert,
+        });
+        if !library_changes.is_empty() {
+            patch["alphaLibraryParams"] = Value::Object(library_changes);
+        }
+        app.run("tool.brush", patch);
+    }
 }
 
 /// Text drawn in a font, as the brush alpha or a decal (`resource.text`).
@@ -2743,7 +2801,7 @@ fn material_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
 
         let mut value = app.session.tool.values.get(&channel).copied().unwrap_or(channel.default_value());
         match channel.kind() {
-            ChannelKind::Color => {
+            ChannelKind::Color | ChannelKind::Data => {
                 ui.horizontal(|ui| {
                     ui.label(tr(channel.label()));
                     if color_swatch(ui, &format!("tool_{}", channel.id()), &mut value, ui.available_width() - TOOL_SWATCH_RIGHT_MARGIN) {
@@ -3061,6 +3119,7 @@ fn projection_transform(ui: &mut Ui, projection: &Projection, salt: &str, edit: 
         | Projection::Cylindrical { uv, .. }
         | Projection::Warp { uv, .. } => (uv.tiling, uv.rotation, uv.offset, "uvOffset"),
         Projection::UvTile => return,
+        Projection::Placed(_) => return,
     };
 
     let lock_id = ui.make_persistent_id(("fill_tiling_lock", salt));
@@ -3090,7 +3149,7 @@ fn projection_transform(ui: &mut Ui, projection: &Projection, salt: &str, edit: 
             }
         }
         Projection::Spherical { scale, .. } | Projection::Cylindrical { scale, .. } => world_scale(ui, *scale, edit),
-        Projection::Uv { .. } | Projection::UvTile | Projection::Warp { .. } => {}
+        Projection::Uv { .. } | Projection::UvTile | Projection::Warp { .. } | Projection::Placed(_) => {}
     }
 }
 
@@ -3144,6 +3203,7 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
                 Source::Uniform(_) => tr("Uniform value").to_string(),
                 Source::Procedural { pattern, .. } => tr(pattern.kind.label()).to_string(),
                 Source::Image { name, .. } => trf("Image: {name}", &[("name", name)]),
+                Source::Graph(graph) => trf("Graph: {name}", &[("name", &graph.name)]),
             };
 
             let (rect, source_response) = ui.allocate_exact_size(vec2(ui.available_width(), crate::placed_fill_slot::SLOT_HEIGHT), Sense::click());
@@ -3159,9 +3219,9 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
             crate::placed_fill_slot::paint(ui, rect, (highlighted, source_response.has_focus()), (tr("Grayscale"), &name));
             let current = crate::fill_material_panel::source_choice(&app.session, source);
             let tabs = || crate::fill_material_panel::source_tabs(&app.session, &anchors, Color32::from_gray(204), false);
-            let picked = crate::resource_picker::show(&source_response, popup, &mut app.thumbs, Some(&current), current != SourceChoice::Uniform, tabs);
+            let picked = crate::resource_picker::show(&source_response, popup, &mut app.thumbs, current.as_ref(), current != Some(SourceChoice::Uniform), tabs);
             let anchor_channel = if let Source::Anchor { channel, .. } = source { *channel } else { Channel::Height };
-            let params = match picked.filter(|choice| *choice != current) {
+            let params = match picked.filter(|choice| current.as_ref() != Some(choice)) {
                 Some(SourceChoice::Procedural(kind)) => Some(json!({"effect": id, "procedural": kind.label()})),
                 Some(SourceChoice::Image(image)) => Some(json!({"effect": id, "image": image})),
                 Some(SourceChoice::Uniform) => Some(json!({"effect": id, "value": 1.0})),
@@ -3210,6 +3270,7 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
                     let target = crate::pattern_target::PatternTarget { command: "effect.set", base: json!({"effect": id}), salt: format!("mask_fill_{id}") };
                     crate::pattern_panel::pattern_properties(app, ui, &target, pattern);
                 }
+                Source::Graph(graph) => crate::graph_params::show(app, ui, &json!({"effect": id}), graph),
             }
             if anchors.is_empty() {
                 ui.label(RichText::new(tr("Add an anchor point to a layer below to use its stack as a mask.")).color(tokens.text_dim));
@@ -3271,6 +3332,10 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
                 hardness: *hardness,
             };
             crate::compare_properties::compare_properties(app, ui, layer, effect_id, settings);
+        }
+        EffectKind::Graph { graph, .. } => crate::graph_params::show(app, ui, &json!({"effect": id}), graph),
+        other => {
+            ui.label(RichText::new(tr(other.name())).color(tokens.text_dim));
         }
     }
 }

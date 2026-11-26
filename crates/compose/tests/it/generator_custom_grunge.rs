@@ -20,7 +20,7 @@ fn fixture() -> GeneratorFixture {
     let mesh = primitives::sphere(1.0, 32, 16);
     let mut fixture = GeneratorFixture::new(mesh, "builtin:sphere", RES);
 
-    let baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![1.0; (RES * RES) as usize]))].into() };
+    let baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![1.0; (RES * RES) as usize].into()))].into() };
 
     let flat = |value: f32| Arc::new(ImageRes::new(4, 4, vec![[value, value, value, 1.0]; 16], false));
     let split_texel = |index: u32| if index % SPLIT_WIDTH < SPLIT_WIDTH / 2 { [0.0, 0.0, 0.0, 1.0] } else { [1.0; 4] };

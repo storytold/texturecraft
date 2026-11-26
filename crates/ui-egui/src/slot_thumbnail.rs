@@ -32,6 +32,8 @@ pub(crate) fn thumbnail(app: &mut TextureCraftApp, ctx: &egui::Context, source: 
             .layer_panel
             .texture_outside(ctx, &app.session, ThumbTarget::Stage { effect: *anchor, channel: *channel })
             .map_or(SlotThumbnail::Glyph(ic::ANCHOR), SlotThumbnail::Stack),
+        // A graph's output has no picture of its own here
+        Source::Graph(_) => SlotThumbnail::Glyph(ic::MAGIC_WAND),
     }
 }
 

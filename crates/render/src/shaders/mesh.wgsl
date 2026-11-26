@@ -21,8 +21,8 @@ struct Globals {
     shadow: vec4<f32>,   // x shadows on (1), y shadow map texel (uv), z normal offset (world units), w shadow opacity (0..1)
     material: vec4<f32>, // x specular/glossiness shading (1), y parallax occlusion (1), z accumulation sample index, w IOR of transmission
     scatter: vec4<f32>,  // xyz per-channel diffuse wrap at scattering weight 1 (0 = Lambert), w G-buffer holds the scattering light (1)
-    fwd: vec4<f32>,      // xyz camera view direction (unit), w -
-    disp: vec4<f32>,     // x displacement on (1), y world units per unit of height at strength 1, z vertex spacing in UV units, w -
+    fwd: vec4<f32>,      // xyz camera view direction (unit), w height-to-normal slope per texel at strength 1 (fraction of the width)
+    disp: vec4<f32>,     // x displacement on (1), y world units per unit of height at strength 1, z vertex spacing in UV units, w height-to-normal filter (0 central, 1 Sobel, 2 backward)
     refr: vec4<f32>,     // x screen-space refraction on (1), y lods of the scene behind, z refraction depth (world units), w -
     highlight: vec4<f32>, // rgb highlighted set's edge color in the scene (before exposure and tone mapping), a opacity
     highlight_shift: vec4<f32>, // xy sideways shift of each highlight line copy (clip units), zw -
@@ -481,12 +481,24 @@ fn shade_mesh(i: VOut, front: bool) -> Shaded {
     let hu = textureSample(t_height, samp, uv - vec2<f32>(0.0, ts.y)).r;
     let hd = textureSample(t_height, samp, uv + vec2<f32>(0.0, ts.y)).r;
 
-    // Match export: a unit height over 1/16 of the width tilts 45°
-    // Combine the height gradient with the tangent-space normal
-    let k = g.mode.z * dims.x / 16.0 * tile_scale(uv);
-    let n_height = normalize(vec3<f32>(-(hr - hl) * 0.5 * k, (hd - hu) * 0.5 * k, 1.0));
-
-    // The Normal texture holds the signed normal in half floats (flat is exactly +z)
+    // Tangent-space normal: height gradient (+Y = up the image) combined with the normal channel.
+    // Same filter and slope as texture export (the project's rule): TextureCraft's own tilts 45° at
+    // strength 1 for a height change of 1 over 1/16 of the width; imported projects use the measured
+    // 3×3 Sobel or backward differences at their measured slope.
+    let k = g.mode.z * dims.x * g.fwd.w * tile_scale(uv);
+    var grad = vec2<f32>(hr - hl, hd - hu) * 0.5;
+    let height_filter = i32(g.disp.w + 0.5);
+    if (height_filter == 1) {
+        let h_ul = textureSample(t_height, samp, uv + vec2<f32>(-ts.x, -ts.y)).r;
+        let h_ur = textureSample(t_height, samp, uv + vec2<f32>(ts.x, -ts.y)).r;
+        let h_dl = textureSample(t_height, samp, uv + vec2<f32>(-ts.x, ts.y)).r;
+        let h_dr = textureSample(t_height, samp, uv + vec2<f32>(ts.x, ts.y)).r;
+        grad = vec2<f32>(h_ur - h_ul + 2.0 * (hr - hl) + h_dr - h_dl, h_dl - h_ul + 2.0 * (hd - hu) + h_dr - h_ur) / 8.0;
+    } else if (height_filter == 2) {
+        grad = vec2<f32>(hc - hl, hc - hu);
+    }
+    let n_height = normalize(vec3<f32>(-grad.x * k, grad.y * k, 1.0));
+    // The Normal texture holds signed components in half floats (flat is exactly +z).
     var n_detail = clamp(nrm_s, vec3<f32>(-1.0), vec3<f32>(1.0));
     n_detail.y *= g.mode.w;
     let n_ts = rnm(n_height, normalize(n_detail));

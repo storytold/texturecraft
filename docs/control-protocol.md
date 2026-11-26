@@ -136,6 +136,10 @@ alone) and `alphaInvert` (swaps paint and no paint inside the stamp square). The
 procedural, library and imported alphas alike and are returned by `tool.brush` with the other
 values. The alpha's rotation is the brush `angle`.
 
+`tool.brush {stampBlending}` controls coverage where stamps overlap within a stroke.
+`normal` (default) composites each stamp over the existing coverage, `lighten` keeps the strongest
+stamp at each texel, and `add` sums the coverage up to full coverage. Brush presets store this mode.
+
 Bake mode applies an edit in Common Settings or Mesh Map Settings to the texture sets sharing that
 group's settings: Common Settings, and each map's settings, are shared by any set of texture sets
 (at first every set shares them). Each set keeps its own enabled mesh-map checkboxes and Include in
@@ -232,7 +236,7 @@ keeps its state in a throwaway file.
 | `ping` | | `"pong"` |
 | `command.run` | `{id, params?}` | the command's JSON result |
 | `command.list` | `{filter?}` | `[{id, label, menu, shortcut, params, enabled}]` |
-| `session.inspect` | | project, mesh, texture sets, layer stack, tool, camera, display, history |
+| `session.inspect` | | project, mesh, texture sets, layer stack, tool, camera, display, history, `memoryBytes` (paint, composites, band cache and UV geometry), `geometryBytes` (UV lookup, covered tiles and materialized display padding) |
 | `ui.inspect` | | UI state, viewport rect, fps, bake progress (`baking`, 0..1), the running bake's stage (`bakeStatus`, e.g. "Baking Ambient Occlusion (2/4)") and live preview (`bakePreview`, see *Live bake preview*), toasts, `titleBar` (who draws the title bar this run: `app`, `integrated` on macOS, or `system`) |
 | `ui.menu.list` | | the menu catalog: `{menu, submenu, label, id, shortcut, implemented, enabled, checked}` |
 | `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window; `ui.resetUi` opens its question; `file.exportMesh` opens the Mesh Export Options prompt, whose Export asks for the file; `ui.view.export` opens the right bar's Export panel). `{"id": "ui.layout.apply", "name": "<layout>"}` switches to a legacy named panel layout (still accessible through assigned shortcuts) (panels only; mode, zoom and wireframes stay) and errors when no layout has that name. `ui.layout.save` still saves the active mode; `ui.layout.save.painting`, `ui.layout.save.rendering` and `ui.layout.save.baking` ask where to save only that mode's panels and view arrangement as a JSON file (without preferences or recent projects); loading preserves the other modes, `ui.layout.load` asks for one to load ("Load UI Layout"); `ui.toolbar.docks` and `ui.toolbar.tools` show or hide the right bar and the painting tools; the disabled Snooze Autosave and Resources Updater buttons stay visible when Tools is off; `ui.view.renderer` toggles the Renderer Settings panel (Rendering Mode only). `{"id": "ui.layout.swap"}` swaps the 3D and 2D views of the split layout (F4) |
@@ -243,6 +247,9 @@ keeps its state in a throwaway file.
 | `ui.reset` | | resets the panels, view settings and interface language without asking for confirmation. Other preferences and shortcuts stay |
 | `ui.bake.start` | `{ts?: index \| [indices]}` (default: the sets ticked in Bake mode) | Opens Bake mode and bakes in the background like the Bake button: the 3D view shows the maps landing on the model as they finish (see *Live bake preview*). → the `bake.preview` state. Errors when a bake is already running |
 | `ui.bake.cancel` | | Stops the running bake; the set being baked keeps the maps it had, sets already finished stay applied, and the previous view mode comes back |
+| `ui.import.open` | `{path}` | Opens a project file as a person would: a project of the reference app shows the import's notice (window 1). → the import windows' status |
+| `ui.import.convert` | | "I understand, convert" on the notice: conversion and view preparation run on a worker. Supported desktop imports can show a read-only viewport of the saved material during conversion. Errors when no notice is showing |
+| `ui.import.status` | | What the import windows show: `window` (`none`, `notice`, `running`, `failed`); while running `step`, `stepId`, `fraction`, `elapsed` (s), `cancelled`, `preview` (a read-only saved material view is active), `log` (up to 64 recent import messages); when failed `step` and `error`; always `pendingTiles` (CPU), `gpuPending`, `project`, `uiMs` |
 | `ui.set` | fields of the UI state, e.g. `{"layout": "Only3D"}`; `dock` is the panel layout, a craft-ui docking `Workspace` (`{version, layout: {root, floating}, hidden}`; `root` is a tree of `Split`, `Tabs` and `Stack` nodes over the panels `Viewport`, `Assets`, `TextureSetList`, `Layers`, `TextureSetSettings`, `Properties`, `Display`, `Shader`, `History`, `Log`, `BakingLog`, `MeshMapBakers`, `BakeMaps`, `BakeSettings`, `Export` and `Renderer` (a floating window holding one right-bar panel is that panel undocked); `hidden` lists where each closed panel was, so reopening it puts it back; a layout that does not read or has no docked `Viewport` becomes the default), `prefs` the settings (`{"language": "ja", "viewport_texture": 1, "brightness": "light", "accent": "blue"}`; missing fields take their defaults; `brightness` is `dark`, `mediumDark` (default), `mediumLight` or `light`, `accent` `copper` (default), `coral`, `blue`, `violet`, `green`, `amber` or `pink`, applied on the next frame; `system_title_bar` `true` has the system draw the title bar from the next start), `keymap` the custom shortcuts (`{"file.save": "F5"}`, `""` unbinds), `log_channel` the Log panel's tab (`General` or `Assets`) | `null` |
 | `viewport.screenshot` | `{view?: "3d" \| "2d"}` | `{width, height, png}` (PNG, base64) |
 | `ui.screenshot` | | `{width, height, png}` of the whole window, after the next frame |

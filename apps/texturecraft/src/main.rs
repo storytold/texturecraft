@@ -1,7 +1,7 @@
 //! TextureCraft desktop app.
 //!
 //! Usage: `texturecraft [project.tcraft | mesh.glb] [--control <port>] [--empty] [--version]`
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -114,8 +114,15 @@ fn parse_args_from<I: IntoIterator<Item = String>>(it: I) -> Result<Option<Args>
     Ok(Some(args))
 }
 
+/// A project file of the reference app: it opens behind the import's notice, not as the first session.
+fn to_convert(args: &Args) -> Option<String> {
+    let f = args.file.as_ref()?;
+    let ext = std::path::Path::new(f).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    (ext == texturecraft_engine::import_cmds::PROJECT_EXT).then(|| f.clone())
+}
+
 fn initial_session(args: &Args) -> Session {
-    if let Some(path) = &args.file {
+    if let Some(path) = args.file.as_ref().filter(|_| to_convert(args).is_none()) {
         match texturecraft_engine::file_cmds::open_path(path) {
             Ok(session) => return session,
             Err(error) => eprintln!("texturecraft: could not open {path}: {error}"),
@@ -385,6 +392,10 @@ fn main() {
     let persistence_path = no_prefs_path.clone().or_else(|| storage_dir().map(|dir| dir.join("app.ron")));
     let ui_file = no_prefs_path.as_ref().map(|path| path.with_extension("json")).or_else(|| storage_dir().map(|folder| folder.join("ui.json")));
     if let Some(file) = &ui_file {
+        let log = if persistence_path.is_some() { file.with_extension("performance.log") } else { file.with_file_name("performance.log") };
+        texturecraft_engine::log::set_performance_log_path(log);
+    }
+    if let Some(file) = &ui_file {
         let _ = ui_state_store::FILE.set(file.clone());
     }
     let prefs = saved_prefs(ui_file.as_deref(), persistence_path.as_deref());
@@ -392,7 +403,9 @@ fn main() {
     // The worker pool's size can only be set before its first job
     prefs.apply_work_threads();
     prefs.apply_resource_limits();
+    prefs.apply_graph_budget();
     let session = initial_session(&args);
+    let convert = to_convert(&args);
     let frame_decision = TitleBar::decide(prefs.system_title_bar);
     let title_bar = TitleBar::of(&frame_decision.frame);
     let mut viewport = egui::ViewportBuilder::default()
@@ -455,6 +468,9 @@ fn main() {
             let mut app = TextureCraftApp::new(cc, session);
             app.title_bar = title_bar;
             app.set_startup_update_check(checks_for_updates_at_start(control));
+            if let Some(f) = convert {
+                texturecraft_ui_egui::import_ui::ask(&mut app, texturecraft_engine::import_cmds::ImportTask::path(f));
+            }
             if let Some(port) = control {
                 app.control = Some(control_server::start(port, cc.egui_ctx.clone()));
             }
@@ -493,7 +509,7 @@ fn append_line(file: &std::path::Path, msg: &str) -> bool {
 }
 
 /// An error that ends the app: printed, logged, and (with `dialog`) shown in a message box, since
-/// a Windows release build has no console and would otherwise close without a word.
+/// the Windows desktop app has no console and would otherwise close without a word.
 fn fatal(msg: &str, dialog: bool) {
     eprintln!("texturecraft: {msg}");
     let log = error_log().filter(|f| append_line(f, msg));

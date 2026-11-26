@@ -24,7 +24,7 @@ fn fixture() -> GeneratorFixture {
             fixture.gbuf.surface(&fixture.mesh, texel as usize).map_or(1.0, |surface| if BAND.contains(&surface.pos.y) { BAND_OCCLUSION } else { 1.0 })
         })
         .collect();
-    let baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, Arc::new(occlusion))].into() };
+    let baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, Arc::new(occlusion.into()))].into() };
     fixture.baked = baked;
     fixture
 }

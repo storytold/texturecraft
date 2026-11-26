@@ -15,10 +15,13 @@ pub const TABLE: &[(&str, u8)] = &[
     ("core", 0),
     ("texel", 0),
     ("geom", 0),
+    ("result-cache", 0),
     ("compose", 1),
+    ("import-verify", 1),
     ("bake", 1),
     ("paint", 2),
     ("formats", 2),
+    ("import", 2),
     ("engine", 3),
     ("render", 3),
     ("automation", 4),
@@ -33,7 +36,7 @@ const UI_CRATES: &[&str] = &["egui", "egui_*", "egui-*", "eframe", "winit", "rfd
 const UI_MIN_LAYER: u8 = 5;
 
 /// External GPU crates, allowed only in [`GPU_ALLOWED`] (and the apps).
-const GPU_CRATES: &[&str] = &["wgpu", "wgpu-*"];
+const GPU_CRATES: &[&str] = &["wgpu", "wgpu-*", "craft-material-graph-wgpu"];
 const GPU_ALLOWED: &[&str] = &["render", "ui-egui"];
 
 pub fn package(dir: &str) -> String {

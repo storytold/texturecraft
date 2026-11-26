@@ -525,14 +525,11 @@ impl Session {
             }
 
             for data in document.baked.values().flat_map(|baked| baked.maps.values()).filter(|data| mesh_maps.insert(Arc::as_ptr(data))) {
-                retained_bytes = retained_bytes.saturating_add(data.capacity() as u64 * std::mem::size_of::<f32>() as u64);
+                retained_bytes = retained_bytes.saturating_add(data.bytes() as u64);
             }
         }
 
-        let mut images = std::collections::HashSet::new();
-        for image in self.images.values().filter(|image| images.insert(Arc::as_ptr(image))) {
-            retained_bytes = retained_bytes.saturating_add(image.retained_texel_bytes());
-        }
+        retained_bytes = retained_bytes.saturating_add(self.images.decoded_bytes() as u64);
 
         budget.set_retained(retained_bytes);
         budget

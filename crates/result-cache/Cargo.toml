@@ -1,0 +1,13 @@
+[package]
+name = "texturecraft-result-cache"
+description = "Results of expensive computations (graph renders) kept in a folder across imports, found by a key of what went into them; native only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+lz4_flex = { workspace = true }

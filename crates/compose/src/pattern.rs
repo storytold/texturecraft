@@ -550,6 +550,9 @@ pub fn procedural_in(pattern: &Procedural, projection: &Projection, coords: &Coo
             planes.into_iter().filter(|(weight, _)| *weight > 0.0).map(|(weight, plane)| flat(place_plane(plane)) * weight).sum()
         }
 
+        // Placed projections supply coordinates in the image's frame
+        Projection::Placed(_) => flat(coords.uv * pattern_scale),
+
         // The coordinates are already in the placed or warped frame (see [`placed_uv`] and [`crate::warp::warp_uv`])
         Projection::Planar { uv, placed: Some(_), .. } | Projection::Warp { uv, .. } => flat(place_frame_uv(coords.uv, uv) * pattern_scale),
         Projection::Planar { scale, axis, offset, uv, projector, .. } => {
@@ -617,22 +620,35 @@ fn pattern_value(pattern: &Procedural, point: Vec3, context: &PatternContext) ->
 /// Texture coordinates (and blend weights) at which an image is sampled for a projection
 /// (unused slots weigh 0; no allocation per texel).
 pub fn image_samples(projection: &Projection, coords: &Coords) -> [(Vec2, f32); 3] {
+    image_samples_with_rules(projection, coords, false)
+}
+
+pub(crate) fn image_samples_with_rules(projection: &Projection, coords: &Coords, measured: bool) -> [(Vec2, f32); 3] {
     let one = |uv: Vec2| [(uv, 1.0), (Vec2::ZERO, 0.0), (Vec2::ZERO, 0.0)];
     match projection {
         Projection::UvTile => one(coords.uv - coords.uv.floor()),
         Projection::Uv { scale, rotation, offset } => one(place(coords.uv, Vec2::from(*scale), *rotation, Vec2::from(*offset))),
         Projection::Triplanar { scale, sharpness, offset, uv, projector } => {
             let coords = &projector_local(projector, coords);
-            let point = coords.pos * *scale + Vec3::from(*offset);
+            let position = coords.pos * *scale;
+            let offset = Vec3::from(*offset);
             let place_plane = uv_placement(uv);
 
             // Float images can exceed 1, so even a tiny plane weight can carry visible detail
             let weights = normalized_triplanar_weights(coords.nrm, *sharpness);
-            [
-                (place_plane(Vec2::new(point.z, -point.y)), weights.x),
-                (place_plane(Vec2::new(point.x, point.z)), weights.y),
-                (place_plane(Vec2::new(point.x, -point.y)), weights.z),
-            ]
+            let planes = if measured {
+                // Imported faces turn their image with the side the surface normal faces
+                let side = |v: f32| if v < 0.0 { -1.0 } else { 1.0 };
+                [
+                    Vec2::new(offset.z - position.z * side(coords.nrm.x), -(position.y + offset.y)),
+                    Vec2::new(position.x + offset.x, offset.z + position.z * side(coords.nrm.y)),
+                    Vec2::new(offset.x + position.x * side(coords.nrm.z), -(position.y + offset.y)),
+                ]
+            } else {
+                let point = position + offset;
+                [Vec2::new(point.z, -point.y), Vec2::new(point.x, point.z), Vec2::new(point.x, -point.y)]
+            };
+            [(place_plane(planes[0]), weights.x), (place_plane(planes[1]), weights.y), (place_plane(planes[2]), weights.z)]
         }
         Projection::Planar { uv, placed: Some(_), .. } | Projection::Warp { uv, .. } => one(place_frame_uv(coords.uv, uv)),
         Projection::Planar { scale, axis, offset, uv, projector, .. } => {
@@ -649,6 +665,7 @@ pub fn image_samples(projection: &Projection, coords: &Coords) -> [(Vec2, f32); 
             let (around_axis, height) = cylinder_coords(*axis, projector, offset, *angle, coords);
             one(place_uv(Vec2::new(around_axis, 0.5 - height * 0.5) * *scale, uv))
         }
+        Projection::Placed(_) => one(coords.uv),
     }
 }
 
@@ -996,6 +1013,26 @@ mod tests {
     fn decal_uv(frame: &Decal, point: Vec3, nrm: Vec3) -> Option<(Vec2, f32)> {
         let Projection::Planar { projector, .. } = Projection::decal(*frame) else { return None };
         crate::projector_cover::placed_cover(frame, &projector, point, nrm).filter(|(_, cover)| *cover > 0.0)
+    }
+
+    #[test]
+    fn tri_planar_faces_never_show_their_image_mirrored() {
+        let proj = Projection::Triplanar { scale: 1.0, sharpness: 64.0, offset: [0.5; 3], uv: Default::default(), projector: Default::default() };
+        // the image coordinates of a point on a face, by its position and normal (the dominant plane only)
+        let at = |pos: Vec3, nrm: Vec3| {
+            let s = image_samples_with_rules(&proj, &Coords { uv: Vec2::ZERO, pos, nrm }, true);
+            s.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|(uv, _)| uv).unwrap()
+        };
+        // walking right as seen from outside each face moves right in the image (u grows), on both sides of each axis
+        let right = |nrm: Vec3, step: Vec3| at(step * 0.1, nrm).x - at(Vec3::ZERO, nrm).x;
+        for (nrm, step) in [(Vec3::Z, Vec3::X), (-Vec3::Z, -Vec3::X), (Vec3::X, -Vec3::Z), (-Vec3::X, Vec3::Z)] {
+            assert!((right(nrm, step) - 0.1).abs() < 1e-5, "{nrm}: {}", right(nrm, step));
+        }
+        // looking down at the top, +z is down the image; looking up at the bottom, +z is up
+        let down = |nrm: Vec3| at(Vec3::Z * 0.1, nrm).y - at(Vec3::ZERO, nrm).y;
+        assert!((down(Vec3::Y) - 0.1).abs() < 1e-5 && (down(-Vec3::Y) + 0.1).abs() < 1e-5);
+        // the centre of the scene is the image's centre
+        assert!((at(Vec3::ZERO, Vec3::Z) - Vec2::new(0.5, -0.5)).length() < 1e-5);
     }
 
     #[test]

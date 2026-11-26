@@ -29,7 +29,7 @@ fn resource_settings_follow_hardware_persist_and_apply_before_control_requests()
         .with_accessibility_check(false)
         .with_context_setup(texturecraft_ui_egui::framework::install_headless)
         .build_eframe(|context| {
-            context.egui_ctx.data_mut(|data| data.insert_temp(egui::Id::unique("settings_resources"), (0.0_f64, available_cores, 16_u64 << 30)));
+            context.egui_ctx.data_mut(|data| data.insert_temp(egui::Id::unique("settings_resources"), (0.0_f64, available_cores, 2_u64 << 30)));
             let mut creation = eframe::CreationContext::_new_kittest(context.egui_ctx.clone());
             creation.storage = Some(&storage);
             TextureCraftApp::new(&creation, session)
@@ -43,11 +43,12 @@ fn resource_settings_follow_hardware_persist_and_apply_before_control_requests()
     harness.get_by_role_and_label(egui::Role::Slider, "Cores kept for the UI").set_value_accesskit(f64::from(u32::MAX));
     harness.run_steps(3);
     assert_eq!(edited(&harness).reserved_cores, available_cores, "editing cannot exceed this machine's CPU count");
-    assert!(harness.query_by_label("≈ 8.00 GiB").is_some(), "50% of 16 GiB is shown beside the percentage");
+    // 2 GiB of free RAM keeps the shares below the in-flight cap (`MAX_SAVE_IN_FLIGHT`), so the readout follows the percentage
+    assert!(harness.query_by_label("≈ 1.00 GiB").is_some(), "50% of 2 GiB is shown beside the percentage");
 
     harness.get_by_role_and_label(egui::Role::Slider, "Max RAM while saving").set_value_accesskit(25.0);
     harness.run_steps(3);
-    assert!(harness.query_by_label("≈ 4.00 GiB").is_some(), "the byte estimate follows the edited percentage");
+    assert!(harness.query_by_label("≈ 0.50 GiB").is_some(), "the byte estimate follows the edited percentage");
 
     harness.get_by_role_and_label(egui::Role::SpinButton, "Max project size on open").set_value_accesskit(24.0);
     harness.run_steps(3);

@@ -87,7 +87,7 @@ fn create_imports_the_listed_maps_in_the_chosen_normal_format() {
     assert_eq!(project.normal_format, NormalFormat::DirectX);
     let baked = |ts: usize, map: BakedMap| state.session.doc.baked.get(&ts).is_some_and(|baked| baked.maps.contains_key(&map));
     assert!(baked(0, BakedMap::Normal) && baked(1, BakedMap::AmbientOcclusion));
-    let normal_green = state.session.doc.baked[&0].maps[&BakedMap::Normal][1];
+    let normal_green = state.session.doc.baked[&0].maps[&BakedMap::Normal].get(1).unwrap_or_default();
     assert!(normal_green > 0.75, "the normal map is read as DirectX (green flipped): {normal_green}");
     assert_eq!(state.session.doc.resources.len(), 2, "the file naming no map is not imported");
     let toast = &state.toasts.last().unwrap().text;

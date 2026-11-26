@@ -21,8 +21,8 @@ fn cropping_projector(proj: &Projection) -> Option<&Projector> {
         | Projection::Planar { projector, .. }
         | Projection::Spherical { projector, .. }
         | Projection::Cylindrical { projector, .. } => projector,
-        // Framed on the surface: see [`framed_cover`]
-        Projection::Warp { .. } | Projection::Uv { .. } | Projection::UvTile => return None,
+        // Framed on the surface: see [`framed_cover`]; a placed projection covers through its own taps
+        Projection::Warp { .. } | Projection::Uv { .. } | Projection::UvTile | Projection::Placed(_) => return None,
     };
     Some(projector).filter(|projector| projector.crop != ShapeCrop::ExtendsOutside || projector.backface.on)
 }
@@ -63,7 +63,7 @@ pub fn projector_cover(proj: &Projection, coords: &Coords) -> f32 {
             let outward = if radius > MIN_AXIS_DISTANCE { (normal_across * across + normal_depth * depth) / radius } else { 1.0 };
             (radius <= 1.0 && height.abs() <= 1.0, Some(outward))
         }
-        Projection::Warp { .. } | Projection::Uv { .. } | Projection::UvTile => (true, None),
+        Projection::Warp { .. } | Projection::Uv { .. } | Projection::UvTile | Projection::Placed(_) => (true, None),
     };
     if projector.crop == ShapeCrop::Cropped && !inside {
         return 0.0;

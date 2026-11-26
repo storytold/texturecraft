@@ -20,16 +20,29 @@ mod cage_gpu;
 pub mod displace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_bake;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gpu_brush;
+pub mod gpu_composite;
+mod gpu_curvature;
+mod gpu_image_source;
+mod gpu_neighbourhood;
+pub mod gpu_quick_mask;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gpu_resize;
+pub mod gpu_stencil;
+mod gpu_tile_pattern;
 pub mod gpu_trace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod headless;
 mod high_poly_gpu;
 pub mod ibl;
 pub mod mesh_maps;
+mod mesh_parts;
 mod mips_dirty;
 mod missing_seam_gpu;
 pub mod neutral_material;
 pub mod overlay_quad;
+mod paint_window;
 pub mod readback;
 pub mod renderer;
 pub mod set_highlight;
@@ -39,8 +52,20 @@ pub mod trace;
 pub use bake_overlay::BakeOverlay;
 pub use bake_visualization::BakeVisualization;
 pub use cage_geometry::CageGeometry;
+#[cfg(not(target_arch = "wasm32"))]
+pub use craft_material_graph_wgpu as gpu_graph;
 pub use neutral_material::NeutralMaterial;
 pub use overlay_quad::OverlayQuad;
-pub use renderer::{COLOR_FORMAT, DEFAULT_BACKGROUND, Frame, MSAA, Renderer, Shade, UV_VIEW_MAX_ZOOM, UV_VIEW_MIN_ZOOM, ViewKind, aux_size, uv_view_scale};
+pub use renderer::{
+    COLOR_FORMAT, DEFAULT_BACKGROUND, Frame, MSAA, Renderer, Shade, UV_VIEW_MAX_ZOOM, UV_VIEW_MIN_ZOOM, ViewKind, aux_size, mask_view_extent, uv_view_scale,
+};
 pub use set_highlight::SetHighlight;
 pub use wgpu;
+
+/// The limits to request at device creation: everything the adapter reports. The compositor
+/// sizes its bands and working buffers against the device's limits (and a later user-set
+/// memory limit, `gpu_composite::user_memory_limit`), so it gets the adapter's full range;
+/// software adapters keep their own reported values.
+pub fn device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    adapter.limits()
+}

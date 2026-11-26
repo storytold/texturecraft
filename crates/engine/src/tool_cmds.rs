@@ -1,10 +1,11 @@
 //! Tool commands: pick a tool, set brush and material values, and paint scripted strokes (the
 //! way agents and the CLI paint).
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use texturecraft_core::Channel;
 use texturecraft_geom::glam::Vec2;
-use texturecraft_paint::{Alignment, BrushAlpha, MAX_RADIAL_COPIES, alphas};
+use texturecraft_paint::{Alignment, BrushAlpha, MAX_RADIAL_COPIES, StampBlending, alphas};
 
 use crate::commands::{CommandSpec, always, bad, boolp, channel_param, color_of, color_param, f32p, strp, vec3};
 use crate::fill_hit_test::FillHitTest;
@@ -36,13 +37,19 @@ pub fn specs() -> Vec<CommandSpec> {
             "Brush settings",
             [],
             None,
-            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, alphaSizeX?: 5..100 and alphaSizeY?: 5..100 (percent of the stamp the alpha fills), alphaRoundness?: 0..100 (Round alpha only: 100 circle, 0 square), alphaContrast?: 1..8, alphaInvert?, backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), cloneAligned? (default true: the first stroke fixes the offset to the source for the following strokes; false: every stroke starts sampling at the source point), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
+            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, stampBlending?: normal|lighten|add, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, alphaSizeX?: 5..100 and alphaSizeY?: 5..100 (percent of the stamp the alpha fills), alphaRotation?: -360..360 degrees inside the stamp, alphaRoundness?: 0..100 (Round alpha only: 100 circle, 0 square), alphaContrast?: 1..8, alphaInvert?, alphaLibraryParams?: {control: number or null to reset} (see alpha.list), backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, minFlow? (pen pressure lowers the flow down to this; 100 = off), smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), cloneAligned? (default true: the first stroke fixes the offset to the source for the following strokes; false: every stroke starts sampling at the source point), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
             always,
             brush
         ),
         cmd!("alpha.list", "List brush alphas", [], None, "{} — procedural alphas and the built-in library", always, |_, _| Ok(json!({
             "procedural": BrushAlpha::ALL.map(BrushAlpha::label),
-            "library": alphas::library().iter().map(|a| json!({"id": a.id, "label": a.label, "category": a.category})).collect::<Vec<_>>(),
+            "library": alphas::library().iter().map(|alpha| {
+                let parameters: Vec<_> = alpha.options().iter().map(|option| json!({
+                    "name": option.control.key(), "label": option.label, "min": option.minimum, "max": option.maximum,
+                    "default": option.default, "integer": option.control.whole_number(),
+                })).collect();
+                json!({"id": alpha.id, "label": alpha.label, "category": alpha.category, "parameters": parameters})
+            }).collect::<Vec<_>>(),
         }))),
         cmd!(
             "tool.material",
@@ -140,12 +147,18 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
     if let Some(value) = percent("minSize") {
         settings.min_size = value;
     }
+    if let Some(value) = percent("minFlow") {
+        settings.min_flow = value;
+    }
 
     if let Some(value) = percent("flow") {
         settings.flow = value;
     }
     if let Some(value) = percent("opacity") {
         settings.opacity = value;
+    }
+    if let Some(value) = params.get("stampBlending") {
+        settings.stamp_blending = StampBlending::deserialize(value).map_err(|_| bad("tool.brush", "`stampBlending` must be normal, lighten or add"))?;
     }
     if let Some(value) = percent("spacing") {
         settings.spacing = value;
@@ -181,6 +194,7 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
         settings.jitter_position = value / 100.0;
     }
 
+    let selected_library = settings.alpha_library.clone();
     let alpha = params.get("alpha");
     if let Some(alpha_name) = strp(params, "alpha") {
         settings.alpha = BrushAlpha::parse(alpha_name).ok_or_else(|| bad("tool.brush", format!("unknown alpha `{alpha_name}`")))?;
@@ -194,9 +208,14 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
     } else if let Some(id) = alpha.and_then(|alpha| alpha.get("library")).and_then(Value::as_str) {
         let alpha = alphas::find(id).ok_or_else(|| bad("tool.brush", format!("unknown library alpha `{id}` (see alpha.list)")))?;
 
-        // Render it now rather than on the first stamp
-        alpha.image();
         (settings.alpha_image, settings.alpha_library) = (None, Some(alpha.id.clone()));
+    }
+
+    if settings.alpha_library != selected_library {
+        settings.alpha_library_params.clear();
+    }
+    if let Some(changes) = params.get("alphaLibraryParams") {
+        set_library_alpha_parameters(&mut settings, changes)?;
     }
 
     let alpha_params = &mut settings.alpha_params;
@@ -204,6 +223,9 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
         if let Some(value) = percent(key) {
             *slot = value;
         }
+    }
+    if let Some(value) = f32p(params, "alphaRotation") {
+        alpha_params.rotation = value;
     }
     if let Some(value) = f32p(params, "alphaContrast") {
         alpha_params.contrast = value;
@@ -269,7 +291,12 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
         session.tool.clone_from
     };
 
-    session.tool.brush = settings.sanitized();
+    let settings = settings.sanitized();
+    if settings.alpha_library != selected_library {
+        // Selecting a generator prepares its tip before the first stroke.
+        settings.library_alpha_image();
+    }
+    session.tool.brush = settings;
     session.tool.clone_from = clone_from;
     if let Some(aligned) = boolp(params, "cloneAligned")
         && aligned != session.tool.clone_aligned
@@ -289,11 +316,37 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
     Ok(brush_json(session))
 }
 
+fn set_library_alpha_parameters(settings: &mut texturecraft_paint::BrushSettings, changes: &Value) -> Result<()> {
+    let alpha = settings
+        .library_alpha()
+        .filter(|_| settings.alpha_image.is_none())
+        .ok_or_else(|| bad("tool.brush", "choose a library alpha before editing its generator parameters"))?;
+    let options = changes.as_object().ok_or_else(|| bad("tool.brush", "`alphaLibraryParams` must be an object"))?;
+    for (key, value) in options {
+        let option = alpha
+            .options()
+            .iter()
+            .find(|option| option.control.key() == key)
+            .ok_or_else(|| bad("tool.brush", format!("{} does not expose an alpha parameter named `{key}`", alpha.label)))?;
+        if value.is_null() {
+            settings.alpha_library_params.remove(&option.control);
+        } else {
+            let value = value
+                .as_f64()
+                .filter(|value| value.is_finite() && value.abs() <= f32::MAX as f64)
+                .ok_or_else(|| bad("tool.brush", format!("alpha parameter `{key}` must be a finite number")))?;
+            settings.alpha_library_params.insert(option.control, value as f32);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn brush_json(session: &Session) -> Value {
     let settings = &session.tool.brush;
     json!({
-        "size": settings.size / 0.25 * 100.0, "minSize": settings.min_size * 100.0, "flow": settings.flow * 100.0, "opacity": settings.opacity * 100.0,
+        "size": settings.size / 0.25 * 100.0, "minSize": settings.min_size * 100.0, "minFlow": settings.min_flow * 100.0, "flow": settings.flow * 100.0, "opacity": settings.opacity * 100.0,
         "spacing": settings.spacing * 100.0, "hardness": settings.hardness * 100.0, "angle": settings.angle, "followPath": settings.follow_path,
+        "stampBlending": settings.stamp_blending,
         "alignment": format!("{:?}", settings.alignment).to_lowercase(), "lazy": settings.lazy,
         "alpha": match (&settings.alpha_image, &settings.alpha_library) {
             (Some(name), _) => json!({ "image": name }),
@@ -301,6 +354,7 @@ pub(crate) fn brush_json(session: &Session) -> Value {
             (None, None) => json!(settings.alpha.label()),
         },
         "alphaSizeX": settings.alpha_params.size_x * 100.0, "alphaSizeY": settings.alpha_params.size_y * 100.0,
+        "alphaRotation": settings.alpha_params.rotation, "alphaLibraryParams": settings.alpha_library_params,
         "alphaRoundness": settings.alpha_params.roundness * 100.0, "alphaContrast": settings.alpha_params.contrast, "alphaInvert": settings.alpha_params.invert,
         "backfaceCulling": settings.backface_culling, "symmetry": [settings.symmetry.x, settings.symmetry.y, settings.symmetry.z],
         "radialSymmetry": { "copies": settings.symmetry.radial, "axis": (["x", "y", "z"].get(settings.symmetry.axis as usize)) },

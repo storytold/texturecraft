@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use texturecraft_core::{
-    BlendMode, Effect, EffectKind, Filter, Generator, GeneratorKind, Layer, LayerId, LayerKind, Mask, MaskBackground, Procedural, ProceduralKind, Project,
-    Projection, Source,
+    BlendMode, Effect, EffectKind, Filter, Generator, GeneratorKind, GraphInput, GraphRef, Layer, LayerId, LayerKind, Mask, MaskBackground, Procedural,
+    ProceduralKind, Project, Projection, Source,
 };
 
 use crate::commands::{CommandSpec, always, bad, has_layer, layer_param, strp};
@@ -241,8 +241,11 @@ impl Session {
             bake_paint: BTreeMap::new(),
             project: pf.project,
             pixels: pf.pixels,
+            stroke_replays: Default::default(),
             baked: BTreeMap::new(),
             resources: BTreeMap::new(),
+            graphs: pf.graphs,
+            strokes: pf.strokes,
         };
 
         let label = src.project.texture_sets.first().map(|t| t.name.clone()).unwrap_or_default();
@@ -273,6 +276,16 @@ impl Session {
                     *name = renamed.clone();
                 }
             }
+            for graph in new.effects.iter_mut().flat_map(|effect| graphs_mut(&mut effect.kind)) {
+                each_graph_input(graph, &mut |input| {
+                    if let GraphInput::Image(name) = input
+                        && let Some(renamed) = renames.get(name.as_str())
+                    {
+                        *name = renamed.clone();
+                    }
+                    Ok(())
+                })?;
+            }
             let old = s.doc.project.layer_mut(layer)?.mask.replace(new);
             for e in old.map(|m| m.effects).unwrap_or_default() {
                 s.doc.pixels.masks.remove(&e.id);
@@ -295,6 +308,31 @@ fn sources_mut(kind: &mut EffectKind) -> Vec<&mut Source> {
     }
 }
 
+/// The graphs an effect runs, whether as the effect or as a source.
+fn graphs_mut(kind: &mut EffectKind) -> Vec<&mut GraphRef> {
+    if let EffectKind::Graph { graph, .. } = kind {
+        return vec![graph];
+    }
+    sources_mut(kind)
+        .into_iter()
+        .filter_map(|source| match source {
+            Source::Graph(graph) => Some(&mut **graph),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Calls `visit` on every input of `graph` and of the graphs nested in it.
+fn each_graph_input(graph: &mut GraphRef, visit: &mut dyn FnMut(&mut GraphInput) -> Result<()>) -> Result<()> {
+    for input in graph.inputs.values_mut() {
+        visit(input)?;
+        if let GraphInput::Nested(inner) = input {
+            each_graph_input(inner, visit)?;
+        }
+    }
+    Ok(())
+}
+
 /// `mask` of document `src` with fresh effect ids from `dst` (anchor sources follow), its painted pixels moved to `dst` at `size`.
 fn copy_mask(src: &crate::session::Document, mask: &Mask, dst: &mut crate::session::Document, size: (u32, u32)) -> Result<Mask> {
     let mut copy = mask.clone();
@@ -310,10 +348,27 @@ fn copy_mask(src: &crate::session::Document, mask: &Mask, dst: &mut crate::sessi
         }
     }
 
-    // Sources that read an anchor effect of this mask follow it to its new id
+    // Sources and graph inputs that read an anchor effect of this mask follow it to its new id
+    let follow = |anchor: &mut LayerId| -> Result<()> {
+        *anchor = *moved.get(anchor).ok_or_else(|| EngineError::Other(format!("smart mask refers to anchor {} outside this mask", anchor.0)))?;
+        Ok(())
+    };
     for source in copy.effects.iter_mut().flat_map(|effect| sources_mut(&mut effect.kind)) {
         if let Source::Anchor { anchor, .. } = source {
-            *anchor = *moved.get(anchor).ok_or_else(|| EngineError::Other(format!("smart mask refers to anchor {} outside this mask", anchor.0)))?;
+            follow(anchor)?;
+        }
+    }
+    for graph in copy.effects.iter_mut().flat_map(|effect| graphs_mut(&mut effect.kind)) {
+        each_graph_input(graph, &mut |input| match input {
+            GraphInput::Anchor { anchor, .. } => follow(anchor),
+            _ => Ok(()),
+        })?;
+    }
+
+    // The texts of the graphs the mask runs travel with it
+    for key in copy.effects.iter().flat_map(|effect| effect.kind.graphs()).flat_map(GraphRef::text_keys) {
+        if let Some(text) = src.graphs.texts.get(key) {
+            dst.graphs.texts.entry(key.to_string()).or_insert_with(|| text.clone());
         }
     }
     Ok(copy)

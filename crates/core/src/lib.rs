@@ -36,6 +36,7 @@ pub mod grayscale_mode;
 pub mod height_to_normal;
 pub mod highpass_space;
 pub mod image_input;
+pub mod import_report;
 pub mod layer;
 pub mod lighting_output;
 pub mod mask_outline;
@@ -51,6 +52,7 @@ pub mod project;
 pub mod projector;
 pub mod ramp_curve;
 pub mod randomized_seed;
+pub mod rules;
 mod saved_decal;
 mod saved_projection;
 pub mod selection_background;
@@ -60,6 +62,7 @@ pub mod slope_blending;
 pub mod source_color_mode;
 pub mod source_slope_blur;
 pub mod source_warp;
+pub mod strokes;
 pub mod stylized_lighting;
 pub mod stylized_shading;
 pub mod sun_and_sky;
@@ -110,14 +113,17 @@ pub use grayscale_mode::GrayscaleMode;
 pub use height_to_normal::HeightToNormal;
 pub use highpass_space::HighpassSpace;
 pub use image_input::ImageInput;
+pub use import_report::{Fidelity, ImportReport, LayerReport, LayerRole, ReportEntry, SafetyFlag, SafetyFlagKind};
 pub use layer::{
     AxisBlend, AxisLayer, BorderDistanceParameters, ChannelBlend, CompareOp, CurvatureDetail, CurvatureMode, Decal, DecalFlip, DecalSymmetry,
-    DistanceParameters, DrippingRustParameters, Effect, EffectKind, Fill, Filter, Filtering, Generator, GeneratorGlobal, GeneratorGrayscale, GeneratorKind,
-    GrayscaleConversionParameters, HeightMask, KindControls, Layer, LayerId, LayerKind, Levels, LightParameters, LinearGradientParameters, LinkParam,
-    LinkPreset, Mask, MaskBackground, MaterialLink, MicroCurvatureType, MicroDetails, OutputResolution, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, PathShape,
-    Procedural, ProceduralKind, Projection, ResolutionMode, SIZE_REFERENCE_RES, Sampling, ScaleMode, SectionParameters, Source, TextureBlend, TextureLayer,
-    TileBlending, TileGenerator, TileInputDistribution, TileShape, TileSizeMode, TileSymmetry, UvCheckerParameters, UvRandomColorParameters, UvTransform,
-    UvWrap, WearParameters, gradient, hsl_adjust, per_unit, posterize,
+    DistanceParameters, DrippingRustParameters, Effect, EffectKind, FacingFalloff, Falloff, Fill, Filter, Filtering, Generator, GeneratorGlobal,
+    GeneratorGrayscale, GeneratorKind, GeometryMask, GraphInput, GraphRef, GraphValue, GrayscaleConversionParameters, HeightMask, IMPORT_LOCK_SOURCE,
+    ImagePlacement, KindControls, Layer, LayerId, LayerKind, Levels, LightParameters, LinearGradientParameters, LinkParam, LinkPreset, Lock, LockReason,
+    MAX_GRAPH_NESTING, Mask, MaskBackground, MaterialLink, MicroCurvatureType, MicroDetails, OutputResolution, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN,
+    PathShape, PlacedMode, PlacedProjection, Procedural, ProceduralKind, Projection, Repeat, ResolutionMode, SIZE_REFERENCE_RES, Sampling, ScaleMode,
+    SectionParameters, Source, StableHash, TextureBlend, TextureLayer, TileBlending, TileGenerator, TileInputDistribution, TileShape, TileSizeMode,
+    TileSymmetry, UvCheckerParameters, UvRandomColorParameters, UvTransform, UvWrap, Volume, WarpGrid, WarpPoint, WearParameters, gradient, hsl_adjust, is_key,
+    per_unit, posterize, text_key,
 };
 pub use lighting_output::LightingOutput;
 pub use mask_outline::MaskOutline;
@@ -135,12 +141,14 @@ pub use project::{
 pub use projector::Projector;
 pub use ramp_curve::RampCurve;
 pub use randomized_seed::RandomizedSeed;
+pub use rules::{BlendRules, CompositeRules, HeightNormal};
 pub use selection_background::SelectionBackground;
 pub use shape_crop::ShapeCrop;
 pub use slope_blending::SlopeBlending;
 pub use source_color_mode::SourceColorMode;
 pub use source_slope_blur::SourceSlopeBlur;
 pub use source_warp::SourceWarp;
+pub use strokes::{StoredStrokes, StrokeRecord};
 pub use stylized_lighting::{DIELECTRIC_REFLECTANCE, StylizedLighting};
 pub use stylized_shading::{FLAT_CURVATURE, StylizedShading};
 pub use sun_and_sky::SunAndSky;

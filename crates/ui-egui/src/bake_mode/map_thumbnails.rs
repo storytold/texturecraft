@@ -9,7 +9,7 @@ use texturecraft_engine::core::{BakedMap, BlockScales};
 const THUMBNAIL_PIXELS: u32 = 44;
 
 /// A thumbnail's texture, with the baked data, the working size and the UV tiles' scales it was drawn from
-type Thumbnail = (Weak<Vec<f32>>, (u32, u32), BlockScales, TextureHandle);
+type Thumbnail = (Weak<texturecraft_engine::compose::Texels>, (u32, u32), BlockScales, TextureHandle);
 
 /// The Mesh Map Bakers rows' thumbnails of the baked maps, redrawn when a map is baked again
 #[derive(Default)]

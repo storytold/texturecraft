@@ -47,6 +47,7 @@ mod gradient_map;
 mod high_poly_missed;
 mod instances;
 mod layer_multi_select;
+mod locks;
 mod mask_clone_smudge;
 mod mask_export;
 mod mask_fill_source;

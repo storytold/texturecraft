@@ -3,7 +3,8 @@
 //! The CPU layer-stack evaluator: [`eval::composite_tiles`] turns a texture set's layers, masks,
 //! fills and painted pixels into one image per channel, tile by tile in parallel, including the
 //! live preview of a stroke being drawn. [`display`] converts composited tiles into the texture
-//! formats the viewport samples; [`pattern`] evaluates procedurals through projections.
+//! formats the viewport samples; [`pattern`] evaluates procedurals through projections, [`placed`] the placed
+//! projections of imported fills.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -20,7 +21,7 @@ pub mod environment_sh;
 pub mod environment_sky;
 pub mod eval;
 mod fabric;
-mod field_cache;
+pub mod field_cache;
 mod field_cache_key;
 pub mod fill_copies;
 pub mod fill_copy;
@@ -29,6 +30,7 @@ mod fill_place;
 pub mod frame_placement;
 mod fur_lock;
 mod generator_maps;
+pub mod graphs;
 mod grunge_pattern;
 mod held_fields;
 mod histogram_scan;
@@ -39,6 +41,7 @@ pub mod mip_level;
 mod organic;
 pub mod pattern;
 mod pattern_context;
+pub mod placed;
 pub mod projector_cover;
 pub mod projector_depth;
 mod projector_depth_cache;
@@ -69,16 +72,27 @@ mod wear_scan;
 mod working_field;
 
 pub use below::{BelowCache, StackKey};
-pub use display::{DisplayKind, kinds_for, tile_bytes};
+pub use display::{DisplayKind, display_tile_bytes, kinds_for, tile_bytes};
 pub use effect_histogram::EffectHistogram;
 pub use eval::{
     BLOCK, Composite, Inputs, MASK_CHANNEL, PaintTarget, Stencil, StrokePreview, all_tiles, compare_histograms, composite_tiles, composite_tiles_cached,
-    composite_tiles_with_projectors, covered_tiles, effect_histogram, flatten_layer, mask_at, mask_image, mask_texels, mask_values, pad_tiles,
-    stack_reads_neighbours,
+    composite_tiles_with_projectors, covered_tiles, effect_histogram, flatten_layer, mask_at, mask_image, mask_image_sized, mask_texels, mask_values,
+    pad_tiles, stack_reads_neighbours,
 };
+pub use field_cache::{FIELD_BUDGET, SetFieldCache};
+pub use graphs::{Cooked, GraphStore, GraphUse};
 pub use mask_gray::MaskGray;
 pub use pattern_context::PatternContext;
 pub use projector_depth_cache::ProjectorDepthCache;
 pub use solo::solo_project;
-pub use store::{BakedMaps, ImageRes, ImageStore, PixelStore};
+pub use store::{BakedMaps, ImageOrigin, ImageRes, ImageSource, ImageStore, PixelStore, Texels};
+
+/// The raw distance transforms of the distance filters (Bevel, Bevel Smooth, Directional
+/// Distance), so the GPU compositor's tests can compare its distances exactly. Not a stable API.
+#[doc(hidden)]
+pub mod distance_test_hooks {
+    pub use crate::distance_envelope::DistanceEnvelope;
+    pub use crate::shape_distance::{edge_distances, trail_distances};
+}
 pub use thumb::{THUMB_TEXELS, ThumbImage, ThumbTarget};
+pub use tile_pattern::{TileLayout, prepare_tile_layout};

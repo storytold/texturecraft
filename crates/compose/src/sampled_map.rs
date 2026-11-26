@@ -1,9 +1,11 @@
 use std::sync::Weak;
 
+use crate::Texels;
+
 /// A mesh map a whole-map field samples: its allocation and the size it was baked at (one allocation read as another layout reads other texels)
 #[derive(Clone)]
 pub(crate) struct SampledMap {
-    pub(crate) data: Weak<Vec<f32>>,
+    pub(crate) data: Weak<Texels>,
     pub(crate) baked_size: (u32, u32),
 }
 

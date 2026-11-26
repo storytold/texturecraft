@@ -12,6 +12,9 @@ use texturecraft_render::gpu_trace::GpuTracer;
 use texturecraft_render::trace::{TraceDisplay, TraceScene, TraceSet, TraceSettings, Tracer};
 use texturecraft_render::{Frame, Shade, ViewKind};
 
+/// Display tiles converted and uploaded between two hand-overs to the device.
+const UPLOAD_CHUNK: usize = 64;
+
 /// A headless GPU device that remembers what it already holds of the session.
 pub struct Gpu {
     h: texturecraft_render::headless::Headless,
@@ -34,7 +37,6 @@ impl Gpu {
 
     /// Bring the GPU up to date with the session (mesh, texture sets, environment, dirty tiles).
     fn sync(&mut self, session: &mut Session) {
-        session.update();
         let headless = &mut self.h;
         let mut reupload = false;
         if self.mesh_id != session.mesh_id {
@@ -59,6 +61,7 @@ impl Gpu {
         }
 
         for set_index in 0..session.caches.len() {
+            session.update_only(&[set_index]);
             let mut tiles = session.take_uploads(set_index);
             let Some(cache) = session.caches.get(set_index) else { continue };
             if reupload {
@@ -69,8 +72,7 @@ impl Gpu {
             let composite = &cache.composite;
 
             // Limit live converted pixels while retaining parallel conversion within each batch
-            const UPLOAD_TILES_PER_BATCH: usize = 64;
-            for batch in tiles.chunks(UPLOAD_TILES_PER_BATCH) {
+            for batch in tiles.chunks(UPLOAD_CHUNK) {
                 let bytes: Vec<_> = batch
                     .par_iter()
                     .flat_map_iter(|&(tile_x, tile_y)| DisplayKind::ALL.into_iter().map(move |kind| (kind, tile_x, tile_y)))
@@ -79,19 +81,24 @@ impl Gpu {
                 for (kind, tile_x, tile_y, pixels) in bytes {
                     headless.renderer.upload_tile(&headless.device, &headless.queue, set_index, kind, tile_x, tile_y, &pixels);
                 }
+                headless.flush();
             }
 
             // The aux texture behind the mesh-map and mask views (rebuilt every render)
             let resolution = texturecraft_render::aux_size(cache.size);
             let aux = match session.view {
-                ViewMode::MeshMap(map) => {
-                    Some(texturecraft_render::mesh_maps::mesh_map_rgba(session.doc.baked.get(&set_index), map, resolution, cache.size, &composite.block_scales))
+                ViewMode::MeshMap(map) => Some((
+                    (resolution, resolution),
+                    texturecraft_render::mesh_maps::mesh_map_rgba(session.doc.baked.get(&set_index), map, resolution, cache.size, &composite.block_scales),
+                )),
+                ViewMode::Mask(id) if session.doc.project.locate(id).is_some_and(|(set, _, _)| set == set_index) => {
+                    let extent = texturecraft_render::mask_view_extent(cache.size);
+                    session.mask_view_rgba(id, extent).map(|rgba| (extent, rgba))
                 }
-                ViewMode::Mask(id) if session.doc.project.locate(id).is_some_and(|(set, _, _)| set == set_index) => session.mask_view_rgba(id, resolution),
                 _ => None,
             };
-            if let Some(rgba) = aux {
-                headless.renderer.upload_aux(&headless.device, &headless.queue, set_index, resolution, &rgba);
+            if let Some((extent, rgba)) = aux {
+                headless.renderer.upload_aux_sized(&headless.device, &headless.queue, set_index, extent, &rgba);
             }
         }
     }
@@ -213,6 +220,13 @@ mod tests {
     use serde_json::json;
     use texturecraft_engine::execute;
 
+    /// One GPU test at a time: the NVIDIA driver (620.70) can deadlock when one test's device is
+    /// destroyed while another test records commands on its own device.
+    fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+        static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A 64×32 Radiance `.hdr` (flat RGBE scanlines): a hot orange sky over a dim blue ground.
     fn sky_hdr() -> Vec<u8> {
         let rgbe = |c: [f32; 3]| {
@@ -233,7 +247,8 @@ mod tests {
         let mesh = texturecraft_engine::geom::primitives::material_ball();
         let mut s = Session::new_project("t", mesh, "builtin:material_ball", None, 256).unwrap();
         let name = s.import_resource_bytes("sky.hdr", sky_hdr()).unwrap();
-        assert!(s.images[&name].rgba[0][0] > 10.0, "the decoder keeps HDR values");
+        assert!(s.images.get(&name).unwrap().rgba[0][0] > 10.0, "the decoder keeps HDR values");
+        let _gpu = gpu_lock();
         let Ok(mut gpu) = Gpu::new() else {
             eprintln!("skipping: no GPU adapter");
             return;
@@ -252,6 +267,7 @@ mod tests {
         let mut session = Session::new_project("Test", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
         session.doc.project.display.taa = false;
         let name = session.import_resource_bytes("sky.hdr", sky_hdr()).unwrap();
+        let _gpu = gpu_lock();
         let Ok(mut gpu) = Gpu::new() else {
             eprintln!("skipping: no GPU adapter");
             return;
@@ -283,6 +299,7 @@ mod tests {
         execute(&mut session, "viewport.view", &json!({"mode": "image", "image": "red"})).unwrap();
         let camera = session.camera;
         let uv = |ts| ViewKind::Uv { ts, zoom: 1.0, pan: [0.0, 0.0], rotation: 0.0 };
+        let _gpu = gpu_lock();
         let Ok(mut gpu) = Gpu::new() else {
             eprintln!("skipping: no GPU adapter");
             return;
@@ -306,6 +323,7 @@ mod tests {
         let mesh = texturecraft_engine::geom::primitives::material_ball();
         let mut s = Session::new_project("t", mesh, "builtin:material_ball", None, 256).unwrap();
         execute(&mut s, "layer.add.fill", &json!({"color": [0.75, 0.42, 0.23], "roughness": 0.3, "metallic": 0.4})).unwrap();
+        let _gpu = gpu_lock();
         let Ok(mut gpu) = Gpu::new() else {
             eprintln!("skipping: no GPU adapter");
             return;
@@ -339,6 +357,7 @@ mod tests {
 
         // Atlas UV 0.75 is the middle of tile 1002
         execute(&mut s, "tool.strokeUv", &json!({"points": [[0.75, 0.5]]})).unwrap();
+        let _gpu = gpu_lock();
         let Ok(mut gpu) = Gpu::new() else {
             eprintln!("skipping: no GPU adapter");
             return;

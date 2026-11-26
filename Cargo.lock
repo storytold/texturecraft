@@ -1117,7 +1117,7 @@ dependencies = [
  "exr",
  "flate2",
  "half",
- "hayro-jpeg2000",
+ "hayro-jpeg2000 0.3.5",
  "image",
  "image-webp",
  "jpeg-encoder",
@@ -1152,6 +1152,26 @@ dependencies = [
  "egui",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "craft-material-graph"
+version = "0.1.0"
+source = "git+https://github.com/vangel76/craft-libs?rev=7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a#7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a"
+dependencies = [
+ "libm",
+ "rayon",
+]
+
+[[package]]
+name = "craft-material-graph-wgpu"
+version = "0.1.0"
+source = "git+https://github.com/vangel76/craft-libs?rev=7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a#7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a"
+dependencies = [
+ "bytemuck",
+ "craft-material-graph",
+ "log",
+ "wgpu",
 ]
 
 [[package]]
@@ -1293,6 +1313,20 @@ dependencies = [
  "toml_edit",
  "web-sys",
  "web-time",
+]
+
+[[package]]
+name = "craft-spp-reader"
+version = "0.1.0"
+source = "git+https://github.com/vangel76/craft-libs?rev=7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a#7d6b0100a4ec5c2cd181e8242378f60ecf00eb8a"
+dependencies = [
+ "adler2",
+ "crc32fast",
+ "hayro-jpeg2000 0.5.0",
+ "lz4_flex",
+ "sevenz-rust2",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2224,6 +2258,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
 
 [[package]]
+name = "fearless_simd"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "629c9d6b6f30b5604089e0980f4d924a013aacb1654a6cdf5d3d852224f68651"
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2804,7 +2844,16 @@ version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c75ab947623ef4ccaa7acf0579edf7cbb5a73838e3839a7be73335e522f433a1"
 dependencies = [
- "fearless_simd",
+ "fearless_simd 0.4.1",
+]
+
+[[package]]
+name = "hayro-jpeg2000"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e5e5f2b3de970707fc22fd956d8f44211602939d5e4588603afa919cb7b3740"
+dependencies = [
+ "fearless_simd 1.2.0",
 ]
 
 [[package]]
@@ -3562,6 +3611,12 @@ name = "lz4_flex"
 version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+
+[[package]]
+name = "lzma-rust2"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1c46f3fcd2e888afdb01a07efc071cb21300e07c68d32c3e8b01b5c8cb1fcaa"
 
 [[package]]
 name = "maybe-owned"
@@ -5474,6 +5529,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sevenz-rust2"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30146010a60b5773ef63f7b0033576c7a0487ecc87a30d97b787ca8e27c85140"
+dependencies = [
+ "crc32fast",
+ "js-sys",
+ "lzma-rust2",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5875,8 +5942,10 @@ dependencies = [
 name = "texturecraft-cli"
 version = "0.6.1"
 dependencies = [
+ "craft-material-graph",
  "image",
  "serde_json",
+ "sysinfo",
  "texturecraft-automation",
  "texturecraft-engine",
  "tokio",
@@ -5887,8 +5956,11 @@ dependencies = [
 name = "texturecraft-compose"
 version = "0.6.1"
 dependencies = [
+ "craft-material-graph",
  "half",
  "rayon",
+ "serde",
+ "sysinfo",
  "texturecraft-core",
  "texturecraft-geom",
  "texturecraft-texel",
@@ -5923,10 +5995,14 @@ dependencies = [
  "texturecraft-core",
  "texturecraft-formats",
  "texturecraft-geom",
+ "texturecraft-import",
+ "texturecraft-import-verify",
  "texturecraft-paint",
+ "texturecraft-result-cache",
  "texturecraft-texel",
  "thiserror 2.0.21",
  "tokio",
+ "web-time",
  "zip",
 ]
 
@@ -5952,6 +6028,7 @@ dependencies = [
  "half",
  "image",
  "png",
+ "postcard",
  "quick-xml 0.41.0",
  "rayon",
  "serde",
@@ -5977,6 +6054,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "texturecraft-import"
+version = "0.6.1"
+dependencies = [
+ "craft-material-graph",
+ "craft-spp-reader",
+ "glam 0.30.10",
+ "image",
+ "rayon",
+ "serde_json",
+ "texturecraft-compose",
+ "texturecraft-core",
+ "texturecraft-geom",
+ "texturecraft-texel",
+]
+
+[[package]]
+name = "texturecraft-import-verify"
+version = "0.6.1"
+dependencies = [
+ "glam 0.30.10",
+ "serde",
+ "serde_json",
+ "texturecraft-geom",
+]
+
+[[package]]
 name = "texturecraft-paint"
 version = "0.6.1"
 dependencies = [
@@ -5996,9 +6099,11 @@ name = "texturecraft-render"
 version = "0.6.1"
 dependencies = [
  "bytemuck",
+ "craft-material-graph-wgpu",
  "half",
  "image",
  "log",
+ "naga",
  "pollster 0.4.0",
  "rayon",
  "serde",
@@ -6006,9 +6111,17 @@ dependencies = [
  "texturecraft-compose",
  "texturecraft-core",
  "texturecraft-geom",
+ "texturecraft-paint",
  "texturecraft-texel",
  "wasm-bindgen-futures",
  "wgpu",
+]
+
+[[package]]
+name = "texturecraft-result-cache"
+version = "0.6.1"
+dependencies = [
+ "lz4_flex",
 ]
 
 [[package]]
@@ -6562,7 +6675,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbb2141a2bca6e6d598e471fd4d1d7eed8e020aad6a28187edda07f091a325dd"
 dependencies = [
  "bytemuck",
- "fearless_simd",
+ "fearless_simd 0.4.1",
  "guillotiere",
  "log",
  "peniko",

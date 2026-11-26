@@ -82,6 +82,8 @@ fn reader_glyph(kind: &EffectKind) -> &'static str {
         EffectKind::Paint | EffectKind::Path(_) => ic::PAINT_BRUSH,
         EffectKind::Anchor => ic::ANCHOR,
         EffectKind::Fill { .. } | EffectKind::Material(_) => ic::PAINT_BUCKET,
+        EffectKind::Graph { .. } => ic::MAGIC_WAND,
+        EffectKind::Placeholder { .. } => ic::WARNING,
     }
 }
 

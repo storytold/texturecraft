@@ -3207,3 +3207,36 @@ fn sheet_scroll_end_snapshots() {
     harness.run_steps(30);
     save(&mut harness, &output_dir, "sheet-end-scrolled-medium");
 }
+
+/// The project import's windows: the notice, the progress part way, and the error view.
+#[test]
+#[ignore]
+fn import_window_snapshots() {
+    use texturecraft_engine::import_cmds::{ImportProgress, ImportTask, Step};
+    use texturecraft_ui_egui::import_ui::ImportUi;
+
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else {
+        eprintln!("set TC_UI_SNAPSHOTS=<dir> to write the pictures");
+        return;
+    };
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session = texturecraft_engine::sample_session(1024, 256).unwrap();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
+    texturecraft_ui_egui::import_ui::ask(harness.state_mut(), ImportTask::path("/projects/Ring.file"));
+    save(&mut harness, &output_dir, "import-notice");
+    let progress = std::sync::Arc::new(ImportProgress::new());
+    progress.report(0.47, Step::CookingGraphs { set: 2, of: 3 });
+    let (_keep, rx) = std::sync::mpsc::channel();
+    let started = harness.ctx.input(|i| i.time) - 83.0;
+    harness.state_mut().import = Some(ImportUi::Running { file: "Ring.file".into(), path: None, progress, rx, started });
+    save(&mut harness, &output_dir, "import-progress");
+    harness.state_mut().import =
+        Some(ImportUi::Failed { file: "Ring.file".into(), step: Step::CookingGraphs { set: 2, of: 3 }, error: "cannot read the mesh: example".into() });
+    save(&mut harness, &output_dir, "import-failed");
+    harness.state_mut().import = None;
+}

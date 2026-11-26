@@ -18,6 +18,6 @@ pub(super) struct PreviewInput {
     pub(super) high: SharedHandle<Mesh>,
     pub(super) cage: SharedHandle<Mesh>,
     pub(super) painted: [SharedHandle<BakePaintMap>; 2],
-    pub(super) previous_pixels: SharedHandle<Vec<f32>>,
+    pub(super) previous_pixels: SharedHandle<texturecraft_engine::compose::Texels>,
     pub(super) size: BakeResolution,
 }

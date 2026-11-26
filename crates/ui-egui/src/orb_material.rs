@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Weak};
 
-use texturecraft_engine::compose::ImageRes;
 use texturecraft_engine::compose::pattern::{Coords, image_samples, procedural};
+use texturecraft_engine::compose::{ImageRes, ImageStore};
 use texturecraft_engine::core::blend::lum;
 use texturecraft_engine::core::{Channel, ChannelKind, Fill, NormalFormat, Projection, Sampling, Source};
 use texturecraft_engine::geom::glam::{Vec2, Vec3};
@@ -51,21 +51,16 @@ impl OrbMaterial {
     }
 
     /// `fill` with the channels in `on`; channels that are off show their defaults, images come from `images`
-    pub(crate) fn of_fill(fill: &Fill, on: &[Channel], images: &std::collections::HashMap<String, Arc<ImageRes>>) -> OrbMaterial {
+    pub(crate) fn of_fill(fill: &Fill, on: &[Channel], images: &ImageStore) -> OrbMaterial {
         OrbMaterial::with_channels(fill, ORB_CHANNELS.into_iter().filter(|channel| on.contains(channel)), images, None)
     }
 
     /// `fill`'s `channel` alone (its default when the fill does not write it, `on` being the channels it writes)
-    pub(crate) fn of_channel(fill: &Fill, channel: Channel, on: &[Channel], images: &std::collections::HashMap<String, Arc<ImageRes>>) -> OrbMaterial {
+    pub(crate) fn of_channel(fill: &Fill, channel: Channel, on: &[Channel], images: &ImageStore) -> OrbMaterial {
         OrbMaterial::with_channels(fill, on.contains(&channel).then_some(channel), images, Some(channel))
     }
 
-    fn with_channels(
-        fill: &Fill,
-        channels: impl IntoIterator<Item = Channel>,
-        images: &std::collections::HashMap<String, Arc<ImageRes>>,
-        alone: Option<Channel>,
-    ) -> OrbMaterial {
+    fn with_channels(fill: &Fill, channels: impl IntoIterator<Item = Channel>, images: &ImageStore, alone: Option<Channel>) -> OrbMaterial {
         let sources: BTreeMap<Channel, Source> = channels.into_iter().map(|channel| (channel, fill.source(channel))).collect();
         let images = sources
             .values()
@@ -142,8 +137,8 @@ impl OrbMaterial {
                 self.image_value(image, channel.kind(), *normal_format, coords, footprint)
             }
 
-            // An anchor reads another layer's result, which only the layer stack knows
-            Source::Anchor { .. } => channel.default_value(),
+            // An anchor reads another layer's result and a graph its own evaluation, which only the layer stack knows
+            Source::Anchor { .. } | Source::Graph(_) => channel.default_value(),
         }
     }
 
@@ -159,7 +154,7 @@ impl OrbMaterial {
             ChannelKind::Color if image.srgb => sum.map(srgb_to_linear),
             // Normal channels are OpenGL (+Y up the image): a DirectX image's green flips
             ChannelKind::NormalMap if normal_format == NormalFormat::DirectX => [sum[0], 1.0 - sum[1], sum[2]],
-            ChannelKind::Color | ChannelKind::NormalMap => sum,
+            ChannelKind::Color | ChannelKind::NormalMap | ChannelKind::Data => sum,
             ChannelKind::Scalar => [lum(sum); 3],
             ChannelKind::Signed => [lum(sum) * 2.0 - 1.0; 3],
         }
@@ -172,7 +167,7 @@ fn image_scale(projection: &Projection) -> f32 {
         Projection::Triplanar { scale, .. } | Projection::Planar { scale, .. } => *scale,
         Projection::Spherical { scale, .. } | Projection::Cylindrical { scale, .. } => scale.max(1.0),
         Projection::Uv { scale, .. } => scale[0].abs().max(scale[1].abs()),
-        Projection::UvTile | Projection::Warp { .. } => 1.0,
+        Projection::UvTile | Projection::Warp { .. } | Projection::Placed(_) => 1.0,
     };
     if scale.is_finite() { scale.abs().clamp(MIN_IMAGE_SCALE, MAX_IMAGE_SCALE) } else { 1.0 }
 }

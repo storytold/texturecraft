@@ -56,7 +56,7 @@ impl BakeTask {
                 super::preserve_tiles::restore_unchecked(&mut output, &self.previous_maps, &self.excluded_tiles, &maps)?;
             }
 
-            let data = Arc::new(data);
+            let data = Arc::new(texturecraft_compose::Texels::new(data));
             on_map(StreamedMap { map, index, total, resolution: output.resolution, height: output.height, data: data.clone() });
             match &mut combined {
                 Some(combined) => {
@@ -64,7 +64,8 @@ impl BakeTask {
                 }
                 None => {
                     // A resized partial bake also returns unchecked maps that must survive application
-                    let mut retained: std::collections::BTreeMap<_, _> = output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(pixels))).collect();
+                    let mut retained: std::collections::BTreeMap<_, _> =
+                        output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(texturecraft_compose::Texels::new(pixels)))).collect();
                     retained.insert(map, data);
                     combined = Some(StreamedBake { resolution: output.resolution, height: output.height, maps: retained, tracer: output.tracer });
                 }
@@ -78,7 +79,7 @@ impl BakeTask {
                 Ok(StreamedBake {
                     resolution: output.resolution,
                     height: output.height,
-                    maps: output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(pixels))).collect(),
+                    maps: output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(texturecraft_compose::Texels::new(pixels)))).collect(),
                     tracer: output.tracer,
                 })
             }
@@ -138,7 +139,7 @@ mod tests {
                 resolution: PREVIOUS_WIDTH,
                 maps: [selected, BakedMap::WorldNormal, BakedMap::Normal, BakedMap::Height, BakedMap::Position, BakedMap::AmbientOcclusion]
                     .into_iter()
-                    .map(|map| (map, Arc::new(vec![PREVIOUS_OPACITY; PREVIOUS_WIDTH as usize * (PREVIOUS_WIDTH as usize / 2) * map.components()])))
+                    .map(|map| (map, Arc::new(vec![PREVIOUS_OPACITY; PREVIOUS_WIDTH as usize * (PREVIOUS_WIDTH as usize / 2) * map.components()].into())))
                     .collect(),
             },
         );
@@ -172,7 +173,7 @@ mod tests {
         let (width, height) = if resized { (64, 32) } else { (128, 64) };
         task.previous_maps = BakedMaps {
             resolution: width,
-            maps: PREVIOUS_MAPS.into_iter().map(|map| (map, Arc::new(vec![0.25; width as usize * height * map.components()]))).collect(),
+            maps: PREVIOUS_MAPS.into_iter().map(|map| (map, Arc::new(vec![0.25; width as usize * height * map.components()].into()))).collect(),
         };
         task
     }
@@ -202,7 +203,7 @@ mod tests {
             assert_eq!(allocations, expected, "each truly unchecked resized map must allocate exactly once");
             assert_eq!(output.maps.keys().collect::<Vec<_>>(), whole.maps.keys().collect::<Vec<_>>());
             for (map, pixels) in &whole.maps {
-                assert_eq!(*output.maps[map], *pixels, "{map:?} must preserve the ordinary bake's pixels");
+                assert_eq!(*output.maps[map], pixels.clone().into(), "{map:?} must preserve the ordinary bake's pixels");
             }
             for map in handed_over {
                 assert!(Arc::ptr_eq(&map.data, &output.maps[&map.map]), "streaming must keep sharing the baked buffer");
@@ -224,7 +225,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(handed_over.len(), 1);
         for map in handed_over {
-            assert_eq!(*map.data, whole.maps[&map.map], "cancellation leaves the handed-over map whole");
+            assert_eq!(*map.data, whole.maps[&map.map].clone().into(), "cancellation leaves the handed-over map whole");
         }
         assert_eq!(super::super::preserve_tiles::take_retained_allocations(), [BakedMap::Normal]);
     }
@@ -242,7 +243,7 @@ mod tests {
                 assert_eq!((output.resolution, output.height), (whole.resolution, whole.height));
                 assert_eq!(output.maps.keys().collect::<Vec<_>>(), whole.maps.keys().collect::<Vec<_>>());
                 for (map, pixels) in whole.maps {
-                    assert_eq!(*output.maps[&map], pixels);
+                    assert_eq!(*output.maps[&map], pixels.into());
                 }
             }
             (Err(whole), Err(output)) => assert_eq!(whole.to_string(), output.to_string()),

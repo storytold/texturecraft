@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use texturecraft_core::{BakedMap, Effect, EffectKind, Fill, Layer, LayerKind, Mask, MaskBackground, TextureSet};
+use texturecraft_core::{BakedMap, BlendMode, Effect, EffectKind, Fill, GeometryMask, Layer, LayerKind, Mask, MaskBackground, TextureSet};
 
 use super::*;
 
@@ -26,10 +26,14 @@ fn sample() -> Sample {
     pixels.layer_mut(paint, Channel::Height, (128, 128)).set(70, 3, &[40000, 65535]);
     pixels.mask_mut(effect, (64, 64)).set(10, 60, &[30000, 65535]);
     let ao: Vec<f32> = (0..256).map(|i| i as f32 / 255.0).collect();
-    let baked = BakedMaps { resolution: 16, maps: [(BakedMap::AmbientOcclusion, Arc::new(ao)), (BakedMap::Normal, Arc::new(vec![0.5; 16 * 16 * 3]))].into() };
+    let baked = BakedMaps {
+        resolution: 16,
+        maps: [(BakedMap::AmbientOcclusion, Arc::new(ao.into())), (BakedMap::Normal, Arc::new(vec![0.5; 16 * 16 * 3].into()))].into(),
+    };
     let pf = ProjectFile {
         project: p,
         pixels,
+        stroke_replay: None,
         baked: [(0, baked)].into(),
         mesh: Some(("glb".into(), vec![1, 2, 3, 4, 5])),
         mesh_uvs: None,
@@ -39,6 +43,8 @@ fn sample() -> Sample {
             .into(),
         thumbnail: Some(vec![137, 80, 78, 71]),
         resources: [("bricks.png".to_string(), vec![9, 8, 7])].into(),
+        graphs: Default::default(),
+        strokes: BTreeMap::new(),
         warnings: Vec::new(),
     };
     Sample { pf, paint }
@@ -103,7 +109,7 @@ fn legacy_bakes_load_as_is_without_layout_conversion() {
     set.uv_tiles = vec![1001, 1002];
     set.tile_resolutions.insert(1002, 128);
     let pixels: Vec<f32> = (0..16).flat_map(|y| (0..32).map(move |x| (y * 32 + x) as f32)).collect();
-    sample.pf.baked.insert(0, BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(pixels))].into() });
+    sample.pf.baked.insert(0, BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(pixels.into()))].into() });
 
     let loaded = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
     assert_eq!(loaded.project.format_version, TANGENT_BENT_NORMAL_VERSION);
@@ -128,7 +134,7 @@ fn a_bent_normal_declared_without_pixels_in_an_older_project_is_dropped_and_repo
 #[test]
 fn a_bent_normal_with_pixels_but_no_declaration_in_an_older_project_is_dropped_and_reported() {
     let mut sample = sample();
-    let bent = Arc::new([0.5, 1.0, 0.5].repeat(16 * 16));
+    let bent = Arc::new([0.5, 1.0, 0.5].repeat(16 * 16).into());
     sample.pf.baked.get_mut(&0).unwrap().maps.insert(BakedMap::BentNormal, bent);
     assert!(!sample.pf.project.texture_sets[0].baked.contains(&BakedMap::BentNormal));
     sample.pf.project.format_version = TANGENT_BENT_NORMAL_VERSION - 1;
@@ -141,7 +147,7 @@ fn a_bent_normal_with_pixels_but_no_declaration_in_an_older_project_is_dropped_a
 #[test]
 fn world_space_bent_normals_of_older_projects_are_dropped_for_a_rebake() {
     let mut sample = sample();
-    let bent = Arc::new([0.5, 1.0, 0.5].repeat(16 * 16));
+    let bent = Arc::new([0.5, 1.0, 0.5].repeat(16 * 16).into());
     sample.pf.baked.get_mut(&0).unwrap().maps.insert(BakedMap::BentNormal, bent);
     sample.pf.project.texture_sets[0].baked.insert(BakedMap::BentNormal);
 
@@ -258,13 +264,33 @@ fn tiles_are_validated_against_the_texture_set() {
 }
 
 #[test]
+fn user_channels_round_trip_with_their_names_and_pixels() {
+    let mut s = sample();
+    let plain = String::from_utf8_lossy(&serde_json::to_vec(&s.pf.project).unwrap()).to_string();
+    assert!(!plain.contains("channel_names"), "files without named channels look as before");
+    let set = &mut s.pf.project.texture_sets[0];
+    set.channels.push((Channel::User3, texturecraft_core::ChannelFormat::L16));
+    set.channel_names.insert(Channel::User3, "Wetness".into());
+    if let Some(layer) = s.pf.project.layers.get_mut(&s.paint) {
+        layer.channels.insert(Channel::User3, Default::default());
+    }
+    s.pf.pixels.layer_mut(s.paint, Channel::User3, (128, 128)).set(5, 6, &[100, 200, 300, 65535]);
+    let back = load_project_bytes(&save_project_bytes(&s.pf).unwrap()).unwrap();
+    assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+    assert_same(&s.pf, &back);
+    assert_eq!(back.project.texture_sets[0].channel_label(Channel::User3), "Wetness");
+    assert_eq!(back.project.texture_sets[0].channel_label(Channel::User4), "User 4");
+    assert_eq!(back.pixels.layer(s.paint, Channel::User3).unwrap().get(5, 6), [100, 200, 300, 65535]);
+}
+
+#[test]
 fn uv_tiled_sets_round_trip_their_atlas_pixels_and_bakes() {
     let mut s = sample();
     s.pf.project.texture_sets[0].uv_tiles = vec![1001, 1002];
     let mut pixels = PixelStore::default();
     pixels.layer_mut(s.paint, Channel::BaseColor, (256, 128)).set(200, 100, &[1, 2, 3, 4]);
     s.pf.pixels = pixels;
-    let baked = BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 32 * 16]))].into() };
+    let baked = BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 32 * 16].into()))].into() };
     s.pf.baked = [(0, baked)].into();
     let back = load_project_bytes(&save_project_bytes(&s.pf).unwrap()).unwrap();
     assert_same(&s.pf, &back);
@@ -324,7 +350,7 @@ fn big_sample() -> ProjectFile {
     let r = 300usize;
     let maps = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Position]
         .into_iter()
-        .map(|m| (m, Arc::new(noise(r * r * m.components()))))
+        .map(|m| (m, Arc::new(noise(r * r * m.components()).into())))
         .collect();
     s.pf.baked.insert(1, BakedMaps { resolution: r as u32, maps });
     s.pf.mesh = Some(("obj".into(), noise(5000).iter().map(|v| (v * 200.0) as u8).collect()));
@@ -357,8 +383,10 @@ fn save_plan_follows_the_reserved_cores_and_the_ram_share() {
     // The share is of the RAM given, clamped to 1..=100 percent, and never overflows.
     assert_eq!(entries::plan(2, 1, 5, 1000, 0).1, 10);
     assert_eq!(entries::plan(2, 1, 5, 1000, 250).1, 1000);
-    assert_eq!(entries::plan(2, 1, 5, u64::MAX, 100).1, u64::MAX);
-    assert_eq!(entries::plan(2, 1, 5, u64::MAX, 50).1, u64::MAX / 2);
+    assert_eq!(entries::plan(2, 1, 5, u64::MAX, 100).1, entries::MAX_SAVE_IN_FLIGHT);
+    // A large machine's share is capped: the save runs beside a full project.
+    assert_eq!(entries::plan(2, 1, 5, 32 << 30, 50).1, entries::MAX_SAVE_IN_FLIGHT);
+    assert_eq!(entries::plan(2, 1, 5, 2 << 30, 50).1, 1 << 30);
 }
 
 #[test]
@@ -485,8 +513,8 @@ fn edit_project_json(project_file: &ProjectFile, mut edit: impl FnMut(&mut serde
 fn recovery_loads_legacy_bake_settings_and_map_names() {
     let mut expected = sample().pf;
     let maps = expected.baked.get_mut(&0).unwrap();
-    maps.maps.insert(BakedMap::WorldNormal, Arc::new(vec![0.5; 16 * 16 * 3]));
-    maps.maps.insert(BakedMap::BentNormal, Arc::new(vec![0.5; 16 * 16 * 3]));
+    maps.maps.insert(BakedMap::WorldNormal, Arc::new(vec![0.5; 16 * 16 * 3].into()));
+    maps.maps.insert(BakedMap::BentNormal, Arc::new(vec![0.5; 16 * 16 * 3].into()));
     expected.project.texture_sets[0].baked = maps.maps.keys().copied().collect();
     expected.project.texture_sets[1].bake.common.dilation = 12;
 
@@ -752,9 +780,9 @@ fn project_open_limit_counts_every_loaded_entry_kind() {
         let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
         let total_bytes: u64 = (0..archive.len()).map(|index| archive.by_index(index).unwrap().size()).sum();
 
-        let accepted = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes)).unwrap();
-        let error = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes - 1)).unwrap_err();
-        let raised_limit = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes + 1)).unwrap();
+        let accepted = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes), None).unwrap();
+        let error = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes - 1), None).unwrap_err();
+        let raised_limit = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes + 1), None).unwrap();
 
         assert!(matches!(error, FormatError::TooLarge(_)), "{name}: {error}");
         assert!(error.to_string().contains(&format!("{} bytes", total_bytes - 1)), "{name}: {error}");
@@ -769,8 +797,8 @@ fn project_open_limit_is_shared_across_the_whole_archive() {
     let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
     let total_bytes: u64 = (0..archive.len()).map(|index| archive.by_index(index).unwrap().size()).sum();
 
-    let accepted = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes)).unwrap();
-    let error = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes - 1)).unwrap_err();
+    let accepted = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes), None).unwrap();
+    let error = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes - 1), None).unwrap_err();
 
     assert_same(&project, &accepted);
     assert!(matches!(error, FormatError::TooLarge(_)), "{error}");
@@ -811,8 +839,8 @@ fn archive_preflight_counts_ignored_entries_and_allows_the_exact_limit() {
     let bytes = writer.finish().unwrap().into_inner();
     let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
 
-    check_archive(&mut archive, 32).unwrap();
-    let error = check_archive(&mut archive, 31).unwrap_err();
+    check_archive(&mut archive, 32, false).unwrap();
+    let error = check_archive(&mut archive, 31, false).unwrap_err();
 
     assert!(matches!(error, FormatError::TooLarge(_)), "{error}");
 }
@@ -826,7 +854,7 @@ fn overlapping_archive_entries_are_rejected_before_decompression() {
     let bytes = writer.finish().unwrap().into_inner();
     let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
 
-    let error = check_archive(&mut archive, 32).unwrap_err();
+    let error = check_archive(&mut archive, 32, false).unwrap_err();
 
     assert!(error.to_string().contains("overlapping ZIP entries"), "{error}");
 }
@@ -841,7 +869,7 @@ fn actual_decompression_is_bounded_even_when_the_declared_size_is_small() {
     // The central header stores the uncompressed size at byte 24
     bytes.get_mut(directory + 24..directory + 28).unwrap().copy_from_slice(&1u32.to_le_bytes());
     let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
-    check_archive(&mut archive, 1024).unwrap();
+    check_archive(&mut archive, 1024, false).unwrap();
     let mut entry = archive.by_index(0).unwrap();
     let mut budget = LoadBudget::new(1024);
 
@@ -912,7 +940,7 @@ fn zip64_entry_counts_remain_supported_and_bounded() {
         let bytes = writer.finish().unwrap().into_inner();
 
         let mut archive = open_archive(Cursor::new(bytes), MAX_ZIP_METADATA_BYTES).unwrap();
-        let result = check_archive(&mut archive, 0);
+        let result = check_archive(&mut archive, 0, false);
 
         assert_eq!(archive.len(), count);
         if count <= MAX_ENTRIES {
@@ -921,6 +949,569 @@ fn zip64_entry_counts_remain_supported_and_bounded() {
             assert!(matches!(result, Err(FormatError::TooLarge(_))), "{result:?}");
         }
     }
+}
+
+/// A project.json written by format version 2 (before locks, placeholders, the import report, UV-tile geometry masks
+/// and the imported blend modes), for `sample()` plus a layer with a part mask, a Tint channel and a levels effect.
+const VERSION_2_PROJECT: &str = include_str!("fixtures/version2.json");
+
+#[test]
+fn version_2_files_still_load_and_resave_as_version_3() {
+    let Sample { pf: sample, paint } = sample();
+    let bytes = edit_archive(&sample, |name, data| {
+        if name == "project.json" {
+            *data = VERSION_2_PROJECT.as_bytes().to_vec();
+        }
+    });
+    let loaded = load_project_bytes(&bytes).unwrap();
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert_eq!(loaded.project.format_version, TANGENT_BENT_NORMAL_VERSION);
+    let parts = loaded.project.layers.values().find(|l| l.name == "Parts only").unwrap();
+    assert_eq!(parts.geometry_mask, Some(GeometryMask::Parts(vec!["Body".into(), "Lid".into()])));
+    assert_eq!(parts.channels[&Channel::BaseColor].mode, BlendMode::Tint);
+    assert!(loaded.project.layers.values().all(|l| l.lock.is_none() && l.placeholders().next().is_none()));
+    assert_eq!(loaded.project.import, None);
+    assert_eq!(loaded.pixels.layer(paint, Channel::BaseColor).map(|i| i.get(127, 127)), Some([65535, 0, 9, 65535]));
+    // Saved again as version 3, a part mask keeps its version 2 form and nothing else is added.
+    let resaved = save_project_bytes(&loaded).unwrap();
+    let json = project_json(&resaved);
+    assert_eq!(json["format_version"], 3);
+    let stored = json["layers"].as_object().unwrap().values().find(|l| l["name"] == "Parts only").unwrap();
+    assert_eq!(stored["geometry_mask"], serde_json::json!(["Body", "Lid"]));
+    assert!(json.get("import").is_none() && json["layers"].as_object().unwrap().values().all(|l| l.get("lock").is_none()));
+    assert_same(&loaded, &load_project_bytes(&resaved).unwrap());
+}
+
+fn project_json(bytes: &[u8]) -> serde_json::Value {
+    let mut zip = ZipArchive::new(Cursor::new(bytes)).unwrap();
+    let mut json = String::new();
+    zip.by_name("project.json").unwrap().read_to_string(&mut json).unwrap();
+    serde_json::from_str(&json).unwrap()
+}
+
+#[test]
+fn version_3_features_round_trip_identically() {
+    use texturecraft_core::import_report::original_result_layer;
+    use texturecraft_core::{Fidelity, ImportReport, LayerReport, LayerRole, Lock, LockReason, SafetyFlag, SafetyFlagKind};
+
+    let mut s = sample();
+    let p = &mut s.pf.project;
+    let channels = p.texture_sets[0].channel_list();
+    // A locked layer with placeholders in its mask and content, every imported blend mode and a UV-tile mask.
+    let mut locked = Layer::new(p.alloc_id(), "Imported", LayerKind::Paint, &channels);
+    locked.content_effects.push(Effect::placeholder(p.alloc_id(), "Filter \"warp\"", "compiled graphs are not computed yet"));
+    locked.mask = Some(Mask { effects: vec![Effect::placeholder(p.alloc_id(), "Generator \"dirt\"", "not computed")], ..Mask::new(MaskBackground::White) });
+    locked.lock = Some(Lock::import(vec![LockReason::new("graph:warp", "content filter \"warp\""), LockReason::new("", "brush strokes")]));
+    locked.geometry_mask = Some(GeometryMask::UvTiles(vec![1001, 1002]));
+    for (c, m) in channels.iter().zip(BlendMode::IMPORTED) {
+        if let Some(b) = locked.channels.get_mut(c) {
+            b.mode = m;
+        }
+    }
+    let locked = p.insert_layer(0, locked, None, false).unwrap();
+    let original = p.alloc_id();
+    p.insert_layer(0, original_result_layer(original, &channels, false), None, false).unwrap();
+    s.pf.pixels.layer_mut(original, Channel::BaseColor, (128, 128)).set(5, 6, &[1, 2, 3, 65535]);
+    let mut report = ImportReport::new("robot.ext (saved with version 1.2)", "texturecraft-import 0.1.0");
+    report.add("texture set \"A\" / layer stack", Fidelity::Approximated, "2 layers imported");
+    report.add("texture set \"A\" / brush strokes", Fidelity::Baked, "");
+    report.layers.insert(original, LayerReport { role: LayerRole::OriginalResult, fidelity: Fidelity::Baked, ..LayerReport::default() });
+    let flags = vec![
+        SafetyFlag::new(SafetyFlagKind::UnhandledSetting, "Class.field", "setting Class.field = 2 not handled"),
+        SafetyFlag::new(SafetyFlagKind::MaskNotComputable, "", "mask generator not computable"),
+    ];
+    report.layers.insert(locked, LayerReport { role: LayerRole::Imported, fidelity: Fidelity::Approximated, path: "Folder / Imported".into(), flags });
+    p.import = Some(report);
+
+    let bytes = save_project_bytes(&s.pf).unwrap();
+    let back = load_project_bytes(&bytes).unwrap();
+    assert!(back.warnings.is_empty());
+    assert_same(&s.pf, &back);
+    assert_eq!(save_project_bytes(&back).unwrap(), bytes, "saving is deterministic");
+    let json = project_json(&bytes);
+    assert_eq!(json["format_version"], 3);
+    let stored = &json["layers"][locked.0.to_string()];
+    assert_eq!(stored["geometry_mask"], serde_json::json!({"UvTiles": [1001, 1002]}));
+    assert_eq!(stored["lock"]["source"], "Project import");
+    assert_eq!(json["import"]["layers"][original.0.to_string()]["role"], "OriginalResult");
+    // A stored fidelity this version does not know is an error, not a silent default.
+    let mut bad = json.clone();
+    bad["import"]["entries"][0]["fidelity"] = serde_json::json!("KeptRaw");
+    let bytes = edit_project_json(&s.pf, |j| *j = bad.clone());
+    assert!(load_project_bytes(&bytes).is_err());
+}
+
+const GREY: &str = "format 3\nsize 8\nnode 1 color r=0.5 g=0.5 b=0.5\noutput grey 1\nexpose gain 1 r 0 1\n";
+const UNUSED: &str = "format 3\nsize 8\nnode 1 color r=1 g=0 b=0\noutput red 1\n";
+
+/// A sample with a graph source, a nested graph in a mask generator, and one cook the source's use read.
+fn graph_sample() -> (ProjectFile, String) {
+    use texturecraft_core::{GraphInput, GraphRef, Projection, Source};
+    let mut pf = sample().pf;
+    let grey = pf.graphs.add_text(GREY);
+    pf.graphs.add_text(UNUSED);
+    let mut g = GraphRef::new(grey.clone(), "grey");
+    g.output = Some("grey".into());
+    let mut fill = Fill::default();
+    fill.sources.insert(Channel::Roughness, Source::Graph(Box::new(g.clone())));
+    let id = pf.project.alloc_id();
+    let mut layer = Layer::new(id, "Graph fill", LayerKind::Fill(fill), &[Channel::Roughness]);
+    let mut outer = GraphRef::new(texturecraft_core::text_key("absent outer"), "outer");
+    outer.inputs.insert(0, GraphInput::Nested(Box::new(g)));
+    layer.mask = Some(Mask {
+        effects: vec![Effect::new(pf.project.alloc_id(), EffectKind::Graph { graph: outer, projection: Projection::default() })],
+        ..Mask::new(MaskBackground::White)
+    });
+    pf.project.insert_layer(0, layer, None, false).unwrap();
+    let t = texturecraft_compose::graphs::Tex { w: 70, h: 70, px: (0..4900).map(|i| [(i % 70) as f32 / 70.0, 0.25, 0.5, 1.0]).collect() };
+    let key = texturecraft_core::StableHash::of(b"a cook").key();
+    pf.graphs.insert_cooked(
+        key.clone(),
+        Cooked::from_textures([("grey".to_string(), t.clone()), ("odd name/x".to_string(), t)].into(), ["grey".to_string()].into()),
+    );
+    pf.graphs.insert_cooked(texturecraft_core::StableHash::of(b"unused cook").key(), Cooked::from_textures(BTreeMap::new(), Default::default()));
+    pf.graphs.set_uses([(GraphUse { set: 0, id, channel: Some(Channel::Roughness) }, key.clone())].into());
+    (pf, key)
+}
+
+#[test]
+fn saving_a_parameter_edit_does_not_reattach_the_old_graph_pixels() {
+    use texturecraft_compose::ImageStore;
+    use texturecraft_compose::graphs::RenderEnv;
+    use texturecraft_core::{GraphValue, Source};
+
+    let (original, key) = graph_sample();
+    let loaded = load_project_bytes(&save_project_bytes(&original).unwrap()).unwrap();
+    let mut edited = loaded.clone();
+    let use_ = loaded.graphs.uses().into_keys().next().unwrap();
+    let LayerKind::Fill(fill) = &mut edited.project.layers.get_mut(&use_.id).unwrap().kind else { panic!("graph fill") };
+    let Source::Graph(graph) = fill.sources.get_mut(&Channel::Roughness).unwrap() else { panic!("graph source") };
+    graph.params.insert("gain".into(), GraphValue::Float(0.75));
+    let updated = graph.as_ref().clone();
+
+    let reopened = load_project_bytes(&save_project_bytes(&edited).unwrap()).unwrap();
+    assert_eq!(reopened.graphs.use_cook_key(&use_), None, "the older result is not current");
+    assert!(reopened.graphs.cooked(&key).is_none(), "a cook held only by an older state is not written");
+    assert_eq!(loaded.graphs.use_cook_key(&use_), Some(key.clone()), "the existing use is still available to Undo");
+    assert_eq!(save_project_bytes(&loaded).unwrap(), save_project_bytes(&original).unwrap());
+
+    let env = RenderEnv { baked: &BakedMaps::default(), images: &ImageStore::default(), side: 8 };
+    edited.graphs.cook_for(use_.clone(), &updated, &env, &[]).unwrap();
+    let fresh = edited.graphs.use_cook_key(&use_).unwrap();
+    assert_ne!(fresh, key);
+    let reopened = load_project_bytes(&save_project_bytes(&edited).unwrap()).unwrap();
+    assert_eq!(reopened.graphs.use_cook_key(&use_), Some(fresh));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_project_opened_from_its_file_reads_cooks_when_they_are_needed() {
+    let (pf, key) = graph_sample();
+    let dir = std::env::temp_dir().join(format!("tc-formats-lazy-cooks-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("lazy.tcraft");
+    save_project(&path, &pf).unwrap();
+    let back = load_project(&path).unwrap();
+    assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+    assert_eq!(back.graphs.held_bytes(), 0, "no cook is held after opening");
+    assert_eq!(back.graphs.used_cook_keys(), vec![key.clone()]);
+    assert_eq!(*back.graphs.cooked(&key).unwrap(), *pf.graphs.cooked(&key).unwrap(), "read from the file as it was saved");
+    // saved again (over itself and elsewhere) it holds the same cooks, byte for byte
+    let bytes = save_project_bytes(&pf).unwrap();
+    assert_eq!(save_project_bytes(&back).unwrap(), bytes);
+    save_project(&path, &back).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(*back.graphs.cooked(&key).unwrap(), *pf.graphs.cooked(&key).unwrap(), "still read after the save over the file");
+    // A lazy snapshot can still read its original cook after the path is removed.
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(*back.graphs.cooked(&key).unwrap(), *pf.graphs.cooked(&key).unwrap());
+    assert_eq!(back.graphs.held_bytes(), 0, "reading from the retained file does not pin the cook");
+}
+
+#[test]
+fn graph_texts_and_cooks_round_trip_byte_for_byte() {
+    let (pf, key) = graph_sample();
+    let bytes = save_project_bytes(&pf).unwrap();
+    let back = load_project_bytes(&bytes).unwrap();
+    assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+    assert_same(&pf, &back);
+    // only the referenced text that the project holds is saved (the outer one is missing: it is just not there)
+    assert_eq!(back.graphs.texts.keys().collect::<Vec<_>>(), [&texturecraft_core::text_key(GREY)]);
+    assert_eq!(back.graphs.uses(), pf.graphs.uses());
+    let cooked = back.graphs.cooked(&key).unwrap();
+    assert_eq!(*cooked, *pf.graphs.cooked(&key).unwrap(), "cooks load as they were saved, linear outputs too");
+    assert_eq!(back.graphs.used_cooks().len(), 1, "cooks no use reads are not saved");
+    assert_eq!(save_project_bytes(&back).unwrap(), bytes, "re-saving gives the same bytes");
+    // version 3 files without graphs load as before
+    let plain = sample().pf;
+    let back = load_project_bytes(&save_project_bytes(&plain).unwrap()).unwrap();
+    assert!(back.graphs.texts.is_empty() && back.graphs.uses().is_empty());
+}
+
+#[test]
+fn hostile_graph_entries_are_refused_or_left_out() {
+    let (pf, key) = graph_sample();
+    let grey = texturecraft_core::text_key(GREY);
+    // a text that does not hash to its name
+    let bytes = edit_archive(&pf, |name, data| {
+        if name.starts_with("graphs/") {
+            data.extend_from_slice(b"node 9 color\n");
+        }
+    });
+    assert!(load_project_bytes(&bytes).unwrap_err().to_string().contains("does not match its key"));
+    // a graph entry that is not named by a key
+    let bytes = edit_archive(&pf, |name, _| {
+        if name.starts_with("graphs/") {
+            *name = "graphs/../../x.txt".into();
+        }
+    });
+    assert!(load_project_bytes(&bytes).is_err());
+    // a reference whose key is not a key
+    let bytes = edit_project_json(&pf, |json| {
+        let text = json.to_string().replace(&grey, "../etc");
+        *json = serde_json::from_str(&text).unwrap();
+    });
+    assert!(load_project_bytes(&bytes).is_err());
+    // an unreadable index: no cooks, a note, the project still opens
+    let bytes = edit_archive(&pf, |name, data| {
+        if name == "cooked/index.json" {
+            *data = b"{not json".to_vec();
+        }
+    });
+    let back = load_project_bytes(&bytes).unwrap();
+    assert!(back.graphs.cooked(&key).is_none() && back.warnings.len() == 1);
+    // a cook whose output entry is broken is left out whole
+    let bytes = edit_archive(&pf, |name, data| {
+        if name.starts_with("cooked/") && name.ends_with(".bin") {
+            data.truncate(30);
+        }
+    });
+    let back = load_project_bytes(&bytes).unwrap();
+    assert!(back.graphs.cooked(&key).is_none() && back.warnings.iter().any(|w| w.contains("rendered again")));
+    assert_eq!(back.graphs.texts.len(), 1);
+}
+
+/// A record with every kind of part, keyed by nothing yet.
+fn sample_record(seed: u32) -> texturecraft_core::StrokeRecord {
+    use texturecraft_core::strokes::*;
+    let tip = StrokeTip::Image { width: 2, height: 1, values: Arc::from(vec![0.25, f32::NAN]) };
+    let brush = StrokeBrush {
+        radius: 0.05,
+        spacing: 0.1,
+        flow: 0.8,
+        size_pressure: Some(0.2),
+        flow_pressure: None,
+        size_jitter: 0.1,
+        flow_jitter: 0.0,
+        position_jitter: 0.3,
+        position_both: true,
+        position_normal: false,
+        rotation: 1.5,
+        rotation_jitter: 0.25,
+        follow: true,
+        alignment: StrokeTipAlignment::Camera,
+        culling: Some(0.5),
+        tip: StrokeTip::Round { hardness: 0.9 },
+        cycle: vec![tip.clone(), tip],
+        cycle_drawn_start: true,
+        up: Some([0.0, 1.0, 0.0]),
+    };
+    let graph = texturecraft_core::GraphRef { output: Some("basecolor".into()), seed: 3, ..texturecraft_core::GraphRef::new("k".repeat(16), "grunge") };
+    let stroke = RecordedStroke {
+        space: StrokeSpace::Mesh { view: [1.0; 16], projection: [-0.0; 16] },
+        points: vec![StrokePoint { position: [0.1, -0.2], pressure: 0.5 }, StrokePoint { position: [0.3, 0.4], pressure: 1.0 }],
+        seed,
+        lazy: 0.02,
+        copies: 1,
+        copy_matrix: [2.0; 16],
+    };
+    let path = PathStroke {
+        pieces: vec![PathPiece { points: [[0.0; 3], [1.0; 3], [2.0; 3], [3.0; 3]], normals: [[0.0, 0.0, 1.0]; 2], size: [0.5, 1.0] }],
+        anchor: None,
+        seed: seed + 1,
+        copies: 0,
+        copy_matrix: [0.0; 16],
+    };
+    let step = StrokeStep {
+        mode: StrokeMode::Paint,
+        values: vec![(Channel::BaseColor, [1.0, 0.5, 0.0], 1.0)],
+        sources: vec![(Channel::Roughness, StrokeSource::Graph(Box::new(graph)), 0.5), (Channel::Metallic, StrokeSource::NotKept("an image".into()), 1.0)],
+        mask_value: 0.0,
+        mask_source: None,
+        opacity: 0.75,
+        brush,
+        stencil: Some(StrokeStencil { image: StencilValues::Image { width: 1, height: 2, values: Arc::from(vec![0.0, 1.0]) }, matrix: [0.5; 9] }),
+        projection: Some(StrokeStencil { image: StencilValues::Uniform(0.3), matrix: [1.0; 9] }),
+        placed: Some([0.25; 9]),
+        strokes: vec![stroke.clone(), RecordedStroke { space: StrokeSpace::Uv, ..stroke }],
+        paths: vec![path],
+        ribbon: Some(StrokeRibbon { width: 0.1, copy: 0.4, tiling: RibbonTiling::Caps { guides: [0.2, 0.8] }, depth: 0.05 }),
+        particles: Some(StrokeParticles {
+            per_point: 2.0,
+            per_length: 0.5,
+            budget: 64.0,
+            speed: 0.3,
+            speed_rand: 0.2,
+            life: 0.5,
+            life_rand: 0.1,
+            gravity: 1.0,
+            friction: 0.5,
+            wander: 0.1,
+            curl: 0.2,
+            fan: 1.0,
+            heading: 0.3,
+            away: true,
+            kink_time: 0.1,
+            kink_angle: 0.4,
+            kink_branches: 2.0,
+            kink_speed: 1.0,
+            stop_speed: 0.01,
+            view_bias: 0.2,
+            spread: 1.0,
+            scatter: 0.1,
+            fade_size: 0.2,
+            fade_size_rand: 0.1,
+            fade_flow: 0.3,
+            fade_flow_rand: 0.1,
+            size: 0.8,
+            flow: 0.9,
+            step: 0.01,
+            file_units: false,
+        }),
+    };
+    let smudge = StrokeStep { mode: StrokeMode::Smudge, sources: vec![], ..step.clone() };
+    StrokeRecord { target: StrokeTarget::Content, label: "Layer 1 / brush strokes".into(), steps: vec![step, smudge] }
+}
+
+fn mask_effect(pf: &ProjectFile) -> LayerId {
+    pf.project.layers.values().find_map(|l| l.mask.as_ref()?.effects.first().map(|e| e.id)).unwrap()
+}
+
+fn stroke_entries(bytes: &[u8]) -> Vec<String> {
+    payloads(bytes).into_iter().map(|p| p.0).filter(|n| n.starts_with("strokes/")).collect()
+}
+
+fn stroke_image_entries(bytes: &[u8]) -> Vec<String> {
+    payloads(bytes).into_iter().map(|p| p.0).filter(|n| n.starts_with(strokes::IMAGE_DIR)).collect()
+}
+
+fn encode(record: &texturecraft_core::StrokeRecord) -> Vec<u8> {
+    strokes::encode(record, &mut strokes::ImageTable::default()).unwrap()
+}
+
+#[test]
+fn stroke_records_round_trip_bit_for_bit() {
+    let mut s = sample();
+    let native_strokes = br#"{"version":2,"targets":[]}"#;
+    s.pf.stroke_replay = Some(StrokeReplayData::loaded(native_strokes.to_vec()));
+    let mask = mask_effect(&s.pf);
+    let record = sample_record(7);
+    s.pf.strokes.insert(s.paint, record.clone().into());
+    let mut on_mask = sample_record(9);
+    on_mask.target = texturecraft_core::strokes::StrokeTarget::Mask;
+    s.pf.strokes.insert(mask, on_mask.into());
+    let bytes = save_project_bytes(&s.pf).unwrap();
+    assert_eq!(stroke_entries(&bytes), [format!("strokes/{}.bin", s.paint.0), format!("strokes/{}.bin", mask.0)]);
+    // the tip (laid by four stamps of two records) and the stencil are kept once each
+    assert_eq!(stroke_image_entries(&bytes).len(), 2);
+    let back = load_project_bytes(&bytes).unwrap();
+    assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+    assert_same(&s.pf, &back);
+    assert_eq!(back.stroke_replay.as_ref().unwrap().bytes().unwrap().as_ref(), native_strokes);
+    // floats keep their bits (NaN, -0.0), so the encodings agree too
+    let read = back.strokes.get(&s.paint).and_then(StoredStrokes::record).unwrap();
+    assert_eq!(encode(read), encode(&record));
+    assert_eq!(back.strokes.len(), 2);
+    // read back, the records share one copy of each image
+    let other = back.strokes.get(&mask).and_then(StoredStrokes::record).unwrap();
+    assert!(Arc::ptr_eq(read.images()[0], other.images()[0]));
+    assert_eq!(save_project_bytes(&back).unwrap(), bytes, "saving again writes the same file");
+}
+
+#[test]
+fn projects_without_stroke_records_are_written_as_before() {
+    let s = sample();
+    let bytes = save_project_bytes(&s.pf).unwrap();
+    assert!(stroke_entries(&bytes).is_empty());
+    let names: Vec<String> = payloads(&bytes).into_iter().map(|p| p.0).collect();
+    let mut with = s.pf.clone();
+    with.strokes.insert(s.paint, sample_record(1).into());
+    let more: Vec<String> = payloads(&save_project_bytes(&with).unwrap())
+        .into_iter()
+        .map(|p| p.0)
+        .filter(|n| !n.starts_with("strokes/") && !n.starts_with(strokes::IMAGE_DIR))
+        .collect();
+    // a record adds its entry (and the text of a graph it paints when the store holds it), nothing else changes
+    assert_eq!(names, more);
+    assert!(load_project_bytes(&bytes).unwrap().strokes.is_empty());
+}
+
+#[test]
+fn records_of_removed_pixels_are_neither_saved_nor_loaded() {
+    let mut s = sample();
+    s.pf.strokes.insert(LayerId(9999), sample_record(1).into());
+    assert!(stroke_entries(&save_project_bytes(&s.pf).unwrap()).is_empty());
+    let record = strokes::encode_inline(&sample_record(1)).unwrap();
+    let back = load_project_bytes(&zip_with(&[("strokes/9999.bin", record.clone()), (&format!("strokes/{}.bin", s.paint.0), record)])).unwrap();
+    assert_eq!(back.strokes.keys().copied().collect::<Vec<_>>(), [s.paint]);
+    assert!(matches!(load_project_bytes(&zip_with(&[("strokes/x.bin", vec![])])), Err(FormatError::Malformed { .. })));
+}
+
+#[test]
+fn unreadable_stroke_records_are_kept_as_their_bytes() {
+    let s = sample();
+    let good = strokes::encode_inline(&sample_record(1)).unwrap();
+    let mut newer = good.clone();
+    newer[4] = 3;
+    let mut trailing = good.clone();
+    trailing.push(0);
+    for (bytes, why) in [
+        (newer, "version 3"),
+        (encode(&sample_record(1)), "missing"),
+        (trailing, "after the stroke record"),
+        (b"TCSR".to_vec(), "cut short"),
+        (b"PNG!....".to_vec(), "not a stroke"),
+    ] {
+        let back = load_project_bytes(&zip_with(&[(&format!("strokes/{}.bin", s.paint.0), bytes.clone())])).unwrap();
+        let Some(StoredStrokes::Unreadable(u)) = back.strokes.get(&s.paint) else { panic!("unreadable: {:?}", back.strokes) };
+        assert!(u.reason.contains(why), "{why}: {}", u.reason);
+        assert_eq!(*u.bytes, bytes);
+        assert!(back.warnings.iter().any(|w| w.contains("stroke record")), "{:?}", back.warnings);
+        // saved again unchanged
+        let again = load_project_bytes(&save_project_bytes(&back).unwrap()).unwrap();
+        assert_eq!(again.strokes.get(&s.paint), back.strokes.get(&s.paint));
+    }
+}
+
+#[test]
+fn damaged_stroke_records_never_panic() {
+    let mut table = strokes::ImageTable::default();
+    let good = strokes::encode(&sample_record(1), &mut table).unwrap();
+    let images: std::collections::HashMap<String, Arc<[f32]>> = table.by_key.into_iter().collect();
+    let decode = |b: &[u8]| strokes::decode(b, &mut images.clone());
+    // (NaN tips: compared by their encodings)
+    assert_eq!(encode(&decode(&good).unwrap()), good);
+    for n in 0..good.len() {
+        assert!(decode(&good[..n]).is_err(), "cut at {n}");
+    }
+    let mut state = 0x9e37_79b9u32;
+    for i in 0..4000 {
+        let mut b = good.clone();
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let at = 8 + state as usize % (b.len() - 8);
+        b[at] ^= (i % 255 + 1) as u8;
+        let _ = decode(&b);
+    }
+    // a length that claims far more than the entry holds
+    let mut huge = good[..8].to_vec();
+    huge.extend_from_slice(&[0, 0, 0xff, 0xff, 0xff, 0xff, 0x0f]);
+    assert!(decode(&huge).is_err());
+    // an image entry that is cut, damaged or not of its key is not read
+    let (key, values) = images.iter().next().unwrap();
+    let bytes = strokes::encode_image(values);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&strokes::decode_image(key, &bytes).unwrap()), bits(values), "(NaN tips: compared by their bits)");
+    assert!(strokes::decode_image(key, &bytes[..bytes.len() - 1]).is_err());
+    assert!(strokes::decode_image(&"0".repeat(32), &bytes).is_err());
+    assert!(strokes::decode_image(key, b"TCSI").is_err());
+}
+
+#[test]
+fn stroke_records_of_the_older_layout_are_still_read() {
+    let s = sample();
+    let record = sample_record(1);
+    let old = strokes::encode_inline(&record).unwrap();
+    let back = load_project_bytes(&zip_with(&[(&format!("strokes/{}.bin", s.paint.0), old)])).unwrap();
+    let read = back.strokes.get(&s.paint).and_then(StoredStrokes::record).unwrap();
+    assert_eq!(encode(read), encode(&record));
+    // its copies of one image are shared once read
+    let images = read.images();
+    assert!(Arc::ptr_eq(images[0], images[1]));
+    // and saved in the newer layout, the images apart
+    let mut pf = s.pf.clone();
+    pf.strokes = back.strokes.clone();
+    assert_eq!(stroke_image_entries(&save_project_bytes(&pf).unwrap()).len(), 2);
+}
+
+#[test]
+fn graphs_painted_by_stroke_records_keep_their_texts() {
+    let mut s = sample();
+    let text = "graph text the brush paints".to_string();
+    let key = texturecraft_core::text_key(&text);
+    let mut record = sample_record(1);
+    if let texturecraft_core::strokes::StrokeSource::Graph(g) = &mut record.steps[0].sources[0].1 {
+        g.key = key.clone();
+    }
+    s.pf.strokes.insert(s.paint, record.into());
+    s.pf.graphs.texts.insert(key.clone(), Arc::from(text.as_str()));
+    let back = load_project_bytes(&save_project_bytes(&s.pf).unwrap()).unwrap();
+    assert_eq!(back.graphs.texts.get(&key).map(|t| t.to_string()), Some(text));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_project_opened_from_its_file_reads_pixels_and_baked_maps_after_its_archive_is_replaced() {
+    let Sample { pf, .. } = sample();
+    let dir = std::env::temp_dir().join(format!("tc-formats-lazy-parts-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (path, moved) = (dir.join("lazy.tcraft"), dir.join("moved.tcraft"));
+    save_project(&path, &pf).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let mut back = load_project(&path).unwrap();
+    assert!(!back.pixels.layers.is_empty() && !back.baked.is_empty());
+    assert!(back.pixels.layers.values().chain(back.pixels.masks.values()).all(|img| !img.is_loaded()), "no pixels read at open");
+    assert!(back.baked.values().flat_map(|b| b.maps.values()).all(|m| m.bytes() == 0), "no baked map read at open");
+    // saved without reading them into memory, the same file
+    save_project(&path, &back).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(back.pixels.layers.values().all(|img| !img.is_loaded()));
+    assert_same(&pf, &back);
+    for img in back.pixels.layers.values_mut().chain(back.pixels.masks.values_mut()) {
+        img.release();
+    }
+    // Simulate saving a document after removing a layer still referenced by undo history.
+    let mut edited = back.clone();
+    edited.pixels.layers.clear();
+    save_project(&path, &edited).unwrap();
+    assert!(load_project(&path).unwrap().pixels.layers.is_empty());
+    save_project(&moved, &edited).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_same(&pf, &back);
+    assert_eq!(save_project_bytes(&back).unwrap(), bytes);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_lazy_open_charges_lazily_read_entries_their_header_only() {
+    let project = sample().pf;
+    let dir = std::env::temp_dir().join(format!("tc-formats-lazy-budget-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("budget.tcraft");
+    save_project(&path, &project).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+    let sizes: Vec<(String, u64)> = (0..archive.len())
+        .map(|index| {
+            let entry = archive.by_index(index).unwrap();
+            (entry.name().unwrap().into_owned(), entry.size())
+        })
+        .collect();
+    let total: u64 = sizes.iter().map(|(_, size)| size).sum();
+    let held: u64 = sizes.iter().map(|(name, size)| if read_lazily(name) { (*size).min(BIN_HEADER_BYTES as u64) } else { *size }).sum();
+    assert!(held < total, "the sample holds layer pixels read lazily");
+
+    // the eager open needs the whole file; the lazy one only what it holds
+    let eager = load_with_budget(Cursor::new(&bytes), LoadBudget::new(held), None).unwrap_err();
+    assert!(matches!(eager, FormatError::TooLarge(_)), "{eager}");
+    let origin = Origin::new(&path).unwrap();
+    let lazy = load_with_budget(origin.reader(), LoadBudget::new(held), Some(&origin)).unwrap();
+    assert_same(&project, &lazy);
+    let short = load_with_budget(origin.reader(), LoadBudget::new(held - 1), Some(&origin)).unwrap_err();
+    assert!(matches!(short, FormatError::TooLarge(_)), "{short}");
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 fn rebuilt_uvs_sample() -> ProjectFile {

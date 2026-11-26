@@ -25,13 +25,17 @@ mod dripping_rust_parameters;
 mod filtering;
 mod generator_global;
 mod generator_grayscale;
+mod geometry_mask;
+mod graph;
 mod grayscale_conversion_parameters;
 mod kind_controls;
 mod light_parameters;
 mod linear_gradient_parameters;
+mod lock;
 mod micro_curvature_type;
 mod micro_details;
 mod output_resolution;
+mod placed;
 mod resolution_mode;
 mod sampling;
 mod scale_mode;
@@ -63,13 +67,17 @@ pub use dripping_rust_parameters::DrippingRustParameters;
 pub use filtering::Filtering;
 pub use generator_global::GeneratorGlobal;
 pub use generator_grayscale::GeneratorGrayscale;
+pub use geometry_mask::GeometryMask;
+pub use graph::{GraphInput, GraphRef, GraphValue, MAX_GRAPH_NESTING, StableHash, is_key, text_key};
 pub use grayscale_conversion_parameters::GrayscaleConversionParameters;
 pub use kind_controls::KindControls;
 pub use light_parameters::LightParameters;
 pub use linear_gradient_parameters::LinearGradientParameters;
+pub use lock::{IMPORT_LOCK_SOURCE, Lock, LockReason};
 pub use micro_curvature_type::MicroCurvatureType;
 pub use micro_details::MicroDetails;
 pub use output_resolution::OutputResolution;
+pub use placed::{FacingFalloff, Falloff, ImagePlacement, PlacedMode, PlacedProjection, Repeat, Volume, WarpGrid, WarpPoint};
 pub use resolution_mode::ResolutionMode;
 pub use sampling::Sampling;
 pub use scale_mode::ScaleMode;
@@ -124,9 +132,12 @@ pub struct Layer {
     /// Combine the mask with the layer's height ("mask with height").
     #[serde(default)]
     pub height_mask: HeightMask,
-    /// Geometry mask: the mesh parts (submesh names) the layer shows on; None shows it on all.
+    /// Geometry mask: the mesh parts or UV tiles the layer shows on; None shows it everywhere.
     #[serde(default)]
-    pub geometry_mask: Option<Vec<String>>,
+    pub geometry_mask: Option<GeometryMask>,
+    /// Set when the layer's content must not change (see [`Lock`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<Lock>,
 }
 
 /// Mask with height: partial mask values follow the layer's own height, so a transition
@@ -218,6 +229,7 @@ impl Layer {
             color_tag: None,
             height_mask: HeightMask::default(),
             geometry_mask: None,
+            lock: None,
         }
     }
 
@@ -310,6 +322,10 @@ pub enum Projection {
         uv: UvTransform,
         projector: Projector,
     },
+    /// A projection with every placement setting spelled out (volume, image placement, repetition per axis) and the
+    /// sampling rules that go with them ([`PlacedProjection`]). TextureCraft's own fills use the projections above;
+    /// a project import writes this one for fills the others cannot hold.
+    Placed(Box<PlacedProjection>),
 }
 
 /// The frame a planar projection placed on the surface (a decal) projects from, in world space
@@ -447,6 +463,14 @@ impl Projection {
             Projection::Spherical { .. } => "Spherical projection",
             Projection::Cylindrical { .. } => "Cylindrical projection",
             Projection::Warp { .. } => "Warp projection",
+            Projection::Placed(p) => match p.mode {
+                PlacedMode::Uv { .. } => "UV projection",
+                PlacedMode::TriPlanar { .. } => "Tri-planar projection",
+                PlacedMode::Planar { .. } => "Planar projection",
+                PlacedMode::Spherical => "Spherical projection",
+                PlacedMode::Cylindrical { .. } => "Cylindrical projection",
+                PlacedMode::Warp { .. } => "Warp projection",
+            },
         }
     }
 }
@@ -718,6 +742,8 @@ pub enum Source {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         ramp: Vec<[f32; 3]>,
     },
+    /// One output of a node graph ([`GraphRef::output`]), rendered for the texture set and sampled like an image.
+    Graph(Box<GraphRef>),
 }
 
 impl Source {
@@ -735,6 +761,15 @@ impl Source {
         match self {
             Source::Image { name, .. } => vec![name.as_str()],
             Source::Procedural { pattern, .. } => pattern.tile.iter().flat_map(|tile| tile.images()).collect(),
+            Source::Graph(graph) => graph
+                .graphs()
+                .into_iter()
+                .flat_map(|graph| graph.inputs.values())
+                .filter_map(|input| match input {
+                    GraphInput::Image(name) => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect(),
             Source::Uniform(_) | Source::Anchor { .. } => Vec::new(),
         }
     }
@@ -755,9 +790,18 @@ impl Source {
         }
     }
 
+    /// The graph this source runs, if any.
+    pub fn graph(&self) -> Option<&GraphRef> {
+        match self {
+            Source::Graph(g) => Some(g),
+            _ => None,
+        }
+    }
+
     /// Whether this source reads anchor point `anchor` (any anchor point when None)
     pub fn reads_anchor(&self, anchor: Option<LayerId>) -> bool {
         self.anchor().is_some_and(|found| anchor.is_none_or(|wanted| wanted == found))
+            || self.graph().is_some_and(|graph| graph.anchors().any(|found| anchor.is_none_or(|wanted| wanted == found)))
     }
 }
 
@@ -1763,7 +1807,7 @@ pub fn per_unit(kind: ChannelKind, v: [f32; 3], f: impl Fn(f32) -> f32) -> [f32;
         // One-component channels hold their value in the first slot (read as gray).
         ChannelKind::Signed => [f(v[0] * 0.5 + 0.5) * 2.0 - 1.0; 3],
         ChannelKind::Scalar => [f(v[0]); 3],
-        ChannelKind::Color => v.map(f),
+        ChannelKind::Color | ChannelKind::Data => v.map(f),
     }
 }
 
@@ -2174,6 +2218,20 @@ pub enum EffectKind {
     Material(Fill),
     /// Records the stack at its place so masks, fills and generators above can read it ([`Source::Anchor`]): in a content stack the composited stack right after its layer (that layer and everything below), in a mask the mask value there (every channel reads that gray)
     Anchor,
+    /// Stands for an effect of an imported project that TextureCraft cannot compute: it composites as identity
+    /// (the stack passes through unchanged) and cannot be edited, only hidden, moved or removed. The import locks
+    /// the layer that holds it. `label` names what it stands for, `reason` says why it is not computed.
+    Placeholder {
+        label: String,
+        reason: String,
+    },
+    /// A node graph as a mask generator (its [`GraphRef::output`], laid on through `projection`) or, when it reads the
+    /// stack below it ([`GraphRef::reads_stack`]), as a filter of the mask or of each layer channel.
+    Graph {
+        graph: GraphRef,
+        #[serde(default)]
+        projection: Projection,
+    },
 }
 
 /// One path of a path sublayer: its control points and how it was painted.
@@ -2275,6 +2333,8 @@ impl EffectKind {
             EffectKind::Compare { .. } => "Compare mask",
             EffectKind::Material(_) => "Fill",
             EffectKind::Anchor => "Anchor point",
+            EffectKind::Placeholder { .. } => "Placeholder",
+            EffectKind::Graph { .. } => "Graph",
         }
     }
 
@@ -2289,7 +2349,13 @@ impl EffectKind {
         match self {
             EffectKind::Material(_) => Some(true),
             EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection { .. } | EffectKind::Compare { .. } => Some(false),
-            EffectKind::Paint | EffectKind::Path(_) | EffectKind::Levels(_) | EffectKind::Filter(_) | EffectKind::Anchor => None,
+            EffectKind::Paint
+            | EffectKind::Path(_)
+            | EffectKind::Levels(_)
+            | EffectKind::Filter(_)
+            | EffectKind::Anchor
+            | EffectKind::Placeholder { .. }
+            | EffectKind::Graph { .. } => None,
         }
     }
 
@@ -2304,6 +2370,7 @@ impl EffectKind {
             EffectKind::Fill { source, .. } => source.reads_anchor(anchor),
             EffectKind::Material(fill) => fill.sources.values().any(|source| source.reads_anchor(anchor)),
             EffectKind::Generator(generator) => generator.sources().any(|source| source.reads_anchor(anchor)),
+            EffectKind::Graph { graph, .. } => graph.anchors().any(|found| anchor.is_none_or(|wanted| wanted == found)),
             _ => false,
         }
     }
@@ -2343,6 +2410,16 @@ impl EffectKind {
     /// Reads a channel of the layer or of the stack below it (a compare mask's layer sides)
     pub fn reads_stack(&self) -> bool {
         matches!(self, EffectKind::Compare { left, right, .. } if left.reads_stack() || right.reads_stack())
+    }
+
+    /// The graph the effect runs: a graph effect's, or a fill's graph source.
+    pub fn graphs(&self) -> Vec<&GraphRef> {
+        match self {
+            EffectKind::Graph { graph, .. } => vec![graph],
+            EffectKind::Fill { source, .. } => source.graph().into_iter().collect(),
+            EffectKind::Material(f) => f.sources.values().filter_map(Source::graph).collect(),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -2426,6 +2503,38 @@ impl Effect {
             _ => blend,
         }
     }
+
+    /// Whether the effect acts on content channel `channel`.
+    pub fn acts_on(&self, channel: Channel) -> bool {
+        !self.off_channels.contains(&channel)
+    }
+
+    /// A [`EffectKind::Placeholder`] named after what it stands for.
+    pub fn placeholder(id: LayerId, label: impl Into<String>, reason: impl Into<String>) -> Effect {
+        let label = label.into();
+        Effect { name: label.clone(), ..Effect::new(id, EffectKind::Placeholder { label, reason: reason.into() }) }
+    }
+
+    pub fn is_placeholder(&self) -> bool {
+        matches!(self.kind, EffectKind::Placeholder { .. })
+    }
+}
+
+impl Layer {
+    /// Every graph the layer runs (its fill's sources, its content and mask effects), outer references only.
+    pub fn graphs(&self) -> Vec<&GraphRef> {
+        let fill = match &self.kind {
+            LayerKind::Fill(f) => f.sources.values().filter_map(Source::graph).collect(),
+            _ => Vec::new(),
+        };
+        let effects = self.mask.iter().flat_map(|m| m.effects.iter()).chain(self.content_effects.iter());
+        fill.into_iter().chain(effects.flat_map(|e| e.kind.graphs())).collect()
+    }
+
+    /// The placeholder effects of the layer's mask and content.
+    pub fn placeholders(&self) -> impl Iterator<Item = &Effect> {
+        self.mask.iter().flat_map(|m| m.effects.iter()).chain(self.content_effects.iter()).filter(|e| e.is_placeholder())
+    }
 }
 
 #[cfg(test)]
@@ -2470,6 +2579,19 @@ mod tests {
         effect.inputs.insert("mask".into(), Source::image("input.png"));
 
         assert_eq!(effect.images_read().collect::<Vec<_>>(), vec!["id.png", "input.png"]);
+    }
+
+    #[test]
+    fn a_color_selection_without_a_map_picks_from_the_id_map_and_another_map_round_trips() {
+        let old: EffectKind = serde_json::from_str(r#"{"ColorSelection":{"colors":[[0.5,0.5,0.5]],"tolerance":0.1}}"#).unwrap();
+        let EffectKind::ColorSelection(selection) = &old else { panic!("not a color selection") };
+        assert_eq!(selection.map, crate::BakedMap::Id);
+        assert!(!serde_json::to_string(&old).unwrap().contains("map"), "the ID map is not written, as before");
+        let mut picked = crate::ColorSelection::new(vec![[0.5; 3]], 0.0);
+        picked.map = crate::BakedMap::Curvature;
+        let curvature = EffectKind::ColorSelection(picked);
+        let text = serde_json::to_string(&curvature).unwrap();
+        assert_eq!(serde_json::from_str::<EffectKind>(&text).unwrap(), curvature);
     }
 
     #[test]
@@ -2925,6 +3047,33 @@ mod tests {
         let saved = serde_json::to_string(&flipped).unwrap();
         assert!(saved.contains(r#""flip":[true,false]"#), "{saved}");
         assert_eq!(serde_json::from_str::<Decal>(&saved).unwrap(), flipped);
+    }
+
+    #[test]
+    fn placeholders_name_what_they_stand_for_and_go_in_either_stack() {
+        let e = Effect::placeholder(LayerId(5), "Mask generator \"dirt\"", "compiled graphs are not computed yet");
+        assert_eq!(e.name, "Mask generator \"dirt\"");
+        assert!(e.is_placeholder() && e.kind.content_only().is_none() && !e.kind.painted());
+        let mut l = Layer::new(LayerId(1), "l", LayerKind::Paint, &[Channel::BaseColor]);
+        l.content_effects.push(Effect::new(LayerId(2), EffectKind::Anchor));
+        l.mask = Some(Mask { effects: vec![e.clone()], ..Mask::new(MaskBackground::White) });
+        assert_eq!(l.placeholders().map(|e| e.id).collect::<Vec<_>>(), [LayerId(5)]);
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(json["kind"], serde_json::json!({"Placeholder": {"label": "Mask generator \"dirt\"", "reason": "compiled graphs are not computed yet"}}));
+        assert_eq!(serde_json::from_value::<Effect>(json).unwrap(), e);
+    }
+
+    #[test]
+    fn layers_without_a_lock_store_none_and_old_layers_load_unlocked() {
+        let l = Layer::new(LayerId(1), "l", LayerKind::Paint, &[Channel::BaseColor]);
+        let mut json = serde_json::to_value(&l).unwrap();
+        assert!(json.get("lock").is_none(), "unlocked layers store no lock");
+        json["geometry_mask"] = serde_json::json!(["Body"]);
+        let old: Layer = serde_json::from_value(json).unwrap();
+        assert_eq!((old.lock, old.geometry_mask), (None, Some(GeometryMask::Parts(vec!["Body".into()]))));
+        let mut locked = l.clone();
+        locked.lock = Some(Lock::import(vec![LockReason::new("graph:x", "fill \"x\"")]));
+        assert_eq!(serde_json::from_value::<Layer>(serde_json::to_value(&locked).unwrap()).unwrap(), locked);
     }
 
     #[test]

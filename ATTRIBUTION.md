@@ -61,3 +61,10 @@ Built-in environments (`crates/render/src/ibl.rs`), smart materials and procedur
 (`crates/paint/src/brush.rs`), meshes (`crates/geom/src/primitives.rs`) and shelf thumbnails
 (`crates/ui-egui/src/thumbs.rs`) are generated in code by TextureCraft contributors (MIT OR
 Apache-2.0). None of them is derived from another product's presets, shaders, materials or images.
+
+## Code derived from other projects
+
+| Path | What | Author | Source | License |
+|---|---|---|---|---|
+| Shared SPP reader and material graph runtime in craft-libs | SPP project reading and graph decompilation by xilefenko. The graph runtime is derived from [PiJellyPin/MaterialCraft](https://github.com/PiJellyPin/MaterialCraft). The shared crates retain the original notices. | xilefenko, PiJellyPin and contributors | [Original importer PR #521](https://github.com/storytold/texturecraft/pull/521) | MIT OR Apache-2.0 |
+| `crates/compose/src/placed/warp.rs` (`BezierMesh`) | The Bézier patch evaluation of the warp projection, copied and generalised to 3D control points with derivatives | ArtCraft Team and the PhotoCraft contributors | PhotoCraft, `crates/geom/src/warp.rs` (revision 5f65579) | MIT OR Apache-2.0 |

@@ -16,6 +16,7 @@ use texturecraft_formats::mesh_import::{MeshUvSource, import_mesh_geometry};
 use texturecraft_formats::{ExportInput, ExportOptions, ExportedFile, FileFormat, MapOverride, Padding, ProjectFile};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_geom::{Mesh, primitives};
+use web_time::Instant;
 
 use crate::commands::{CommandSpec, always, bad, normal_format_param, strp, u64p};
 use crate::session::{Document, Session};
@@ -23,7 +24,10 @@ use crate::{EngineError, Result, cmd};
 
 type BakePaintMaps = BTreeMap<(usize, texturecraft_core::BakePaintTarget), Arc<texturecraft_bake::BakePaintMap>>;
 
-fn prepare_archive<Bytes>(archive: &mut ProjectFile<Bytes, Bytes>, uv_source: Option<&Mesh>, bake_paint: &BakePaintMaps) {
+/// Recorded strokes the archive saves, with the mesh their world strokes were painted on
+type ReplaySource<'a> = (&'a crate::stroke_replay::StrokeReplays, &'a Arc<Mesh>);
+
+fn prepare_archive<Bytes>(archive: &mut ProjectFile<Bytes, Bytes>, uv_source: Option<&Mesh>, bake_paint: &BakePaintMaps, (replays, mesh): ReplaySource<'_>) {
     let project = &mut archive.project;
     project.format_version = project.save_format_version();
 
@@ -35,6 +39,9 @@ fn prepare_archive<Bytes>(archive: &mut ProjectFile<Bytes, Bytes>, uv_source: Op
     };
     archive.pixels.layers.retain(|(id, _), img| size_of(*id) == Some((img.width(), img.height())));
     archive.pixels.masks.retain(|id, img| size_of(*id) == Some((img.width(), img.height())));
+
+    // Recorded strokes describe the pixels the archive keeps
+    archive.stroke_replay = replays.archive(&archive.project, &archive.pixels, mesh);
 
     archive.mesh_uvs = uv_source.map(texturecraft_formats::mesh_import::corner_uvs);
     archive.bake_paint = bake_paint
@@ -263,11 +270,17 @@ impl Session {
 
     /// Open a `.tcraft` project from bytes.
     pub fn from_project_bytes(bytes: &[u8]) -> Result<Session> {
+        let start = Instant::now();
         let pf = texturecraft_formats::load_project_bytes(bytes).map_err(fe)?;
-        Session::from_project_file(pf)
+        let mut log = crate::SessionLog::new();
+        log.performance(format!("CPU project archive decoded in {} ms", start.elapsed().as_millis()));
+        let mut session = Session::from_project_file(pf)?;
+        session.log.prepend(log);
+        Ok(session)
     }
 
     pub fn from_project_file(project_file: ProjectFile) -> Result<Session> {
+        let start = Instant::now();
         project_file.validate_mesh_uvs().map_err(fe)?;
 
         let mesh = match (&project_file.mesh, project_file.project.mesh.strip_prefix("builtin:")) {
@@ -280,6 +293,7 @@ impl Session {
         drop(project_file.mesh_uvs);
         check_materials(&project_file.project, &mesh)?;
         let resources = project_file.resources.into_iter().map(|(name, bytes)| (name, Arc::new(bytes))).collect();
+        let mesh_time = Instant::now();
 
         let mut session = Session::new(
             Document {
@@ -287,17 +301,37 @@ impl Session {
                 bake_paint: Default::default(),
                 project: project_file.project,
                 pixels: project_file.pixels,
+                stroke_replays: Default::default(),
                 baked: project_file.baked,
                 resources,
+                graphs: project_file.graphs,
+                strokes: project_file.strokes,
             },
             mesh,
             project_file.mesh,
         )?;
 
+        let cache_time = Instant::now();
+        let (stroke_replays, ignored_replays) = project_file
+            .stroke_replay
+            .as_ref()
+            .map(|data| crate::stroke_replay::StrokeReplays::load(data, &session.doc.project, &session.doc.pixels, &session.mesh))
+            .unwrap_or_default();
+        session.doc.stroke_replays = stroke_replays;
         session.sync_images();
         session.load_bake_meshes(project_file.high_poly, project_file.cage);
         session.load_bake_paint(project_file.bake_paint);
+        session.log.performance(format!(
+            "CPU project setup: mesh {} ms, UV and mesh indexes {} ms, resources {} ms ({} texture sets)",
+            mesh_time.duration_since(start).as_millis(),
+            cache_time.duration_since(mesh_time).as_millis(),
+            cache_time.elapsed().as_millis(),
+            session.caches.len()
+        ));
         session.log.warnings("Project", project_file.warnings);
+        if ignored_replays {
+            session.log.warn("Project", "Some saved stroke operations could not be restored. The affected paint is available as raster pixels.");
+        }
 
         Ok(session)
     }
@@ -308,6 +342,7 @@ impl Session {
         ProjectFile {
             project: self.doc.project.clone(),
             pixels: self.doc.pixels.clone(),
+            stroke_replay: None,
             baked: self.doc.baked.clone(),
             mesh: self.mesh_source.as_ref().map(|(extension, bytes)| (extension.clone(), store_mesh_bytes(bytes))),
             mesh_uvs: None,
@@ -316,6 +351,8 @@ impl Session {
             bake_paint: BTreeMap::new(),
             thumbnail: None,
             resources,
+            graphs: self.doc.graphs.clone(),
+            strokes: self.doc.strokes.clone(),
             warnings: Vec::new(),
         }
     }
@@ -324,14 +361,14 @@ impl Session {
     pub fn project_file(&self) -> ProjectFile {
         let resources = self.doc.resources.iter().map(|(name, bytes)| (name.clone(), bytes.as_ref().clone())).collect();
         let mut archive = self.capture_archive(resources, |bytes| bytes.as_ref().clone());
-        prepare_archive(&mut archive, self.saved_uv_source().map(Arc::as_ref), &self.doc.bake_paint);
+        prepare_archive(&mut archive, self.saved_uv_source().map(Arc::as_ref), &self.doc.bake_paint, (&self.doc.stroke_replays, &self.mesh));
         archive
     }
 
     /// A save snapshot that shares immutable resource and mesh payloads with the document.
     pub fn project_snapshot(&self) -> ProjectFile<Arc<Vec<u8>>, Arc<Vec<u8>>> {
         let mut archive = self.capture_archive(self.doc.resources.clone(), Arc::clone);
-        prepare_archive(&mut archive, self.saved_uv_source().map(Arc::as_ref), &self.doc.bake_paint);
+        prepare_archive(&mut archive, self.saved_uv_source().map(Arc::as_ref), &self.doc.bake_paint, (&self.doc.stroke_replays, &self.mesh));
         archive
     }
 
@@ -360,21 +397,22 @@ impl Session {
         options: &ExportOptions,
         mut select: impl FnMut(usize, Vec<PlannedFile>) -> Vec<PlannedFile>,
     ) -> Result<Vec<ExportedFile>> {
-        if self.solo.is_none() {
-            self.update();
-        }
-
         let mesh_name = stem_of(self.doc.project.mesh.trim_start_matches("builtin:"));
         let mut out = Vec::new();
         let empty = Default::default();
         for &set_index in sets {
-            let cache = self.caches.get(set_index).ok_or_else(|| EngineError::Other(format!("no texture set {set_index}")))?;
             let plans = texturecraft_formats::list_outputs(&self.doc.project, set_index, &mesh_name, options).map_err(fe)?;
             let plans = select(set_index, plans);
             if plans.is_empty() {
                 continue;
             }
 
+            // one set at a time: the others composite when they are exported or shown
+            if self.solo.is_none() {
+                self.update_only(&[set_index]);
+            }
+
+            let cache = self.caches.get(set_index).ok_or_else(|| EngineError::Other(format!("no texture set {set_index}")))?;
             let composite =
                 self.document_composite(set_index, &cache.covered_tiles).ok_or_else(|| EngineError::Other(format!("no texture set {set_index}")))?;
             let coverage = cache.gbuf.coverage_mask();
@@ -565,8 +603,12 @@ mod native {
     pub fn open_path(path: &str) -> Result<Session> {
         let p = Path::new(path);
         if ext_of(path) == PROJECT_EXT {
+            let start = Instant::now();
             let pf = texturecraft_formats::load_project(p).map_err(fe)?;
+            let mut log = crate::SessionLog::new();
+            log.performance(format!("CPU project archive read and decoded in {} ms", start.elapsed().as_millis()));
             let mut s = Session::from_project_file(pf)?;
+            s.log.prepend(log);
             s.path = Some(path.to_string());
             s.modified = false;
             Ok(s)
@@ -741,6 +783,9 @@ impl Session {
         next.modified = true;
         next.project_id = self.project_id;
         let preserved = preserve_strokes.then(|| crate::preserve::preserve_strokes(self, &mut next));
+        if next.doc.stroke_replays.discard_stale(&next.doc.project, &next.doc.pixels, &next.mesh) {
+            next.note_raster_paint();
+        }
 
         // Keep the stored source in the current session until reimport succeeds
         if next.mesh_source.is_none() {
@@ -805,9 +850,33 @@ fn export_textures(session: &mut Session, params: &Value) -> Result<Value> {
         written.extend(write_materialx(session, &sets, &mut textures, dir, &mut taken_names, &mut warnings, &mut udim_patterns)?);
         written
     } else if taken_names.is_empty() {
-        let files = session.export_files(&sets, &options)?;
-        warnings.extend(files.iter().flat_map(|file| file.warnings.iter().cloned()));
-        texturecraft_formats::write_files(&files, dir).map_err(fe)?
+        // A name an earlier set exports is planned once, for that set
+        let mesh_name = stem_of(session.doc.project.mesh.trim_start_matches("builtin:"));
+        let planned: BTreeMap<_, _> = texturecraft_formats::export::list_set_outputs(&session.doc.project, &sets, &mesh_name, &options)
+            .map_err(fe)?
+            .into_iter()
+            .map(|(set, file)| (file.name, (set, file.warnings)))
+            .collect();
+
+        // set by set, each one's files written before the next is composited
+        let mut written = Vec::new();
+        for &set in &sets {
+            let files = session.render_export_files(&[set], &options, |set, mut plans| {
+                plans.retain_mut(|plan| {
+                    let Some((_, planned_warnings)) = planned.get(&plan.name).filter(|(owner, _)| *owner == set) else { return false };
+                    for warning in planned_warnings {
+                        if !plan.warnings.contains(warning) {
+                            plan.warnings.push(warning.clone());
+                        }
+                    }
+                    true
+                });
+                plans
+            })?;
+            warnings.extend(files.iter().flat_map(|file| file.warnings.iter().cloned()));
+            written.extend(texturecraft_formats::write_files(&files, dir).map_err(fe)?);
+        }
+        written
     } else {
         let files = session.render_export_files(&sets, &options, |set, mut plans| {
             reserve_export_names(set, &mut plans, &mut taken_names, &reserved_patterns, &mut warnings, false);

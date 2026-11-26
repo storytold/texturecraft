@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use texturecraft_compose::{DisplayKind, ImageRes};
+use texturecraft_core::rules::{HeightNormal, MEASURED_SLOPE};
 use texturecraft_core::{Channel, DisplaySettings, EnvAlignment, Project, ToneMapping};
 use texturecraft_geom::glam::{Mat4, Vec3};
 use texturecraft_geom::{Mesh, OrbitCamera};
@@ -33,6 +34,8 @@ use texturecraft_texel::TILE;
 use crate::bake_visualization::BakeVisualization;
 use crate::cage_geometry::CageGeometry;
 use crate::cage_gpu::CageGpu;
+use crate::gpu_composite::{CompositeProgram, CompositeRegion, CompositeTiming, GpuCompositor};
+use crate::gpu_quick_mask::{QuickMaskAlpha, QuickMaskGpu, QuickMaskOverlay};
 use crate::gpu_trace::{Checked, checked};
 use crate::high_poly_gpu::HighPolyGpu;
 use crate::ibl;
@@ -157,6 +160,9 @@ pub struct Shade {
     pub env_opacity: f32,
     pub ao_intensity: f32,
     pub height_strength: f32,
+    /// How height becomes normal detail: the project's rule ([`Project::rules`]), the same filter and slope as texture
+    /// export. Set by [`Shade::from_project`].
+    pub height_normal: HeightNormal,
     /// -1 for DirectX normal maps in the normal channel, 1 for OpenGL.
     pub normal_y: f32,
     /// 0 material, 1 channel, 2 mesh map (aux texture), 3 UV checker.
@@ -229,6 +235,18 @@ pub struct Shade {
     pub bake: Option<BakeVisualization>,
 }
 
+/// The height-to-normal rule as the mesh shader reads it: (filter, slope). Filter 0 is TextureCraft's own (central
+/// differences, 45° at strength 1 for a height change of 1 over 1/16 of the width), 1 the measured 3×3 Sobel and 2 the
+/// measured backward differences; slope is the normal tilt per unit of height per texel at strength 1 as a fraction of
+/// the texture width (the export's `height_normal`).
+fn height_normal_globals(h: HeightNormal) -> [f32; 2] {
+    match h {
+        HeightNormal::Native => [0.0, 1.0 / 16.0],
+        HeightNormal::Sobel => [1.0, MEASURED_SLOPE],
+        HeightNormal::Backward => [2.0, MEASURED_SLOPE],
+    }
+}
+
 /// The viewport's subsurface scattering approximation: the diffuse lighting wraps around the
 /// terminator by `min(1, 4 × radius × color)` per channel (radius as a fraction of the mesh
 /// size, about the softening angle on mesh-scale curvature; the path tracer walks the real
@@ -280,6 +298,7 @@ impl Shade {
         Shade {
             sss_blur: scatters.then(|| d.scatter_color.map(|c| c.max(0.0) * d.scatter_radius)),
             refraction: has(Channel::Transmission),
+            height_normal: p.rules.height_normal,
             ..Shade::from_display(d)
         }
     }
@@ -295,6 +314,7 @@ impl Default for Shade {
             env_opacity: 0.0,
             ao_intensity: 0.75,
             height_strength: 1.0,
+            height_normal: HeightNormal::Native,
             normal_y: 1.0,
             view_mode: 0,
             channel: 0,
@@ -353,6 +373,7 @@ pub struct Frame {
     pub overlay: Vec<OverlayQuad>,
 }
 
+#[derive(Clone)]
 struct Tex {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -388,7 +409,23 @@ fn display_dims(size: (u32, u32), shift: u32) -> (u32, u32) {
 /// Side of the square aux (mesh map / mask / quick mask) texture of a set of `size` texels; it
 /// stretches over the set like its other textures.
 pub fn aux_size(size: (u32, u32)) -> u32 {
-    size.0.max(size.1).clamp(1, 2048)
+    size.0.max(size.1).clamp(1, MAX_AUX_SIDE)
+}
+
+/// The longest side of an aux texture.
+const MAX_AUX_SIDE: u32 = 2048;
+
+/// Width and height of the mask view's aux texture for a set of `size` texels: the set halved
+/// until its longer side fits [`aux_size`]'s limit, so a set of UV tiles shows each tile as the
+/// square its block is. Output texel (x, y) shows the set's texel (x · width / mask width, y ·
+/// height / mask height), as `texturecraft_compose::mask_image_sized` samples it.
+pub fn mask_view_extent(size: (u32, u32)) -> (u32, u32) {
+    display_dims(size, mask_view_shift(size))
+}
+
+/// How many times [`mask_view_extent`] halves a set of `size` texels.
+fn mask_view_shift(size: (u32, u32)) -> u32 {
+    size.0.max(size.1).max(1).div_ceil(MAX_AUX_SIDE).next_power_of_two().trailing_zeros()
 }
 
 impl Tex {
@@ -415,6 +452,7 @@ impl Tex {
 struct SetGpu {
     /// Texels across and down (a UV-tiled set's whole atlas).
     size: (u32, u32),
+    material: usize,
     /// Display textures hold the set at `size >> shift`: halved until they fit the device.
     shift: u32,
     /// The display textures in [`DisplayKind::ALL`] order, then the aux (mesh map) texture.
@@ -423,6 +461,8 @@ struct SetGpu {
     /// until its sets are painted.
     tex: Vec<Tex>,
     bind_group: wgpu::BindGroup,
+    /// The last complete material, kept bound until the new resolution has been uploaded.
+    resize_from: Option<wgpu::BindGroup>,
     mips_dirty: Vec<MipsDirty>,
     /// Textures whose full-size allocation failed (out of GPU memory): they keep their
     /// placeholder until the set is re-created, instead of retrying on every tile.
@@ -430,6 +470,8 @@ struct SetGpu {
     /// Full-size textures the browser's WebGPU has not yet confirmed: tiles go into them while
     /// the placeholder stays bound (see [`Renderer::resolve_pending`]).
     pending: Vec<Option<PendingTex>>,
+    /// The overview we are waiting to bind, and detail tiles to apply over it.
+    pending_seed: Option<PendingDisplaySeed>,
 }
 
 /// A full-size texture waiting for WebGPU's verdict on its allocation.
@@ -438,6 +480,37 @@ struct PendingTex {
     /// `None` for success, else what went wrong. (A mutex: the renderer is shared with the
     /// paint callback, so it must be `Sync`.)
     answer: std::sync::Mutex<std::sync::mpsc::Receiver<Option<String>>>,
+}
+
+impl SetGpu {
+    fn display_bind_group(&self) -> &wgpu::BindGroup {
+        self.resize_from.as_ref().unwrap_or(&self.bind_group)
+    }
+}
+
+struct PendingDisplaySeed {
+    textures: Vec<Tex>,
+    answer: std::sync::Mutex<std::sync::mpsc::Receiver<Option<String>>>,
+    tiles: Vec<SeedTile>,
+}
+
+struct SeedTile {
+    kind: DisplayKind,
+    x: u32,
+    y: u32,
+    bytes: Vec<u8>,
+    shift: u32,
+}
+
+/// Replace the material's textures while leaving its aux view in place.
+fn install_display_seed(set: &mut SetGpu, textures: Vec<Tex>, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler) {
+    for (i, texture) in textures.into_iter().enumerate() {
+        set.mips_dirty[i] = if texture.mips > 1 { MipsDirty::All } else { MipsDirty::Clean };
+        set.tex[i] = texture;
+        set.pending[i] = None;
+        set.failed[i] = false;
+    }
+    set.bind_group = set_bind_group(device, layout, sampler, &set.tex);
 }
 
 /// Swap `tex` in for slot `slot` of `set` (bound at once; its mips are rebuilt).
@@ -505,6 +578,16 @@ struct MeshGpu {
     /// Bounding sphere (center, radius) for fitting the shadow map.
     center: Vec3,
     radius: f32,
+    /// The parts after the first of a mesh too large for one buffer ([`crate::mesh_parts`]), each with its own
+    /// vertices; `geo` and `lines` hold the first.
+    extra: Vec<MeshPartGpu>,
+}
+
+/// One more part of a mesh split over several buffers: its triangles and its wireframe lines.
+struct MeshPartGpu {
+    geo: Geometry,
+    lines: wgpu::Buffer,
+    line_draws: Vec<(u32, u32, usize)>,
 }
 
 /// The scene effect targets of a view (full resolution unless noted), created the first time
@@ -629,6 +712,15 @@ pub struct Renderer {
     dof_gather_pipeline: wgpu::RenderPipeline,
     dof_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
+    compositor: Option<GpuCompositor>,
+    /// The compositor compiles new pipelines on worker threads (`set_asynchronous_compile`)
+    asynchronous_compile: bool,
+    /// The compositor takes the pipelines the tests on the shared device share
+    /// ([`Renderer::share_test_pipelines`])
+    shared_test_pipelines: bool,
+    quick_mask: Option<QuickMaskGpu>,
+    #[cfg(not(target_arch = "wasm32"))]
+    brush: Option<crate::gpu_brush::BrushPipeline>,
     mip_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     util_module: wgpu::ShaderModule,
     sampler: wgpu::Sampler,
@@ -1276,6 +1368,12 @@ impl Renderer {
             shadow_pipeline,
             accum_pipeline,
             mip_pipelines: HashMap::new(),
+            compositor: None,
+            asynchronous_compile: false,
+            shared_test_pipelines: false,
+            quick_mask: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            brush: None,
             util_module,
             sampler,
             env_sampler,
@@ -1357,9 +1455,34 @@ impl Renderer {
         if self.mesh.as_ref().is_some_and(|m| m.id == id) {
             return;
         }
+        self.quick_mask = None;
+        // A replacement mesh may reuse the same display dimensions. Its textures must
+        // not be replaced by a late overview from the previous mesh.
+        for set in &mut self.sets {
+            set.pending_seed = None;
+            set.resize_from = None;
+            set.pending.iter_mut().take(DisplayKind::ALL.len()).for_each(|slot| *slot = None);
+        }
+        if let Some(compositor) = &mut self.compositor {
+            compositor.clear_baked_inputs();
+            compositor.release_unused_surfaces();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(brush) = &mut self.brush {
+            brush.clear_visibility();
+        }
 
         let verts = subdivide::vertices(mesh);
         let mk = |label: &str, data: &[u8], usage: wgpu::BufferUsages| upload_buffer(device, queue, label, data, usage);
+        // a mesh larger than one buffer is drawn in parts, each within the device's limit (headroom for the
+        // wireframe's copied ends)
+        let limit = device.limits().max_buffer_size;
+        let max_verts = (limit / std::mem::size_of::<Vertex>() as u64 / 10 * 9) as usize;
+        let max_indices = (limit / 4 / 3 * 3) as usize;
+        if verts.len() > max_verts || mesh.indices.len() > max_indices {
+            self.set_mesh_parts(device, queue, mesh, id, verts, max_verts, max_indices);
+            return;
+        }
         let mut idx_bytes = bytemuck::cast_slice::<u32, u8>(&mesh.indices).to_vec();
         idx_bytes.resize(idx_bytes.len().next_multiple_of(4), 0);
         let vb = mk("tc_vb", bytemuck::cast_slice(&verts), wgpu::BufferUsages::VERTEX);
@@ -1381,7 +1504,33 @@ impl Renderer {
         let world_per_uv = subdivide::world_per_uv(&verts, &mesh.indices).unwrap_or(radius);
         let coarse = (subdivide::level_for(triangles) > 0).then(|| (verts, mesh.indices.clone()));
         let geo = Geometry { vb, ib, draws, triangles };
-        self.mesh = Some(MeshGpu { id, geo, coarse, dense: None, world_per_uv, lines, line_draws, center, radius });
+        self.mesh = Some(MeshGpu { id, geo, coarse, dense: None, world_per_uv, lines, line_draws, center, radius, extra: Vec::new() });
+        self.content_rev += 1;
+    }
+
+    /// [`Self::set_mesh`] for a mesh over the buffer limit: its triangles and wireframe in parts of at most
+    /// `max_verts` vertices and `max_indices` indices, uploaded one by one. No displacement copy is made (a mesh this
+    /// dense is not subdivided).
+    #[allow(clippy::too_many_arguments)]
+    fn set_mesh_parts(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh, id: u64, verts: Vec<Vertex>, max_verts: usize, max_indices: usize) {
+        let draws: Vec<(u32, u32, usize)> = mesh.submeshes.iter().map(|s| (s.start, s.count, s.material)).collect();
+        let (lo, hi) = mesh.bounds();
+        let (center, radius) = ((lo + hi) * 0.5, ((hi - lo).length() * 0.5).max(1e-3));
+        let triangles = mesh.indices.len() / 3;
+        let world_per_uv = subdivide::world_per_uv(&verts, &mesh.indices).unwrap_or(radius);
+        let parts = crate::mesh_parts::split(&verts, &mesh.indices, &draws, &mesh.wire_edges(), max_verts, max_indices);
+        drop(verts);
+        let mut uploaded = parts.into_iter().map(|p| {
+            let vb = upload_buffer(device, queue, "tc_vb", bytemuck::cast_slice(&p.verts), wgpu::BufferUsages::VERTEX);
+            let ib = upload_buffer(device, queue, "tc_ib", bytemuck::cast_slice(&p.indices), wgpu::BufferUsages::INDEX);
+            let lines = upload_buffer(device, queue, "tc_lines", bytemuck::cast_slice(&p.lines), wgpu::BufferUsages::INDEX);
+            let part_triangles = p.indices.len() / 3;
+            MeshPartGpu { geo: Geometry { vb, ib, draws: p.draws, triangles: part_triangles }, lines, line_draws: p.line_draws }
+        });
+        let Some(first) = uploaded.next() else { return };
+        let extra: Vec<MeshPartGpu> = uploaded.collect();
+        let geo = Geometry { triangles, ..first.geo };
+        self.mesh = Some(MeshGpu { id, geo, coarse: None, dense: None, world_per_uv, lines: first.lines, line_draws: first.line_draws, center, radius, extra });
         self.content_rev += 1;
     }
 
@@ -1495,16 +1644,36 @@ impl Renderer {
     /// UV-tiled set's atlas) and map mesh materials to sets. Re-created textures start neutral;
     /// returns the sets that were reset (the caller must upload all their tiles).
     pub fn set_texture_sets(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, sets: &[((u32, u32), usize)], material_count: usize) -> Vec<usize> {
+        self.set_texture_sets_preserving(device, queue, sets, material_count, &[])
+    }
+
+    /// For an interactive resize, draw the previous material while the replacement texture fills.
+    pub fn set_texture_sets_preserving(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sets: &[((u32, u32), usize)],
+        material_count: usize,
+        resizing: &[usize],
+    ) -> Vec<usize> {
         let mut reset = Vec::new();
         self.content_rev += 1;
         self.sets.truncate(sets.len());
+        if let Some(quick_mask) = &mut self.quick_mask {
+            quick_mask.retain_texture_sets(sets.len());
+        }
+        if let Some(compositor) = &mut self.compositor {
+            compositor.retain_texture_sets(sets.len());
+        }
         let max = device.limits().max_texture_dimension_2d.max(1);
-        for (i, &(size, _)) in sets.iter().enumerate() {
+        for (i, &(size, material)) in sets.iter().enumerate() {
             // Downscale sets that exceed the device's texture dimension limit
             let shift = (0..31).find(|s| size.0.max(size.1) >> s <= max).unwrap_or(0).max(self.display_shift);
-            if self.sets.get(i).is_some_and(|s| s.size == size && s.shift == shift) {
+            let preserve = resizing.contains(&i);
+            if !preserve && self.sets.get(i).is_some_and(|s| s.size == size && s.shift == shift && s.material == material) {
                 continue;
             }
+            let resize_from = self.sets.get(i).filter(|s| preserve && s.material == material).map(|s| s.display_bind_group().clone());
 
             // Allocate full-size textures on the first non-neutral upload
             let mut tex: Vec<Tex> =
@@ -1512,8 +1681,18 @@ impl Renderer {
             tex.push(neutral_tex(device, queue, (1, 1), wgpu::TextureFormat::Rgba8Unorm, 1, &AUX_NEUTRAL));
             let bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &tex);
             let n = tex.len();
-            let gpu =
-                SetGpu { size, shift, tex, bind_group, mips_dirty: vec![MipsDirty::All; n], failed: vec![false; n], pending: (0..n).map(|_| None).collect() };
+            let gpu = SetGpu {
+                size,
+                material,
+                shift,
+                tex,
+                bind_group,
+                resize_from,
+                mips_dirty: vec![MipsDirty::All; n],
+                failed: vec![false; n],
+                pending: (0..n).map(|_| None).collect(),
+                pending_seed: None,
+            };
             if i < self.sets.len() {
                 self.sets[i] = gpu;
             } else {
@@ -1530,9 +1709,402 @@ impl Renderer {
         reset
     }
 
+    /// Publish a CPU-prepared resized texture set once its last tile is uploaded.
+    pub fn finish_texture_set_resize(&mut self, ts: usize) {
+        if let Some(set) = self.sets.get_mut(ts)
+            && set.pending.iter().all(Option::is_none)
+            && set.pending_seed.is_none()
+            && set.resize_from.take().is_some()
+        {
+            self.content_rev += 1;
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start_gpu_brush(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: crate::gpu_brush::BrushInput,
+    ) -> Result<crate::gpu_brush::GpuBrushStroke, String> {
+        if !GpuCompositor::supports(device) {
+            return Err("adapter limits do not support the GPU brush".into());
+        }
+        let compile = (self.asynchronous_compile, self.shared_test_pipelines);
+        let (compositor, brush, stroke) = crate::gpu_trace::scoped(device, "GPU brush startup", || {
+            let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, compile));
+            let mut brush = self.brush.take().unwrap_or_else(|| crate::gpu_brush::BrushPipeline::new(device));
+            let stroke = compositor.uv_surface(device, queue, &input.mesh, &input.uv).and_then(|surface| brush.begin(device, queue, input, surface));
+            (compositor, brush, stroke)
+        })?;
+        self.compositor = Some(compositor);
+        self.brush = Some(brush);
+        stroke
+    }
+
+    /// Drop the inputs a texture set no longer needs for GPU compositing.
+    pub fn release_composite_inputs(&mut self, ts: usize) {
+        if let Some(compositor) = &mut self.compositor {
+            compositor.release_inputs(ts);
+        }
+    }
+
+    /// Bytes of the GPU compositor's last update: its working buffer and its paint upload buffer.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn composite_update_bytes(&self) -> [u64; 2] {
+        self.compositor.as_ref().map_or([0; 2], |compositor| compositor.update_bytes())
+    }
+
+    /// A compositor compiling on worker threads when `asynchronous`, and taking the tests' shared
+    /// pipelines when `shared`
+    fn new_compositor(device: &wgpu::Device, (asynchronous, shared): (bool, bool)) -> GpuCompositor {
+        let mut compositor = GpuCompositor::new_with(device, shared);
+        compositor.set_asynchronous_compile(asynchronous);
+        compositor
+    }
+
+    /// Let the compositor take the compiled pipelines the tests on the shared device share
+    /// ([`crate::headless::Headless::for_tests`])
+    #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+    pub(crate) fn share_test_pipelines(&mut self) {
+        self.shared_test_pipelines = true;
+    }
+
+    /// Compile new composite pipelines on worker threads: `composite_on_gpu` then answers
+    /// [`crate::gpu_composite::GPU_PIPELINES_PENDING`] until they are ready, leaving the set's
+    /// textures as they are. Off by default (tests); never on wasm.
+    pub fn set_asynchronous_compile(&mut self, asynchronous: bool) {
+        self.asynchronous_compile = asynchronous;
+        if let Some(compositor) = &mut self.compositor {
+            compositor.set_asynchronous_compile(asynchronous);
+        }
+    }
+
+    /// Start compiling `program`'s pipelines on worker threads (the current project's variants
+    /// at load), so its first composite does not wait for them.
+    pub fn prewarm_composite(&mut self, device: &wgpu::Device, program: &CompositeProgram) {
+        // Only with asynchronous compiles (the viewport): tests and wasm compile in place
+        if !self.asynchronous_compile || cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
+            return;
+        }
+        let compile = (self.asynchronous_compile, self.shared_test_pipelines);
+        self.compositor.get_or_insert_with(|| Self::new_compositor(device, compile)).prewarm(device, program);
+    }
+
+    /// Whether `program`'s pipelines are compiled (starting them otherwise): with asynchronous
+    /// compiles, a composite first waits for this. An error when their compile failed.
+    fn composite_pipelines_ready(&mut self, device: &wgpu::Device, program: &CompositeProgram) -> Result<bool, String> {
+        if !self.asynchronous_compile || cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
+            return Ok(true);
+        }
+        let compile = (true, self.shared_test_pipelines);
+        self.compositor.get_or_insert_with(|| Self::new_compositor(device, compile)).pipelines_ready(device, program)
+    }
+
+    /// Composite a supported layer stack or standalone mask into the viewport's textures.
+    /// Scratch holds one band. The final maps stay on the adapter for shading and mip generation.
+    pub fn composite_on_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<(), String> {
+        self.composite_on_gpu_timed(device, queue, ts, program, None)
+    }
+
+    /// Prepare the shared compositor layout before the import worker builds any shaders.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn composite_pipeline_warmup(&mut self, device: &wgpu::Device) -> Result<crate::gpu_composite::CompositePipelineWarmup, String> {
+        if !GpuCompositor::supports(device) {
+            return Err("GPU composition is unavailable on this adapter.".into());
+        }
+        match &self.compositor {
+            Some(compositor) => Ok(compositor.warmup(device)),
+            None => {
+                let compile = (self.asynchronous_compile, self.shared_test_pipelines);
+                let compositor = crate::gpu_trace::scoped(device, "GPU material layout", || Self::new_compositor(device, compile))?;
+                let warmup = compositor.warmup(device);
+                self.compositor = Some(compositor);
+                Ok(warmup)
+            }
+        }
+    }
+
+    /// Composite with optional host-side timings for the main viewport material.
+    pub fn composite_on_gpu_timed(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        ts: usize,
+        program: &CompositeProgram,
+        timing: Option<&mut CompositeTiming>,
+    ) -> Result<(), String> {
+        // New pipelines compile on worker threads: the set keeps its textures meanwhile
+        if !program.is_neutral() && !self.composite_pipelines_ready(device, program)? {
+            return Err(crate::gpu_composite::GPU_PIPELINES_PENDING.into());
+        }
+        if program.is_mask_preview() {
+            return self.composite_mask_preview(device, queue, ts, program);
+        }
+        let set = self.sets.get(ts).ok_or("texture set does not exist")?;
+        if program.is_neutral() {
+            self.release_composite_inputs(ts);
+            let textures = crate::gpu_trace::scoped(device, "empty GPU material", || {
+                let textures = DisplayKind::ALL
+                    .iter()
+                    .zip(&self.default_texels)
+                    .map(|(&kind, neutral)| neutral_tex(device, queue, (1, 1), display_format(kind), 1, neutral))
+                    .collect::<Vec<_>>();
+                queue.submit([]);
+                textures
+            })?;
+            let set = &mut self.sets[ts];
+            set.pending_seed = None;
+            // A replaced slot's earlier allocation failure no longer holds: later tiles may grow it
+            for (i, texture) in textures.into_iter().enumerate() {
+                set.tex[i] = texture;
+                set.pending[i] = None;
+                set.failed[i] = false;
+                set.mips_dirty[i] = MipsDirty::Clean;
+            }
+            set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
+            set.resize_from = None;
+            self.content_rev += 1;
+            return Ok(());
+        }
+        let size = display_dims(set.size, set.shift);
+        if cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
+            return Err("GPU composition is unavailable on this device or for this layout".into());
+        }
+
+        // A composed map whose texture has another extent (a seeded overview, a placeholder) gets a
+        // new texture: a regional update would leave it neutral outside the region, so it
+        // composes the whole set
+        let resized =
+            DisplayKind::ALL.iter().zip(&set.tex).any(|(&kind, old)| program.writes_display(kind) && (old.texture.width(), old.texture.height()) != size);
+        let region = if resized { None } else { program.region };
+        let mut submitted = None;
+        let mut in_place = [false; DisplayKind::ALL.len()];
+        let compile = (self.asynchronous_compile, self.shared_test_pipelines);
+        let result = crate::gpu_trace::scoped(device, "viewport GPU composite", || {
+            let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, compile));
+            let mut maps: Vec<_> = DisplayKind::ALL
+                .iter()
+                .zip(&self.default_texels)
+                .zip(&set.tex)
+                .map(|((&kind, neutral), old)| {
+                    let composed = program.writes_display(kind);
+                    let extent = if composed { size } else { (1, 1) };
+                    // At full extent 1×1, even an inactive map's old texel could be painted.
+                    if extent == (old.texture.width(), old.texture.height()) && (composed || size != (1, 1)) {
+                        in_place[kind as usize] = composed;
+                        old.clone()
+                    } else if composed && region.is_none() {
+                        Tex::new(device, "tc_composite", extent.0, extent.1, display_format(kind), mip_count(extent.0.max(extent.1)))
+                    } else {
+                        neutral_tex(device, queue, extent, display_format(kind), mip_count(extent.0.max(extent.1)), neutral)
+                    }
+                })
+                .collect();
+            let targets: &[Tex; DisplayKind::ALL.len()] = maps.as_slice().try_into().map_err(|_| "The GPU display textures are missing.")?;
+            compositor.compose(
+                (device, queue),
+                program,
+                (ts, set.size, set.shift, region),
+                &targets.each_ref().map(|target| &target.texture),
+                &mut submitted,
+                timing,
+            )?;
+            maps.extend(set.tex.last().cloned());
+            Ok::<_, String>((compositor, maps))
+        })
+        .and_then(|output| output);
+        let (compositor, textures) = match result {
+            Ok(output) => output,
+            Err(error) => {
+                let slots = in_place.into_iter().enumerate().filter_map(|(slot, reused)| reused.then_some(slot));
+                self.invalidate_gpu_writes(ts, submitted, slots);
+                return Err(error);
+            }
+        };
+        self.compositor = Some(compositor);
+        if let Some(set) = self.sets.get_mut(ts) {
+            let region = region.map(|r| r.viewport(set.shift, size));
+            for ((mips, old), new) in set.mips_dirty.iter_mut().zip(&set.tex).zip(&textures).take(DisplayKind::ALL.len()) {
+                if let Some(region) = region
+                    && old.texture == new.texture
+                {
+                    if new.mips > 1 {
+                        mips.add(region.min[0], region.min[1], region.max[0], region.max[1]);
+                    }
+                } else {
+                    *mips = MipsDirty::All;
+                }
+            }
+            set.tex = textures;
+            set.pending.iter_mut().take(DisplayKind::ALL.len()).for_each(|slot| *slot = None);
+            set.failed.iter_mut().take(DisplayKind::ALL.len()).for_each(|failed| *failed = false);
+            set.pending_seed = None;
+            set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
+            set.resize_from = None;
+            self.content_rev += 1;
+        }
+        Ok(())
+    }
+
+    fn composite_mask_preview(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, program: &CompositeProgram) -> Result<(), String> {
+        if cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
+            return Err("GPU mask preview is unavailable on this device".into());
+        }
+        let set = self.sets.get(ts).ok_or("texture set does not exist")?;
+        let slot = DisplayKind::ALL.len();
+        let old = set.tex.get(slot).ok_or("The GPU aux texture is missing.")?;
+        let shift = mask_view_shift(set.size);
+        let (width, height) = mask_view_extent(set.size);
+        // The GPU reads every 2^shift-th texel: the CPU's nearest texel only when both sides divide
+        if (width << shift, height << shift) != set.size {
+            return Err("The mask preview layout uses CPU compositing.".into());
+        }
+        let reuse = (old.texture.width(), old.texture.height()) == (width, height);
+        let region = if reuse { program.region } else { None };
+        let mut submitted = None;
+        let compile = (self.asynchronous_compile, self.shared_test_pipelines);
+        let result = crate::gpu_trace::scoped(device, "viewport GPU mask preview", || {
+            let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, compile));
+            let tex = if reuse {
+                old.clone()
+            } else {
+                Tex::new(device, "tc_gpu_mask_preview", width, height, wgpu::TextureFormat::Rgba8Unorm, mip_count(width.max(height)))
+            };
+            compositor.compose((device, queue), program, (ts, set.size, shift, region), &[&tex.texture], &mut submitted, None)?;
+            Ok::<_, String>((compositor, tex))
+        })
+        .and_then(|output| output);
+        let (compositor, tex) = match result {
+            Ok(output) => output,
+            Err(error) => {
+                self.invalidate_gpu_writes(ts, submitted, reuse.then_some(slot));
+                return Err(error);
+            }
+        };
+        self.compositor = Some(compositor);
+        let set = &mut self.sets[ts];
+        set.pending[slot] = None;
+        set.failed[slot] = false;
+        if reuse {
+            let dirty = &mut set.mips_dirty[slot];
+            if let Some(region) = region {
+                let region = region.viewport(shift, (width, height));
+                if tex.mips > 1 {
+                    dirty.add(region.min[0], region.min[1], region.max[0], region.max[1]);
+                }
+            } else {
+                *dirty = MipsDirty::All;
+            }
+        } else {
+            install(set, slot, tex, device, &self.set_bgl, &self.sampler);
+        }
+        self.content_rev += 1;
+        Ok(())
+    }
+
+    // A later submission can fail after an earlier window wrote the bound texture.
+    fn invalidate_gpu_writes(&mut self, ts: usize, submitted: Option<CompositeRegion>, slots: impl IntoIterator<Item = usize>) {
+        let Some(region) = submitted else { return };
+        let set = &mut self.sets[ts];
+        let mut changed = false;
+        for slot in slots {
+            if set.tex[slot].mips > 1 {
+                set.mips_dirty[slot].add(region.min[0], region.min[1], region.max[0], region.max[1]);
+            }
+            changed = true;
+        }
+        if changed {
+            self.content_rev += 1;
+        }
+    }
+
+    /// Present a bounded image of the entire material until the detailed tiles arrive.
+    /// Retire old project textures even when the next project has the same dimensions.
+    pub fn seed_display(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, size: (u32, u32), maps: &[(DisplayKind, Vec<u8>)]) {
+        let Some(set) = self.sets.get(ts) else { return };
+        let target = display_dims(set.size, set.shift);
+        if size.0 == 0 || size.1 == 0 || size.0.max(size.1) > 256 || size.0 > target.0 || size.1 > target.1 {
+            return;
+        }
+        if maps.is_empty() {
+            // A clear is a scene change, not an optional overview. Bind the same
+            // neutral placeholders used to initialise a set.
+            self.replace_display_seed(device, queue, ts, None);
+            return;
+        }
+        for (kind, _) in maps {
+            self.ensure_mip_pipeline(device, display_format(*kind));
+        }
+        let textures = checked(device, "material overview", || {
+            DisplayKind::ALL
+                .iter()
+                .zip(&self.default_texels)
+                .map(|(&kind, neutral)| {
+                    let stride = kind.bytes_per_texel();
+                    let pixels = maps
+                        .iter()
+                        .find(|(k, _)| *k == kind)
+                        .map(|(_, v)| v.as_slice())
+                        .filter(|v| v.len() == size.0 as usize * size.1 as usize * stride && !v.chunks_exact(stride).all(|p| p == neutral));
+                    let (w, h) = if pixels.is_some() { size } else { (1, 1) };
+                    let levels = if (w, h) == target { mip_count(w.max(h)) } else { 1 };
+                    let tex = Tex::new(device, "tc_overview", w, h, display_format(kind), levels);
+                    queue.write_texture(
+                        tex.texture.as_image_copy(),
+                        pixels.unwrap_or(neutral),
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * stride as u32), rows_per_image: None },
+                        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    );
+                    tex
+                })
+                .collect::<Vec<_>>()
+        });
+        self.replace_display_seed(device, queue, ts, Some(textures));
+    }
+
+    fn replace_display_seed(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, textures: Option<Checked<Vec<Tex>>>) {
+        let Some(set) = self.sets.get_mut(ts) else { return };
+        let pending = match textures {
+            Some(Checked::Later(textures, answer)) => Some(PendingDisplaySeed { textures, answer: std::sync::Mutex::new(answer), tiles: Vec::new() }),
+            Some(Checked::Done(Ok(textures))) => {
+                set.pending_seed = None;
+                install_display_seed(set, textures, device, &self.set_bgl, &self.sampler);
+                self.content_rev += 1;
+                return;
+            }
+            Some(Checked::Done(Err(_))) | None => None,
+        };
+        let neutral = DisplayKind::ALL
+            .iter()
+            .zip(&self.default_texels)
+            .map(|(&kind, neutral)| neutral_tex(device, queue, (1, 1), display_format(kind), 1, neutral))
+            .collect();
+        install_display_seed(set, neutral, device, &self.set_bgl, &self.sampler);
+        set.pending_seed = pending;
+        self.content_rev += 1;
+    }
+
     /// Upload one 64×64 tile of a display texture (bytes from `compose::tile_bytes`).
     #[allow(clippy::too_many_arguments)]
     pub fn upload_tile(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, kind: DisplayKind, tile_x: u32, tile_y: u32, bytes: &[u8]) {
+        self.upload_display_tile(device, queue, texture_set, kind, tile_x, tile_y, bytes, 0);
+    }
+
+    /// Upload a tile already sampled at the UI's display shift. The adapter's dimension
+    /// limit may require another reduction for this particular set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_display_tile(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture_set: usize,
+        kind: DisplayKind,
+        tile_x: u32,
+        tile_y: u32,
+        bytes: &[u8],
+        source_shift: u32,
+    ) {
         let Some(set) = self.sets.get_mut(texture_set) else { return };
         let Some(kind_index) = DisplayKind::ALL.iter().position(|k| *k == kind) else { return };
         let (Some(texture), Some(texel)) = (set.tex.get(kind_index), self.default_texels.get(kind_index)) else { return };
@@ -1540,21 +2112,53 @@ impl Renderer {
 
         // Reject overflowing coordinates before a GPU origin can wrap to another tile
         let (Some(x), Some(y)) = (tile_x.checked_mul(TILE), tile_y.checked_mul(TILE)) else { return };
-        if x >= set.size.0 || y >= set.size.1 || bytes.len() < (TILE * TILE * bytes_per_texel) as usize {
+        let shift = set.shift.min(TILE.ilog2());
+        if source_shift > shift {
+            return;
+        }
+        let source_side = TILE >> source_shift;
+        let bytes_needed = (source_side * source_side * bytes_per_texel) as usize;
+        if x >= set.size.0 || y >= set.size.1 || bytes.len() < bytes_needed {
+            return;
+        }
+        if let Some(seed) = &mut set.pending_seed {
+            // Detail uploads may start in the same frame as the overview. Replay them
+            // after acceptance so they overwrite only their own part of the overview.
+            seed.tiles.push(SeedTile { kind, x: tile_x, y: tile_y, bytes: bytes[..bytes_needed].to_vec(), shift: source_shift });
             return;
         }
 
         let display_size = display_dims(set.size, set.shift);
         let allocation_pending = set.pending.get(kind_index).is_some_and(Option::is_some);
         if !allocation_pending && (texture.texture.width() < display_size.0 || texture.texture.height() < display_size.1) {
-            // A neutral tile needs no full-size texture allocation
-            if set.failed.get(kind_index).copied().unwrap_or(true) || bytes.chunks_exact(texel.len()).all(|px| px == texel.as_slice()) {
+            // A neutral tile can still replace non-neutral pixels from the overview.
+            let has_overview = texture.texture.width() > 1 || texture.texture.height() > 1;
+            if set.failed.get(kind_index).copied().unwrap_or(true) || (!has_overview && bytes.chunks_exact(texel.len()).all(|px| px == texel.as_slice())) {
                 return;
             }
 
             let allocation_label = format!("texture set {} ({kind:?}, {}×{})", texture_set + 1, display_size.0, display_size.1);
             let full_texture = checked(device, &allocation_label, || {
-                neutral_tex(device, queue, display_size, display_format(kind), mip_count(display_size.0.max(display_size.1)), texel)
+                let format = display_format(kind);
+                let mips = mip_count(display_size.0.max(display_size.1));
+                if has_overview && let Some(pipe) = self.mip_pipelines.get(&format) {
+                    let full = Tex::new(device, "tc_set", display_size.0, display_size.1, format, mips);
+                    let dst = full.texture.create_view(&wgpu::TextureViewDescriptor { mip_level_count: Some(1), ..Default::default() });
+                    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("tc_overview_enlarge"),
+                        layout: &self.mip_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&texture.view) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                        ],
+                    });
+                    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                    mip_pass(&mut encoder, "tc_overview_enlarge", &dst, pipe, &group, None);
+                    queue.submit([encoder.finish()]);
+                    full
+                } else {
+                    neutral_tex(device, queue, display_size, format, mips, texel)
+                }
             });
             if !grow(set, texture_set, kind_index, full_texture, (device, &self.set_bgl, &self.sampler), &mut self.memory_failures) {
                 return;
@@ -1569,13 +2173,13 @@ impl Renderer {
         let validation_scope = pending.is_some().then(|| device.push_error_scope(wgpu::ErrorFilter::Validation));
 
         // Downscaled sets take every `step`-th texel of the tile
-        let (step, tile_extent) = (1usize << set.shift.min(6), TILE >> set.shift.min(6));
+        let (step, tile_extent) = (1usize << (shift - source_shift), TILE >> shift);
         let downscaled_bytes: Vec<u8>;
         let upload_bytes = if step == 1 {
             bytes
         } else {
             let texel = |row: usize, column: usize| {
-                bytes.get((row * TILE as usize + column) * bytes_per_texel as usize..).unwrap_or_default().iter().take(bytes_per_texel as usize)
+                bytes.get((row * source_side as usize + column) * bytes_per_texel as usize..).unwrap_or_default().iter().take(bytes_per_texel as usize)
             };
             downscaled_bytes =
                 (0..tile_extent as usize).flat_map(|row| (0..tile_extent as usize).flat_map(move |column| texel(row * step, column * step))).copied().collect();
@@ -1608,26 +2212,90 @@ impl Renderer {
         }
     }
 
+    /// Release uploaded Quick Mask coverage when the overlay is no longer using the GPU.
+    pub fn release_quick_mask_inputs(&mut self) {
+        if let Some(quick_mask) = &mut self.quick_mask {
+            quick_mask.clear_coverage();
+        }
+    }
+
+    /// Draw the red Quick Mask overlay from the material texture already on the device.
+    pub fn draw_quick_mask(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, overlay: &QuickMaskOverlay) -> Result<(), String> {
+        let set = self.sets.get(ts).ok_or("texture set does not exist")?;
+        let matches_set = |mask: &texturecraft_texel::TileImage| (mask.width(), mask.height()) == set.size && mask.comps() == 1;
+        if !matches_set(&overlay.mask)
+            || overlay.stroke.as_ref().is_some_and(|(alpha, ..)| match alpha {
+                QuickMaskAlpha::Gpu(view) => {
+                    let texture = view.texture();
+                    (texture.width(), texture.height()) != set.size || texture.format() != wgpu::TextureFormat::R16Uint
+                }
+                QuickMaskAlpha::Cpu(mask) => !matches_set(mask),
+            })
+        {
+            return Err("The Quick Mask coverage does not match the texture set.".into());
+        }
+        let size = aux_size(set.size);
+        let slot = DisplayKind::ALL.len();
+        let old = set.tex.get(slot).ok_or("The GPU aux texture is missing.")?;
+        let reused = (old.texture.width(), old.texture.height()) == (size, size);
+        let (gpu, tex) = crate::gpu_trace::scoped(device, "GPU Quick Mask overlay", || {
+            let mut gpu = self.quick_mask.take().unwrap_or_else(|| QuickMaskGpu::new(device));
+            let aux = if reused { old.clone() } else { Tex::new(device, "tc_quick_mask", size, size, wgpu::TextureFormat::Rgba8Unorm, mip_count(size)) };
+            let view = aux.texture.create_view(&wgpu::TextureViewDescriptor { mip_level_count: Some(1), ..Default::default() });
+            let bindings = gpu.bindings((device, queue), ts, size, &set.tex[DisplayKind::BaseColor as usize].view, overlay);
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_quick_mask") });
+            fullscreen(&mut encoder, "tc_quick_mask", &view, CLEAR, &gpu.pipeline, &bindings);
+            queue.submit([encoder.finish()]);
+            (gpu, aux)
+        })?;
+        self.quick_mask = Some(gpu);
+        let set = &mut self.sets[ts];
+        set.pending[slot] = None;
+        set.failed[slot] = false;
+        if reused {
+            set.mips_dirty[slot] = MipsDirty::All;
+        } else {
+            install(set, slot, tex, device, &self.set_bgl, &self.sampler);
+        }
+        self.content_rev += 1;
+        Ok(())
+    }
+
     /// Upload the aux (mesh map / debug) texture of a set: RGBA8, `size × size` with `size` from
     /// [`aux_size`]. The first upload allocates it.
     pub fn upload_aux(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, size: u32, rgba: &[u8]) {
+        self.upload_aux_sized(device, queue, texture_set, (size, size), rgba);
+    }
+
+    /// [`Renderer::upload_aux`] at `extent` (width, height): `aux_size` × `aux_size`, or the
+    /// mask view's [`mask_view_extent`].
+    pub fn upload_aux_sized(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, extent: (u32, u32), rgba: &[u8]) {
         let Some(set) = self.sets.get_mut(texture_set) else { return };
-        let desired_size = aux_size(set.size);
+        let square = aux_size(set.size);
         let aux_index = set.tex.len().saturating_sub(1);
         let Some(texture) = set.tex.last() else { return };
-        if size != desired_size || rgba.len() < (size as usize) * (size as usize) * 4 {
+        let (width, height) = extent;
+        let known = extent == (square, square) || extent == mask_view_extent(set.size);
+        if !known || rgba.len() < (width as usize) * (height as usize) * 4 {
             return;
         }
 
+        // A pending allocation of another extent (a mesh map view still allocating when the mask
+        // view takes the slot) is retired: this upload sizes the slot anew
+        let pending_extent = set.pending.get(aux_index).and_then(Option::as_ref).map(|p| (p.tex.texture.width(), p.tex.texture.height()));
+        if pending_extent.is_some_and(|pending| pending != extent) {
+            set.pending[aux_index] = None;
+        }
         let allocation_pending = set.pending.get(aux_index).is_some_and(Option::is_some);
-        if !allocation_pending && texture.texture.width() != size {
+        if !allocation_pending && (texture.texture.width(), texture.texture.height()) != extent {
             if set.failed.get(aux_index).copied().unwrap_or(true) {
                 return;
             }
 
-            let allocation_label = format!("texture set {} (mesh map view, {size}×{size})", texture_set + 1);
-            let full_texture =
-                checked(device, &allocation_label, || neutral_tex(device, queue, (size, size), wgpu::TextureFormat::Rgba8Unorm, mip_count(size), &AUX_NEUTRAL));
+            let allocation_label = format!("texture set {} (mesh map view, {width}×{height})", texture_set + 1);
+            let full_texture = checked(device, &allocation_label, || {
+                neutral_tex(device, queue, extent, wgpu::TextureFormat::Rgba8Unorm, mip_count(width.max(height)), &AUX_NEUTRAL)
+            });
             if !grow(set, texture_set, aux_index, full_texture, (device, &self.set_bgl, &self.sampler), &mut self.memory_failures) {
                 return;
             }
@@ -1658,16 +2326,18 @@ impl Renderer {
         std::mem::take(&mut self.memory_failures)
     }
 
-    /// Whether a full-size texture still waits for WebGPU's verdict: keep drawing frames, since
-    /// [`Renderer::prepare`] installs it (or reports the failure) once the answer is in.
+    /// Whether a texture still waits for WebGPU's verdict: keep drawing frames until
+    /// [`Renderer::prepare`] can apply the result.
     pub fn awaiting_gpu(&self) -> bool {
-        self.sets.iter().any(|s| s.pending.iter().any(Option::is_some))
+        self.sets.iter().any(|s| s.pending_seed.is_some() || s.pending.iter().any(Option::is_some))
     }
 
     /// Install the pending full-size textures WebGPU accepted; drop the ones it rejected (their
     /// placeholder stays and the failure is reported).
-    fn resolve_pending(&mut self, device: &wgpu::Device) {
-        for (ts, set) in self.sets.iter_mut().enumerate() {
+    fn resolve_pending(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        for ts in 0..self.sets.len() {
+            self.resolve_display_seed(device, queue, ts);
+            let set = &mut self.sets[ts];
             for slot in 0..set.pending.len() {
                 let poll = |p: &PendingTex| p.answer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).try_recv();
                 let verdict = match set.pending.get(slot).and_then(Option::as_ref).map(poll) {
@@ -1692,9 +2362,31 @@ impl Renderer {
         }
     }
 
+    fn resolve_display_seed(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize) {
+        let set = &mut self.sets[ts];
+        let Some(seed) = set.pending_seed.as_ref() else { return };
+        let verdict = seed.answer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).try_recv();
+        if matches!(verdict, Err(std::sync::mpsc::TryRecvError::Empty)) {
+            return;
+        }
+        let Some(seed) = set.pending_seed.take() else { return };
+        if matches!(verdict, Ok(None)) {
+            install_display_seed(set, seed.textures, device, &self.set_bgl, &self.sampler);
+            self.content_rev += 1;
+        }
+        // On rejection, the seed is optional and the tiles still refine the neutral set.
+        for tile in seed.tiles {
+            self.upload_display_tile(device, queue, ts, tile.kind, tile.x, tile.y, &tile.bytes, tile.shift);
+        }
+    }
+
     /// Size of the aux texture of a set (1 until a mesh map or mask was shown).
     pub fn aux_size(&self, ts: usize) -> Option<u32> {
-        self.sets.get(ts).and_then(|s| s.tex.last()).map(|t| t.texture.width())
+        self.aux_texture(ts).map(wgpu::Texture::width)
+    }
+
+    pub fn aux_texture(&self, ts: usize) -> Option<&wgpu::Texture> {
+        self.sets.get(ts).and_then(|s| s.tex.last()).map(|t| &t.texture)
     }
 
     fn generate_mips(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
@@ -2008,11 +2700,14 @@ impl Renderer {
         pass.set_bind_group(0, &self.shadow.bg, &[]);
         if let Some(m) = &self.mesh {
             let geo = m.dense.as_ref().filter(|_| displacing).unwrap_or(&m.geo);
-            pass.set_vertex_buffer(0, geo.vb.slice(..));
-            pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, _, set) in self.drawable(&geo.draws, visible, None) {
-                pass.set_bind_group(1, &set.bind_group, &[]);
-                pass.draw_indexed(range, 0, 0..1);
+            let extra = if std::ptr::eq(geo, &m.geo) { m.extra.as_slice() } else { &[] };
+            for geo in std::iter::once(geo).chain(extra.iter().map(|p| &p.geo)) {
+                pass.set_vertex_buffer(0, geo.vb.slice(..));
+                pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
+                for (range, _, set) in self.drawable(&geo.draws, visible, None) {
+                    pass.set_bind_group(1, set.display_bind_group(), &[]);
+                    pass.draw_indexed(range, 0, 0..1);
+                }
             }
         }
         drop(pass);
@@ -2032,7 +2727,7 @@ impl Renderer {
     /// `shade.taa` that repeats the previous one adds a jittered sample to the average instead,
     /// and renders nothing once [`TAA_SAMPLES`] are in.
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, frame: &Frame) {
-        self.resolve_pending(device);
+        self.resolve_pending(device, queue);
         self.generate_mips(device, encoder);
         let rev = self.content_rev;
         let sample = match self.views.get(&frame.view_id) {
@@ -2129,8 +2824,8 @@ impl Renderer {
             ],
             material: [if s.spec_gloss { 1.0 } else { 0.0 }, if s.parallax { 1.0 } else { 0.0 }, sample as f32, s.ior],
             scatter: [s.scatter[0], s.scatter[1], s.scatter[2], if sss.is_some() { 1.0 } else { 0.0 }],
-            fwd: [fwd.x, fwd.y, fwd.z, 0.0],
-            disp,
+            fwd: [fwd.x, fwd.y, fwd.z, height_normal_globals(s.height_normal)[1]],
+            disp: [disp[0], disp[1], disp[2], height_normal_globals(s.height_normal)[0]],
             refr: [if refraction { 1.0 } else { 0.0 }, (BEHIND_LEVELS - 1) as f32, REFRACTION_DEPTH * radius, 0.0],
             highlight: highlight_globals(s.highlight, HIGHLIGHT_OPACITY, s, data),
             highlight_shift: highlight_shift(frame.size),
@@ -2221,15 +2916,17 @@ impl Renderer {
         pass.set_bind_group(0, globals_bg, &[]);
         pass.set_bind_group(2, &self.refr_black, &[]);
         let geo = self.geometry(m, frame);
-        pass.set_vertex_buffer(0, geo.vb.slice(..));
-        pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
-
         // Instance index 1 lets the G-buffer mark the hovered set for the scattering composite
         let hover_set = frame.shade.set_hover.filter(|_| frame.kind == ViewKind::Scene).map(|hover| hover.set);
-        for (range, texture_set, set) in self.drawable(&geo.draws, &frame.visible, None) {
-            pass.set_bind_group(1, &set.bind_group, &[]);
-            let first_instance = u32::from(hover_set == Some(texture_set));
-            pass.draw_indexed(range, 0, first_instance..first_instance + 1);
+        let extra = if std::ptr::eq(geo, &m.geo) { m.extra.as_slice() } else { &[] };
+        for geo in std::iter::once(geo).chain(extra.iter().map(|p| &p.geo)) {
+            pass.set_vertex_buffer(0, geo.vb.slice(..));
+            pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
+            for (range, texture_set, set) in self.drawable(&geo.draws, &frame.visible, None) {
+                pass.set_bind_group(1, set.display_bind_group(), &[]);
+                let first_instance = u32::from(hover_set == Some(texture_set));
+                pass.draw_indexed(range, 0, first_instance..first_instance + 1);
+            }
         }
     }
 
@@ -2362,7 +3059,15 @@ impl Renderer {
             (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, uv_set, 1, None),
             (highlight, &mesh.geo.vb, &mesh.lines, &mesh.line_draws, highlight_set, HIGHLIGHT_SHIFTS, None),
         ];
-        for (pipeline, vertices, indices, ranges, only_set, instances, hover_set) in passes {
+        let extra = if std::ptr::eq(geometry, &mesh.geo) { mesh.extra.as_slice() } else { &[] };
+        let extra_passes = extra.iter().flat_map(|part| {
+            [
+                (low_poly_shown.then_some(mesh_pipeline), &part.geo.vb, &part.geo.ib, &part.geo.draws, uv_set, 1, hover_set),
+                (wire.filter(|_| low_poly_shown), &part.geo.vb, &part.lines, &part.line_draws, uv_set, 1, None),
+                (highlight, &part.geo.vb, &part.lines, &part.line_draws, highlight_set, HIGHLIGHT_SHIFTS, None),
+            ]
+        });
+        for (pipeline, vertices, indices, ranges, only_set, instances, hover_set) in passes.into_iter().chain(extra_passes) {
             let Some(pipeline) = pipeline else { continue };
 
             pass.set_pipeline(pipeline);
@@ -2371,7 +3076,7 @@ impl Renderer {
             for (range, texture_set, set) in self.drawable(ranges, &frame.visible, only_set) {
                 // Instance index 1 lets the mesh shader tint the hovered draw
                 let first_instance = u32::from(hover_set == Some(texture_set));
-                pass.set_bind_group(1, &set.bind_group, &[]);
+                pass.set_bind_group(1, set.display_bind_group(), &[]);
                 pass.draw_indexed(range, 0, first_instance..first_instance + instances);
             }
         }
@@ -2381,13 +3086,13 @@ impl Renderer {
         }
         if let Some(texture_set) = uv_set
             && frame.shade.bake.is_some_and(|bake| bake.missing_seams.shown)
-            && let Some(seams) = self.missing_seams.as_ref().filter(|seams| seams.mesh_id == mesh.id)
+            && let Some(seams) = self.missing_seams.as_ref().filter(|seams| seams.mesh_id == mesh.id && mesh.extra.is_empty())
         {
             pass.set_pipeline(&self.uv_missing_seam_pipeline);
             pass.set_vertex_buffer(0, mesh.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
             for (range, _, set) in self.drawable(&seams.line_draws, &frame.visible, Some(texture_set)) {
-                pass.set_bind_group(1, &set.bind_group, &[]);
+                pass.set_bind_group(1, set.display_bind_group(), &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
         }
@@ -2415,13 +3120,13 @@ impl Renderer {
         }
 
         if bake.missing_seams.shown
-            && let Some(seams) = self.missing_seams.as_ref().filter(|seams| seams.mesh_id == low_poly.id)
+            && let Some(seams) = self.missing_seams.as_ref().filter(|seams| seams.mesh_id == low_poly.id && low_poly.extra.is_empty())
         {
             pass.set_pipeline(&self.missing_seam_pipeline);
             pass.set_vertex_buffer(0, low_poly.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
             for (range, _, set) in self.drawable(&seams.line_draws, &frame.visible, None) {
-                pass.set_bind_group(1, &set.bind_group, &[]);
+                pass.set_bind_group(1, set.display_bind_group(), &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
         }
@@ -2597,6 +3302,42 @@ fn highlight_shift(size: [u32; 2]) -> [f32; 4] {
 mod tests {
     use super::*;
     use crate::headless::Headless;
+    use texturecraft_core::rules::CompositeRules;
+
+    #[test]
+    fn height_to_normal_follows_the_project_rule() {
+        let mut project = Project::new("p", "m.obj");
+        let native = Shade::from_project(&project);
+        assert_eq!(native.height_normal, HeightNormal::Native);
+        // Native projects keep the viewport's own slope: 45° for a height change of 1 over 1/16 of the width.
+        assert_eq!(height_normal_globals(native.height_normal), [0.0, 1.0 / 16.0]);
+        for (rule, filter) in [(HeightNormal::Sobel, 1.0), (HeightNormal::Backward, 2.0)] {
+            project.rules = CompositeRules::measured(rule);
+            let shade = Shade::from_project(&project);
+            assert_eq!(shade.height_normal, rule);
+            assert_eq!(height_normal_globals(shade.height_normal), [filter, MEASURED_SLOPE]);
+        }
+    }
+
+    /// The mask view halves a set until its longer side fits 2048 texels, keeping its shape: a
+    /// classic square set as before, a grid of UV tiles one square per block.
+    #[test]
+    fn the_mask_view_halves_a_set_until_it_fits() {
+        let cases = [
+            ((1024, 1024), (1024, 1024)),
+            ((4096, 4096), (2048, 2048)),
+            ((128, 64), (128, 64)),
+            ((3072, 1024), (1536, 512)),
+            ((6144, 4096), (1536, 1024)),
+            ((3000, 3000), (1500, 1500)),
+        ];
+
+        for (size, extent) in cases {
+            assert_eq!(mask_view_extent(size), extent, "{size:?}");
+            let shift = mask_view_shift(size);
+            assert_eq!((extent.0 << shift, extent.1 << shift), size, "{size:?}: every 2^shift-th texel, as the CPU samples it");
+        }
+    }
 
     #[test]
     fn oversized_overlays_leave_the_view_usable() {
@@ -2637,7 +3378,7 @@ mod tests {
 
     fn prepare(h: &mut Headless) {
         let mut enc = h.device.create_command_encoder(&Default::default());
-        h.renderer.resolve_pending(&h.device);
+        h.renderer.resolve_pending(&h.device, &h.queue);
         h.renderer.generate_mips(&h.device, &mut enc);
         h.queue.submit([enc.finish()]);
     }
@@ -2677,6 +3418,90 @@ mod tests {
         prepare(&mut h);
         assert_eq!(base_width(&h), 1);
         assert!(!h.renderer.awaiting_gpu());
+    }
+
+    fn pending_overview(h: &mut Headless) -> std::sync::mpsc::Sender<Option<String>> {
+        let maps = [(DisplayKind::BaseColor, [255, 0, 0, 255].repeat(64 * 64))];
+        h.renderer.seed_display(&h.device, &h.queue, 0, (64, 64), &maps);
+        let textures = h.renderer.sets[0].tex[..DisplayKind::ALL.len()].to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        h.renderer.replace_display_seed(&h.device, &h.queue, 0, Some(Checked::Later(textures, rx)));
+        tx
+    }
+
+    fn base_pixel(h: &Headless, x: usize, y: usize) -> [u8; 4] {
+        let texture = h.renderer.display_textures()[0][0];
+        let (width, _, bytes) = crate::readback::Readback::blocking_level(&h.device, &h.queue, texture, 0).unwrap();
+        let offset = (y * width as usize + x) * 4;
+        bytes[offset..offset + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn a_cpu_resize_keeps_the_old_material_bound_until_its_replacement_is_ready() {
+        let Ok(mut h) = Headless::new() else { return };
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[((128, 128), 0)], 1);
+        let previous = h.renderer.sets[0].display_bind_group().clone();
+        h.renderer.set_texture_sets_preserving(&h.device, &h.queue, &[((256, 256), 0)], 1, &[0]);
+        h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, 0, 0, &[230, 20, 25, 255].repeat(64 * 64));
+        assert_eq!(h.renderer.sets[0].display_bind_group(), &previous, "partial replacement tiles must not be visible");
+        h.renderer.finish_texture_set_resize(0);
+        assert_ne!(h.renderer.sets[0].display_bind_group(), &previous);
+        assert_eq!(base_pixel(&h, 32, 32), [230, 20, 25, 255]);
+    }
+
+    #[test]
+    fn late_overview_keeps_detail_tiles_over_the_coarse_background() {
+        let Ok(mut h) = Headless::new() else { return };
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[((256, 256), 0)], 1);
+        let tx = pending_overview(&mut h);
+        let kind = DisplayKind::BaseColor;
+        let neutral = kind.default_texel();
+        let green = [0, 255, 0, 255];
+        h.renderer.upload_tile(&h.device, &h.queue, 0, kind, 0, 0, &neutral.repeat(64 * 64));
+        h.renderer.upload_tile(&h.device, &h.queue, 0, kind, 1, 0, &green.repeat(64 * 64));
+        prepare(&mut h);
+        assert!(h.renderer.awaiting_gpu());
+        assert_eq!(base_width(&h), 1, "the overview stays unbound until approved");
+
+        tx.send(None).unwrap();
+        prepare(&mut h);
+        assert!(!h.renderer.awaiting_gpu());
+        assert_eq!(base_pixel(&h, 32, 32).as_slice(), neutral.as_slice(), "even a neutral tile replaces coarse color");
+        assert_eq!(base_pixel(&h, 96, 32), green, "the color uploaded while waiting is preserved");
+        assert_eq!(base_pixel(&h, 160, 32), [255, 0, 0, 255], "untouched tiles still show the overview");
+    }
+
+    #[test]
+    fn rejected_overview_still_applies_detail_tiles() {
+        let Ok(mut h) = Headless::new() else { return };
+        let kind = DisplayKind::BaseColor;
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[((256, 256), 0)], 1);
+        let tx = pending_overview(&mut h);
+        let green = [0, 255, 0, 255];
+        h.renderer.upload_tile(&h.device, &h.queue, 0, kind, 1, 0, &green.repeat(64 * 64));
+        tx.send(Some("overview allocation rejected".into())).unwrap();
+        prepare(&mut h);
+        assert_eq!(base_pixel(&h, 96, 32), green);
+        assert_eq!(base_pixel(&h, 160, 32).as_slice(), kind.default_texel().as_slice());
+    }
+
+    #[test]
+    fn clearing_an_overview_discards_old_tiles_even_at_the_same_size() {
+        let Ok(mut h) = Headless::new() else { return };
+        let kind = DisplayKind::BaseColor;
+        let layout = [((256, 256), 0)];
+        h.renderer.set_texture_sets(&h.device, &h.queue, &layout, 1);
+        let tx = pending_overview(&mut h);
+        h.renderer.upload_tile(&h.device, &h.queue, 0, kind, 1, 0, &[255, 0, 0, 255].repeat(64 * 64));
+        assert!(h.renderer.set_texture_sets(&h.device, &h.queue, &layout, 1).is_empty());
+        // This is the explicit clear used before submitting details for the new view.
+        h.renderer.seed_display(&h.device, &h.queue, 0, (1, 1), &[]);
+        assert!(tx.send(None).is_err(), "the old overview can no longer be accepted");
+        let green = [0, 255, 0, 255];
+        h.renderer.upload_tile(&h.device, &h.queue, 0, kind, 0, 0, &green.repeat(64 * 64));
+        prepare(&mut h);
+        assert_eq!(base_pixel(&h, 32, 32), green);
+        assert_eq!(base_pixel(&h, 96, 32).as_slice(), kind.default_texel().as_slice());
     }
 
     #[test]
@@ -2769,6 +3594,28 @@ mod tests {
 
         assert_eq!(headless.renderer.content_rev, revision);
         assert_eq!(headless.renderer.display_textures()[0][0].width(), 1);
+    }
+
+    #[test]
+    fn a_neutral_detail_tile_replaces_only_its_part_of_the_material_overview() {
+        let Ok(mut h) = Headless::new() else { return };
+        let kind = DisplayKind::BaseColor;
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let mut preview = red.repeat(64 * 32);
+        preview.extend(blue.repeat(64 * 32));
+        h.renderer.set_texture_sets(&h.device, &h.queue, &[((256, 256), 0)], 1);
+        h.renderer.seed_display(&h.device, &h.queue, 0, (64, 64), &[(kind, preview)]);
+        let neutral = kind.default_texel();
+        h.renderer.upload_tile(&h.device, &h.queue, 0, kind, 0, 0, &neutral.repeat(64 * 64));
+        let index = DisplayKind::ALL.iter().position(|k| *k == kind).unwrap();
+        let tex = h.renderer.display_textures()[0][index];
+        let (w, height, pixels) = crate::readback::Readback::blocking_level(&h.device, &h.queue, tex, 0).unwrap();
+        assert_eq!((w, height), (256, 256));
+        let pixel = |x: usize, y: usize| &pixels[(y * 256 + x) * 4..(y * 256 + x + 1) * 4];
+        assert_eq!(pixel(32, 32), neutral);
+        assert_eq!(pixel(128, 32), red);
+        assert_eq!(pixel(128, 224), blue);
     }
 
     /// Every mip level below 0 of the `kind` texture of set 0.

@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::layer::Projection;
+use crate::layer::{PlacedMode, Projection};
 
 /// Scale and Rotation a folder lays on every fill inside it, on top of each fill's own: the tiling is multiplied by `scale` and `rotation` (degrees) is added to the fill's angle; the fills themselves never change, so dropping the offset gives each its own back
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -70,6 +70,16 @@ impl ContentsOffset {
                 uv.tiling = uv.tiling.map(|t| t * offset.scale);
                 uv.rotation += offset.rotation;
             }
+            Projection::Placed(placed) => match &mut placed.mode {
+                PlacedMode::Uv { scale, rotation, .. } => {
+                    *scale = scale.map(|s| s * offset.scale);
+                    *rotation += offset.rotation;
+                }
+                _ => {
+                    placed.image.tiling = placed.image.tiling.map(|t| t * offset.scale);
+                    placed.image.rotation += offset.rotation;
+                }
+            },
         }
 
         out

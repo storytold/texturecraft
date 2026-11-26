@@ -376,7 +376,7 @@ mod tests {
         ]});
         run(&mut s, "export.preset.save", json!({"preset": packed})).unwrap();
         s.update();
-        let coverage = s.caches[0].gbuf.coverage_mask();
+        let coverage = s.caches[0].gbuf().coverage_mask();
         let i = coverage.iter().position(|c| *c).unwrap() as u32;
         let res = s.doc.project.texture_sets[0].resolution;
         let (x, y) = (i % res, i / res);

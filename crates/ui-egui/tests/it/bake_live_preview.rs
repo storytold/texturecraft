@@ -201,6 +201,6 @@ fn a_new_resolution_or_a_settings_change_from_anywhere_bakes_the_preview_again()
 }
 
 /// True when the preview holds a picture other than `before`, which the caller keeps alive so its address can't be reused
-fn is_new(now: Option<std::sync::Arc<Vec<f32>>>, before: Option<&std::sync::Arc<Vec<f32>>>) -> bool {
+fn is_new(now: Option<std::sync::Arc<texturecraft_engine::compose::Texels>>, before: Option<&std::sync::Arc<texturecraft_engine::compose::Texels>>) -> bool {
     now.is_some_and(|now| before.is_none_or(|before| !std::sync::Arc::ptr_eq(&now, before)))
 }

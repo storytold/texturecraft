@@ -156,6 +156,10 @@ pub struct Prefs {
     /// Viewport texture resolution: 0 full, 1 half, 2 quarter of each texture set's size (lighter
     /// on GPU memory and uploads for 4K and 8K sets; painting and export keep full resolution).
     pub viewport_texture: u8,
+    /// Prefer GPU layer compositing in the material viewport where available.
+    pub gpu_compositing: bool,
+    /// Show a coarse view of the whole material before its detailed CPU tiles arrive.
+    pub material_start_preview: bool,
     /// Interface brightness (the views keep their own background).
     pub brightness: crate::theme::Brightness,
     /// The colour of what is on, chosen or focused.
@@ -206,6 +210,9 @@ pub struct Prefs {
     /// Settings > Preview options > Local cache directory (desktop). Empty or relative uses the
     /// app's default cache directory. Stored only until TextureCraft has a preview cache.
     pub local_cache_directory: String,
+    /// Percent of the machine's RAM graph renders running at once may take (imports, composites, exports; 1 to
+    /// 100): a render waits while the others leave no room for its estimated peak.
+    pub render_ram_percent: u8,
 }
 
 /// The orbit speed the built-in navigation runs at.
@@ -221,6 +228,8 @@ impl Default for Prefs {
             recent_projects_limit: 10,
             language: crate::i18n::SYSTEM_LANGUAGE.into(),
             viewport_texture: 0,
+            gpu_compositing: true,
+            material_start_preview: true,
             brightness: crate::theme::Brightness::default(),
             accent: crate::theme::Accent::default(),
             system_title_bar: false,
@@ -243,6 +252,7 @@ impl Default for Prefs {
             save_preprocessed_scene_files: true,
             live_preview_baking: true,
             local_cache_directory: String::new(),
+            render_ram_percent: texturecraft_engine::compose::graphs::budget::DEFAULT_PERCENT,
         }
     }
 }
@@ -259,6 +269,13 @@ impl Prefs {
         #[cfg(not(target_arch = "wasm32"))]
         texturecraft_engine::formats::set_save_resources(self.reserved_cores as usize, self.save_ram_percent);
         texturecraft_engine::bake::set_gpu_raytracing(self.gpu_raytracing);
+    }
+
+    /// Set the graph memory budget at startup or when its preference changes.
+    pub fn apply_graph_budget(&self) {
+        use texturecraft_engine::compose::graphs::budget;
+
+        budget::set_limit(Some(budget::limit_for_percent(self.render_ram_percent)));
     }
 
     /// Size the shared worker pool to `work_threads` (0 keeps one thread per logical CPU). Only

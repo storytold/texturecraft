@@ -261,7 +261,7 @@ fn shown_projection(projection: &Projection, bounds: (Vec3, Vec3)) -> Option<Pro
             offset.iter().all(|value| value.is_finite()).then_some(Projection::Planar { scale: 1.0, axis: 2, offset, uv, projector, placed: None })
         }
         Projection::Planar { .. } | Projection::Spherical { .. } | Projection::Cylindrical { .. } | Projection::Triplanar { .. } => Some(projection.clone()),
-        Projection::Warp { .. } | Projection::Uv { .. } | Projection::UvTile => None,
+        Projection::Warp { .. } | Projection::Uv { .. } | Projection::UvTile | Projection::Placed(_) => None,
     }
 }
 
@@ -282,7 +282,7 @@ fn at_rest(projection: &Projection) -> Projection {
         | Projection::Cylindrical { offset, .. } => {
             *offset = [0.0; 3];
         }
-        Projection::Warp { .. } | Projection::Uv { .. } | Projection::UvTile => {}
+        Projection::Warp { .. } | Projection::Uv { .. } | Projection::UvTile | Projection::Placed(_) => {}
     }
     resting
 }

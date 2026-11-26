@@ -4,7 +4,7 @@
 
 pub(crate) mod usd;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 
 use craft_image_codecs::{DecodeOptions, Format, Limits, SampleType, decode_as_with, png_probe};
@@ -265,12 +265,61 @@ pub fn glb_bytes(mesh: &Mesh, name: &str, textures: &[GlbTextures]) -> Result<Ve
             m
         })
         .collect();
-    let scene = to_craft_scene(mesh, name, materials, images);
+    let mut scene = craft_mesh::Scene::from_meshes(named_glb_meshes(mesh, name)?, materials);
+    scene.images = images;
     let options = craft_mesh::gltf::GlbWriteOptions {
         mag_filter: Some(craft_mesh::gltf::MagFilter::Linear),
         min_filter: Some(craft_mesh::gltf::MinFilter::LinearMipmapLinear),
     };
     craft_mesh::gltf::write_glb_with_options(&scene, &craft_mesh::Limits::default(), &options).map_err(|e| FormatError::Invalid(e.to_string()))
+}
+
+/// A glTF reader sees the name on each mesh, so preserve the source part name on its own mesh.
+fn named_glb_meshes(mesh: &Mesh, name: &str) -> Result<Vec<craft_mesh::Mesh>> {
+    let mut meshes: Vec<craft_mesh::Mesh> = Vec::new();
+    let mut vertices = HashMap::new();
+    let has_uvs = mesh.uvs.len() == mesh.positions.len();
+    let has_normals = mesh.normals.len() == mesh.positions.len();
+    for part in parts(mesh, name) {
+        let indices = mesh.indices.get(part.start as usize..(part.start as usize).saturating_add(part.count as usize)).unwrap_or_default();
+        let indices = &indices[..indices.len() / 3 * 3];
+        if indices.is_empty() {
+            continue;
+        }
+        if meshes.last().is_none_or(|last| last.name != part.name) {
+            vertices.clear();
+            meshes.push(craft_mesh::Mesh { name: part.name.clone(), uv_sets: if has_uvs { vec![Vec::new()] } else { Vec::new() }, ..Default::default() });
+        }
+        let Some(output) = meshes.last_mut() else { continue };
+        let mut corners = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let source = index as usize;
+            let position = mesh.positions.get(source).ok_or_else(|| FormatError::Invalid("a corner index is out of range".into()))?;
+            let next = output.positions.len() as u32;
+            let local = *vertices.entry(index).or_insert(next);
+            if local == next {
+                output.positions.push(position.to_array().map(f64::from));
+                if has_uvs {
+                    output.uv_sets[0].push(mesh.uvs[source].to_array());
+                }
+                if has_normals {
+                    output.normals.push(mesh.normals[source].to_array().map(f64::from));
+                }
+            }
+            corners.push(craft_mesh::Corner {
+                position: local,
+                uv: if has_uvs { local } else { craft_mesh::NONE },
+                normal: if has_normals { local } else { craft_mesh::NONE },
+            });
+        }
+        output.parts.push(craft_mesh::Part {
+            name: part.name,
+            material: (part.material < mesh.materials.len()).then_some(part.material),
+            corners,
+            ..Default::default()
+        });
+    }
+    Ok(meshes)
 }
 
 /// OBJ names end at whitespace.
@@ -399,6 +448,26 @@ mod tests {
         assert_eq!(declared, used, "each OBJ part must resolve to its own MTL material");
         let maps: Vec<_> = mtl.lines().filter_map(|line| line.strip_prefix("map_Kd ")).collect();
         assert_eq!(maps, [files[1].0.as_str(), files[2].0.as_str()], "material index and texture mapping stay aligned");
+    }
+
+    #[test]
+    fn glb_round_trips_part_names() {
+        let mut mesh = texturecraft_geom::primitives::cube(1.0);
+        mesh.materials = vec!["Skin".into(), "Horn".into()];
+        let n = mesh.indices.len() as u32;
+        mesh.submeshes = vec![
+            SubMesh { name: "Body_low".into(), material: 0, start: 0, count: 12 },
+            SubMesh { name: "Horns_low".into(), material: 1, start: 12, count: 12 },
+            SubMesh { name: "Body_low".into(), material: 1, start: 24, count: n - 24 },
+        ];
+        let back = crate::import_mesh_bytes("mesh.glb", &glb_bytes(&mesh, "Project", &[]).unwrap()).unwrap().mesh;
+        assert_eq!(back.triangle_count(), mesh.triangle_count());
+        let tris = |m: &Mesh, part: &str| m.submeshes.iter().filter(|s| s.name == part).map(|s| s.count).sum::<u32>();
+        // the parts come back by name (not under the project's name), with their triangles
+        for part in ["Body_low", "Horns_low"] {
+            assert_eq!(tris(&back, part), tris(&mesh, part), "{part}");
+        }
+        assert!(back.submeshes.iter().all(|s| s.name != "Project"));
     }
 
     #[test]

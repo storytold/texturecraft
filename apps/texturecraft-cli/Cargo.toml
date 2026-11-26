@@ -1,6 +1,6 @@
 [package]
 name = "texturecraft-cli"
-description = "Headless TextureCraft: info, run, batch, bake, export, render, MCP server, JSON-lines server"
+description = "Headless TextureCraft: info, run, batch, bake, export, render, graph, MCP server, JSON-lines server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,10 @@ workspace = true
 [dependencies]
 texturecraft-automation = { workspace = true }
 texturecraft-engine = { workspace = true }
+texturecraft-graph = { workspace = true }
 serde_json = { workspace = true }
+# Free memory, to size how many projects `import <folder> --jobs` converts at once.
+sysinfo = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

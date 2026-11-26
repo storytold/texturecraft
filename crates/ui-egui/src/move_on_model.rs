@@ -205,7 +205,7 @@ fn frame_target(mut params: Value, gizmo: &FrameGizmo) -> Value {
 /// A projection's UV tiling, rotation and offset (None for Fill (Match per UV Tile))
 fn placement(projection: &Projection) -> Option<([f32; 2], f32, [f32; 2])> {
     match projection {
-        Projection::UvTile => None,
+        Projection::UvTile | Projection::Placed(_) => None,
         Projection::Uv { scale, rotation, offset } => Some((*scale, *rotation, *offset)),
         Projection::Triplanar { uv, .. }
         | Projection::Planar { uv, .. }

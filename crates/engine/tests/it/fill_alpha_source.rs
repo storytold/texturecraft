@@ -89,7 +89,7 @@ fn an_import_and_a_legacy_resource_keep_their_own_pixels_when_picking_an_alpha()
 
         let Source::Image { name, .. } = source(&session, layer, Channel::Roughness) else { panic!("alpha image") };
         assert_ne!(name, imported, "the library picture must have a separate resource");
-        assert_eq!(session.images[&name].width as usize, alphas::BASE);
+        assert_eq!(session.images.get(&name).unwrap().width as usize, alphas::BASE);
         assert_eq!(session.doc.resources[&imported].as_slice(), image_bytes);
         assert_eq!(source(&session, layer, Channel::Metallic), Source::image(imported.clone()));
 

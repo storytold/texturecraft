@@ -50,7 +50,8 @@ fn unit_tile(projection: &Projection, size: MeshSize) -> Option<[f32; 2]> {
             let around = TAU * radius * across * (angle.max(MIN_CYLINDER_ANGLE) / FULL_TURN_DEGREES);
             Some([around / scale, 2.0 * radius * height / scale])
         }
-        Projection::UvTile | Projection::Spherical { .. } => None,
+        // A placed projection is sized by the imported project, not by a physical size
+        Projection::UvTile | Projection::Spherical { .. } | Projection::Placed(_) => None,
     }
 }
 
@@ -59,7 +60,7 @@ fn tiling(projection: &Projection) -> Option<[f32; 2]> {
     match projection {
         Projection::Uv { scale, .. } => Some(*scale),
         Projection::Triplanar { uv, .. } | Projection::Planar { uv, .. } | Projection::Cylindrical { uv, .. } | Projection::Warp { uv, .. } => Some(uv.tiling),
-        Projection::UvTile | Projection::Spherical { .. } => None,
+        Projection::UvTile | Projection::Spherical { .. } | Projection::Placed(_) => None,
     }
 }
 

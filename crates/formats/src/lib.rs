@@ -45,7 +45,7 @@ pub use export::{
     Dest, ExportInput, ExportOptions, ExportPreset, ExportedFile, FileFormat, MapOverride, MapSpec, Padding, PlannedFile, SourceRef, VirtualMap, list_outputs,
     render_maps, skip_repeated_names,
 };
-pub use image_res::{DecodedImage, coverage_png, decode_cooked_image, decode_image, decode_image_within, gray16_png, gray16_resource};
+pub use image_res::{DecodedImage, coverage_png, decode_cooked_image, decode_image, decode_image_within, gray16_png, gray16_resource, probe_image};
 pub use mesh_export::{
     GlbTextures, NamedFiles, UsdExport, UsdFormat, UsdTextureBinding, glb_bytes, glb_export_options, obj_bytes, obj_with_mtl, usd_bytes, usd_export_options,
     usd_layer_with_textures, usd_texture_bindings,
@@ -55,8 +55,8 @@ pub use mesh_import::{HighPolyMesh, ImportedMesh, MeshFile, MeshReport, import_h
 pub use presets::load_preset;
 pub use presets::{DEFAULT_PRESET, builtin_preset, builtin_presets, preset_from_json, preset_to_json};
 pub use project_file::{
-    BakePaintData, DEFAULT_PROJECT_OPEN_LIMIT_GIB, MAX_RESOURCE_NAME_LEN, ProjectFile, RamReservation, load_project_bytes, project_open_limit_gib,
-    sanitize_resource_name, save_project_bytes, set_project_open_limit_gib,
+    BakePaintData, DEFAULT_PROJECT_OPEN_LIMIT_GIB, MAX_RESOURCE_NAME_LEN, ProjectFile, RamReservation, StrokeReplayData, load_project_bytes,
+    project_open_limit_gib, sanitize_resource_name, save_project_bytes, set_project_open_limit_gib,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

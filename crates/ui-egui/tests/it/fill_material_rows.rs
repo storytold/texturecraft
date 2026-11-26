@@ -221,7 +221,7 @@ fn source_picker_images_render_on_scroll_and_release_on_removal() {
     assert_eq!(source(&harness, layer, Channel::Metallic), Source::image(last));
 
     let app = harness.state_mut();
-    app.session.images.clear();
+    app.session.images = Default::default();
     app.thumbs.sync_images(&app.session.images, app.session.revision + 1);
 
     assert_eq!(image_thumbnails(&harness), 0, "removed images release their picker thumbnails");

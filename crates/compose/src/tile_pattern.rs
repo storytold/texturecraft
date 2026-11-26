@@ -177,14 +177,42 @@ fn wrap(delta: f32, span: f32) -> f32 {
     delta - (delta / span).round() * span
 }
 
-/// What one tile gives a texel (its shape times its luminance), or None when hidden or out of reach; `inputs` are its input images
-fn tile_value(
-    tile: &TileGenerator,
-    seed: u32,
-    (column, row): (i32, i32),
-    (columns, rows): (i32, i32),
-    (point, inputs): (Vec2, &[Option<&ImageRes>]),
-) -> Option<f32> {
+/// The part of a tile's evaluation that is constant across every image texel.
+#[derive(Clone, Copy, Debug)]
+pub struct TilePlacement {
+    pub center: Vec2,
+    pub size: Vec2,
+    pub radius: Vec2,
+    /// Sine and cosine of the clockwise screen-space rotation.
+    pub rotation: [f32; 2],
+    pub quarter_turns: u32,
+    pub mirrors: [bool; 2],
+    pub input: Option<usize>,
+    pub luminance: f32,
+}
+
+/// Positions and search bounds shared by the CPU and GPU Tile Generator.
+#[derive(Debug)]
+pub struct TileLayout {
+    pub amount: [u32; 2],
+    pub reach: Vec2,
+    pub line_shifts: Vec<f32>,
+    /// Columns first, then rows, matching the generator's pattern order.
+    pub placements: Vec<Option<TilePlacement>>,
+}
+
+pub fn prepare_tile_layout(tile: &TileGenerator, seed: u32) -> TileLayout {
+    let amount = tile.amount.map(|count| count.clamp(1, *TileGenerator::AMOUNT.end()));
+    let [columns, rows] = amount.map(|count| count as i32);
+    let reach = reach(tile, Vec2::new(columns as f32, rows as f32));
+    let line_count = if tile.vertical_offset { columns } else { rows };
+    let line_shifts = (0..line_count).map(|line| line_shift(tile, line)).collect();
+    let input_count = tile.inputs.len().min(TileGenerator::MAX_INPUTS);
+    let placements = (0..columns).flat_map(|column| (0..rows).map(move |row| place_tile(tile, seed, (column, row), (columns, rows), input_count))).collect();
+    TileLayout { amount, reach, line_shifts, placements }
+}
+
+fn place_tile(tile: &TileGenerator, seed: u32, (column, row): (i32, i32), (columns, rows): (i32, i32), input_count: usize) -> Option<TilePlacement> {
     let total = columns * rows;
     let number = column * rows + row;
     let index = (if tile.reverse_order { total - 1 - number } else { number }) as u32;
@@ -211,22 +239,43 @@ fn tile_value(
         return None;
     }
 
-    let delta = Vec2::new(wrap(point.x - center.x, 1.0), wrap(point.y - center.y, 1.0));
     let turns = (tile.rotation + tile.rotation_random * TileRandomStream::Rotation.draw(seed, index) * 360.0) / 360.0;
     let (sin, cos) = (turns * std::f32::consts::TAU).sin_cos();
     let radius = Vec2::new(cos.abs() * size.x + sin.abs() * size.y, sin.abs() * size.x + cos.abs() * size.y) * 0.5;
-    let first = (-radius - delta).ceil().max(Vec2::splat(-MAX_PERIODIC_COPY));
-    let last = (radius - delta).floor().min(Vec2::splat(MAX_PERIODIC_COPY));
     let quarter_turns = quarter_turns(tile, seed, (column, row), index);
     let mirrors = tile.symmetry_random * 0.5;
     let mirror_x = tile.symmetry != TileSymmetry::Vertical && TileRandomStream::MirrorX.draw(seed, index) < mirrors;
     let mirror_y = tile.symmetry != TileSymmetry::Horizontal && TileRandomStream::MirrorY.draw(seed, index) < mirrors;
 
-    let input = match tile.input_distribution {
-        _ if inputs.is_empty() => None,
-        TileInputDistribution::Random => inputs.get((TileRandomStream::Input.draw(seed, index) * inputs.len() as f32) as usize).copied().flatten(),
-        TileInputDistribution::ByNumber => inputs.get(number as usize % inputs.len()).copied().flatten(),
+    let input = if input_count == 0 {
+        None
+    } else {
+        Some(match tile.input_distribution {
+            TileInputDistribution::Random => (TileRandomStream::Input.draw(seed, index) * input_count as f32) as usize,
+            TileInputDistribution::ByNumber => number as usize % input_count,
+        })
     };
+    let mut luminance = 1.0;
+    if tile.luminance_random != 0.0 {
+        luminance -= tile.luminance_random * TileRandomStream::Luminance.draw(seed, index);
+    }
+    if tile.luminance_by_number {
+        luminance *= (number + 1) as f32 / total as f32;
+    }
+    if tile.luminance_by_scale {
+        luminance *= scale_factor;
+    }
+    Some(TilePlacement { center, size, radius, rotation: [sin, cos], quarter_turns, mirrors: [mirror_x, mirror_y], input, luminance })
+}
+
+/// What one tile gives a texel (its shape times its luminance), or None when hidden or out of reach.
+fn tile_value(tile: &TileGenerator, seed: u32, cell: (i32, i32), counts: (i32, i32), (point, inputs): (Vec2, &[Option<&ImageRes>])) -> Option<f32> {
+    let placement = place_tile(tile, seed, cell, counts, inputs.len())?;
+    let TilePlacement { center, size, radius, rotation: [sin, cos], quarter_turns, mirrors: [mirror_x, mirror_y], input, luminance } = placement;
+    let input = input.and_then(|index| inputs.get(index)).copied().flatten();
+    let delta = Vec2::new(wrap(point.x - center.x, 1.0), wrap(point.y - center.y, 1.0));
+    let first = (-radius - delta).ceil().max(Vec2::splat(-MAX_PERIODIC_COPY));
+    let last = (radius - delta).floor().min(Vec2::splat(MAX_PERIODIC_COPY));
     let mut value = 0.0f32;
     // A rotated shape may cross a repeat boundary even when the nearest copy misses it
     for copy_y in first.y as i32..=last.y as i32 {
@@ -256,13 +305,6 @@ fn tile_value(
         return None;
     }
 
-    let mut luminance = 1.0 - tile.luminance_random * TileRandomStream::Luminance.draw(seed, index);
-    if tile.luminance_by_number {
-        luminance *= (number + 1) as f32 / total as f32;
-    }
-    if tile.luminance_by_scale {
-        luminance *= scale_factor;
-    }
     Some(value * luminance)
 }
 

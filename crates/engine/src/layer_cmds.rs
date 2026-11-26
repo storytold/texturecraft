@@ -1030,6 +1030,8 @@ pub(crate) fn projection_from(p: &Value, cmd: &str, current: Option<&Projection>
             place(uv);
             turn(projector);
         }
+        // placed with the settings an import gave it; picking a projection kind replaces it
+        Projection::Placed(_) => {}
         Projection::Cylindrical { scale: projection_scale, axis: projection_axis, uv, offset, projector, angle } => {
             *projection_scale = scale.map_or(*projection_scale, |across| across[0]);
             *angle = f32p(p, "angle").map_or(*angle, |given| clamp_to(given, &Projection::CYLINDER_ANGLE_RANGE));

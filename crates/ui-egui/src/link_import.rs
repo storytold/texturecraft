@@ -133,7 +133,7 @@ mod tests {
         execute(&mut app.session, "layer.add.paint", &json!({"name":"Drop target"})).unwrap();
         let target = app.session.selected_layer().unwrap();
 
-        let pixels = Arc::new(vec![0.25; 128 * 128]);
+        let pixels = Arc::new(texturecraft_engine::compose::Texels::F32(vec![0.25; 128 * 128]));
         let replaced = Arc::downgrade(&pixels);
         let baked = texturecraft_engine::compose::BakedMaps { resolution: 128, maps: [(texturecraft_engine::core::BakedMap::Curvature, pixels)].into() };
         app.session.doc.baked.insert(0, baked);

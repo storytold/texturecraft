@@ -112,6 +112,7 @@ fn inputs<'a>(f: &'a Fixture, ts: usize, images: &'a texturecraft_compose::Image
         block_scales: f.project.texture_sets[ts].block_scales(),
         preview: None,
         images,
+        graphs: texturecraft_compose::GraphStore::empty(),
         bounds: f.mesh.bounds(),
     }
 }
@@ -917,7 +918,7 @@ fn generator_input_image_changes_invalidate_stack_key() {
 
     assert_eq!(key(&images), original, "an unrelated image leaves the key unchanged");
 
-    let old_image = Arc::downgrade(&images["used"]);
+    let old_image = Arc::downgrade(images.get("used").unwrap());
     images.insert("used".into(), image(0.9));
 
     assert!(old_image.upgrade().is_none(), "the cache must not retain the old image pixels");
@@ -1120,7 +1121,7 @@ fn cache_after_changing_mesh(owned: bool) {
 
     let mut fixture = fixture();
     let lower = add(&mut fixture, 0, fill(&[(Channel::BaseColor, Source::Uniform([1.0, 0.0, 0.0]))]), None);
-    fixture.project.layer_mut(lower).unwrap().geometry_mask = Some(vec!["Lid".into()]);
+    fixture.project.layer_mut(lower).unwrap().geometry_mask = Some(texturecraft_core::GeometryMask::Parts(vec!["Lid".into()]));
     let hot = add(&mut fixture, 0, LayerKind::Paint, None);
     let mut named = fixture.mesh.clone();
     named.submeshes[0].name = "Lid".into();

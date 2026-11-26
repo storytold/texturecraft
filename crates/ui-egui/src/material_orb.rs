@@ -246,7 +246,7 @@ mod tests {
 
         // Left half black, right half white
         let rgba = (0..64 * 64).map(|i| if i % 64 < 32 { [0.0, 0.0, 0.0, 1.0] } else { [1.0; 4] }).collect();
-        let images = std::collections::HashMap::from([("stripes".to_owned(), Arc::new(ImageRes::new(64, 64, rgba, false)))]);
+        let images = texturecraft_engine::compose::ImageStore::from([("stripes".to_owned(), Arc::new(ImageRes::new(64, 64, rgba, false)))]);
         let fill = fill_with(Channel::BaseColor, Source::Image { name: "stripes".into(), normal_format: Default::default() });
         let image = render(&OrbMaterial::of_fill(&fill, &[Channel::BaseColor], &images), 64, BACKDROP);
         let lightness: Vec<u8> = image.pixels.iter().filter(|pixel| **pixel != BACKDROP).map(|pixel| pixel.g()).collect();
@@ -306,7 +306,7 @@ mod tests {
         crate::orb_environment::OrbEnvironment::get();
         eprintln!("studio prefilter (once): {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
         let rgba = (0..512 * 512).map(|i| [(i % 512) as f32 / 512.0, 0.5, (i / 512) as f32 / 512.0, 1.0]).collect();
-        let images = std::collections::HashMap::from([("photo".to_owned(), std::sync::Arc::new(ImageRes::new(512, 512, rgba, true)))]);
+        let images = texturecraft_engine::compose::ImageStore::from([("photo".to_owned(), std::sync::Arc::new(ImageRes::new(512, 512, rgba, true)))]);
         let mut complex = Fill::default();
         complex.sources.insert(Channel::BaseColor, Source::Image { name: "photo".into(), normal_format: Default::default() });
         complex.sources.insert(

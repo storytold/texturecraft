@@ -197,7 +197,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use egui::Color32;
-    use texturecraft_engine::compose::ImageRes;
+    use texturecraft_engine::compose::{ImageRes, ImageStore};
     use texturecraft_engine::core::{Channel, Fill, Source};
 
     use super::*;
@@ -367,7 +367,7 @@ mod tests {
     /// An orb of a fill whose base colour reads `image` under one name, the name a re-import keeps
     fn image_orb(image: Arc<ImageRes>) -> OrbJob {
         let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::image(REIMPORTED))]), ..Fill::default() };
-        let images = HashMap::from([(REIMPORTED.to_owned(), image)]);
+        let images = ImageStore::from([(REIMPORTED.to_owned(), image)]);
         OrbJob::new(OrbMaterial::of_fill(&fill, &[Channel::BaseColor], &images), 64, Color32::BLACK)
     }
 

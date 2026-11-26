@@ -241,6 +241,7 @@ mod tests {
             block_scales: project.texture_sets[0].block_scales(),
             preview: None,
             images: &images,
+            graphs: crate::GraphStore::empty(),
             bounds: mesh.bounds(),
         };
 
@@ -295,6 +296,7 @@ mod tests {
                 block_scales: project.texture_sets[0].block_scales(),
                 preview: None,
                 images: &images,
+                graphs: crate::GraphStore::empty(),
                 bounds: mesh.bounds(),
             };
             let field: Vec<f32> =

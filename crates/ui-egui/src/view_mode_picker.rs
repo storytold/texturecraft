@@ -157,7 +157,7 @@ fn image_picker(app: &mut TextureCraftApp, combo: &egui::Response, popup_id: egu
             ui.set_width(IMAGE_PICKER_WIDTH);
             let words = query_field::words(&query_field::show(ui, popup_id.with("query"), IMAGE_QUERY), IMAGE_QUERY);
             let images: Vec<String> =
-                app.session.doc.resources.keys().filter(|name| app.session.images.contains_key(*name) && query_field::matches(&words, name)).cloned().collect();
+                app.session.doc.resources.keys().filter(|name| app.session.images.contains_key(name) && query_field::matches(&words, name)).cloned().collect();
             egui::ScrollArea::vertical().max_height(IMAGE_PICKER_HEIGHT).show(ui, |ui| {
                 ui.set_min_height(IMAGE_PICKER_HEIGHT);
                 crate::shelf::tiles(ui, |ui| {

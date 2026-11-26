@@ -132,7 +132,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
     crate::id_color_pick::IdColorPick::end_when_stale(app);
     let tokens = Tokens::get(ui.ctx());
     let aux_view = aux_view(app);
-    let mut sync = PendingSync(Some(aux_view));
+    let mut sync = PendingSync::default();
     let full = ui.available_rect_before_wrap();
     path_keys(app, ui);
 
@@ -140,7 +140,10 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
     let layout = if mode == crate::state::Mode::Painting || bake_painting { app.ui.layout } else { ViewLayout::Only3D };
     match layout {
         ViewLayout::Only3D => view_3d(app, ui, full, &mut sync),
-        ViewLayout::Only2D => view_2d(app, ui, full, &mut sync),
+        ViewLayout::Only2D => {
+            sync.uv_size = Some(frame_size_in_pixels(ui, full));
+            view_2d(app, ui, full, &mut sync);
+        }
         ViewLayout::Split => {
             // The 2D view's edges sit on whole pixels, so rounding can't nudge a texture its zoom keeps at one size
             let pixels_per_point = ui.ctx().pixels_per_point();
@@ -151,6 +154,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
             let (rect_3d, rect_2d) = if app.ui.swap_views { (right, left) } else { (left, right) };
 
             // Each view draws only on its side, so overlays such as the texture set name stay out of a narrow neighbour
+            sync.uv_size = Some(frame_size_in_pixels(ui, rect_2d));
             let clip = ui.clip_rect();
             ui.set_clip_rect(rect_3d.intersect(clip));
             view_3d(app, ui, rect_3d, &mut sync);
@@ -163,6 +167,7 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
         }
     }
 
+    sync.finish(app, ui, aux_view);
     crate::properties_popup::show(app, ui.ctx());
 
     if mode == crate::state::Mode::Rendering {
@@ -413,6 +418,11 @@ fn set_highlight(ui: &Ui, texture_set: usize) -> SetHighlight {
 
 /// Show what the GPU side reported (each message once while its toast is up).
 fn gpu_report_toasts(app: &mut TextureCraftApp, reports: crate::gpu::GpuReports) {
+    for (mesh, message) in reports.performance {
+        if app.session.mesh_id == mesh {
+            app.session.log.performance(message);
+        }
+    }
     let names: Vec<String> = reports.memory.iter().filter_map(|ts| app.session.doc.project.texture_sets.get(*ts).map(|t| t.name.clone())).collect();
 
     if !names.is_empty() {
@@ -465,9 +475,52 @@ const MAX_NAMED_SETS: usize = 5;
 /// Characters of a set name in that notice (long names are cut, with "...").
 const MAX_NAME_CHARS: usize = 32;
 
-/// This frame's scene sync (compositing and GPU uploads), run by the first view drawn, after
-/// that view handled its input: a stroke shows in the frame it is painted, not the next.
-pub struct PendingSync(Option<Option<crate::gpu::AuxView>>);
+/// Reserve the first callback's draw position so both views can handle input before
+/// we build the one scene update that must precede either view's GPU draw.
+#[derive(Default)]
+pub struct PendingSync {
+    first: Option<(egui::Painter, egui::layers::ShapeIdx, ViewCallback)>,
+    uv_size: Option<[u32; 2]>,
+}
+
+impl PendingSync {
+    fn finish(self, app: &mut TextureCraftApp, ui: &Ui, aux: Option<crate::gpu::AuxView>) {
+        let Some((painter, slot, mut callback)) = self.first else { return };
+        let Some(gpu) = app.gpu.as_mut() else { return };
+        let start = crate::now_ms();
+        let visible_uv = self
+            .uv_size
+            .zip(app.session.caches.get(app.session.ts()))
+            .map(|(size, cache)| visible_uv_bounds(size, cache.size, app.ui.uv_zoom, app.ui.uv_pan, app.ui.uv_rotation));
+        gpu.prefer_gpu_layers = app.ui.prefs.gpu_compositing;
+        gpu.material_start_preview = app.ui.prefs.material_start_preview;
+        let scene = gpu.sync_view(
+            &mut app.session,
+            aux,
+            callback.frame.shade.bake,
+            u32::from(app.ui.prefs.viewport_texture.min(2)),
+            f64::from(app.profiler.logic_ms),
+            visible_uv,
+        );
+        let reports = gpu.take_reports();
+        if scene.compositor_changed || gpu.display_pending(&app.session) || gpu.gpu_composite_pending() || gpu.bake_busy() {
+            ui.ctx().request_repaint();
+        }
+        app.profiler.sync_ms += (crate::now_ms() - start) as f32;
+        gpu_report_toasts(app, reports);
+        callback.sync = Mutex::new(Some(scene));
+        painter.set(slot, eframe::egui_wgpu::Callback::new_paint_callback(callback.rect, callback));
+    }
+}
+
+/// Atlas-aligned bounds of the four corners of the displayed, possibly rotated UV view.
+pub(crate) fn visible_uv_bounds(frame_size: [u32; 2], atlas: (u32, u32), zoom: f32, pan: [f32; 2], rotation: f32) -> [Vec2; 2] {
+    let size = egui::vec2(frame_size[0].max(1) as f32, frame_size[1].max(1) as f32);
+    let rect = Rect::from_min_size(Pos2::ZERO, size);
+    let view = crate::uv_view_map::UvViewMap { rect, scale: texturecraft_render::uv_view_scale(size.x / size.y, zoom, atlas), pan, rotation };
+    let corners = [rect.left_top(), rect.right_top(), rect.left_bottom(), rect.right_bottom()].map(|p| view.to_uv(p));
+    corners.into_iter().fold([corners[0]; 2], |[lo, hi], uv| [lo.min(uv), hi.max(uv)])
+}
 
 /// A view's render size in pixels, rounded as egui rounds the rect it draws the frame into, so the frame is never stretched
 fn frame_size_in_pixels(ui: &Ui, rect: Rect) -> [u32; 2] {
@@ -488,23 +541,6 @@ fn add_callback(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, mut frame: Frame
     let tokens = Tokens::get(ui.ctx());
     let bake = bake_visualization(app);
     frame.shade.bake = bake;
-    let scene = match (sync.0.take(), app.gpu.as_mut()) {
-        (Some(aux), Some(gpu_link)) => {
-            let sync_start_ms = crate::now_ms();
-            let scene = gpu_link.sync(&mut app.session, aux, bake, u32::from(app.ui.prefs.viewport_texture.min(2)), f64::from(app.profiler.logic_ms));
-            let reports = gpu_link.take_reports();
-            app.profiler.sync_ms += (crate::now_ms() - sync_start_ms) as f32;
-            gpu_report_toasts(app, reports);
-
-            // Display tiles left for later frames (the frame budget ran out), or the bake visualization still being worked out
-            if app.session.caches.iter().any(|cache| !cache.upload.is_empty()) || app.gpu.as_ref().is_some_and(crate::gpu::GpuLink::bake_busy) {
-                ui.ctx().request_repaint();
-            }
-            Some(scene)
-        }
-        _ => None,
-    };
-
     let Some(gpu) = &app.gpu else {
         ui.painter().text(
             rect.center(),
@@ -516,8 +552,14 @@ fn add_callback(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, mut frame: Frame
         return;
     };
 
-    let callback = ViewCallback { frame, sync: Mutex::new(scene), rect, lost: gpu.lost.clone() };
-    ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, callback));
+    let callback = ViewCallback { frame, sync: Mutex::new(None), rect, lost: gpu.lost.clone() };
+    if sync.first.is_none() {
+        let painter = ui.painter().clone();
+        let slot = painter.add(egui::Shape::Noop);
+        sync.first = Some((painter, slot, callback));
+    } else {
+        ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, callback));
+    }
 }
 
 /// Text size of the notice a view shows without a GPU renderer
@@ -809,8 +851,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         if alt {
             app.session.camera.zoom(-delta.y * DRAG_ZOOM_PER_POINT * app.ui.prefs.drag_zoom_scale());
         } else if shift {
-            let display = &mut app.session.doc.project.display;
-            display.env_rotation = (display.env_rotation + delta.x * LIGHT_DEGREES_PER_POINT).rem_euclid(360.0);
+            turn_environment(&mut app.session, delta.x * LIGHT_DEGREES_PER_POINT);
         } else {
             orbit(app, delta);
         }
@@ -1984,11 +2025,11 @@ fn cursor_is_circle(brush: &texturecraft_engine::paint::BrushSettings) -> bool {
 
 /// The stamp's outline scaled by `scale` (the hardness ring's share of the radius), as points around the
 /// stamp center in a y-up frame in units of the stamp radius: the alpha's extent (Size X and Y), the
-/// squarer corners of a Round alpha with low roundness, then turned by the brush angle.
+/// squarer corners of a Round alpha with low roundness, then turned by the brush and alpha angles.
 fn cursor_outline(brush: &texturecraft_engine::paint::BrushSettings, scale: f32) -> Vec<Vec2> {
     let params = brush.alpha_params;
     let roundness = cursor_roundness(brush);
-    let (sin, cos) = brush.angle.to_radians().sin_cos();
+    let (sin, cos) = (brush.angle + params.rotation).to_radians().sin_cos();
     (0..=CURSOR_OUTLINE_SEGMENTS)
         .map(|segment| {
             let angle = segment as f32 / CURSOR_OUTLINE_SEGMENTS as f32 * std::f32::consts::TAU;
@@ -2561,6 +2602,16 @@ fn eyedrop(app: &mut TextureCraftApp, ctx: &egui::Context, bar: egui::Id, pixel:
     }
 }
 
+/// Turn the viewport environment by `degrees` (Shift+right-drag): the layers Baked Lighting
+/// Environment lights with it composite again, as `display.set` does
+fn turn_environment(session: &mut Session, degrees: f32) {
+    let display = &mut session.doc.project.display;
+    let rotation_before_degrees = display.env_rotation;
+    display.env_rotation = (rotation_before_degrees + degrees).rem_euclid(360.0);
+    let environment = display.environment.clone();
+    texturecraft_engine::view_cmds::relight_environment(session, &environment, rotation_before_degrees);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2684,6 +2735,56 @@ mod tests {
     }
 
     use texturecraft_engine::paint::{AlphaParams, BrushAlpha, BrushSettings};
+
+    #[test]
+    fn quarter_turn_swaps_the_visible_uv_extents_of_a_wide_view() {
+        let bounds = |rotation| visible_uv_bounds([800, 400], (1024, 1024), 4.0, [0.0; 2], rotation);
+        let [a, b] = bounds(0.0);
+        let [c, d] = bounds(std::f32::consts::FRAC_PI_2);
+        let size = b - a;
+        assert!(size.x > size.y);
+        assert!((d - c).abs_diff_eq(Vec2::new(size.y, size.x), 1e-5));
+    }
+
+    #[test]
+    fn split_view_uploads_the_second_views_brush_before_either_draw() {
+        let ctx = egui::Context::default();
+        let session = Session::new_project("split", texturecraft_engine::geom::primitives::plane(1.0, 1), "builtin:plane", None, 1024).unwrap();
+        let mut app = TextureCraftApp::new(&eframe::CreationContext::_new_kittest(ctx.clone()), session);
+        app.gpu = Some(crate::gpu::tests::link());
+        app.profiler.logic_ms = 100.0;
+        app.session.update();
+        let frame = Frame {
+            view_id: VIEW_3D,
+            size: [256, 256],
+            kind: ViewKind::Scene,
+            camera: app.session.camera,
+            shade: Shade::default(),
+            visible: vec![true],
+            overlay: Vec::new(),
+        };
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let mut sync = PendingSync { uv_size: Some([256, 256]), ..Default::default() };
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(256.0, 256.0));
+            add_callback(&mut app, ui, rect, frame.clone(), &mut sync);
+            app.session.begin_stroke_uv(Vec2::splat(0.96875), 1.0).unwrap();
+            let uv_frame = Frame { view_id: VIEW_2D, kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0; 2], rotation: 0.0 }, ..frame.clone() };
+            add_callback(&mut app, ui, rect.translate(vec2(256.0, 0.0)), uv_frame, &mut sync);
+            sync.finish(&mut app, ui, None);
+            assert!(!app.session.caches[0].upload.contains(&(15, 15)), "second view's dab must be in this frame");
+            assert!(!app.session.caches[0].upload.is_empty());
+        });
+        let callback_positions: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Callback(callback) => Some(callback.rect.left()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(callback_positions, [0.0, 256.0], "the scene update precedes the second GPU draw");
+        output.drop_without_applying_deltas();
+    }
 
     fn extent(points: &[Vec2]) -> Vec2 {
         let (low, high) = points.iter().fold((Vec2::splat(f32::MAX), Vec2::splat(f32::MIN)), |(low, high), point| (low.min(*point), high.max(*point)));
@@ -3118,5 +3219,25 @@ mod tests {
         visible_dashes(VIEW, &[pos2(-50.0, -10.0), pos2(150.0, -10.0), pos2(120.0, 300.0)], 6.0, 4.0, |_| count += 1);
 
         assert_eq!(count, 0);
+    }
+
+    /// Shift+right-drag's turn composites the layers Baked Lighting Environment lights again, as
+    /// `display.set` does: the CPU material keeps the old light otherwise
+    #[test]
+    fn turning_the_environment_in_the_viewport_relights_the_layers_lit_by_it() {
+        use texturecraft_engine::execute;
+
+        let mut session = texturecraft_engine::sample_session(128, 32).unwrap();
+        execute(&mut session, "layer.add.fill", &serde_json::json!({})).unwrap();
+        execute(&mut session, "effect.add.filter", &serde_json::json!({"target": "content", "filter": "bakedLightingEnvironment"})).unwrap();
+        let revisions = |session: &Session| session.caches.iter().map(|cache| cache.material_revision).collect::<Vec<_>>();
+        let before = revisions(&session);
+
+        turn_environment(&mut session, 25.0);
+
+        // Only the set holding the lit layer composites again
+        let (after, lit) = (revisions(&session), session.ts());
+        let changed: Vec<usize> = before.iter().zip(&after).enumerate().filter(|(_, (before, after))| before != after).map(|(set, _)| set).collect();
+        assert_eq!(changed, [lit], "{before:?} {after:?}");
     }
 }

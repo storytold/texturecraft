@@ -1,11 +1,12 @@
 use std::sync::Weak;
 
 use super::slot_key::SlotKey;
+use crate::Texels;
 
 /// What a micro map was built from: the mesh map giving its layout, its slots, its settings, atlas dimensions and UV tile block
 #[derive(Clone)]
 pub(super) struct CacheKey {
-    pub(super) map: Weak<Vec<f32>>,
+    pub(super) map: Weak<Texels>,
     pub(super) height: Option<SlotKey>,
     pub(super) normal: Option<SlotKey>,
     pub(super) settings: Vec<u32>,

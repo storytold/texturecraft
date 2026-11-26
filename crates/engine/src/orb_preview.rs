@@ -120,15 +120,22 @@ impl OrbPreview {
 
     /// [`Self::generator_of`] with `images` (the images the generator reads, by name) loaded for this render only
     pub fn generator_reading(&mut self, generator: Generator, images: &[(String, Arc<ImageRes>)], size: usize) -> Option<Vec<Option<MaskPreviewPixel>>> {
-        let replaced: Vec<_> = images.iter().map(|(name, image)| (name.clone(), self.session.images.insert(name.clone(), image.clone()))).collect();
+        let replaced: Vec<_> = images
+            .iter()
+            .map(|(name, image)| {
+                let previous = self.session.images.get(name).cloned();
+                self.session.images.insert(name.clone(), image.clone());
+                (name.clone(), previous)
+            })
+            .collect();
         let pixels = self.generator_of(generator, size);
 
         // Restore in reverse so a name given twice ends as it began
         for (name, previous) in replaced.into_iter().rev() {
             match previous {
                 Some(previous) => self.session.images.insert(name, previous),
-                None => self.session.images.remove(&name),
-            };
+                None => drop(self.session.images.remove(&name)),
+            }
         }
 
         pixels

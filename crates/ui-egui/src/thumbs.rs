@@ -14,7 +14,7 @@ use texturecraft_engine::paint::presets::BrushPreset;
 use texturecraft_engine::paint::{BrushAlpha, BrushSettings, alphas};
 use texturecraft_engine::texel::linear_to_srgb;
 
-use crate::preview_image::{aces, image_preview, shade};
+use crate::preview_image::{aces, image_preview, library_alpha_image, shade};
 use crate::preview_request::PreviewRequest;
 use crate::preview_worker::PreviewWorker;
 use crate::shelf_preview::ShelfPreview;
@@ -39,14 +39,18 @@ const STENCIL_MAX_SIZE_PX: f32 = 1024.0;
 /// Big hover previews kept at most (the least recently shown go first)
 const BIG_PREVIEWS_KEPT: usize = 32;
 
-/// Parsed settings, weak image identity and preview revision for a saved brush
-type SavedBrushCacheEntry = (Option<BrushSettings>, Option<Weak<ImageRes>>, u64);
+/// Most recent customized alpha drawn in Properties.
+type SelectedAlpha = (&'static alphas::LibraryAlpha, alphas::LibraryAlphaParams, TextureHandle);
+
+/// Parsed settings, weak image identity and preview revision for a saved brush.
+type SavedBrushCacheEntry = (Option<Arc<BrushSettings>>, Option<Weak<ImageRes>>, u64);
 
 /// The shelf's and the brush panel's preview textures
 #[derive(Default)]
 pub struct Thumbs {
     /// Shelf thumbnails by [`ShelfPreview::key`]
     shelf: HashMap<String, TextureHandle>,
+    selected_alpha: Option<SelectedAlpha>,
     /// Parsed settings, weak image identity and preview revision for each saved brush
     saved_brush_previews: HashMap<PathBuf, SavedBrushCacheEntry>,
     /// Refresh generation; queued results from earlier generations must not match new requests
@@ -59,7 +63,7 @@ pub struct Thumbs {
     /// Separates cached pixels and late completions when an image allocation is replaced
     generator_images_epoch: u64,
     /// Each texture set's ID mesh map preview, with the map it shows (a rebake's new map replaces it)
-    id_maps: HashMap<usize, (Weak<Vec<f32>>, TextureHandle)>,
+    id_maps: HashMap<usize, (Weak<texturecraft_engine::compose::Texels>, TextureHandle)>,
     /// (frame, thumbnails rendered in it)
     budget: (u64, usize),
     /// Renders the orb thumbnails and the big previews
@@ -377,6 +381,32 @@ impl Thumbs {
         self.shelf(ctx, ShelfPreview::Alpha(alpha), SWATCH_PX)
     }
 
+    /// Keep the latest configured swatch per panel so dragging a slider cannot grow the shelf cache.
+    pub fn configured_alpha(
+        &mut self,
+        ctx: &egui::Context,
+        alpha: &'static alphas::LibraryAlpha,
+        params: &alphas::LibraryAlphaParams,
+    ) -> Option<TextureHandle> {
+        if params.is_empty() {
+            self.selected_alpha = None;
+            return self.alpha(ctx, alpha);
+        }
+        if let Some((previous, values, texture)) = &self.selected_alpha
+            && previous.id == alpha.id
+            && values == params
+        {
+            return Some(texture.clone());
+        }
+        if !self.spend_budget(ctx, 1) {
+            return self.selected_alpha.as_ref().filter(|(previous, ..)| previous.id == alpha.id).map(|(_, _, texture)| texture.clone());
+        }
+        let image = library_alpha_image(alpha, params, SWATCH_PX);
+        let texture = ctx.load_texture("active_brush_alpha", image, TextureOptions::LINEAR);
+        self.selected_alpha = Some((alpha, params.clone(), texture.clone()));
+        Some(texture)
+    }
+
     /// A lighting environment's panorama
     pub fn environment(&mut self, ctx: &egui::Context, name: &'static str) -> Option<TextureHandle> {
         self.shelf(ctx, ShelfPreview::Environment(name), SWATCH_PX)
@@ -412,7 +442,7 @@ impl Thumbs {
         }
 
         if let Some(settings) = initial_settings {
-            self.saved_brush_previews.entry(path.to_path_buf()).or_insert_with(|| (Some(settings.clone()), None, 0));
+            self.saved_brush_previews.entry(path.to_path_buf()).or_insert_with(|| (Some(Arc::new(settings.clone())), None, 0));
         }
 
         let preview = cached_preview.unwrap_or_else(|| self.saved_brush_preview(path, images));
@@ -676,7 +706,7 @@ mod tests {
         let mut thumbs = Thumbs { worker: PreviewWorker::Inline { shape: OrbShape::default(), results: Vec::new() }, ..Thumbs::default() };
         let path = PathBuf::from("changed-alpha.tcbrush");
         let settings = BrushSettings { alpha_image: Some("alpha.png".into()), ..BrushSettings::default() };
-        thumbs.saved_brush_previews.insert(path.clone(), (Some(settings), None, 0));
+        thumbs.saved_brush_previews.insert(path.clone(), (Some(Arc::new(settings)), None, 0));
         let image = |value| Arc::new(ImageRes::new(2, 2, vec![[value; 4]; 4], false));
         let mut images: ImageStore = [("alpha.png".into(), image(0.2))].into();
 
@@ -707,7 +737,7 @@ mod tests {
         let mut thumbs = Thumbs::default();
         thumbs.budget = (context.cumulative_pass_nr(), PER_FRAME);
 
-        assert!(thumbs.saved_brush(&context, &path, &ImageStore::new()).is_none());
+        assert!(thumbs.saved_brush(&context, &path, &ImageStore::default()).is_none());
         assert!(thumbs.saved_brush_previews.is_empty(), "a deferred thumbnail has not read its file");
 
         std::fs::remove_file(&path).unwrap();
@@ -719,7 +749,7 @@ mod tests {
             std::env::temp_dir().join(format!("texturecraft-brush-preview-{}-{}.tcbrush", std::process::id(), NEXT_FILE.fetch_add(1, Ordering::Relaxed)));
         std::fs::write(&path, serde_json::to_vec(&BrushSettings::default()).unwrap()).unwrap();
         let mut thumbs = Thumbs::default();
-        let images = ImageStore::new();
+        let images = ImageStore::default();
 
         assert!(matches!(thumbs.saved_brush_preview(&path, &images), ShelfPreview::SavedBrush { settings: Some(_), .. }));
         std::fs::remove_file(&path).unwrap();
@@ -739,7 +769,7 @@ mod tests {
         let brush = BrushSettings { size: 0.07, ..BrushSettings::default() };
         let path = crate::shelf_preview::session_brush_path("Session brush");
 
-        assert!(thumbs.session_brush(&context, "Session brush", &brush, &ImageStore::new()).is_some());
+        assert!(thumbs.session_brush(&context, "Session brush", &brush, &ImageStore::default()).is_some());
         assert!(matches!(thumbs.saved_brush_previews.get(&path), Some((Some(settings), _, _)) if settings.size == brush.size));
 
         thumbs.forget_saved_files();
@@ -752,8 +782,8 @@ mod tests {
         let mut thumbs = Thumbs::default();
         thumbs.budget = (context.cumulative_pass_nr(), PER_FRAME);
 
-        assert!(thumbs.session_brush(&context, "First deferred", &BrushSettings::default(), &ImageStore::new()).is_none());
-        assert!(thumbs.session_brush(&context, "Second deferred", &BrushSettings::default(), &ImageStore::new()).is_none());
+        assert!(thumbs.session_brush(&context, "First deferred", &BrushSettings::default(), &ImageStore::default()).is_none());
+        assert!(thumbs.session_brush(&context, "Second deferred", &BrushSettings::default(), &ImageStore::default()).is_none());
         assert!(thumbs.saved_brush_previews.is_empty());
     }
 
@@ -775,8 +805,8 @@ mod tests {
         assert!(old_image.rgba.iter().map(|pixel| std::hint::black_box(pixel[0])).sum::<f32>() > 0.0);
         assert!(other_image.rgba.iter().map(|pixel| std::hint::black_box(pixel[0])).sum::<f32>() > 0.0);
 
-        thumbs.saved_brush_previews.insert(first_path.clone(), (Some(settings.clone()), None, 0));
-        thumbs.saved_brush_previews.insert(second_path.clone(), (Some(settings), None, 0));
+        thumbs.saved_brush_previews.insert(first_path.clone(), (Some(Arc::new(settings.clone())), None, 0));
+        thumbs.saved_brush_previews.insert(second_path.clone(), (Some(Arc::new(settings)), None, 0));
         let mut images: ImageStore = [("alpha.png".into(), old_image.clone())].into();
         drop(thumbs.saved_brush_preview(&first_path, &images));
         images.insert("alpha.png".into(), other_image.clone());
@@ -788,7 +818,7 @@ mod tests {
         assert!(other_weak.upgrade().is_some(), "the project still owns its current image");
         eprintln!(
             "saved brush cache after first replacement: 0 of {IMAGE_BYTES} old image bytes retained, {} current image strong owners",
-            Arc::strong_count(&images["alpha.png"])
+            Arc::strong_count(images.get("alpha.png").unwrap())
         );
 
         let replacement = Arc::new(ImageRes::new(IMAGE_SIDE, IMAGE_SIDE, vec![[0.0; 4]; IMAGE_TEXELS], false));
@@ -821,13 +851,13 @@ mod tests {
     fn removing_resources_releases_their_previews() {
         let context = egui::Context::default();
         let mut thumbs = Thumbs::default();
-        let mut images = ImageStore::new();
+        let mut images = ImageStore::default();
         for index in 0..3 {
             let name = format!("image-{index}");
             images.insert(name, Arc::new(ImageRes::new(2, 2, vec![[index as f32; 4]; 4], false)));
         }
 
-        for (name, image) in &images {
+        for (name, image) in images.iter() {
             drop(thumbs.image(&context, name, image));
         }
         let cached_pixel_bytes = |thumbs: &Thumbs| thumbs.images.values().map(|(_, texture)| texture.size()[0] * texture.size()[1] * 4).sum::<usize>();
@@ -846,12 +876,12 @@ mod tests {
         assert!(thumbs.images.contains_key("image-2"));
 
         images.insert("image-3".into(), Arc::new(ImageRes::new(2, 2, vec![[0.7; 4]; 4], false)));
-        drop(thumbs.image(&context, "image-3", &images["image-3"]));
+        drop(thumbs.image(&context, "image-3", images.get("image-3").unwrap()));
         thumbs.sync_images(&images, 2);
 
         assert_eq!(thumbs.images.len(), 2);
 
-        images.clear();
+        images = ImageStore::default();
         thumbs.sync_images(&images, 3);
         eprintln!("cached previews after clearing resources: {}", thumbs.images.len());
         assert!(thumbs.images.is_empty());
@@ -859,7 +889,7 @@ mod tests {
 
     /// A 2 × 2 ID map of one red, in a map of its own
     fn id_map() -> BakedMaps {
-        BakedMaps { resolution: 2, maps: BTreeMap::from([(BakedMap::Id, Arc::new([1.0, 0.0, 0.0].repeat(4)))]) }
+        BakedMaps { resolution: 2, maps: BTreeMap::from([(BakedMap::Id, Arc::new([1.0, 0.0, 0.0].repeat(4).into()))]) }
     }
 
     #[test]

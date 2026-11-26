@@ -405,7 +405,7 @@ fn close_releases_the_layer_thumbnail_snapshot() {
             .baked
             .values()
             .flat_map(|maps| maps.maps.values())
-            .map(|pixels| (std::sync::Arc::downgrade(pixels), std::mem::size_of_val(pixels.as_slice())))
+            .map(|pixels| (std::sync::Arc::downgrade(pixels), pixels.bytes()))
             .collect();
         let tracked_bytes: usize = old_maps.iter().map(|(_, bytes)| bytes).sum();
 

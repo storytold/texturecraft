@@ -150,12 +150,12 @@ fn encode_flat(flat: &[FlatTile], channel: Channel, w: u32, h: u32) -> ThumbImag
 }
 
 /// A channel value as display bytes: colors linear → sRGB, signed values with 0 at mid gray,
-/// normal maps and scalars as stored.
+/// normal maps, scalars and data channels as stored.
 fn display(channel: Channel, v: [f32; 3]) -> [u8; 3] {
     match channel.kind() {
         ChannelKind::Color => v.map(|c| to_byte(linear_to_srgb(c.clamp(0.0, 1.0)))),
         ChannelKind::Signed => v.map(|c| to_byte(c * 0.5 + 0.5)),
-        ChannelKind::Scalar | ChannelKind::NormalMap => v.map(to_byte),
+        ChannelKind::Scalar | ChannelKind::NormalMap | ChannelKind::Data => v.map(to_byte),
     }
 }
 

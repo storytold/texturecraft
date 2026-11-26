@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::SelectionBackground;
+use crate::{BakedMap, SelectionBackground};
 
 /// Selects ID-map colors within a tolerance: the selected parts get the output value, the rest the background
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -22,6 +22,17 @@ pub struct ColorSelection {
     /// The image resource read as the ID map; none reads the texture set's ID mesh map
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_map: Option<String>,
+    /// The baked map the colors are picked from when no ID map image is set
+    #[serde(default = "baked_id_map", skip_serializing_if = "is_baked_id_map")]
+    pub map: BakedMap,
+}
+
+fn baked_id_map() -> BakedMap {
+    BakedMap::Id
+}
+
+fn is_baked_id_map(map: &BakedMap) -> bool {
+    *map == BakedMap::Id
 }
 
 fn full() -> f32 {
@@ -36,7 +47,7 @@ fn is_full(value: &f32) -> bool {
 impl ColorSelection {
     /// A selection of `colors` with the defaults of a new one
     pub fn new(colors: Vec<[f32; 3]>, tolerance: f32) -> ColorSelection {
-        ColorSelection { colors, tolerance, output: 1.0, hardness: 1.0, background: SelectionBackground::Black, id_map: None }
+        ColorSelection { colors, tolerance, output: 1.0, hardness: 1.0, background: SelectionBackground::Black, id_map: None, map: BakedMap::Id }
     }
 
     /// How much ID color `id` is selected, 0..1 (none: no ID map there)

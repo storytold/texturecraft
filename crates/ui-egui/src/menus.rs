@@ -41,6 +41,7 @@ pub const CATALOG: &[Item] = &[
     sub("File", "Recent Projects", "Clear", "ui.recent.clear", None),
     sep("File"),
     it("File", "Open Sample Project", "project.sample", None),
+    it("File", "Import Project", "file.importProject", None),
     sep("File"),
     it("File", "Close", "file.close", Some("Ctrl+F4")),
     sep("File"),
@@ -213,6 +214,10 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
         return;
     }
 
+    // the import's windows hold the project until the converted one opens
+    if crate::import_ui::active(app) && id != "ui.quit" {
+        return;
+    }
     if matches!(id, "file.open" | "file.close") && crate::windows::ask_to_save(app, crate::state::Unsaved::Command(id.into())) {
         return;
     }
@@ -480,6 +485,16 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
                 i.events.insert(0, egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers });
             });
         }
+    }
+
+    if crate::import_ui::active(app) {
+        // The import owns the input. Keep the Quit shortcut, leaving the other keys for its
+        // controls and camera instead of dispatching them to the previous project.
+        let quit = ctx.input(|input| app.bindings.dispatch(&mut input.clone()).iter().any(|id| id == "ui.quit"));
+        if quit {
+            invoke(app, ctx, "ui.quit");
+        }
+        return;
     }
 
     // The dispatcher reads clipboard events as shortcuts; a pasted image also means Ctrl+V

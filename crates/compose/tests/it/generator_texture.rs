@@ -30,7 +30,7 @@ fn fixture(flat: [f32; 3]) -> GeneratorFixture {
     let mesh = primitives::sphere(1.0, 32, 16);
     let mut fixture = GeneratorFixture::new(mesh, "builtin:sphere", RES);
 
-    let baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![OCCLUSION; (RES * RES) as usize]))].into() };
+    let baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![OCCLUSION; (RES * RES) as usize].into()))].into() };
 
     let [red, green, blue] = flat;
     let flat = ImageRes::new(4, 4, vec![[red, green, blue, 1.0]; 16], false);

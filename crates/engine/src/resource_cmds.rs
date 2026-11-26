@@ -99,10 +99,14 @@ impl Session {
         Ok(name)
     }
 
-    /// Decode resources that are not decoded yet and forget removed ones (after undo, redo, load).
+    /// Images for the resources that have none yet, and none for removed ones (after undo, redo, load). An image is
+    /// decoded from its resource when something first reads it (see [`texturecraft_compose::ImageStore`]); a resource
+    /// whose header does not read as an image is left out, with a note in the log.
     pub fn sync_images(&mut self) {
-        self.images.retain(|name, _| self.doc.resources.contains_key(name));
-        self.library_alphas.retain(|name| self.images.contains_key(name));
+        let resources = &self.doc.resources;
+        self.images.retain_names(|name| resources.contains_key(name));
+        let images = &self.images;
+        self.library_alphas.retain(|name| images.has_slot(name));
 
         let mut linked_packages = std::collections::HashSet::new();
         let mut linked_images = std::collections::HashMap::new();
@@ -117,27 +121,43 @@ impl Session {
             }
         }
 
+        let package_suffix = format!(".{}", texturecraft_formats::mcmat::MCRAFT_EXT);
         for (name, bytes) in &self.doc.resources {
-            if self.images.contains_key(name) || linked_packages.contains(name.as_str()) {
+            if self.images.has_slot(name) || linked_packages.contains(name.as_str()) || name.ends_with(&package_suffix) {
                 continue;
             }
 
-            // EXR may need a full float decode buffer even when encoded project bytes are small
-            let image = match linked_images.get(name.as_str()) {
-                Some(&size) if size > 0 && bytes.starts_with(EXR_SIGNATURE) => {
-                    let texels = (u64::from(size) * u64::from(size)).min(texturecraft_formats::MAX_RESOURCE_TEXELS);
-                    let decoder_bytes = texels * std::mem::size_of::<[f32; 4]>() as u64;
-                    texturecraft_formats::decode_cooked_image(bytes, [size; 2], decoder_bytes).or_else(|_| texturecraft_formats::decode_image(bytes))
+            // A saved library alpha picture is told by its pixels, so it is decoded now (it is small)
+            if crate::fill_alpha::library_alpha_of(name).is_some()
+                && let Ok(image) = texturecraft_formats::decode_image(bytes)
+            {
+                if crate::fill_alpha::matches_saved_picture(name, &image) {
+                    self.library_alphas.insert(name.clone());
                 }
-                _ => texturecraft_formats::decode_image(bytes),
-            };
-            match image {
-                Ok(image) => {
-                    if crate::fill_alpha::matches_saved_picture(name, &image) {
-                        self.library_alphas.insert(name.clone());
-                    }
 
-                    self.images.insert(name.clone(), decoded(image));
+                self.images.insert(name.clone(), decoded(image));
+                continue;
+            }
+
+            // Probe each header once; file-backed resources release their decoded pixels under memory pressure.
+            match texturecraft_formats::probe_image(bytes) {
+                Ok(_) => {
+                    let size = linked_images.get(name.as_str()).copied().unwrap_or(0);
+                    let origin: Arc<dyn std::any::Any + Send + Sync> = bytes.clone();
+                    let origin = Arc::downgrade(&origin);
+                    let bytes = bytes.clone();
+                    let source: texturecraft_compose::ImageSource = Arc::new(move || {
+                        // EXR cook outputs can require a full float buffer despite small stored bytes.
+                        let image = if size > 0 && bytes.starts_with(EXR_SIGNATURE) {
+                            let texels = (u64::from(size) * u64::from(size)).min(texturecraft_formats::MAX_RESOURCE_TEXELS);
+                            let decoder_bytes = texels * size_of::<[f32; 4]>() as u64;
+                            texturecraft_formats::decode_cooked_image(&bytes, [size; 2], decoder_bytes).or_else(|_| texturecraft_formats::decode_image(&bytes))
+                        } else {
+                            texturecraft_formats::decode_image(&bytes)
+                        };
+                        image.ok().map(|image| Arc::unwrap_or_clone(decoded(image)))
+                    });
+                    self.images.insert_source(name.clone(), origin, source);
                 }
                 Err(error) => self.log.warn(crate::log::LIBRARY_SOURCE, format!("resource {name}: {error}")),
             }
@@ -162,7 +182,8 @@ fn list(s: &Session) -> Value {
             .resources
             .iter()
             .map(|(k, v)| {
-                let (w, h) = s.images.get(k).map(|i| (i.width, i.height)).unwrap_or((0, 0));
+                // from the header: listing does not decode
+                let (w, h) = if s.images.has_slot(k) { texturecraft_formats::probe_image(v).unwrap_or((0, 0)) } else { (0, 0) };
                 json!({"name": k, "bytes": v.len(), "width": w, "height": h})
             })
             .collect::<Vec<_>>()

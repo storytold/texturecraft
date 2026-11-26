@@ -56,6 +56,9 @@ mod generator_section_rows;
 mod generator_slot;
 mod generator_wear_rows;
 pub mod gpu;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod gpu_port_gate;
+mod graph_params;
 mod gray_slider;
 mod grid_tile;
 #[cfg(not(target_arch = "wasm32"))]
@@ -65,6 +68,7 @@ pub mod i18n;
 pub mod id_color_pick;
 #[cfg(not(target_arch = "wasm32"))]
 mod import_resources;
+pub mod import_ui;
 mod inactive_set_hint;
 mod instance_properties;
 pub mod keymap;
@@ -217,8 +221,15 @@ pub const UPDATE_APP: craft_update::App = craft_update::App {
 
 /// A texture set resize running on a worker thread (`Session::resize_task`).
 pub struct ResizeJob {
-    pub progress: Arc<Progress>,
+    pub progress: Arc<texturecraft_engine::ResizeProgress>,
     pub rx: std::sync::mpsc::Receiver<texturecraft_engine::Result<texturecraft_engine::ResizeOutput>>,
+    project: u64,
+}
+
+impl Drop for ResizeJob {
+    fn drop(&mut self) {
+        self.progress.cancel();
+    }
 }
 
 mod link_bake_input;
@@ -293,6 +304,11 @@ pub struct TextureCraftApp {
     /// High poly files being loaded for the bake
     #[cfg(not(target_arch = "wasm32"))]
     pub high_poly_job: Option<HighPolyJob>,
+    /// Latest resize requested while a cancelled worker releases its resources.
+    queued_resize: Option<(usize, u32)>,
+    /// The project import's windows and the conversion running behind them.
+    pub import: Option<import_ui::ImportUi>,
+    pub(crate) import_presentation: Option<import_ui::Presentation>,
     pub link_cooks: Vec<LinkCook>,
     #[cfg(not(target_arch = "wasm32"))]
     link_imports: Vec<link_import::LinkImport>,
@@ -342,6 +358,8 @@ pub struct TextureCraftApp {
     pub screen_picking: bool,
     /// The wgpu state (screenshots read the renderer's targets).
     pub render_state: Option<eframe::egui_wgpu::RenderState>,
+    #[cfg(not(target_arch = "wasm32"))]
+    graph_accelerator: Option<Arc<texturecraft_render::gpu_graph::GraphAccelerator>>,
     /// CJK fallback fonts for the UI language.
     pub fonts: fonts::UiFonts,
     /// A notice across the top of the window until dismissed (English key, shown translated).
@@ -410,6 +428,13 @@ fn uses_wayland(ctx: &egui::Context) -> bool {
 }
 
 impl TextureCraftApp {
+    fn finish_ui_frame(&mut self, ui_start_ms: f64) {
+        let end_ms = now_ms();
+        let ui_frame_ms = (end_ms - ui_start_ms) as f32;
+        self.ui_ms = if self.ui_ms == 0.0 { ui_frame_ms } else { self.ui_ms * FRAME_AVERAGE_KEEP + ui_frame_ms * (1.0 - FRAME_AVERAGE_KEEP) };
+        self.profiler.end_frame(end_ms, ui_frame_ms);
+    }
+
     /// The app around `session`, with the saved UI state (or defaults in the OS language) and the GPU viewport.
     pub fn new(cc: &eframe::CreationContext<'_>, mut session: Session) -> TextureCraftApp {
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -426,6 +451,14 @@ impl TextureCraftApp {
         #[cfg(not(target_arch = "wasm32"))]
         texturecraft_engine::bake::install_gpu_tracer(Arc::new(texturecraft_render::gpu_bake::GpuBaker::new()));
         let gpu = cc.wgpu_render_state.as_ref().map(|render_state| gpu::init(render_state, &cc.egui_ctx));
+        #[cfg(not(target_arch = "wasm32"))]
+        let graph_accelerator = cc.wgpu_render_state.as_ref().filter(|_| gpu.as_ref().is_some_and(gpu::GpuLink::supports_gpu_layers)).map(|render_state| {
+            Arc::new(texturecraft_render::gpu_graph::GraphAccelerator::new(
+                &render_state.device,
+                &render_state.queue,
+                texturecraft_engine::compose::graphs::budget::limit,
+            ))
+        });
 
         // The first run speaks the OS (or browser) language
         let mut ui_store = ui_state_store::UiStateStore::new(ui_state_store::FILE.get().cloned());
@@ -439,6 +472,7 @@ impl TextureCraftApp {
 
         let next_autosave = autosave_period_seconds(ui.prefs.autosave_minutes);
         ui.prefs.apply_resource_limits();
+        ui.prefs.apply_graph_budget();
 
         let project_id = session.project_id;
         let mut app = TextureCraftApp {
@@ -464,6 +498,9 @@ impl TextureCraftApp {
             resize: None,
             #[cfg(not(target_arch = "wasm32"))]
             high_poly_job: None,
+            queued_resize: None,
+            import: None,
+            import_presentation: None,
             link_cooks: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             link_imports: Vec::new(),
@@ -495,6 +532,8 @@ impl TextureCraftApp {
             #[cfg(target_arch = "wasm32")]
             screen_picking: false,
             render_state: cc.wgpu_render_state.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            graph_accelerator,
             fonts: fonts::UiFonts::default(),
             banner: None,
             title_bar: titlebar::TitleBar::default(),
@@ -598,13 +637,8 @@ impl TextureCraftApp {
                 }
 
                 // Pending work and thumbnail snapshots belong to the old project
-                if matches!(id, "file.open" | "file.new" | "file.close" | "project.new" | "project.sample") {
-                    self.pbr_import = None;
-                    self.resize = None;
-                    #[cfg(not(target_arch = "wasm32"))]
-                    self.link_imports.clear();
-                    self.link_cooks.clear();
-                    self.layer_panel = Default::default();
+                if matches!(id, "file.open" | "file.new" | "file.close" | "file.importProject" | "project.new" | "project.sample") {
+                    self.clear_project_jobs();
                 }
 
                 // Schedule the reset only when Painting or Baking draws a 2D view
@@ -640,6 +674,18 @@ impl TextureCraftApp {
                 None
             }
         }
+    }
+
+    /// Clear work that belongs to the previous project after replacing or closing it.
+    pub(crate) fn clear_project_jobs(&mut self) {
+        self.pbr_import = None;
+        self.resize = None;
+        self.queued_resize = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.link_imports.clear();
+        self.link_cooks.clear();
+        self.layer_panel = Default::default();
+        self.camera_glide = None;
     }
 
     /// After command `id` ran without starting a glide (the camera was `before`): a projection switch
@@ -941,17 +987,41 @@ impl TextureCraftApp {
     /// Resize texture set `ts` to `resolution` on a worker thread (the document changes when
     /// it is done, as one undo step).
     pub fn start_resize(&mut self, ts: usize, resolution: u32) {
-        if self.resize.is_some() {
+        if let Some(job) = &self.resize {
+            if job.progress.is_cancelled() {
+                self.queued_resize = Some((ts, resolution));
+            }
             return;
         }
 
         match self.session.resize_task(ts, resolution) {
             Ok(task) => {
-                let progress = Arc::new(Progress::new());
+                let progress = Arc::new(texturecraft_engine::ResizeProgress::default());
                 let p = progress.clone();
-                self.resize = Some(ResizeJob { progress, rx: spawn_worker("texturecraft-resize", move || task.run(&p)) });
+                #[cfg(not(target_arch = "wasm32"))]
+                let gpu = self
+                    .render_state
+                    .as_ref()
+                    .filter(|_| self.ui.prefs.gpu_compositing && self.gpu.as_ref().is_some_and(gpu::GpuLink::supports_gpu_layers))
+                    .map(|state| (state.device.clone(), state.queue.clone()));
+                let rx = spawn_worker("texturecraft-resize", move || {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    return resize_for_view(task, &p, gpu);
+                    #[cfg(target_arch = "wasm32")]
+                    return task.run_for_browser(&p);
+                });
+                self.resize = Some(ResizeJob { progress, rx, project: self.session.project_id });
             }
             Err(e) => self.toast(e.to_string(), true),
+        }
+    }
+
+    fn cancel_resize(&mut self) {
+        self.queued_resize = None;
+        if let Some(job) = &self.resize {
+            job.progress.cancel();
+            // Its result cannot commit, even if a GPU dispatch must drain before it returns.
+            self.toast(i18n::tr("Texture set resize cancelled"), false);
         }
     }
 
@@ -960,8 +1030,9 @@ impl TextureCraftApp {
         let Some(job) = &self.resize else { return };
 
         // Nothing to resize without a project (a result that arrives after Close is dropped)
-        if !self.session.project_open {
+        if !self.session.project_open || self.session.project_id != job.project {
             self.resize = None;
+            self.queued_resize = None;
             return;
         }
 
@@ -975,9 +1046,32 @@ impl TextureCraftApp {
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(texturecraft_engine::EngineError::Other(i18n::tr("The resize worker stopped").into())),
         };
+        let cancelled = job.progress.is_cancelled();
         self.resize = None;
-        if let Err(e) = result.and_then(|out| self.session.apply_resize(out)) {
-            self.toast(e.to_string(), true);
+        if cancelled {
+            if let Some((ts, resolution)) = self.queued_resize.take() {
+                self.start_resize(ts, resolution);
+            }
+            return;
+        }
+        if let Ok(output) = &result
+            && !output.matches_session(&self.session)
+        {
+            let (ts, resolution) = output.target();
+            self.start_resize(ts, resolution);
+            return;
+        }
+        match result.and_then(|out| {
+            let target = out.target().0;
+            self.session.apply_resize(out)?;
+            Ok(target)
+        }) {
+            Ok(target) => {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.replace_resized_view(self.session.project_id, target);
+                }
+            }
+            Err(error) => self.toast(error.to_string(), true),
         }
     }
 
@@ -1013,6 +1107,27 @@ impl TextureCraftApp {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn resize_for_view(
+    task: texturecraft_engine::ResizeTask,
+    progress: &texturecraft_engine::ResizeProgress,
+    gpu: Option<(texturecraft_render::wgpu::Device, texturecraft_render::wgpu::Queue)>,
+) -> texturecraft_engine::Result<texturecraft_engine::ResizeOutput> {
+    use texturecraft_render::gpu_resize::PaintResampler;
+    let mut resampler = None;
+    task.run_for_view(
+        progress,
+        |image, size, empty| {
+            let (device, queue) = gpu.as_ref()?;
+            Some(match resampler.get_or_insert_with(|| PaintResampler::new(device, queue)) {
+                Ok(resampler) => resampler.resize(image, size, empty, || progress.is_cancelled()),
+                Err(error) => Err(error.clone()),
+            })
+        },
+        |inputs| gpu.is_some() && texturecraft_render::gpu_composite::CompositeProgram::try_compile_inputs(inputs, None).is_ok(),
+    )
+}
+
 /// Run `f` on a worker thread named `name`; its result arrives on the returned channel.
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_worker<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> std::sync::mpsc::Receiver<T> {
@@ -1040,6 +1155,14 @@ fn autosave_period_seconds(minutes: u32) -> f64 {
 }
 
 impl TextureCraftApp {
+    pub(crate) fn material_graph_accelerator(&self) -> Option<Arc<dyn texturecraft_engine::compose::graphs::GraphAccelerator>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.ui.prefs.gpu_compositing {
+            return self.graph_accelerator.clone().map(|backend| backend as _);
+        }
+        None
+    }
+
     fn reschedule_autosave_if_changed(&mut self, previous_minutes: u32) {
         let minutes = self.ui.prefs.autosave_minutes;
         if minutes != previous_minutes {
@@ -1184,7 +1307,17 @@ impl eframe::App for TextureCraftApp {
         }
         self.step_camera_glide(ctx);
         self.ui.prefs.apply_resource_limits();
-
+        self.session.doc.graphs.set_accelerator(self.material_graph_accelerator());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let paint_view = self.session.quick_mask.editing
+                || !matches!(self.session.view, texturecraft_engine::ViewMode::MeshMap(_) | texturecraft_engine::ViewMode::Image);
+            self.session.brush_device = if self.ui.prefs.gpu_compositing && self.ui.mode == state::Mode::Painting && paint_view && self.session.solo.is_none() {
+                self.gpu.as_ref().and_then(|gpu| gpu.brush_device(&self.session))
+            } else {
+                None
+            };
+        }
         control::poll(self, ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.run_file_dialog_answers();
@@ -1285,6 +1418,18 @@ impl eframe::App for TextureCraftApp {
         let ctx = ui.ctx().clone();
         let ui_start_ms = now_ms();
 
+        if import_ui::show_preview(self, ui) {
+            windows::unsaved(self, &ctx);
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.ui.windows.unsaved.is_some() {
+                self.file_dialogs.show_pending(frame);
+            }
+            self.framework_dialogs.run(ui);
+            pointer_lock::settle(&ctx);
+            self.finish_ui_frame(ui_start_ms);
+            return;
+        }
+
         // Baking and rendering need a project (a saved layout may start in one of them)
         if !self.session.project_open {
             self.ui.mode = state::Mode::Painting;
@@ -1337,7 +1482,9 @@ impl eframe::App for TextureCraftApp {
         self.framework_dialogs.run(ui);
         toasts(self, &ctx);
         #[cfg(not(target_arch = "wasm32"))]
-        self.file_dialogs.show_pending(frame);
+        if !import_ui::active(self) || self.ui.windows.unsaved.is_some() {
+            self.file_dialogs.show_pending(frame);
+        }
 
         // Last, so no widget's pointer replaces it: an armed eyedropper is the pointer over the whole window
         if self.picking_color.is_some() {
@@ -1345,10 +1492,7 @@ impl eframe::App for TextureCraftApp {
         }
         pointer_lock::settle(&ctx);
 
-        let end_ms = now_ms();
-        let ui_frame_ms = (end_ms - ui_start_ms) as f32;
-        self.ui_ms = if self.ui_ms == 0.0 { ui_frame_ms } else { self.ui_ms * FRAME_AVERAGE_KEEP + ui_frame_ms * (1.0 - FRAME_AVERAGE_KEEP) };
-        self.profiler.end_frame(end_ms, ui_frame_ms);
+        self.finish_ui_frame(ui_start_ms);
     }
 }
 

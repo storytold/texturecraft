@@ -772,7 +772,7 @@ pub fn brush_values(id: &str) -> Option<Vec<(Channel, [f32; 3])>> {
             .filter_map(|(channel, source)| match source {
                 Source::Uniform(value) => Some((channel, value)),
                 Source::Procedural { low, high, .. } => Some((channel, mean(&low, &high))),
-                Source::Image { .. } | Source::Anchor { .. } => None,
+                Source::Image { .. } | Source::Anchor { .. } | Source::Graph(_) => None,
             })
             .collect(),
     )
@@ -1011,7 +1011,7 @@ mod tests {
         for sm in crate::smart_masks::SMART_MASKS {
             crate::smart_masks::apply(&mut s, layer, sm.id).unwrap();
             s.update();
-            let view = s.mask_view_rgba(layer, 64).unwrap();
+            let view = s.mask_view_rgba(layer, (64, 64)).unwrap();
             assert!(view.chunks(4).any(|px| px[0] > 0), "{} is empty", sm.id);
             assert!(snapshot(&s, 1).iter().flatten().all(|v| v.is_finite()), "{}", sm.id);
         }

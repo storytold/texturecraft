@@ -8,6 +8,7 @@ fn session() -> Session {
     session_at(256)
 }
 
+/// The fixture session with texture sets of `texture_size` texels a side
 fn session_at(texture_size: u32) -> Session {
     let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, texture_size).unwrap();
     s.viewport = texturecraft_engine::geom::glam::Vec2::new(400.0, 400.0);
@@ -190,6 +191,23 @@ fn polygon_fill_and_color_picker() {
 }
 
 #[test]
+fn color_picker_reads_material_before_cpu_tiles_are_composited() {
+    use texturecraft_engine::geom::glam::Vec2;
+
+    let mut s = session();
+    let cpu_revision = s.caches[0].revision;
+    let center = Vec2::new(200.0, 200.0);
+    assert!(s.color_pick(center, s.viewport).unwrap()[&Channel::BaseColor][1] > 0.4);
+    execute(&mut s, "layer.add.fill", &json!({"color": [0.9, 0.1, 0.05]})).unwrap();
+
+    let picked = s.color_pick(center, s.viewport).unwrap()[&Channel::BaseColor];
+
+    assert!(picked[0] > 0.8 && picked[1] < 0.2, "{picked:?}");
+    assert_eq!(s.tool.values[&Channel::BaseColor], picked);
+    assert_eq!(s.caches[0].revision, cpu_revision, "a pick leaves viewport updates on the chosen backend");
+}
+
+#[test]
 fn color_at_reads_the_surface_without_changing_the_brush() {
     let mut s = session();
     execute(&mut s, "tool.material", &json!({"channel": "roughness", "value": 0.9})).unwrap();
@@ -244,6 +262,9 @@ fn panic_hunt() {
         json!({"layer": 1, "index": -5, "delta": i64::MIN, "above": "x", "points": [[f64::MAX, -1e300]], "size": -1e30}),
         json!({"resolution": 0, "maps": ["x"], "rays": u64::MAX, "antialiasing": 3, "color": [1], "value": "nan"}),
         json!({"effect": 0, "x": 1e30, "y": -1e30, "viewport": [0, 0], "mesh": "../../etc", "material": ""}),
+        json!({"path": "/dev/null", "bytes": "!!not base64", "maxResolution": -1, "originalOnTop": "yes"}),
+        json!({"bytes": [999, -1, "x"], "name": "", "measure": 7}),
+        json!({"bytes": "iUhERg0KGgoAAAAAAAAAAAAAAAAAAAAAAAAA", "maxResolution": 128}),
     ];
     for spec in command_specs() {
         if spec.id == "project.sample" {
@@ -500,6 +521,107 @@ fn an_srgb_hex_colour_matches_its_linear_rgb_value() {
     assert!(digits[0] - hex[0] > 0.1, "{digits:?} {hex:?}");
 }
 
+/// A session whose layers run graphs with hostile references: values that are not numbers, a missing text, a text that
+/// does not parse, nesting past the bound, outputs and anchors that do not exist, a stack input in a nested graph.
+fn graph_session() -> Session {
+    graph_session_at(256)
+}
+
+/// [`graph_session`] with texture sets of `resolution` texels a side.
+fn graph_session_at(resolution: u32) -> Session {
+    use texturecraft_engine::core::{
+        Effect, EffectKind, Fill, GraphInput, GraphRef, GraphValue, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source,
+    };
+    let mut s = session_at(resolution);
+    let colour = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 color r=0.25 g=0.5 b=0.75\noutput colour 1\nexpose gain 1 r 0 1\n");
+    let broken = s.doc.graphs.add_text("format 3\nnode 1 invert in=@99\nnode 2 nonsense\n");
+    let invert = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 input idx=0\nnode 2 invert in=@1\noutput out 2\n");
+    let mut hostile = GraphRef::new(colour.clone(), "hostile");
+    hostile.params.insert("gain".into(), GraphValue::Vector(vec![f32::NAN, f32::INFINITY, -1e30, 7.0, 9.0]));
+    hostile.params.insert("missing".into(), GraphValue::Int2([i32::MIN, i32::MAX]));
+    hostile.seed = u32::MAX;
+    hostile.output = Some("no such output".into());
+    hostile.alpha_output = Some("neither".into());
+    hostile.inputs.insert(u32::MAX, GraphInput::Image("not a resource".into()));
+    hostile.inputs.insert(3, GraphInput::Anchor { anchor: LayerId(u64::MAX), channel: None, levels: None });
+    let mut deep = GraphRef::new(colour.clone(), "deep");
+    for _ in 0..(texturecraft_engine::core::layer::MAX_GRAPH_NESTING + 3) {
+        let mut outer = GraphRef::new(invert.clone(), "outer");
+        outer.inputs.insert(0, GraphInput::Nested(Box::new(deep)));
+        deep = outer;
+    }
+    let mut nested_stack = GraphRef::new(invert.clone(), "nested stack");
+    let mut inner = GraphRef::new(invert.clone(), "inner");
+    inner.inputs.insert(0, GraphInput::Stack { channel: Some(Channel::Height) });
+    nested_stack.inputs.insert(0, GraphInput::Nested(Box::new(inner)));
+    let mut filter = GraphRef::new(invert.clone(), "filter");
+    filter.inputs.insert(0, GraphInput::Stack { channel: Some(Channel::Normal) });
+    filter.inputs.insert(1, GraphInput::StackAlpha { channel: None });
+    filter.outputs.insert(Channel::Height, "out".into());
+    let missing = GraphRef::new(texturecraft_engine::core::text_key("not stored"), "missing");
+    let unparsable = GraphRef::new(broken, "broken");
+    let mut fill = Fill::default();
+    for (c, g) in
+        [(Channel::BaseColor, hostile.clone()), (Channel::Roughness, deep.clone()), (Channel::Metallic, missing.clone()), (Channel::Height, unparsable.clone())]
+    {
+        fill.sources.insert(c, Source::Graph(Box::new(g)));
+    }
+    let id = s.doc.project.alloc_id();
+    let mut layer = Layer::new(id, "graphs", LayerKind::Fill(fill), &Channel::DEFAULT_SET);
+    let mut effects = Vec::new();
+    for g in [hostile, deep, nested_stack, filter, missing, unparsable] {
+        let e = s.doc.project.alloc_id();
+        effects.push(Effect::new(e, EffectKind::Graph { graph: g, projection: Projection::default() }));
+    }
+    layer.content_effects = effects.clone();
+    for e in &mut effects {
+        e.id = s.doc.project.alloc_id();
+    }
+    layer.mask = Some(Mask { effects, ..Mask::new(MaskBackground::White) });
+    s.doc.project.insert_layer(0, layer, None, false).unwrap();
+    for c in &mut s.caches {
+        c.invalidate_all();
+    }
+    s
+}
+
+/// Every command on a project of hostile graph references returns Ok or Err, and the project composites, saves and opens.
+#[test]
+fn panic_hunt_with_hostile_graphs() {
+    let mut s = graph_session();
+    s.update();
+    let problems = execute(&mut s, "project.inspect", &Value::Null).unwrap()["graphs"]["problems"].as_array().map_or(0, Vec::len);
+    assert!(problems > 0, "graphs that cannot render say so");
+    let bytes = s.to_project_bytes().unwrap();
+    let mut back = Session::from_project_bytes(&bytes).unwrap();
+    back.update();
+    let hostile = [json!({}), json!({"layer": 4, "effect": 5, "key": "../x", "value": f64::NAN, "seed": -1, "output": [1]})];
+    // A command gets the hostile-graph session as built: a fresh one after any command that ran, the same one after
+    // commands that were refused (a refused edit leaves the document as it was). Building it renders every graph, so
+    // the hunt builds it only as often as a command changed it, and at the smallest texture size: the hostile
+    // references, not the size, are what it hunts (the start of this test reads them at full size).
+    let fresh = || {
+        let mut s = graph_session_at(128);
+        for texture_set in &mut s.doc.project.texture_sets {
+            texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R256;
+        }
+        s
+    };
+    let mut s = fresh();
+    for spec in command_specs() {
+        if spec.id == "project.sample" {
+            continue;
+        }
+        for p in &hostile {
+            let ran = execute(&mut s, spec.id, p).is_ok();
+            s.update();
+            if ran {
+                s = fresh();
+            }
+        }
+    }
+}
+
 #[test]
 fn copy_paste_flatten_and_resize_keep_the_look() {
     let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 256).unwrap();
@@ -554,6 +676,7 @@ fn image_resources_fill_layers_and_round_trip() {
     let bytes = s.to_project_bytes().unwrap();
     let back = Session::from_project_bytes(&bytes).unwrap();
     assert_eq!(back.doc.resources.len(), 1);
+    assert_eq!(back.images.decoded_bytes(), 0, "an opened project decodes its images when they are read");
     assert_eq!(back.images.len(), 1);
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
@@ -659,7 +782,7 @@ fn text_becomes_a_brush_alpha_and_a_decal() {
     assert_eq!(name, "Text_TEXT.png");
     assert!(r["width"].as_u64().unwrap() > r["height"].as_u64().unwrap() / 2, "two short lines");
     // White with the glyphs in alpha.
-    let img = s.images[&name].clone();
+    let img = s.images.get(&name).unwrap().clone();
     assert!(img.rgba.iter().any(|t| t[3] > 0.99) && img.rgba.iter().any(|t| t[3] == 0.0) && img.rgba.iter().all(|t| t[0] == 1.0));
     // As the brush alpha it paints (keeping its proportions), and it places as a decal.
     execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [1.0, 0.0, 0.0]})).unwrap();
@@ -771,6 +894,47 @@ fn committed_strokes_settle_to_the_full_composite() {
     assert_eq!(full(&mut s), original);
 }
 
+#[test]
+fn cancelling_a_mask_stroke_does_not_reuse_its_paint_margin() {
+    use texturecraft_engine::StackTarget;
+    use texturecraft_engine::core::LayerId;
+    use texturecraft_engine::geom::glam::Vec2;
+
+    let mut s = Session::new_project("t", primitives::plane(1.0, 1), "builtin:plane", None, 256).unwrap();
+    execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+    let plain = s.selected_layer().unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+    let blurred = s.selected_layer().unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let filter = execute(&mut s, "effect.add.filter", &json!({"filter": "blur", "radius": 32.0})).unwrap();
+    let filter = LayerId(filter["effect"].as_u64().unwrap());
+    s.tool.brush.size = 0.01;
+    s.tool.mask_value = 1.0;
+    s.update();
+
+    let uv = Vec2::new(58.0 / 256.0, 96.0 / 256.0);
+    execute(&mut s, "layer.select", &json!({"layer": plain.0})).unwrap();
+    s.target = StackTarget::Mask;
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    s.update();
+    s.cancel_stroke();
+    s.update();
+
+    execute(&mut s, "layer.select", &json!({"layer": blurred.0})).unwrap();
+    s.target = StackTarget::Effect(filter);
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    assert_eq!(s.stroke_tiles(), 1, "the brush stays on one side of the tile boundary");
+    s.end_stroke().unwrap();
+    s.update();
+    let incremental = s.caches[0].composite.clone();
+
+    let recomposited = full(&mut s);
+    assert!(recomposited.value(Channel::BaseColor, 64, 96)[0] > 0.5, "the blur reaches the neighbouring tile");
+    assert_eq!(incremental.value(Channel::BaseColor, 64, 96), recomposited.value(Channel::BaseColor, 64, 96));
+    assert!(incremental == recomposited, "the complete cache matches a full recomposite");
+}
+
 /// A resize prepared from a snapshot and applied later matches the command, keeps edits made
 /// while it ran, and undoes in one step.
 #[test]
@@ -812,6 +976,49 @@ fn background_resizes_match_the_command_and_keep_later_edits() {
     assert_eq!((b.doc.project.texture_sets[0].resolution, painted(&b)), (512, before));
     b.update();
     assert_eq!(b.caches[0].size, (512, 512));
+}
+
+#[test]
+fn graph_resize_keeps_the_current_view_until_ready_and_reuses_previous_results() {
+    use texturecraft_engine::ResizeProgress;
+    use texturecraft_engine::core::{Fill, GraphRef, Layer, LayerKind, Source};
+
+    let mut s = session();
+    let key = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 color r=0.8 g=0.2 b=0.1\noutput out 1\n");
+    let mut fill = Fill::default();
+    fill.sources.insert(Channel::BaseColor, Source::Graph(Box::new(GraphRef::new(key, "resize test"))));
+    let layer = Layer::new(s.doc.project.alloc_id(), "graph fill", LayerKind::Fill(fill), &Channel::DEFAULT_SET);
+    s.doc.project.insert_layer(0, layer, None, false).unwrap();
+    let starting = s.caches[0].size;
+    s.touched();
+    s.update();
+    let old_uses = s.doc.graphs.uses();
+    let old_renders = s.doc.graphs.renders();
+    assert!(!old_uses.is_empty());
+
+    let progress = ResizeProgress::default();
+    let cancelled = s.resize_task(0, 128).unwrap();
+    progress.cancel();
+    assert!(cancelled.run_for_view(&progress, |_, _, _| None, |_| false).is_err());
+    assert_eq!(s.doc.graphs.uses(), old_uses);
+
+    let task = s.resize_task(0, 512).unwrap();
+    let replacement = task.run_for_view(&ResizeProgress::default(), |_, _, _| None, |_| false).unwrap();
+    assert_eq!(s.caches[0].size, starting);
+    assert_eq!(s.doc.graphs.uses(), old_uses);
+    s.apply_resize(replacement).unwrap();
+    assert_eq!(s.pending_tiles(), 0, "the live viewport needs no graph work after the swap");
+    assert!(!s.caches[0].upload.is_empty());
+    assert_ne!(s.doc.graphs.uses(), old_uses);
+    assert!(s.doc.graphs.renders() > old_renders);
+
+    let renders = s.doc.graphs.renders();
+    let task = s.resize_task(0, starting.0).unwrap();
+    let replacement = task.run_for_view(&ResizeProgress::default(), |_, _, _| None, |_| false).unwrap();
+    s.apply_resize(replacement).unwrap();
+    assert_eq!(s.pending_tiles(), 0);
+    assert_eq!(s.doc.graphs.uses(), old_uses, "the previous graph resolution is reusable");
+    assert_eq!(s.doc.graphs.renders(), renders, "returning to the previous size needs no render");
 }
 
 /// A 2048 sphere set with a fill layer and an empty paint layer, a small brush, and the
@@ -862,7 +1069,7 @@ fn undo_recomposites_only_changed_tiles() {
 }
 
 #[test]
-fn undo_with_a_blur_above_recomposites_everything() {
+fn undo_keeps_a_stroke_local_when_a_different_layer_has_a_blur() {
     use texturecraft_engine::geom::glam::Vec2;
     let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 2048).unwrap();
     s.viewport = Vec2::new(400.0, 400.0);
@@ -874,7 +1081,21 @@ fn undo_with_a_blur_above_recomposites_everything() {
     execute(&mut s, "tool.stroke", &json!({"points": [[150, 160], [170, 170]]})).unwrap();
     s.update();
     let stroke = |s: &mut Session| drop(execute(s, "tool.stroke", &json!({"points": [[150, 200], [190, 210]]})).unwrap());
-    check_undo_redo(&mut s, stroke, None);
+    let mut plain = painted_set();
+    stroke(&mut plain);
+    stroke(&mut s);
+    plain.update();
+    s.update();
+    for command in ["edit.undo", "edit.redo"] {
+        execute(&mut plain, command, &Value::Null).unwrap();
+        execute(&mut s, command, &Value::Null).unwrap();
+        assert!(!plain.caches[0].dirty.is_empty());
+        assert_eq!(s.caches[0].dirty, plain.caches[0].dirty, "{command}: the unrelated blur adds no tiles");
+        plain.update();
+        s.update();
+        let incremental = s.caches[0].composite.clone();
+        assert_eq!(incremental, full(&mut s));
+    }
 }
 
 #[test]
@@ -1099,6 +1320,161 @@ fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
     execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"baseColor": {"opacity": 2.0}, "roughness": {"opacity": -1.0}}})).unwrap();
 
     assert_eq!((read(&s)[&Channel::BaseColor].opacity, read(&s)[&Channel::Roughness].opacity), (1.0, 0.0), "opacity is clamped");
+}
+
+#[test]
+fn uniform_uv_sets_do_not_materialize_padding_until_explicitly_read() {
+    use texturecraft_engine::{Solo, texel::DilationMap};
+    for uv_scale in [1.0, 0.0, 0.5] {
+        let mut mesh = primitives::plane(1.0, 1);
+        for uv in &mut mesh.uvs {
+            *uv *= uv_scale;
+        }
+        let mut session = Session::new_project("padding", mesh, "builtin:plane", None, 128).unwrap();
+        session.update();
+        let layer = session.selected_layer().unwrap();
+        session.set_solo(Some(Solo { layer, ignore_mask: false }));
+        session.update();
+        let options = texturecraft_engine::file_cmds::export_options(&session, &json!({"format": "png"}), "test").unwrap();
+        session.export_files(&[0], &options).unwrap();
+        let before = session.memory().total();
+        let coverage = session.caches[0].gbuf.coverage_mask();
+        let oracle = DilationMap::in_blocks(&coverage, 128, 128, Some(texturecraft_engine::session::DISPLAY_PADDING), 128);
+        assert_eq!(session.caches[0].dilation.src, oracle.src);
+        let added = session.memory().total() - before;
+        let expected = if uv_scale == 0.5 { 0 } else { 128 * 128 * size_of::<u32>() };
+        assert_eq!(added, expected, "dense padding allocation for UV scale {uv_scale}");
+    }
+}
+
+#[test]
+fn a_budgeted_slice_composites_the_brush_then_the_visible_uv_before_the_backlog() {
+    use texturecraft_engine::geom::glam::Vec2;
+    let mut s = Session::new_project("demand", primitives::plane(1.0, 1), "builtin:plane", None, 512).unwrap();
+    execute(&mut s, "tool.material", &json!({"channel":"baseColor","color":[1.0,0.0,0.0]})).unwrap();
+    let uv = Vec2::splat(0.9375);
+    s.begin_stroke_uv(uv, 1.0).unwrap();
+    let visible = [Vec2::new(0.5, 0.75), Vec2::new(0.625, 0.875)];
+    s.take_uploads(0);
+    s.caches[0].chunk = 1;
+    s.update_for_view(0.0, || 0.0, s.tile_demand(Some(visible)));
+    assert_eq!(s.take_uploads(0), [(7, 7)]);
+    let value = s.caches[0].composite.value(Channel::BaseColor, 480, 480);
+    assert!(value[0] > value[1]);
+    s.end_stroke().unwrap();
+    s.update_for_view(0.0, || 0.0, s.tile_demand(Some(visible)));
+    assert_eq!(s.take_uploads(0), [(7, 7)], "the released dab gets the first slice");
+    s.update_for_view(0.0, || 0.0, s.tile_demand(Some(visible)));
+    assert_eq!(s.take_uploads(0), [(4, 6)], "the visible UV comes first once the dab upload is acknowledged");
+    s.update();
+    let result = s.caches[0].composite.clone();
+    assert_eq!(result, full(&mut s));
+
+    // A 3D stroke supplies the atlas UV from its existing surface hit.
+    let screen = Vec2::splat(128.0);
+    let viewport = Vec2::splat(256.0);
+    let hit = s.pick(screen, viewport).unwrap();
+    let tile = ((hit.uv.x * 512.0) as u32 / 64, (hit.uv.y * 512.0) as u32 / 64);
+    assert_ne!(tile, (0, 0));
+    assert!(s.begin_stroke(screen, viewport, 1.0).unwrap());
+    s.caches[0].invalidate_all();
+    s.take_uploads(0);
+    s.caches[0].chunk = 1;
+    s.update_for_view(0.0, || 0.0, s.tile_demand(None));
+    assert_eq!(s.take_uploads(0), [tile]);
+}
+
+#[test]
+fn switching_materials_reuses_idle_bands_within_the_active_budget() {
+    let mut s = Session::new_project("bands", primitives::crate_scene(), "builtin:crate", None, 128).unwrap();
+    let source = s.selected[&1];
+    execute(&mut s, "layer.instance", &json!({"layer":source.0, "ts":2})).unwrap();
+    execute(&mut s, "textureSet.select", &json!({"ts":0})).unwrap();
+    execute(&mut s, "layer.add.fill", &json!({"color":[0.1,0.3,0.7]})).unwrap();
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    s.update();
+    let bytes = s.caches[0].below.bytes();
+    assert!(bytes > 0);
+    let select = |s: &mut Session, ts| {
+        execute(s, "textureSet.select", &json!({"ts": ts})).unwrap();
+        s.update();
+    };
+    select(&mut s, 1);
+    assert_eq!(s.caches[0].below.bytes(), bytes);
+    select(&mut s, 0);
+    assert_eq!(s.caches[0].below.bytes(), bytes);
+    // The parked set alone would fit. A third set drawing an instance of
+    // material one's selected layer also earns bands from this pass.
+    s.caches[1].below.budget = bytes + s.caches[1].below.bytes();
+    s.caches[2].invalidate_all();
+    select(&mut s, 1);
+    assert!(s.caches[2].below.bytes() > 0);
+    assert_eq!(s.caches[0].below.bytes(), 0);
+    select(&mut s, 0);
+    s.caches[0].invalidate_all();
+    s.update();
+    assert_eq!(s.caches[0].composite.clone(), full(&mut s));
+}
+
+#[test]
+fn an_opened_project_reads_its_pixels_when_it_composites_and_composites_the_same() {
+    let mut s = session();
+    execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [1.0, 0.0, 0.0]})).unwrap();
+    execute(&mut s, "tool.brush", &json!({"size": 20, "hardness": 90})).unwrap();
+    execute(&mut s, "tool.stroke", &json!({"points": [[180, 200], [220, 200]]})).unwrap();
+    s.update();
+    let dir = std::env::temp_dir().join(format!("tc-lazy-open-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (path, moved) = (dir.join("a.tcraft"), dir.join("b.tcraft"));
+    execute(&mut s, "file.saveCopy", &json!({"path": path.to_str().unwrap()})).unwrap();
+
+    let mut back = texturecraft_engine::file_cmds::open_path(path.to_str().unwrap()).unwrap();
+    assert!(!back.doc.pixels.layers.is_empty());
+    assert!(back.doc.pixels.layers.values().all(|img| !img.is_loaded()), "nothing read at open");
+    back.update();
+    assert!(back.doc.pixels.layers.values().any(|img| img.is_loaded()), "read to composite");
+    for c in [Channel::BaseColor, Channel::Roughness] {
+        assert!(back.caches[0].composite.channels.get(&c) == s.caches[0].composite.channels.get(&c), "{c:?} composites the same");
+    }
+    // Saving a new archive and deleting the original path preserves the open document's pixel sources.
+    execute(&mut back, "file.save", &json!({"path": moved.to_str().unwrap()})).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    for img in back.doc.pixels.layers.values_mut() {
+        img.release();
+    }
+    assert!(back.doc.pixels.layers.values().all(|img| img.allocated_count() > 0 && !img.is_loaded()));
+    assert_eq!(back.doc.pixels.layers, s.doc.pixels.layers, "the original archive generation remains readable");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A fill channel reading a graph's alpha output itself (a material's opacity output on the opacity channel) lays that
+/// value whole; the other channels of the source are covered by it.
+#[test]
+fn a_source_reading_its_own_alpha_output_is_not_gated_by_it() {
+    use texturecraft_engine::core::{Fill, GraphRef, Layer, LayerKind, Source};
+    let mut s = session();
+    let text = s.doc.graphs.add_text("format 3\nsize 16\nnode 1 color r=0.25 g=0.25 b=0.25\nnode 2 color r=0.75 g=0.75 b=0.75\noutput a 1\noutput v 2\n");
+    let mut own = GraphRef::new(text.clone(), "material");
+    own.output = Some("a".into());
+    own.alpha_output = Some("a".into());
+    let mut other = own.clone();
+    other.output = Some("v".into());
+    let mut fill = Fill::default();
+    fill.sources.insert(Channel::Roughness, Source::Graph(Box::new(own)));
+    fill.sources.insert(Channel::Metallic, Source::Graph(Box::new(other)));
+    let id = s.doc.project.alloc_id();
+    let layer = Layer::new(id, "material", LayerKind::Fill(fill), &Channel::DEFAULT_SET);
+    s.doc.project.insert_layer(0, layer, None, false).unwrap();
+    for c in &mut s.caches {
+        c.invalidate_all();
+    }
+    let below = s.caches[0].composite.value(Channel::Metallic, 128, 128)[0];
+    s.update();
+    let rough = s.caches[0].composite.value(Channel::Roughness, 128, 128)[0];
+    let metal = s.caches[0].composite.value(Channel::Metallic, 128, 128)[0];
+    assert!((rough - 0.25).abs() < 0.02, "the alpha output laid whole: {rough}");
+    let expected = 0.75 * 0.25 + below * 0.75;
+    assert!((metal - expected).abs() < 0.02, "another output covered by the alpha: {metal} (below {below})");
 }
 
 #[test]

@@ -144,7 +144,7 @@ fn baking_covers_every_tile() {
     let baked = s.baked(0).unwrap();
     assert_eq!((baked.resolution, baked.height(BakedMap::Position)), (256, 128));
     // Position x grows across the atlas: tile 1001 holds x < 0, tile 1002 x > 0.
-    let pos = &baked.maps[&BakedMap::Position];
+    let pos = baked.maps[&BakedMap::Position].to_f32();
     let x_at = |x: usize| pos[(64 * 256 + x) * 3];
     assert!(x_at(10) < 0.3 && x_at(250) > 0.7, "{} {}", x_at(10), x_at(250));
     s.update();
@@ -167,7 +167,7 @@ fn mesh_maps_from_images_take_one_image_per_tile() {
     assert!(set(&mut s, &plain).is_err(), "no tile number in the name");
     s.import_resource_bytes("ao.1002.png", png(0)).unwrap();
     let r = set(&mut s, &left).unwrap()["resolution"].as_u64().unwrap() as usize;
-    let ao = &s.doc.baked[&0].maps[&BakedMap::AmbientOcclusion];
+    let ao = s.doc.baked[&0].maps[&BakedMap::AmbientOcclusion].to_f32();
     let h = ao.len() / r;
     assert_eq!(r, 2 * h, "a block of the bake size per tile, side by side");
     let at = |x: usize| ao[(h / 2) * r + x];

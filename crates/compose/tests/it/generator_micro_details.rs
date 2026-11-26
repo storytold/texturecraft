@@ -30,7 +30,7 @@ fn fixture() -> GeneratorFixture {
     let mut fixture = GeneratorFixture::new(mesh, "builtin:plane", RES);
 
     let texels = (RES * RES) as usize;
-    let maps = [(BakedMap::AmbientOcclusion, Arc::new(vec![1.0; texels])), (BakedMap::Curvature, Arc::new(vec![0.5; texels]))];
+    let maps = [(BakedMap::AmbientOcclusion, Arc::new(vec![1.0; texels].into())), (BakedMap::Curvature, Arc::new(vec![0.5; texels].into()))];
     let baked = BakedMaps { resolution: RES, maps: maps.into() };
 
     let texel_xy = |index: u32| ((index % BUMP_SIZE) as f32 + 0.5, (index / BUMP_SIZE) as f32 + 0.5);
@@ -196,7 +196,7 @@ fn saved_micro_values_out_of_range_render_as_their_nearest_valid_ones() {
 #[test]
 fn micro_curvature_follows_the_layout_of_a_shared_bake() {
     let mut fixture = fixture();
-    let curvature = Arc::new(vec![0.5; (2 * RES * RES) as usize]);
+    let curvature = Arc::new(texturecraft_compose::Texels::from(vec![0.5; (2 * RES * RES) as usize]));
     fixture.baked.maps.insert(BakedMap::Curvature, curvature.clone());
     let generator = raw_curvature(with_micro(GeneratorKind::Curvature, Some("bump"), None, strong));
 

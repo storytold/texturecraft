@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use texturecraft_compose::{DisplayKind, ImageRes};
 use texturecraft_geom::glam::Vec3;
 use texturecraft_geom::{OrbitCamera, primitives};
@@ -46,9 +49,29 @@ impl Img {
 /// The id `setup` uploads the material ball under
 const MESH_ID: u64 = 1;
 
+/// Holds this test thread's turn until the thread ends, after the test dropped its device: the
+/// NVIDIA driver can deadlock when one test destroys its device while another records commands
+/// on its own. A thread that runs several tests (one test thread) keeps its turn.
+fn take_turn() {
+    static TURN: Mutex<()> = Mutex::new(());
+    thread_local! {
+        static HELD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
+    }
+    HELD.with(|held| {
+        if held.borrow().is_none() {
+            *held.borrow_mut() = Some(TURN.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+    });
+}
+
 /// A headless renderer with the material ball framed in a 480×360 view (None without a GPU).
 fn setup() -> Option<(Headless, Frame)> {
-    let Ok(mut h) = Headless::new() else {
+    setup_with(Headless::new)
+}
+
+fn setup_with(headless: impl FnOnce() -> Result<Headless, String>) -> Option<(Headless, Frame)> {
+    take_turn();
+    let Ok(mut h) = headless() else {
         eprintln!("skipping: no GPU adapter");
         return None;
     };
@@ -595,7 +618,8 @@ fn bake_visualization_draws_the_high_poly_and_the_cage() {
 
 #[test]
 fn oversized_bake_high_poly_leaves_the_view_renderable() {
-    let Some((mut headless, frame)) = setup() else { return };
+    // The WebGPU default buffer limit (256 MiB) keeps the oversized mesh small enough to build
+    let Some((mut headless, frame)) = setup_with(|| Headless::with_limits(|_| texturecraft_render::wgpu::Limits::default())) else { return };
 
     let high = primitives::sphere(0.5, 16, 8);
     headless.renderer.set_bake_high(&headless.device, &headless.queue, Some(&high), 1).unwrap();
@@ -814,6 +838,43 @@ fn parallax_follows_the_height_channel() {
     let (off, on) = (render(&mut h, &frame, "parallax_off"), render(&mut h, &pom, "parallax_on"));
     assert_ne!(off.px, on.px, "a checker height field shifts the textures");
     assert!(on.mean(200, 100, 280, 180) > 20.0);
+}
+
+/// Mean tilt of the shown tangent-space normal (channel view 3) over the ball: |x| + |y| in 8-bit levels.
+fn normal_tilt(img: &Img) -> f32 {
+    let mut sum = 0.0;
+    for y in 100..180 {
+        for x in 200..280 {
+            let [r, g, _] = img.at(x, y);
+            sum += (r as f32 - 128.0).abs() + (g as f32 - 128.0).abs();
+        }
+    }
+    sum / 6400.0
+}
+
+#[test]
+fn height_to_normal_follows_the_project_rule() {
+    use texturecraft_core::rules::HeightNormal;
+    let Some((mut h, frame)) = setup() else { return };
+    let normals = |rule: HeightNormal| {
+        shaded(&frame, |s| {
+            s.view_mode = 1;
+            s.channel = 3;
+            s.height_normal = rule;
+        })
+    };
+    upload_height(&mut h, |x, y| [((x as f32 * 0.2).sin() + (y as f32 * 0.2).sin()) * 0.25, 0.04, 0.04, 0.04]);
+    let native = render(&mut h, &normals(HeightNormal::Native), "height_normal_native");
+    let default = render(&mut h, &shaded(&frame, |s| (s.view_mode, s.channel) = (1, 3)), "height_normal_default");
+    assert_same(&native, &default, "rules off keep the viewport's own height bumps");
+    let sobel = render(&mut h, &normals(HeightNormal::Sobel), "height_normal_sobel");
+    let backward = render(&mut h, &normals(HeightNormal::Backward), "height_normal_backward");
+    let (n, s, b) = (normal_tilt(&native), normal_tilt(&sobel), normal_tilt(&backward));
+    // The measured slope is 0.16 of the native one.
+    assert!(n > 10.0, "the height field tilts the native normals ({n})");
+    assert!(s > 0.5 && s < n * 0.3, "Sobel at the measured slope tilts far less ({s} vs {n})");
+    assert!(b > 0.5 && b < n * 0.3, "backward differences at the measured slope tilt far less ({b} vs {n})");
+    assert_ne!(sobel.px, backward.px, "the two measured filters differ");
 }
 
 #[test]
@@ -1291,4 +1352,34 @@ fn signed_half_float_normal_tiles_change_shading() {
     let (tilted_pixels, _) = tilted.px.as_chunks::<4>();
     let changed_pixels = flat_pixels.iter().zip(tilted_pixels).filter(|(before, after)| before != after).count();
     assert!(changed_pixels > 100, "the signed normal should change the material highlight: {changed_pixels} pixels");
+}
+
+#[test]
+fn prepacked_viewport_tiles_match_full_tiles_after_device_downscaling() {
+    let Some((mut h, frame)) = setup() else { return };
+    h.renderer.set_display_shift(2);
+    h.renderer.set_texture_sets(&h.device, &h.queue, &[((80, 96), 0)], 2);
+    let mut uv = Frame { kind: ViewKind::Uv { ts: 0, zoom: 1.0, pan: [0.0, 0.0], rotation: 0.0 }, ..frame };
+    uv.shade.view_mode = 1;
+    uv.shade.channel = 0;
+    let neutral = render(&mut h, &uv, "before_packed_tiles");
+    let full: Vec<u8> = (0..64u8).flat_map(|y| (0..64u8).flat_map(move |x| [4 * x, 4 * y, 244, 255])).collect();
+    let packed: Vec<_> =
+        full.as_chunks::<{ 64 * 4 }>().0.iter().step_by(2).flat_map(|row| row.as_chunks::<4>().0.iter().step_by(2).flatten().copied()).collect();
+    for y in 0..2 {
+        for x in 0..2 {
+            h.renderer.upload_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, x, y, &full);
+        }
+    }
+    let reference = render(&mut h, &uv, "full_tiles_downscaled");
+    assert_ne!(reference.px, neutral.px);
+    // Recreate the texture so missing writes cannot reuse the reference pixels.
+    h.renderer.set_texture_sets(&h.device, &h.queue, &[], 2);
+    h.renderer.set_texture_sets(&h.device, &h.queue, &[((80, 96), 0)], 2);
+    for y in 0..2 {
+        for x in 0..2 {
+            h.renderer.upload_display_tile(&h.device, &h.queue, 0, DisplayKind::BaseColor, x, y, &packed, 1);
+        }
+    }
+    assert_same(&render(&mut h, &uv, "packed_tiles_downscaled"), &reference, "packed tiles and clipped edges");
 }

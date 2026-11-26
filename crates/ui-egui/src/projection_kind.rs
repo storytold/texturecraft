@@ -1,6 +1,6 @@
 //! The projections a fill's Projection dropdown offers
 
-use texturecraft_engine::core::Projection;
+use texturecraft_engine::core::{PlacedMode, Projection};
 
 use crate::i18n::n_;
 
@@ -50,6 +50,16 @@ impl ProjectionKind {
             Projection::Spherical { .. } => ProjectionKind::Spherical,
             Projection::Cylindrical { .. } => ProjectionKind::Cylindrical,
             Projection::Warp { .. } => ProjectionKind::Warp,
+
+            // An imported placement shows as the kind it places
+            Projection::Placed(placed) => match placed.mode {
+                PlacedMode::Uv { .. } => ProjectionKind::Uv,
+                PlacedMode::TriPlanar { .. } => ProjectionKind::Triplanar,
+                PlacedMode::Planar { .. } => ProjectionKind::Planar,
+                PlacedMode::Spherical => ProjectionKind::Spherical,
+                PlacedMode::Cylindrical { .. } => ProjectionKind::Cylindrical,
+                PlacedMode::Warp { .. } => ProjectionKind::Warp,
+            },
         }
     }
 

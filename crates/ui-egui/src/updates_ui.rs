@@ -130,7 +130,6 @@ mod tests {
     use egui_kittest::kittest::Queryable as _;
     use serde_json::json;
     use texturecraft_engine::Tool;
-    use texturecraft_engine::bake::Progress;
     use texturecraft_engine::geom::glam::Vec2;
 
     use super::*;
@@ -305,7 +304,8 @@ mod tests {
         assert!(!safe_to_close(h.state()), "an accepted high-poly import is still pending");
         h.state_mut().high_poly_job = None;
 
-        h.state_mut().resize = Some(crate::ResizeJob { progress: Arc::new(Progress::new()), rx: channel().1 });
+        let project = h.state().session.project_id;
+        h.state_mut().resize = Some(crate::ResizeJob { progress: Arc::new(texturecraft_engine::ResizeProgress::default()), rx: channel().1, project });
         assert!(!safe_to_close(h.state()), "a resize");
         h.state_mut().resize = None;
 

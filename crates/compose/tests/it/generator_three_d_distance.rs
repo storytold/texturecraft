@@ -15,7 +15,7 @@ fn fixture() -> GeneratorFixture {
     let mesh = primitives::sphere(1.0, 32, 16);
     let mut fixture = GeneratorFixture::new(mesh, "builtin:sphere", RES);
 
-    let baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![1.0; (RES * RES) as usize]))].into() };
+    let baked = BakedMaps { resolution: RES, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![1.0; (RES * RES) as usize].into()))].into() };
     fixture.baked = baked;
     fixture
 }

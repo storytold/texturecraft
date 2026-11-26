@@ -71,7 +71,7 @@ static CURVATURE_CACHE: MicroCache<MicroCurvature> = MicroCache::new();
 static OCCLUSION_CACHE: MicroCache<LayoutMap> = MicroCache::new();
 
 /// A baked map, its size and the size of one UV tile's block in it
-type MapLayout = (Arc<Vec<f32>>, (u32, u32), (u32, u32));
+type MapLayout = (Arc<crate::Texels>, (u32, u32), (u32, u32));
 
 /// The baked `map`'s layout (None when it isn't baked)
 fn layout(inp: &Inputs, map: BakedMap) -> Option<MapLayout> {
