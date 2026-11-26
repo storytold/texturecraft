@@ -108,7 +108,7 @@ fn a_number_field_scrubs_past_the_edge_with_the_pointer_held() {
     let (mut harness, layer) = crate::frame_gizmo::tests::fill_app("triplanar");
     hold_like(&harness.ctx, Hold::PutBack);
     let press = harness.get_by_label("Offset X").rect().center();
-    let mut pointer = SystemPointer::at(&mut harness, press);
+    let mut pointer = SystemPointer::in_app(&mut harness, press);
     pointer.button(&mut harness, PointerButton::Primary, true, Modifiers::NONE);
     let window = harness.ctx.content_rect().width();
     pointer.drags(&mut harness, vec2(2.0 * window, 0.0), 40, Modifiers::NONE);

@@ -154,7 +154,7 @@ cargo run --release -p texturecraft-cli -- new builtin:crate crate.tcraft --samp
 cargo run --release -p texturecraft-cli -- render crate.tcraft crate.png --samples 256   # path traced
 cargo run --release -p texturecraft-cli -- export crate.tcraft textures                 # headless export
 cd apps/texturecraft-web && trunk serve                      # web build
-cargo xtask ci                                               # fmt, clippy, tests, layering, wasm
+cargo xtask ci                                               # fmt, clippy, tests, layering, wasm (not on Windows)
 ```
 
 You need Rust 1.95 or newer. The app opens with no project (**File ▸ Open sample project** loads a baked one, and **File ▸ Close** returns to the empty state).

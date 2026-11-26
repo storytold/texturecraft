@@ -436,7 +436,8 @@ mod tests {
     #[test]
     fn mesh_picks_only_update_the_current_new_project_request() {
         let session = Session::closed().unwrap();
-        let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
         let app = harness.state_mut();
         crate::new_project_advanced::open(app);
         app.ui.new_project.mesh_request_id = 2;
@@ -458,7 +459,8 @@ mod tests {
     #[test]
     fn environment_pick_after_close_does_not_edit_the_placeholder() {
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
-        let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
         let png = texturecraft_engine::formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
         let old_project_id = harness.state().session.project_id;
 
@@ -480,7 +482,8 @@ mod tests {
     #[test]
     fn environment_pick_from_replaced_project_does_not_edit_the_new_project() {
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
-        let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
         let png = texturecraft_engine::formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
         let old_project_id = harness.state().session.project_id;
 
@@ -498,7 +501,8 @@ mod tests {
     #[test]
     fn bake_mesh_picks_after_close_do_not_edit_the_placeholder() {
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
-        let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
         let old_project_id = harness.state().session.project_id;
         assert!(harness.state_mut().run("file.close", serde_json::Value::Null).is_some());
         let cage = harness.state().session.mesh_obj_bytes().unwrap();

@@ -27,7 +27,7 @@ fn app(storage: &MemoryStorage) -> Harness<'static, TextureCraftApp> {
 
     // The view has no accessible name of its own; these tests drive it by position
     let builder = Harness::builder().with_size(PROPERTIES_WINDOW).with_accessibility_check(false);
-    let mut harness = builder.build_eframe(|context| {
+    let mut harness = builder.with_context_setup(texturecraft_ui_egui::framework::install_headless).build_eframe(|context| {
         let mut creation = eframe::CreationContext::_new_kittest(context.egui_ctx.clone());
         creation.storage = Some(storage);
         TextureCraftApp::new(&creation, session)
@@ -93,7 +93,7 @@ fn stroke_on_model(harness: &mut Harness<'_, TextureCraftApp>, modifiers: Modifi
 
 /// Opens the paint tool's Base color swatch from its Properties' Material tab
 fn open_tool_color(harness: &mut Harness<'_, TextureCraftApp>) {
-    let header = harness.get_by_label("Properties - Paint").rect();
+    let header = harness.get_by_role_and_label(egui::Role::Tab, "Properties - Paint").rect();
     let in_properties = |rect: egui::Rect| header.x_range().contains(rect.center().x) && rect.top() > header.top();
     let material = harness.get_all_by_label("Material").find(|node| in_properties(node.rect())).unwrap();
     material.click();

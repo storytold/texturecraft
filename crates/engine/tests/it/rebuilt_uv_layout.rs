@@ -57,6 +57,31 @@ fn a_rebuilt_project_reopens_with_its_saved_uv_layout_not_a_new_unwrap() {
 }
 
 #[test]
+fn a_pending_save_keeps_the_rebuilt_layout_and_releases_unused_bake_geometry() {
+    let mut session = Session::from_project_bytes(&locked_archive()).unwrap();
+    session.add_high_poly_bytes("high.obj", QUAD_OBJ.as_bytes().to_vec()).unwrap();
+    let expected_layout = corner_uvs(&session.source_mesh());
+    let high = &session.doc.bake_meshes.high[0];
+    let encoded = std::sync::Arc::downgrade(&high.bytes);
+    let parsed = std::sync::Arc::downgrade(&high.mesh);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("saved.tcraft");
+
+    let save = session.save_task(path.to_str().unwrap(), true);
+    drop(session);
+    assert!(parsed.upgrade().is_none(), "only the source UV layout needs parsed geometry");
+    assert!(encoded.upgrade().is_some(), "the pending archive shares the original file bytes");
+
+    save.run(None).unwrap();
+    let reopened = texturecraft_engine::file_cmds::open_path(path.to_str().unwrap()).unwrap();
+
+    assert!(encoded.upgrade().is_none(), "the worker released the original bytes");
+    assert_eq!(reopened.doc.bake_meshes.high[0].bytes.as_slice(), QUAD_OBJ.as_bytes());
+    assert!(reopened.doc.project.mesh_rebuild_uvs);
+    assert_eq!(corner_uvs(&reopened.source_mesh()), expected_layout);
+}
+
+#[test]
 fn opening_a_builtin_project_refuses_rebuilt_mesh_uvs() {
     let mut file = texturecraft_engine::formats::load_project_bytes(&locked_archive()).unwrap();
     file.project.mesh = "builtin:plane".into();

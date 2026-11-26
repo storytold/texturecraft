@@ -155,6 +155,13 @@ entry and icons).
 Secrets live only in the `release` environment and are all optional: a missing one gives an
 unsigned artifact and a `::warning::`, never a failed build.
 
+The supervised nightly signer does not sign from `release`: it runs on `refs/heads/nightly-signer`,
+which only ever fast-forwards to reviewed main commits, and the `release` environment must admit
+`nightly-signer` alongside `release` before the first dispatch. Everything that can reach it is the
+trust closure: all of `.github/` and `packaging/`, including `packaging/env.sh`, which
+`packaging/macos/import-cert.sh` sources with the Apple keys. Stable releases still come only from
+`refs/heads/release`.
+
 - macOS: `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `KEYCHAIN_PASSWORD` (import into a
   temporary keychain, `packaging/macos/import-cert.sh`), then `APPLE_ID`, `APPLE_PASSWORD`,
   `APPLE_TEAM_ID` for `notarytool` and stapling. Without them the app is ad-hoc signed.
@@ -173,7 +180,7 @@ artwork and keep `ATTRIBUTION.md` in step. See `assets/app-icon/README.md`.
 
 ## Local checks
 
-- `cargo xtask ci`: fmt, clippy, tests, `cargo xtask layers`, `cargo xtask wasm`.
+- `cargo xtask ci`: fmt, clippy, tests, `cargo xtask layers`, `cargo xtask wasm` (not run by `ci` on Windows; the other hosts cover it).
 - `bash packaging/linux/apprun-test.sh` and `bash packaging/freebsd/package.sh --dry-run` run
   anywhere with bash.
 - `packaging/macos/package.sh --arch aarch64` on a Mac builds an ad-hoc signed DMG.

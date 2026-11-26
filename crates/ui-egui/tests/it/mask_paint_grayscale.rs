@@ -26,7 +26,11 @@ fn folder_mask_harness() -> (Harness<'static, TextureCraftApp>, String) {
     let folder = LayerId(execute(&mut session, "layer.add.group", &json!({})).unwrap()["layer"].as_u64().unwrap());
     execute(&mut session, "mask.add.white", &json!({"layer": folder.0})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": folder.0, "target": "mask"})).unwrap();
-    let mut harness = Harness::builder().with_size(PROPERTIES_WINDOW).with_step_dt(FRAME_SECONDS).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_step_dt(FRAME_SECONDS)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.props_tab = PropsTab::Material;
     harness.run_steps(STARTUP_FRAMES);

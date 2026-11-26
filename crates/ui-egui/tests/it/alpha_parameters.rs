@@ -17,7 +17,10 @@ fn changed_params() -> AlphaParams {
 /// The app showing the Alpha tab of Properties, with `brush`
 fn app_with_brush(brush: BrushSettings) -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().session.tool.brush = brush;
     harness.state_mut().ui.props_tab = PropsTab::Alpha;

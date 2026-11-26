@@ -18,7 +18,10 @@ fn app_with_dirt() -> (Harness<'static, TextureCraftApp>, LayerId) {
     execute(&mut session, "layer.select", &json!({"layer": layer["layer"]})).unwrap();
     session.target = StackTarget::Effect(effect);
 
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(4);
     (harness, effect)
 }
@@ -92,7 +95,11 @@ fn generator_picker_snapshots() {
     let effect = execute(&mut session, "effect.add.generator", &json!({"generator": "EdgeWear"})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": layer["layer"]})).unwrap();
     session.target = StackTarget::Effect(LayerId(effect["effect"].as_u64().unwrap()));
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(20);
     harness.get_by_role_and_label(Role::ComboBox, "Worn Metal Edges").click();
 

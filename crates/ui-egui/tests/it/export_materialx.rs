@@ -11,7 +11,10 @@ const OPENPBR: &str = "OpenPBR (separate maps)";
 /// The Export textures window writing into a scratch folder of its own for `name`
 fn harness(name: &str) -> (Harness<'static, TextureCraftApp>, std::path::PathBuf) {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut app_harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut app_harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     app_harness.state_mut().ui.prefs.language = "en".into();
     app_harness.run_steps(4);
 

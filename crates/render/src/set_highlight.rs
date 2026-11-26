@@ -1,4 +1,4 @@
-//! A texture set's mesh edges drawn over the 3D view in a highlight color (the set under a shelf drag)
+//! Texture-set highlighting in the 3D viewport.
 
 /// Brightest on-screen value the tone curve can reach without an infinite scene value
 const MAX_ACES_SCREEN_VALUE: f32 = 0.99;
@@ -6,16 +6,16 @@ const MAX_ACES_SCREEN_VALUE: f32 = 0.99;
 /// Scene scale the post pass applies before its ACES curve (`aces` in post.wgsl)
 const ACES_INPUT_SCALE: f32 = 0.6;
 
-/// Draw texture set `set`'s mesh edges over the 3D view in `color`
+/// A texture set to highlight in the 3D viewport.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SetHighlight {
     pub set: usize,
-    /// The lines' color on screen, linear RGB
+    /// The highlight color on screen, linear RGB.
     pub color: [f32; 3],
 }
 
 impl SetHighlight {
-    /// The scene color the lines are drawn with so that exposure `exposure_ev` and the tone curve (ACES when `aces`) show them in [`Self::color`]
+    /// The scene color that exposure `exposure_ev` and the tone curve (ACES when `aces`) show as [`Self::color`].
     pub fn scene_color(&self, exposure_ev: f32, aces: bool) -> [f32; 3] {
         scene_color_showing(self.color, exposure_ev, aces)
     }

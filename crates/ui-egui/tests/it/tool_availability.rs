@@ -24,7 +24,10 @@ fn select_nothing(session: &mut Session) {
 
 fn app_harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.run_steps(4);
     harness
 }
@@ -68,7 +71,7 @@ fn a_fill_layer_greys_the_paint_tools_and_shows_its_own_properties() {
     assert!(shelf_button_disabled(&harness, "Polygon fill (4)"));
     assert!(!shelf_button_selected(&harness, "Polygon fill (4)"), "the equipped tool doesn't show as selected while greyed");
     assert!(!shelf_button_disabled(&harness, "Geometry mask (8)"));
-    assert!(shows_text(&harness, "PROPERTIES - FILL"), "a fill layer shows its fill whatever the tool");
+    assert!(shows_text(&harness, "Properties - Fill"), "a fill layer shows its fill whatever the tool");
     assert!(!shows_text(&harness, "Size"), "a tool that can't act leaves the top bar");
 }
 
@@ -138,7 +141,10 @@ fn a_tool_that_cant_act_ignores_the_view() {
 fn bake_painting_turns_on_the_shelf_paint_tool() {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     session.add_high_poly_bytes("High.obj", b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".to_vec()).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.mode = Mode::Baking;
     harness.run_steps(4);
     assert!(shelf_button_disabled(&harness, "Paint (1)"), "nothing is being painted yet");
@@ -188,7 +194,11 @@ fn tool_availability_snapshots() {
 
     std::fs::create_dir_all(&directory).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).wgpu().build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     let save = |harness: &mut Harness<'_, TextureCraftApp>, name: &str| {
         for (brightness, suffix) in [(Brightness::MediumDark, "medium"), (Brightness::Dark, "dark"), (Brightness::Light, "light")] {
             harness.state_mut().ui.prefs.brightness = brightness;

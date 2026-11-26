@@ -1,3 +1,5 @@
+use super::warp_toolbar::GizmoMode;
+
 /// What a drag on the frame does
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum FrameGrab {
@@ -13,15 +15,29 @@ pub(crate) enum FrameGrab {
     Corner(usize),
     /// The ring: turn it round its normal
     Turn,
+    /// Place on surface: anywhere over the model puts the frame where the pointer touches it
+    Place,
 }
 
 impl FrameGrab {
+    /// Whether a warp's gizmo in `mode` offers this handle: its corners stay in every mode
+    pub(super) fn offered_in(self, mode: GizmoMode) -> bool {
+        match self {
+            FrameGrab::Slide | FrameGrab::Axis(_) => mode == GizmoMode::Move,
+            FrameGrab::Turn => mode == GizmoMode::Rotate,
+            FrameGrab::Side(_) => mode == GizmoMode::Scale,
+            FrameGrab::Place => mode == GizmoMode::PlaceOnSurface,
+            FrameGrab::Scale | FrameGrab::Corner(_) => true,
+        }
+    }
+
     pub(super) fn cursor(self, dragging: bool) -> egui::CursorIcon {
         match self {
             FrameGrab::Slide if dragging => egui::CursorIcon::Grabbing,
             FrameGrab::Slide => egui::CursorIcon::Grab,
             FrameGrab::Axis(_) | FrameGrab::Corner(_) | FrameGrab::Turn => egui::CursorIcon::Move,
             FrameGrab::Scale => egui::CursorIcon::ResizeNwSe,
+            FrameGrab::Place => egui::CursorIcon::Crosshair,
             FrameGrab::Side(side) if side % 2 == 0 => egui::CursorIcon::ResizeVertical,
             FrameGrab::Side(_) => egui::CursorIcon::ResizeHorizontal,
         }

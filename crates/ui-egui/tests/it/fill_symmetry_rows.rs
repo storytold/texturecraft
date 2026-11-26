@@ -134,7 +134,9 @@ fn commit_value_by_clicking_track(harness: &mut Harness<'_, TextureCraftApp>, va
     let pos = along(track, 0.75);
     let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
     harness.input_mut().events.extend([egui::Event::PointerMoved(pos), button(true), button(false)]);
-    harness.step();
+    // The runtime takes one press per pass: the click's release, and the field's commit on losing focus, land in the
+    // next frame
+    harness.run_steps(2);
 }
 
 #[test]

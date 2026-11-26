@@ -42,11 +42,13 @@ mod load_budget;
 mod project_open_limit;
 mod ram_operation;
 mod ram_reservation;
+mod save_progress;
 mod uv_layout;
 #[cfg(not(target_arch = "wasm32"))]
 pub use entries::{DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, configured_ram_budget, save_ram_budget, set_save_resources};
 pub use project_open_limit::{DEFAULT_PROJECT_OPEN_LIMIT_GIB, project_open_limit_gib, set_project_open_limit_gib};
 pub use ram_reservation::RamReservation;
+pub use save_progress::SaveProgress;
 
 const KIND: &str = "project file";
 #[cfg(test)]
@@ -70,21 +72,21 @@ pub use bake_paint_data::BakePaintData;
 
 /// Everything a project file holds.
 #[derive(Clone, Debug)]
-pub struct ProjectFile<Resource = Vec<u8>> {
+pub struct ProjectFile<Resource = Vec<u8>, MeshBytes = Vec<u8>> {
     pub project: Project,
     pub pixels: PixelStore,
     /// Baked mesh maps per texture set index.
     pub baked: BTreeMap<usize, BakedMaps>,
     /// Original mesh file: (extension, bytes).
-    pub mesh: Option<(String, Vec<u8>)>,
+    pub mesh: Option<(String, MeshBytes)>,
     /// Saved UV layout of `mesh` when its UVs were rebuilt: the UV of every triangle corner, in
     /// index order, as the mesh was first imported.
     pub mesh_uvs: Option<Vec<Vec2>>,
     /// High-definition mesh files for baking: (file name, bytes). Names are
     /// [`sanitize_resource_name`]d on save.
-    pub high_poly: Vec<(String, Vec<u8>)>,
+    pub high_poly: Vec<(String, MeshBytes)>,
     /// Baking cage mesh file: (file name, bytes).
-    pub cage: Option<(String, Vec<u8>)>,
+    pub cage: Option<(String, MeshBytes)>,
     pub bake_paint: BTreeMap<(usize, BakePaintTarget), BakePaintData>,
     pub thumbnail: Option<Vec<u8>>,
     /// Imported resources (images used by fills, alphas, stencils), by name: original bytes.
@@ -93,7 +95,7 @@ pub struct ProjectFile<Resource = Vec<u8>> {
     pub warnings: Vec<String>,
 }
 
-impl<Resource> ProjectFile<Resource> {
+impl<Resource, MeshBytes> ProjectFile<Resource, MeshBytes> {
     /// Check that the mesh source and the rebuild setting agree with the saved layout.
     pub fn validate_mesh_uvs(&self) -> Result<()> {
         if self.project.mesh_rebuild_uvs != self.mesh_uvs.is_some() {
@@ -132,11 +134,15 @@ pub fn save_project(path: &std::path::Path, project_file: &ProjectFile) -> Resul
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn write_project_atomic(path: &std::path::Path, project_file: &ProjectFile<impl Borrow<Vec<u8>>>) -> Result<()> {
+fn write_project_atomic(
+    path: &std::path::Path,
+    project_file: &ProjectFile<impl Borrow<Vec<u8>>, impl Borrow<Vec<u8>>>,
+    progress: Option<&SaveProgress>,
+) -> Result<()> {
     let (temporary_path, file) = crate::create_temp(path)?;
     let result = (|| -> Result<()> {
         let mut file = std::io::BufWriter::new(file);
-        write_project(&mut file, project_file)?;
+        write_project(&mut file, project_file, progress)?;
         file.into_inner().map_err(|error| error.into_error())?.sync_all()?;
         std::fs::rename(&temporary_path, path)?;
         Ok(())
@@ -210,7 +216,7 @@ fn write_baked(w: &mut dyn Write, res: u32, h: u32, comps: usize, data: &[f32]) 
 }
 
 /// The zip entries of a project file, in file order. Bodies run later, possibly on other threads.
-fn entries(project_file: &ProjectFile<impl Borrow<Vec<u8>>>) -> Result<Vec<Entry<'_>>> {
+fn entries(project_file: &ProjectFile<impl Borrow<Vec<u8>>, impl Borrow<Vec<u8>>>) -> Result<Vec<Entry<'_>>> {
     project_file.validate_mesh_uvs()?;
 
     let deflate = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).large_file(true);
@@ -227,6 +233,7 @@ fn entries(project_file: &ProjectFile<impl Borrow<Vec<u8>>>) -> Result<Vec<Entry
     let mut out = vec![Entry { name: "project.json".into(), options: deflate, weight: json.len() as u64, body: Box::new(move |w| w.write_all(&json)) }];
 
     if let Some((ext, bytes)) = &project_file.mesh {
+        let bytes = bytes.borrow();
         out.push(Entry {
             name: format!("mesh.{}", sanitize_ext(ext)),
             options: deflate,
@@ -246,6 +253,7 @@ fn entries(project_file: &ProjectFile<impl Borrow<Vec<u8>>>) -> Result<Vec<Entry
 
     let mut used = HashSet::new();
     for (dir, (name, bytes)) in project_file.high_poly.iter().map(|m| ("highpoly", m)).chain(project_file.cage.iter().map(|m| ("cage", m))) {
+        let bytes = bytes.borrow();
         out.push(Entry {
             name: unique_entry_name(dir, name, &mut used),
             options: deflate,
@@ -327,9 +335,13 @@ fn entries(project_file: &ProjectFile<impl Borrow<Vec<u8>>>) -> Result<Vec<Entry
     Ok(out)
 }
 
-fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile<impl Borrow<Vec<u8>>>) -> Result<()> {
+fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile<impl Borrow<Vec<u8>>, impl Borrow<Vec<u8>>>, progress: Option<&SaveProgress>) -> Result<()> {
     let mut zip = ZipWriter::new(out);
-    entries::write_entries(&mut zip, entries(pf)?)?;
+    let mut entries = entries(pf)?;
+    if let Some(progress) = progress {
+        progress.track(&mut entries);
+    }
+    entries::write_entries(&mut zip, entries)?;
     zip.finish().map_err(zip_err)?;
     Ok(())
 }

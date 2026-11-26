@@ -17,7 +17,10 @@ fn harness() -> Harness<'static, TextureCraftApp> {
         texture_set.bake.maps.select([BakedMap::Id]);
     }
 
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.mode = Mode::Baking;
     harness.run_steps(4);
     harness.state_mut().ui.dock.focus(Panel::MeshMapBakers);
@@ -178,7 +181,10 @@ fn a_partial_bake_does_not_count_preserved_unchecked_maps() {
     set.bake.common.resolution = BakeResolution::R64;
     set.bake.maps.select([BakedMap::Id]);
     set.bake_excluded_tiles.insert(1002);
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.mode = Mode::Baking;
     harness.state_mut().start_bake(vec![0]);
 

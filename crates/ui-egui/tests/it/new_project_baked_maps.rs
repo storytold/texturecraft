@@ -19,7 +19,10 @@ fn harness_for(dir: &Path) -> Harness<'static, TextureCraftApp> {
     let mesh = dir.join("Ball.obj");
     std::fs::write(&mesh, TWO_MATERIALS).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.windows.new_project = true;
     h.state_mut().ui.new_project.resolution = 256;
     h.state_mut().ui.new_project.file = Some(mesh.display().to_string());
@@ -129,11 +132,16 @@ fn new_project_baked_maps_snapshots() {
     let output_dir = PathBuf::from(std::env::var_os("TC_UI_SNAPSHOTS").expect("set TC_UI_SNAPSHOTS"));
     std::fs::create_dir_all(&output_dir).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| {
-        let adapter = cc.wgpu_render_state.as_ref().unwrap().adapter.get_info();
-        eprintln!("snapshot adapter: {adapter:?}");
-        TextureCraftApp::new(cc, session)
-    });
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| {
+            let adapter = cc.wgpu_render_state.as_ref().unwrap().adapter.get_info();
+            eprintln!("snapshot adapter: {adapter:?}");
+            TextureCraftApp::new(cc, session)
+        });
     let dir = TempDir::new("new-project-baked-maps-snapshots");
     let mesh = dir.join("Ball.obj");
     std::fs::write(&mesh, TWO_MATERIALS).unwrap();

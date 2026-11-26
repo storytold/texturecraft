@@ -11,7 +11,10 @@ use texturecraft_ui_egui::TextureCraftApp;
 
 fn harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     h
 }
@@ -108,7 +111,11 @@ fn alt_shift_drag_orbits_in_quarter_turns() {
 /// A harness whose frames are 10 ms apart, so a 0.35 s glide spans about 35 frames and a drag fits inside it.
 fn slow_glide_harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_step_dt(0.01).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_step_dt(0.01)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     h
 }

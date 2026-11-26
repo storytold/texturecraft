@@ -15,7 +15,10 @@ const SMART_MATERIALS_TYPE: usize = 1;
 fn harness(prepare: impl FnOnce(&mut texturecraft_engine::Session)) -> Harness<'static, TextureCraftApp> {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     prepare(&mut session);
-    let mut harness = Harness::builder().with_size(WINDOW).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(4);
     harness
 }

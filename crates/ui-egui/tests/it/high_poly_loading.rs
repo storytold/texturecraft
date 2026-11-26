@@ -18,7 +18,10 @@ const STROKE_FRAMES: usize = 200;
 /// A bake-mode app with Common Settings in front
 fn harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1500.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1500.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.mode = Mode::Baking;
     harness.run_steps(4);
     harness.state_mut().ui.dock.focus(Panel::CommonSettings);

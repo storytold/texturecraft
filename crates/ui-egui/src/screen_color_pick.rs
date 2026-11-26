@@ -44,8 +44,8 @@ fn pick_with(ui: &mut Ui, id: Id, linear: &mut [f32; 3], button: impl FnOnce(&mu
         pick.target = if picking { None } else { Some(id) };
     } else if picking {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-        let (clicked, escaped, pointer) =
-            ui.input(|input| (input.pointer.primary_clicked(), input.key_pressed(egui::Key::Escape), input.pointer.interact_pos()));
+        let (clicked, pointer) = ui.input(|input| (input.pointer.primary_clicked(), input.pointer.interact_pos()));
+        let escaped = crate::framework::escape_pressed(ui.ctx());
         if escaped {
             pick.target = None;
         } else if clicked && let Some(point) = pointer {

@@ -13,7 +13,10 @@ const SAMPLE_FILE_NAME: &str = "Material Ball.tcraft";
 
 fn closed_app(samples_folder: &Path) -> Harness<'static, TextureCraftApp> {
     let session = Session::closed().unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().samples_folder = samples_folder.to_path_buf();
     harness.run_steps(4);
     harness

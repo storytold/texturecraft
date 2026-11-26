@@ -29,7 +29,11 @@ const ESCAPES_TO_CLEAR: usize = 2;
 fn screen(setup: impl FnOnce(&mut Session)) -> Harness<'static, TextureCraftApp> {
     let mut session = texturecraft_engine::sample_session(TEXTURE_RESOLUTION, BAKE_RESOLUTION).unwrap();
     setup(&mut session);
-    let mut harness = Harness::builder().with_size(PROPERTIES_WINDOW).with_accessibility_check(false).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_accessibility_check(false)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
 
     // The labels below are English; a first run would speak the system's language
     harness.state_mut().ui.prefs.language = "en".into();

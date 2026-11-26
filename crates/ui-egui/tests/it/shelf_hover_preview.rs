@@ -27,6 +27,7 @@ fn materials_shelf(step_seconds: f32, pixels_per_point: f32) -> (Harness<'static
         .with_size(egui::vec2(1600.0, 960.0))
         .with_step_dt(step_seconds)
         .with_pixels_per_point(pixels_per_point)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
         .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.shelf_tab = MATERIALS_TAB;
     harness.run_steps(4);

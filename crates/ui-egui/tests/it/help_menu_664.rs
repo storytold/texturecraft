@@ -11,7 +11,10 @@ fn harness() -> Harness<'static, TextureCraftApp> {
     let mut session = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
     session.log.push("first line".into());
     session.log.warn(texturecraft_engine::log::DEFAULT_SOURCE, "second line");
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     h

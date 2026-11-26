@@ -97,7 +97,11 @@ pub(crate) fn map_settings_shown(app: &TextureCraftApp) -> Option<LivePreviewTar
 
 /// What the preview should show: the map whose settings show, while the preview is on and no real bake runs
 fn wanted(app: &TextureCraftApp) -> Option<LivePreviewTarget> {
-    map_settings_shown(app).filter(|_| app.ui.bake_visualization.map_preview && app.bake.is_none())
+    if !app.ui.prefs.live_preview_baking || !app.ui.bake_visualization.map_preview || app.bake.is_some() {
+        return None;
+    }
+
+    map_settings_shown(app)
 }
 
 /// A slider dragged in Mesh Map Settings changed a setting: a running drag bake finishes and shows before the newest value bakes, so pictures keep coming while the slider moves

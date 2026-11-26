@@ -21,7 +21,10 @@ fn harness() -> Harness<'static, TextureCraftApp> {
 
 fn harness_sized(size: egui::Vec2) -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::Session::new_project("Open", texturecraft_engine::geom::primitives::cube(1.0), "builtin:cube", None, 128).unwrap();
-    let mut h = Harness::builder().with_size(size).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(size)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(2);
     let ctx = h.ctx.clone();

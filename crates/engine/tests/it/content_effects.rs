@@ -247,6 +247,42 @@ fn anchor_effects_added_through_instance_validate_against_source() {
 }
 
 #[test]
+fn an_instance_selects_the_effects_of_the_mask_it_draws_with() {
+    let mut s = session();
+    let source = id(execute(&mut s, "layer.add.fill", &json!({"height": 0.5})).unwrap(), "layer");
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let source_mask = id(execute(&mut s, "effect.add.generator", &json!({"generator": "position", "level": 0.5})).unwrap(), "effect");
+    let source_content = id(execute(&mut s, "effect.add.filter", &json!({"target": "content", "filter": "invert"})).unwrap(), "effect");
+    let other = id(execute(&mut s, "layer.add.fill", &Value::Null).unwrap(), "layer");
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let other_mask = id(execute(&mut s, "effect.add.generator", &json!({"generator": "position", "level": 0.5})).unwrap(), "effect");
+    let instance = id(execute(&mut s, "layer.instance", &json!({"layer": source})).unwrap(), "layer");
+    let select = |s: &mut Session, effect: u64| execute(s, "layer.select", &json!({"layer": instance, "target": effect}));
+
+    // The instance inherits its source mask
+    select(&mut s, source_mask).unwrap();
+
+    assert_eq!(s.selected_layer(), Some(LayerId(instance)));
+    assert_eq!(s.target, StackTarget::Effect(LayerId(source_mask)));
+
+    // The source's content and unrelated layers remain outside the selection
+    for effect in [source_content, other_mask] {
+        let error = select(&mut s, effect).unwrap_err().to_string();
+        assert!(error.contains("an effect id of this layer or of the mask it draws with"), "{error}");
+    }
+    assert_ne!(other, instance);
+
+    // A local mask overrides the source mask
+    execute(&mut s, "layer.select", &json!({"layer": instance})).unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let own = id(execute(&mut s, "effect.add.generator", &json!({"generator": "position", "level": 0.5})).unwrap(), "effect");
+
+    assert!(select(&mut s, source_mask).is_err());
+    select(&mut s, own).unwrap();
+    assert_eq!(s.target, StackTarget::Effect(LayerId(own)));
+}
+
+#[test]
 fn mask_anchor_points_feed_layers_above_and_folders_take_them() {
     let mut s = session();
     let low = id(execute(&mut s, "layer.add.fill", &json!({"height": 0.5})).unwrap(), "layer");

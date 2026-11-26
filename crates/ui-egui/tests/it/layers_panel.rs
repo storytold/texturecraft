@@ -1,5 +1,5 @@
-//! The Layers panel rows: content and mask thumbnails select their own target, effect groups
-//! fold without touching the document, and the thumbnails arrive from the worker.
+//! The Layers panel rows: thumbnails select and disclose their own effects without editing the
+//! document, and the thumbnail images arrive from the worker.
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
@@ -24,7 +24,10 @@ fn harness() -> (Harness<'static, TextureCraftApp>, LayerId) {
     execute(&mut session, "mask.add.black", &Value::Null).unwrap();
     execute(&mut session, "effect.add.generator", &json!({"generator": "position", "level": 0.5, "name": "Effect M"})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     (h, layer)
 }
@@ -40,11 +43,12 @@ fn thumb(h: &Harness<'_, TextureCraftApp>, name: &str, mask: bool) -> egui::Pos2
 /// The accessible name of the mask thumbnail of the layer "Masked fill"
 const MASK_THUMBNAIL_NAME: &str = "Select the mask (Alt+click: show it in the viewport, Shift+click: switch it on or off) (Masked fill)";
 
-/// The `label` header that follows the "Masked fill" row (other layers have groups too).
-fn header(h: &mut Harness<'_, TextureCraftApp>, label: &str) {
-    let top = h.get_by_label("Masked fill").rect().top();
-    let at = h.get_all_by_label(label).map(|n| n.rect()).filter(|r| r.top() > top).min_by(|a, b| a.top().total_cmp(&b.top())).unwrap().center();
-    click(h, at);
+/// Toggle the effect rows through the selected layer's content thumbnail.
+pub(super) fn click_selected_content_thumbnail(h: &mut Harness<'_, TextureCraftApp>) {
+    let layer = h.state().session.selected_layer().unwrap();
+    let name = &h.state().session.doc.project.layers[&layer].name;
+    h.get_by_label(&format!("Select the layer content ({name})")).click();
+    h.run_steps(3);
 }
 
 fn click(h: &mut Harness<'_, TextureCraftApp>, at: egui::Pos2) {
@@ -53,36 +57,135 @@ fn click(h: &mut Harness<'_, TextureCraftApp>, at: egui::Pos2) {
     h.run_steps(3);
 }
 
+/// An instance without a mask of its own shows its source's mask thumbnail with the effect badge, so
+/// that thumbnail opens the source mask's effects and each of those rows can be selected from the instance.
 #[test]
-fn mask_and_content_thumbnails_select_their_own_target() {
-    let (mut h, layer) = harness();
-    let at = thumb(&h, "Masked fill", true);
-    click(&mut h, at);
-    assert_eq!(h.state().session.selected_layer(), Some(layer));
-    assert_eq!(h.state().session.target, StackTarget::Mask, "the mask thumbnail routes to the mask");
-    let at = thumb(&h, "Masked fill", false);
-    click(&mut h, at);
-    assert_eq!(h.state().session.target, StackTarget::Content, "the content thumbnail routes back");
-    // Clicking an effect row's name still selects that effect (its right end holds the blend mode and opacity)
-    let row = h.get_by_label("Effect A").rect();
+fn an_instance_mask_thumbnail_opens_the_inherited_mask_effects() {
+    let (mut h, source) = harness();
+    let instance = LayerId(id(execute(&mut h.state_mut().session, "layer.instance", &json!({"layer": source.0})).unwrap(), "layer"));
+    execute(&mut h.state_mut().session, "layer.rename", &json!({"layer": instance.0, "name": "Instance row"})).unwrap();
+    execute(&mut h.state_mut().session, "layer.select", &json!({"layer": instance.0})).unwrap();
+    h.run_steps(4);
+    assert!(h.state().session.doc.project.layers[&instance].mask.is_none(), "the instance draws with its source's mask");
+    assert!(h.query_by_label("Effect M").is_none(), "stacks start closed");
+
+    let mask = thumb(&h, "Instance row", true);
+    click(&mut h, mask);
+    assert_eq!(h.state().session.selected_layer(), Some(instance));
+    assert_eq!(h.state().session.target, StackTarget::Mask);
+    assert!(h.query_by_label("Effect M").is_some(), "the inherited mask effect is listed");
+    click(&mut h, mask);
+    assert!(h.query_by_label("Effect M").is_none(), "the same thumbnail closes the stack");
+    click(&mut h, mask);
+
+    // Select the effect through the instance
+    let row = h.get_by_label("Effect M").rect();
     click(&mut h, row.center());
-    assert!(matches!(h.state().session.target, StackTarget::Effect(_)));
+
+    let StackTarget::Effect(effect) = h.state().session.target else { panic!("{:?}", h.state().session.target) };
+    assert_eq!(h.state().session.doc.project.effect(effect).map(|(owner, _)| owner), Some(source));
+    assert_eq!(h.state().session.selected_layer(), Some(instance));
+    assert!(h.query_by_label("Effect M").is_some(), "selecting an effect leaves its stack open");
+}
+
+/// An instance with a mask of its own lists that mask's effects, not its source's.
+#[test]
+fn an_instance_with_its_own_mask_opens_its_own_mask_effects() {
+    let (mut h, source) = harness();
+    let instance = LayerId(id(execute(&mut h.state_mut().session, "layer.instance", &json!({"layer": source.0})).unwrap(), "layer"));
+    execute(&mut h.state_mut().session, "layer.rename", &json!({"layer": instance.0, "name": "Instance row"})).unwrap();
+    execute(&mut h.state_mut().session, "layer.select", &json!({"layer": instance.0})).unwrap();
+    execute(&mut h.state_mut().session, "mask.add.black", &Value::Null).unwrap();
+    execute(&mut h.state_mut().session, "effect.add.generator", &json!({"generator": "position", "level": 0.5, "name": "Own effect"})).unwrap();
+    execute(&mut h.state_mut().session, "layer.select", &json!({"layer": instance.0})).unwrap();
+    h.run_steps(4);
+
+    let mask = thumb(&h, "Instance row", true);
+    click(&mut h, mask);
+
+    assert!(h.query_by_label("Own effect").is_some(), "the instance's own mask effect is listed");
+    assert!(h.query_by_label("Effect M").is_none(), "the source's mask effect is not");
 }
 
 #[test]
-fn folding_an_effect_group_hides_its_rows_without_changing_the_document() {
-    let (mut h, _) = harness();
-    let (project, undo) = (h.state().session.doc.project.clone(), h.state().session.revision);
-    assert!(h.query_by_label("Effect A").is_some() && h.query_by_label("Effect M").is_some());
-    header(&mut h, "Content effects");
-    assert!(h.query_by_label("Effect A").is_none(), "folded content effects are hidden");
-    assert!(h.query_by_label("Effect M").is_some(), "the mask group stays open");
-    header(&mut h, "Mask effects");
-    assert!(h.query_by_label("Effect M").is_none());
-    assert_eq!(h.state().session.doc.project, project);
-    assert_eq!(h.state().session.revision, undo, "folding is not an edit");
-    header(&mut h, "Content effects");
-    assert!(h.query_by_label("Effect A").is_some(), "unfolds again");
+fn mask_and_content_thumbnails_toggle_their_own_stacks() {
+    let (mut h, layer) = harness();
+    let content = thumb(&h, "Masked fill", false);
+    let mask = thumb(&h, "Masked fill", true);
+    assert!(h.query_by_label("Effect A").is_none() && h.query_by_label("Effect M").is_none(), "stacks start closed");
+
+    click(&mut h, mask);
+    assert_eq!(h.state().session.selected_layer(), Some(layer));
+    assert_eq!(h.state().session.target, StackTarget::Mask);
+    assert!(h.query_by_label("Effect M").is_some());
+    click(&mut h, mask);
+    assert!(h.query_by_label("Effect M").is_none(), "the same mask thumbnail closes its stack");
+    click(&mut h, mask);
+    assert!(h.query_by_label("Effect M").is_some());
+
+    click(&mut h, content);
+    assert_eq!(h.state().session.target, StackTarget::Content);
+    assert!(h.query_by_label("Effect M").is_none(), "switching thumbnails closes the mask stack");
+    assert!(h.query_by_label("Effect A").is_some());
+    click(&mut h, content);
+    assert!(h.query_by_label("Effect A").is_none(), "the same content thumbnail closes its stack");
+    click(&mut h, content);
+    let row = h.get_by_label("Effect A").rect();
+    click(&mut h, row.center());
+    assert!(matches!(h.state().session.target, StackTarget::Effect(_)));
+    assert!(h.query_by_label("Effect A").is_some(), "selecting an effect leaves its stack open");
+}
+
+#[test]
+fn keyboard_toggles_effects_without_editing_the_document() {
+    let (mut h, layer) = harness();
+    let session = &h.state().session;
+    let (project, history, modified) = (session.doc.project.clone(), session.history_labels(), session.modified);
+    let content = "Select the layer content (Masked fill)";
+    assert_eq!(h.get_by_label(content).accesskit_node().data().is_expanded(), Some(false));
+
+    // Use the standard button keys so both paths preserve focus
+    h.get_by_label(content).focus();
+    h.run_steps(3);
+    assert!(h.get_by_label(content).is_focused());
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert!(h.query_by_label("Effect A").is_some());
+    h.key_press(egui::Key::Space);
+    h.run_steps(3);
+    assert!(h.query_by_label("Effect A").is_none());
+    assert_eq!(h.get_by_label(content).accesskit_node().data().is_expanded(), Some(false));
+
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert!(h.get_by_label(content).is_focused());
+    assert_eq!(h.get_by_label(content).accesskit_node().data().is_expanded(), Some(true));
+
+    let session = &h.state().session;
+    let empty = session.doc.project.texture_sets[session.ts()]
+        .stack
+        .iter()
+        .rev()
+        .find_map(|id| {
+            let layer = session.doc.project.layers.get(id)?;
+            (layer.mask.is_none() && layer.content_effects.is_empty()).then(|| (*id, layer.name.clone()))
+        })
+        .expect("sample contains an empty paint layer");
+    let empty_thumbnail = format!("Select the layer content ({})", empty.1);
+    h.get_by_label(&empty_thumbnail).focus();
+    h.run_steps(3);
+    assert!(h.get_by_label(&empty_thumbnail).is_focused());
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(h.state().session.selected_layer(), Some(empty.0));
+    assert_ne!(empty.0, layer);
+    assert!(h.query_by_label("Effect A").is_none() && h.query_by_label("Effect M").is_none(), "switching layers closes the old stack");
+    assert_eq!(h.get_by_label(&empty_thumbnail).accesskit_node().data().is_expanded(), None);
+
+    let session = &h.state().session;
+    assert_eq!(session.doc.project, project);
+    assert_eq!(session.history_labels(), history);
+    assert_eq!(session.modified, modified);
 }
 
 #[test]
@@ -90,20 +193,21 @@ fn visible_rows_get_their_thumbnails() {
     let (mut h, layer) = harness();
     let content = ThumbTarget::Content { layer, channel: Channel::BaseColor };
     let mask = ThumbTarget::Mask { layer };
+    let effect = h.state().session.doc.project.layers[&layer].content_effects[0].id;
+    let stage = ThumbTarget::Stage { effect, channel: Channel::BaseColor };
+    click_selected_content_thumbnail(&mut h);
     let t0 = std::time::Instant::now();
-    while !(h.state().layer_panel.service().is_fresh(content) && h.state().layer_panel.service().is_fresh(mask)) {
+    while ![content, mask, stage].iter().all(|target| h.state().layer_panel.service().is_fresh(*target)) {
         assert!(t0.elapsed().as_secs() < 60, "thumbnails never arrived");
         h.run_steps(1);
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    // Rows, mask, and every effect stage on screen were asked for: well under the cache size.
-    assert!(h.state().layer_panel.service().cached() >= 4);
 }
 
 #[test]
 fn deeply_nested_effect_visibility_is_reachable_in_a_narrow_panel() {
-    use craft_ui::docking::Node;
-    use craft_ui::layout::SplitSize;
+    use craft_behavior::dock::Node;
+    use craft_behavior::dock::SplitSize;
     use texturecraft_ui_egui::docking::Dock;
 
     let (mut harness, layer) = harness();
@@ -111,8 +215,9 @@ fn deeply_nested_effect_visibility_is_reachable_in_a_narrow_panel() {
         execute(&mut harness.state_mut().session, "layer.group", &Value::Null).unwrap();
     }
 
-    let mut workspace = harness.state().ui.dock.workspace().clone();
-    let Some(Node::Split { second, .. }) = workspace.layout.root.as_mut() else { panic!("default columns") };
+    let workspace = harness.state().ui.dock.workspace().clone();
+    let mut layout = workspace.layout().clone();
+    let Some(Node::Split { second, .. }) = layout.root.as_mut() else { panic!("default columns") };
     let Node::Split { size, second: column, .. } = second.as_mut() else { panic!("viewport and right column") };
     *size = SplitSize::Ratio(0.99);
 
@@ -120,12 +225,16 @@ fn deeply_nested_effect_visibility_is_reachable_in_a_narrow_panel() {
     let Node::Split { second: below_sets, .. } = column.as_mut() else { panic!("texture sets and the rest") };
     let Node::Split { size: layers_share, .. } = below_sets.as_mut() else { panic!("layers and properties") };
     *layers_share = SplitSize::Ratio(0.9);
+    let workspace = texturecraft_ui_egui::docking::Workspace::from_parts(layout, workspace.hidden().to_vec(), workspace.floated().to_vec());
     harness.state_mut().ui.dock = Dock::from_value(serde_json::to_value(workspace).unwrap());
 
     // Closing Properties lets the column shrink to the Layers minimum
     harness.state_mut().ui.dock.close(texturecraft_ui_egui::docking::Panel::Properties);
     harness.run_steps(4);
 
+    harness.state_mut().run("layer.select", json!({"layer": layer.0})).unwrap();
+    harness.run_steps(3);
+    click_selected_content_thumbnail(&mut harness);
     let row = harness.get_by_label("Effect A").rect();
     assert!(row.width() < 180.0, "the test must use a compact panel: {row:?}");
 
@@ -154,7 +263,11 @@ fn hidpi_harness() -> (Harness<'static, TextureCraftApp>, LayerId) {
     let layer = LayerId(id(execute(&mut session, "layer.add.fill", &json!({"color": "#336699"})).unwrap(), "layer"));
     execute(&mut session, "layer.rename", &json!({"layer": layer.0, "name": "Active one"})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1200.0, 800.0)).with_pixels_per_point(2.0).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .with_pixels_per_point(2.0)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     (h, layer)
 }
@@ -260,7 +373,10 @@ fn narrow_harness() -> Harness<'static, TextureCraftApp> {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     let layer = id(execute(&mut session, "layer.add.fill", &json!({"color": "#336699"})).unwrap(), "layer");
     execute(&mut session, "layer.rename", &json!({"layer": layer, "name": LONG_NAME})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 800.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     h
@@ -296,12 +412,16 @@ const LONG_EFFECT_NAME: &str = "Edge wear from curvature with dirt accumulation"
 fn an_effect_name_cut_short_shows_in_full_on_hover() {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     let layer = id(execute(&mut session, "layer.add.fill", &json!({"color": "#336699"})).unwrap(), "layer");
-    execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
     execute(&mut session, "effect.add.filter", &json!({"target": "content", "filter": "invert", "name": LONG_EFFECT_NAME})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 800.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
 
+    click_selected_content_thumbnail(&mut h);
     let row = h.get_by_label(LONG_EFFECT_NAME).rect();
     let before = h.query_all_by_label_contains(LONG_EFFECT_NAME).count();
     h.hover_at(egui::pos2(row.left() + 75.0, row.center().y));

@@ -99,7 +99,7 @@ impl Session {
         images_used(&mini.project, root, &mut used, 0);
         let resources = used.into_iter().filter_map(|name| self.doc.resources.get(&name).map(|bytes| (name, Arc::clone(bytes)))).collect();
 
-        let snapshot = texturecraft_formats::ProjectFile {
+        let snapshot = texturecraft_formats::ProjectFile::<Arc<Vec<u8>>> {
             project: mini.project,
             pixels: mini.pixels,
             baked: BTreeMap::new(),

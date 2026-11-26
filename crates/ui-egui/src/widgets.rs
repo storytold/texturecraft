@@ -1,8 +1,7 @@
 //! Compact widgets matching the app's look: labelled slim sliders, icon buttons, section
 //! headers, channel toggle chips and color swatches.
 
-use craft_ui::buttons::{ButtonVisuals, IconButton, IconButtonStyle};
-use egui::{Color32, CornerRadius, Response, RichText, Sense, Stroke, Ui, vec2};
+use egui::{Color32, CornerRadius, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, vec2};
 
 use crate::drawn_icon::DrawnIcon;
 use crate::i18n::tr;
@@ -277,6 +276,98 @@ pub fn icon_badge_dropdown_button(ui: &mut Ui, icon: &str, badge: &str, label: &
         ui.painter().text(badge_center, egui::Align2::CENTER_CENTER, badge, egui::FontId::proportional(size * BADGE_SCALE), color);
         ui.painter().text(caret_center, egui::Align2::CENTER_CENTER, egui_phosphor::regular::CARET_DOWN, egui::FontId::proportional(size * CARET_SCALE), color);
     })
+}
+
+/// The background, border and icon colour of an icon button in one interaction state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ButtonVisuals {
+    fill: Color32,
+    stroke: Stroke,
+    icon: Color32,
+}
+
+/// The look of an icon button in each state. Selection takes precedence over press and hover.
+#[derive(Clone, Copy, Debug)]
+struct IconButtonStyle {
+    normal: ButtonVisuals,
+    hovered: ButtonVisuals,
+    /// `None` keeps the hover or normal look while pressed.
+    pressed: Option<ButtonVisuals>,
+    selected: ButtonVisuals,
+    corner_radius: CornerRadius,
+    /// An inset outline while the button has keyboard focus.
+    focus_stroke: Stroke,
+}
+
+impl IconButtonStyle {
+    fn visuals(&self, selected: bool, hovered: bool, pressed: bool) -> ButtonVisuals {
+        if selected {
+            self.selected
+        } else if let Some(visuals) = self.pressed.filter(|_| pressed) {
+            visuals
+        } else if hovered {
+            self.hovered
+        } else {
+            self.normal
+        }
+    }
+}
+
+/// An icon-only button painted in TextureCraft's own colours. The label is its accessible name; the caller paints
+/// the icon, attaches a tooltip and acts on the response. Selection is the caller's.
+struct IconButton<'a> {
+    label: &'a str,
+    size: Vec2,
+    selected: bool,
+    style: &'a IconButtonStyle,
+}
+
+impl<'a> IconButton<'a> {
+    fn new(label: &'a str, size: Vec2, style: &'a IconButtonStyle) -> Self {
+        Self { label, size, selected: false, style }
+    }
+
+    fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    /// Paints the button and returns its response. `paint_icon` gets the button's rect and the icon tint. A
+    /// non-finite, non-positive or oversized (over 4096 points) size gives an inert zero-size response.
+    fn show(self, ui: &mut Ui, paint_icon: impl FnOnce(&Ui, Rect, Color32)) -> Response {
+        let valid = self.size.is_finite() && self.size.x > 0.0 && self.size.y > 0.0 && self.size.x <= 4096.0 && self.size.y <= 4096.0;
+        let (rect, response) = ui.allocate_exact_size(if valid { self.size } else { Vec2::ZERO }, if valid { Sense::click() } else { Sense::hover() });
+        response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, valid && ui.is_enabled(), self.selected, self.label));
+        if !valid {
+            return response;
+        }
+        let visuals = self.style.visuals(self.selected, response.hovered(), response.is_pointer_button_down_on());
+        let stroke = bounded_stroke(visuals.stroke, rect);
+        if visuals.fill != Color32::TRANSPARENT {
+            ui.painter().rect_filled(rect, self.style.corner_radius, visuals.fill);
+        }
+        if !stroke.is_empty() {
+            ui.painter().rect_stroke(rect, self.style.corner_radius, stroke, StrokeKind::Inside);
+        }
+        paint_icon(ui, rect, visuals.icon);
+        if response.has_focus() && rect.width() > 4.0 && rect.height() > 4.0 {
+            let focus_rect = rect.shrink(2.0);
+            let stroke = bounded_stroke(self.style.focus_stroke, focus_rect);
+            if !stroke.is_empty() {
+                ui.painter().rect_stroke(focus_rect, self.style.corner_radius, stroke, StrokeKind::Inside);
+            }
+        }
+        response
+    }
+}
+
+/// `stroke` no wider than half of `rect`'s smaller side; none when its width is not positive.
+fn bounded_stroke(stroke: Stroke, rect: Rect) -> Stroke {
+    if stroke.width.is_finite() && stroke.width > 0.0 {
+        Stroke::new(stroke.width.min(rect.width().min(rect.height()) * 0.5), stroke.color)
+    } else {
+        Stroke::NONE
+    }
 }
 
 /// Transparent at rest, a hover well, and the active-tool well when pressed or selected

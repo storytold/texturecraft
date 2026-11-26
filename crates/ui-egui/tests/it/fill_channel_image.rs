@@ -26,7 +26,10 @@ fn a_fill_channel_takes_an_image_from_its_source_picker() {
     let name = session.import_resource_bytes("rough.png", png_bytes).unwrap();
     let result = texturecraft_engine::execute(&mut session, "layer.add.fill", &json!({"roughness": 0.6})).unwrap();
     let layer = LayerId(result["layer"].as_u64().unwrap());
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
 
     // Use English so first-run locale does not change queried labels
     harness.state_mut().ui.prefs.language = "en".into();
@@ -51,7 +54,10 @@ fn the_source_picker_offers_only_images_that_were_decoded() {
     // Bytes that are not an image never reach the decoded images
     session.doc.resources.insert("broken.png".into(), std::sync::Arc::new(vec![1, 2, 3]));
     texturecraft_engine::execute(&mut session, "layer.add.fill", &json!({"roughness": 0.6})).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
 
     // Use English so first-run locale does not change queried labels
     harness.state_mut().ui.prefs.language = "en".into();
@@ -122,7 +128,10 @@ fn a_mask_fill_selects_an_image_edits_projection_and_returns_to_uniform() {
     texturecraft_engine::execute(&mut session, "mask.add.black", &json!({})).unwrap();
     let output = texturecraft_engine::execute(&mut session, "effect.add.fill", &json!({"target": "mask"})).unwrap();
     let effect_id = LayerId(output["effect"].as_u64().unwrap());
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
 
@@ -166,7 +175,10 @@ fn a_normal_image_can_be_marked_directx() {
     let out = texturecraft_engine::execute(&mut session, "layer.add.fill", &json!({})).unwrap();
     let layer = LayerId(out["layer"].as_u64().unwrap());
     texturecraft_engine::execute(&mut session, "layer.fill.set", &json!({"layer": layer.0, "channel": "normal", "image": name})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
 

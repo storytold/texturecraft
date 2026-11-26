@@ -26,7 +26,10 @@ fn selected_generator() -> (Harness<'static, TextureCraftApp>, LayerId) {
         })
         .unwrap();
     texturecraft_engine::execute(&mut session, "layer.select", &json!({"layer": layer.0, "target": effect.0})).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|creation_context| TextureCraftApp::new(creation_context, session));
     harness.run_steps(4);
     (harness, effect)
 }

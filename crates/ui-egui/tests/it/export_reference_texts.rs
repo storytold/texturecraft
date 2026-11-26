@@ -18,7 +18,10 @@ const RAIL_WIDTH_POINTS: f32 = 38.0;
 /// The Export textures window open on SETTINGS in a screen of `screen_size`
 fn harness(screen_size: egui::Vec2) -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(screen_size).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(screen_size)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     h.state_mut().ui.windows.export = true;
