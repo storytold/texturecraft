@@ -8,7 +8,8 @@ struct Params {
     words: vec4<u32>,
     // The tile grid of a UV tile atlas (columns, rows, column, row; columns 0 without one)
     grid: vec4<f32>,
-    // The occlusion bake's width and height, and 1 when there is one
+    // The occlusion bake's width and height, 1 when there is one, and the block side the tile
+    // scales are kept by (BlockScales::block; 0 when every tile fills its block)
     bake: vec4<u32>,
     // The kernel's values (each kernel's comment names them)
     values: array<vec4<f32>, 5>,
@@ -31,6 +32,10 @@ struct Corner {
 @group(0) @binding(6) var third: texture_2d<f32>;
 @group(0) @binding(7) var output: texture_storage_2d<r32float, write>;
 @group(0) @binding(8) var occlusion_bake: texture_2d<f32>;
+// Each block's tile scale row by row (TextureSet::block_scales), and the box radius of each
+// block, row by row over the working atlas's blocks, for the box passes
+@group(0) @binding(9) var<storage, read> block_scales: array<f32>;
+@group(0) @binding(10) var<storage, read> block_radii: array<u32>;
 
 const NO_TRIANGLE: u32 = 0xffffffffu;
 const NO_ISLAND: u32 = 0xffffffffu;
@@ -92,12 +97,63 @@ fn hit_at(pixel: vec2<u32>) -> Hit {
     return Hit(true, a.extra.y, uv, position);
 }
 
-// texel_coords' UV: a UV tile atlas's projections see the mesh's own UVs (TileGrid::from_atlas)
+// The tile scale of the block holding working texel (x, y) (BlockScales::at): 1 without scales
+fn scale_at(x: u32, y: u32) -> f32 {
+    if params.bake.w == 0u {
+        return 1.0;
+    }
+    let column = x / params.bake.w;
+    let columns = u32(params.grid.x);
+    let index = (y / params.bake.w) * columns + column;
+    if column >= columns || index >= arrayLength(&block_scales) {
+        return 1.0;
+    }
+    return block_scales[index];
+}
+
+// The texels of the UV tile holding the texel: the block's width at its tile scale
+fn tile_texels(pixel: vec2<u32>) -> f32 {
+    return f32(block().x) * scale_at(pixel.x, pixel.y);
+}
+
+// texel_coords' UV: a UV tile atlas's projections see the mesh's own UVs (TextureSet::from_atlas,
+// which undoes a tile's own scale)
 fn mesh_uv(hit: Hit) -> vec2<f32> {
     if params.grid.x == 0.0 {
         return hit.uv;
     }
-    return vec2(hit.uv.x * params.grid.x + params.grid.z, hit.uv.y * params.grid.y - params.grid.w);
+    let atlas = vec2(hit.uv.x * params.grid.x + params.grid.z, hit.uv.y * params.grid.y - params.grid.w);
+    if params.bake.w == 0u {
+        return atlas;
+    }
+    let corner = floor(atlas);
+    // The UDIM tile at the corner (udim_at), and its block in the grid (TileGrid::udim)
+    let udim_row = -corner.y;
+    let column = corner.x - params.grid.z;
+    let row = params.grid.w - udim_row;
+    var scale = 1.0;
+    let is_udim = corner.x >= 0.0 && corner.x <= 9.0 && udim_row >= 0.0 && udim_row <= 99.0;
+    if is_udim && column >= 0.0 && column < params.grid.x && row >= 0.0 && row < params.grid.y {
+        scale = block_scales[u32(row) * u32(params.grid.x) + u32(column)];
+    }
+    return vec2(corner.x + (atlas.x - corner.x) / scale, corner.y + (atlas.y - corner.y) / scale);
+}
+
+// BlockScales::bake_uv: the uniform bake's UV of a working atlas UV, invalid (w 0) where a tile
+// smaller than its block leaves the block empty
+fn bake_uv(uv: vec2<f32>) -> vec3<f32> {
+    if params.bake.w == 0u {
+        return vec3(uv, 1.0);
+    }
+    let block_side = f32(params.bake.w);
+    let position = uv * vec2<f32>(size()) / block_side;
+    let origin = floor(position);
+    let scale = scale_at(u32(origin.x * block_side), u32(origin.y * block_side));
+    let local = (position - origin) / scale;
+    if any(local < vec2(0.0)) || any(local >= vec2(1.0)) {
+        return vec3(0.0);
+    }
+    return vec3((origin + local) * block_side / vec2<f32>(size()), 1.0);
 }
 
 // Rust's f32::round: halves away from zero (WGSL's round goes to even)
@@ -197,12 +253,13 @@ fn distance_columns(@builtin(global_invocation_id) id: vec3<u32>) {
     store_value(pixel, sqrt(best));
 }
 
-// UV Border Distance's gradient from the distances in `first`: values[0].x is the reach in texels
+// UV Border Distance's gradient from the distances in `first`: values[0].x is the reach per
+// texel of the UV tile
 @compute @workgroup_size(WORKGROUP, WORKGROUP)
 fn border_gradient(@builtin(global_invocation_id) id: vec3<u32>) {
     let pixel = id.xy;
     if !in_size(pixel) { return; }
-    let reach = params.values[0].x;
+    let reach = params.values[0].x * tile_texels(pixel);
     var value = 0.0;
     if covered(pixel) && reach > 0.0 {
         value = clamp(1.0 - read_first(pixel) / reach, 0.0, 1.0);
@@ -210,13 +267,14 @@ fn border_gradient(@builtin(global_invocation_id) id: vec3<u32>) {
     store_value(pixel, value);
 }
 
-// One box pass of radius words.x along the block's rows (words.y 0) or columns (1), reading
+// One box pass of its block's radius along the block's rows (words.y 0) or columns (1), reading
 // black past the block's edges (blur_blocks, box_line)
 @compute @workgroup_size(WORKGROUP, WORKGROUP)
 fn box_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let pixel = id.xy;
     if !in_size(pixel) { return; }
-    let radius = i32(params.words.x);
+    let blocks = (size().x + block().x - 1u) / block().x;
+    let radius = i32(block_radii[(pixel.y / block().y) * blocks + pixel.x / block().x]);
     let along_columns = params.words.y != 0u;
     let line = block_line(pixel, along_columns);
     let at = i32(line.x);
@@ -278,9 +336,11 @@ fn rust_seed(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     var occlusion = 1.0;
     if params.bake.z != 0u {
-        let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(size());
-        let at = min(vec2<u32>(uv * vec2<f32>(params.bake.xy)), params.bake.xy - 1u);
-        occlusion = textureLoad(occlusion_bake, vec2<i32>(at), 0).x;
+        let uv = bake_uv((vec2<f32>(pixel) + 0.5) / vec2<f32>(size()));
+        if uv.z != 0.0 {
+            let at = min(vec2<u32>(uv.xy * vec2<f32>(params.bake.xy)), params.bake.xy - 1u);
+            occlusion = textureLoad(occlusion_bake, vec2<i32>(at), 0).x;
+        }
     }
     let shape = params.values[0];
     let base = shape.x + shape.y * pow(max(shape.z - occlusion, 0.0), shape.w);
@@ -330,7 +390,8 @@ fn tap(index: u32) -> vec2<f32> {
 }
 
 // Each texel takes the most rust found uphill along the drip axis, fading with how far up it
-// lies (dripping_rust.rs drips): values[0].z is the reach in texels, words.y the samples
+// lies (dripping_rust.rs drips): values[0].z is the reach per texel of the UV tile times the 2K
+// UV tile's texels (values[0].w), words.y the samples
 @compute @workgroup_size(WORKGROUP, WORKGROUP)
 fn drips(@builtin(global_invocation_id) id: vec3<u32>) {
     let pixel = id.xy;
@@ -353,7 +414,7 @@ fn drips(@builtin(global_invocation_id) id: vec3<u32>) {
         store_value(pixel, here);
         return;
     }
-    let reach = params.values[0].z;
+    let reach = params.values[0].z * tile_texels(pixel) / params.values[0].w;
     var most = here;
     var current = vec2(x, y);
     for (var index = 0u; index < params.words.y; index++) {
@@ -393,12 +454,13 @@ fn next_ray_texel(origin: vec2<i32>, at: vec2<i32>, goal: vec2<i32>, direction: 
 
 // The light or dark checker square's colour at `at` in texels of a 2K UV tile with the grid laid
 // over it (uv_islands.rs checker_color): values[1] holds the square, the minor line period, the
-// line reach and the grid's opacity; values[3] the dark shade and the two line shades
-fn checker_color(light: vec3<f32>, at: vec2<f32>) -> vec3<f32> {
+// line's half width and the grid's opacity; values[3] the dark shade and the two line shades
+fn checker_color(light: vec3<f32>, at: vec2<f32>, footprint: f32) -> vec3<f32> {
     let grid = params.values[1];
     let square = grid.x;
     let minor = grid.y;
-    let reach = grid.z;
+    // Include the texel footprint so thin grid lines survive coarse sampling
+    let reach = grid.z + footprint / 2.0;
     let opacity = grid.w;
     let shades = params.values[3];
     let is_light = rem_euclid(floor(at.x / square) + floor(at.y / square), 2.0) >= 1.0;
@@ -425,8 +487,8 @@ fn on_line(position: f32, period: f32, reach: f32) -> bool {
 
 // UV Checker: the gray of its colour (uv_islands.rs checker_field). values[0] holds the light
 // colour and 1 for Random Colors, values[2] the border colour and the border width in 2K
-// texels, values[3].w the texels of a 2K UV tile one working texel spans, values[4].x the 2K UV
-// tile's texels; `first` holds the distances and words.x is 1 with a border
+// texels, values[4].x the 2K UV tile's texels; `first` holds the distances and words.x is 1
+// with a border
 @compute @workgroup_size(WORKGROUP, WORKGROUP)
 fn checker(@builtin(global_invocation_id) id: vec3<u32>) {
     let pixel = id.xy;
@@ -436,7 +498,7 @@ fn checker(@builtin(global_invocation_id) id: vec3<u32>) {
         store_value(pixel, 0.0);
         return;
     }
-    let texels_2k = params.values[3].w;
+    let texels_2k = params.values[4].x / tile_texels(pixel);
     let footprint = max(texels_2k - 1.0, 0.0);
     // Measure from the texel footprint so coarse texels still show the border they cover
     let on_border = params.words.x != 0u && read_first(pixel) * texels_2k - footprint <= params.values[2].w;
@@ -448,7 +510,7 @@ fn checker(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         let uv = mesh_uv(hit);
         let reference = params.values[4].x;
-        color = checker_color(light, vec2(rem_euclid(uv.x, 1.0) * reference, rem_euclid(uv.y, 1.0) * reference));
+        color = checker_color(light, vec2(rem_euclid(uv.x, 1.0) * reference, rem_euclid(uv.y, 1.0) * reference), footprint);
     }
     store_value(pixel, (color.x + color.y + color.z) / 3.0);
 }

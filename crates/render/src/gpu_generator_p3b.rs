@@ -9,7 +9,7 @@
 //! exact distance transform per UV tile block, the box blurs, the occlusion and grunge, the drips.
 //!
 //! Declined (composed on the CPU): wear, light or section controls on these kinds, which compose
-//! as other kinds do, and UV tile atlases whose tiles have resolutions of their own.
+//! as other kinds do. A UV tile with a resolution of its own builds at its block's scale.
 
 #[path = "gpu_generator_p3b_field_plan.rs"]
 pub(crate) mod field_plan;
@@ -52,11 +52,10 @@ pub(super) fn reads_field(op: &Operation) -> bool {
 
 /// A whole-map kind's generator operation: its field's layer in `procedural[1]`, its finish in
 /// `high` (Border Distance's balance and contrast, Dripping Rust's spreading and contrast). None
-/// where its ramp would not be its field's (wear, light or section controls) or the atlas's
-/// tiles have resolutions of their own.
+/// where its ramp would not be its field's (wear, light or section controls).
 pub(super) fn operation(generator: &Generator, inputs: &mut ProceduralInputs) -> Option<Operation> {
     let other_ramp = generator.wear.is_some() || generator.light.is_some() || generator.section_controls().is_some();
-    if other_ramp || !inputs.levels.is_empty() {
+    if other_ramp {
         return None;
     }
 
@@ -95,7 +94,9 @@ pub(super) fn operation(generator: &Generator, inputs: &mut ProceduralInputs) ->
     if cell >= 2 {
         inputs.generator_stages.push((None, cell));
         op.spatial[1] = inputs.generator_stages.len() as u32;
-        inputs.generator_levels.push(Vec::new());
+        // P8: the cells at each further UV tile scale
+        let levels = inputs.levels.iter().map(|&resolution| (None, generator.resolution.cell(resolution, inputs.texture_set))).collect();
+        inputs.generator_levels.push(levels);
     }
     op.high.iter().chain(&op.projection).all(|value| value.is_finite()).then_some(op)
 }
@@ -151,8 +152,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error:?}"));
     }
 
-    /// Wear, light or section controls, and a UV tile atlas whose tiles have resolutions of their
-    /// own, stay on the CPU; the plain kinds lower to one field each, shared when equal
+    /// Wear, light or section controls stay on the CPU; the plain kinds lower to one field each,
+    /// shared when equal
     #[test]
     fn whole_map_kinds_lower_to_shared_fields_and_decline_what_they_do_not_build() {
         let (mut inputs, mut patterns) = (ProceduralInputs::new(64), TilePatterns::default());
@@ -164,8 +165,6 @@ mod tests {
 
         let sectioned = Generator { section: SectionParameters::defaults(GeneratorKind::Curvature), ..checker.clone() };
         assert!(generator_operation(&sectioned, &mut inputs, &mut patterns).is_none(), "section controls");
-        inputs.levels = vec![32];
-        assert!(generator_operation(&checker, &mut inputs, &mut patterns).is_none(), "UV tiles at resolutions of their own");
     }
 
     /// UV Random Color, UV Checker (Random Colors, borders, grid, coarser resolution) and UV Border
@@ -197,45 +196,62 @@ mod tests {
         assert_matches_cpu(&mut gpu, &case, Tolerance::POINT, "UV island kinds");
     }
 
-    /// UV Border Distance blurred by Smoothness and UV Checker's borders on a UV tile atlas of two
-    /// tiles: each block's distances and blur stop at its edges, and the checker reads the mesh's
-    /// own UVs
+    /// UV Border Distance blurred by Smoothness, UV Checker's borders and Dripping Rust from a
+    /// bake on a UV tile atlas of two tiles: each block's distances and blur stop at its edges,
+    /// the checker reads the mesh's own UVs. The tiles share the set's resolution, have
+    /// resolutions of their own (1002 half its block: its texels, blur radii, reaches and bake
+    /// share scale), or share one resolution apart from the set's (every block at scale 1)
     #[test]
     fn border_blur_and_tile_blocks_match_the_cpu_on_uv_tiles() {
         let Some(mut gpu) = headless() else { return };
-        let mut set = TextureSet::new("Tiles", 0, 64);
-        set.uv_tiles = vec![1001, 1002];
-        let grid = set.tile_grid().unwrap();
-        let mut mesh = Mesh::default();
-        for column in 0..2 {
-            let mut part = primitives::plane(1.0, 4);
-            for position in &mut part.positions {
-                position.x += 1.5 * column as f32;
-            }
-            let corner = Vec2::new(column as f32, 0.0);
-            // An island inset in each tile, so the blur meets both the empty space and the block's edge
-            part.map_material_uvs_with(0, |centroid, uv| {
-                let inset = uv * 0.8 + 0.05;
-                Vec2::from(set.to_atlas(&grid, (centroid + corner).to_array(), (inset + corner).to_array()))
-            });
-            mesh.append(&part);
-        }
-        for submesh in &mut mesh.submeshes {
-            submesh.material = 0;
-        }
-        let mesh = Arc::new(mesh);
-        let mut project = Project::new("Tiles", "builtin:plane");
-        project.texture_sets.push(set);
-        let border = BorderDistanceParameters { distance: 0.4, smoothness: 1.0, balance: 0.5, contrast: 0.0 };
-        let checker = UvCheckerParameters { grid_tile: 2, grid_opacity: 0.8, border_width: 0.6, ..Default::default() };
-        masked_fills(
-            &mut project,
-            vec![(Channel::BaseColor, generator(KindControls::BorderDistance(border))), (Channel::Roughness, generator(KindControls::UvChecker(checker)))],
-        );
-        let (pixels, baked, images) = (PixelStore::default(), BakedMaps::default(), ImageStore::default());
-        let case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+        const BAKE: u32 = 64;
+        let occlusion: Vec<f32> = (0..BAKE * BAKE).map(|texel| 0.3 + 0.6 * (((texel % BAKE) + texel / BAKE) as f32 / (2 * BAKE) as f32)).collect();
+        let baked = BakedMaps { resolution: BAKE, maps: BTreeMap::from([(BakedMap::AmbientOcclusion, Arc::new(occlusion))]) };
+        let (pixels, images) = (PixelStore::default(), ImageStore::default());
+        let layouts: [(&str, u32, &[(u32, u32)]); 3] =
+            [("one resolution", 128, &[]), ("a tile at half its block", 128, &[(1002, 64)]), ("both tiles apart from the set", 128, &[(1001, 64), (1002, 64)])];
 
-        assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, "Border Distance and Checker on UV tiles");
+        for (label, resolution, tile_resolutions) in layouts {
+            let mut set = TextureSet::new("Tiles", 0, resolution);
+            set.uv_tiles = vec![1001, 1002];
+            set.tile_resolutions.extend(tile_resolutions.iter().copied());
+            let grid = set.tile_grid().unwrap();
+            let mut mesh = Mesh::default();
+            for column in 0..2 {
+                let mut part = primitives::plane(1.0, 4);
+                for position in &mut part.positions {
+                    position.x += 1.5 * column as f32;
+                    position.y = 0.3 * position.z;
+                }
+                let corner = Vec2::new(column as f32, 0.0);
+                // An island inset in each tile, so the blur meets both the empty space and the block's edge
+                part.map_material_uvs_with(0, |centroid, uv| {
+                    let inset = uv * 0.8 + 0.05;
+                    Vec2::from(set.to_atlas(&grid, (centroid + corner).to_array(), (inset + corner).to_array()))
+                });
+                mesh.append(&part);
+            }
+            for submesh in &mut mesh.submeshes {
+                submesh.material = 0;
+            }
+            let mesh = Arc::new(mesh);
+            let mut project = Project::new("Tiles", "builtin:plane");
+            project.texture_sets.push(set);
+            let border = BorderDistanceParameters { distance: 0.4, smoothness: 1.0, balance: 0.5, contrast: 0.0 };
+            let checker = UvCheckerParameters { grid_tile: 2, grid_opacity: 0.8, border_width: 0.6, ..Default::default() };
+            let rust = DrippingRustParameters { spreading_smoothness: 1.0, drips_intensity: 1.0, ..Default::default() };
+            masked_fills(
+                &mut project,
+                vec![
+                    (Channel::BaseColor, generator(KindControls::BorderDistance(border))),
+                    (Channel::Roughness, generator(KindControls::UvChecker(checker))),
+                    (Channel::Metallic, generator(KindControls::DrippingRust(rust))),
+                ],
+            );
+            let case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+
+            assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("UV tiles, {label}"));
+        }
     }
 
     /// Dripping Rust over a strip that rises gently to a ridge, falls steeply past it and lies

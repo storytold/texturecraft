@@ -3365,10 +3365,7 @@ impl GpuCompositor {
         let id_bake = self.id_bake_input(device, queue, ts, program.id_bake.as_ref())?;
         // P3b: the whole-map generator fields, one array layer each
         let generator_fields = match &mut self.generator_fields {
-            Some(fields) => {
-                let grid = program.udim_layout.as_ref().map(|layout| layout.grid);
-                Some(fields.fields((device, queue), (ts, program.mask_preview), &program.p3b_fields, grid, &surface)?)
-            }
+            Some(fields) => Some(fields.fields((device, queue), (ts, program.mask_preview), &program.p3b_fields, program.udim_layout.as_ref(), &surface)?),
             None if !program.p3b_fields.requests.is_empty() => return Err("The GPU adapter cannot bind the whole-map generator fields.".into()),
             None => None,
         };
