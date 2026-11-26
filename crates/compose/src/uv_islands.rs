@@ -170,11 +170,7 @@ fn island_colors(inp: &Inputs, seed: u32) -> HashMap<u32, [f32; 3]> {
 pub fn island_color(seed: u32, island: u32) -> [f32; 3] {
     let island = island as i32;
     let within = |range: &std::ops::RangeInclusive<f32>, random: f32| range.start() + (range.end() - range.start()) * random;
-    hsv_to_rgb(
-        cell_hash(island, 0, 1, seed),
-        within(&RANDOM_SATURATION, cell_hash(island, 1, 1, seed)),
-        within(&RANDOM_VALUE, cell_hash(island, 2, 1, seed)),
-    )
+    hsv_to_rgb(cell_hash(island, 0, 1, seed), within(&RANDOM_SATURATION, cell_hash(island, 1, 1, seed)), within(&RANDOM_VALUE, cell_hash(island, 2, 1, seed)))
 }
 
 /// A color from its hue (in turns), saturation and value

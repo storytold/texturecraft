@@ -109,9 +109,8 @@ mod tests {
 
     use texturecraft_compose::{BakedMaps, ImageStore, PixelStore};
     use texturecraft_core::{
-        BakedMap, BorderDistanceParameters, Channel, DrippingRustParameters, Effect, EffectKind, Fill, Generator, GeneratorKind, KindControls, Layer,
-        LayerId, LayerKind, Mask, MaskBackground, OutputResolution, Project, SectionParameters, Source, TextureSet, UvCheckerParameters,
-        UvRandomColorParameters,
+        BakedMap, BorderDistanceParameters, Channel, DrippingRustParameters, Effect, EffectKind, Fill, Generator, GeneratorKind, KindControls, Layer, LayerId,
+        LayerKind, Mask, MaskBackground, OutputResolution, Project, SectionParameters, Source, TextureSet, UvCheckerParameters, UvRandomColorParameters,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::{Mesh, primitives};
@@ -179,8 +178,7 @@ mod tests {
         let mut project = Project::new("Islands", "builtin:cube");
         project.texture_sets.push(TextureSet::new("Cube", 0, 128));
         let checker = UvCheckerParameters { random_colors: true, grid_tile: 3, grid_opacity: 0.6, border_width: 0.4, ..Default::default() };
-        let coarse_checker =
-            Generator { resolution: OutputResolution { factor: -1, ..Default::default() }, ..generator(KindControls::UvChecker(checker)) };
+        let coarse_checker = Generator { resolution: OutputResolution { factor: -1, ..Default::default() }, ..generator(KindControls::UvChecker(checker)) };
         let border = BorderDistanceParameters { distance: 0.05, smoothness: 0.0, balance: 0.4, contrast: 0.3 };
         let layers = masked_fills(
             &mut project,

@@ -123,10 +123,14 @@ impl Kernels {
                 float(8),
             ],
         });
-        let pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("tc_generator_fields"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tc_generator_fields"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
         let source = [include_str!("shaders/noise.wgsl"), include_str!("shaders/generator_p3b.wgsl")].join("\n");
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc_generator_fields"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+        let module =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("tc_generator_fields"), source: wgpu::ShaderSource::Wgsl(source.into()) });
         let pipeline = |name| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(name),
@@ -198,7 +202,13 @@ impl Pass<'_> {
     }
 
     /// Three box passes of `radius` along the block's rows, then its columns (blur_blocks): `source` into `target` through `middle`
-    fn blur(&self, encoder: &mut wgpu::CommandEncoder, islands: &wgpu::Buffer, radius: usize, (source, middle, target): (&wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView)) {
+    fn blur(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        islands: &wgpu::Buffer,
+        radius: usize,
+        (source, middle, target): (&wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView),
+    ) {
         let mut read = source;
         for pass in 0..2 * BOX_PASSES {
             let axis = u32::from(pass >= BOX_PASSES);
@@ -253,10 +263,8 @@ fn island_table(device: &wgpu::Device, request: &FieldRequest, islands: usize) -
 
 impl GeneratorFieldsGpu {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
-        let empty = plane(device, "tc_generator_fields_empty", (1, 1), 1).create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
+        let empty = plane(device, "tc_generator_fields_empty", (1, 1), 1)
+            .create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
         Self { kernels: None, empty, built: None }
     }
 
@@ -297,7 +305,14 @@ impl GeneratorFieldsGpu {
         Ok(view)
     }
 
-    fn build(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, plan: &FieldPlan, grid: Option<TileGrid>, surface_uv: &wgpu::TextureView) -> Result<wgpu::TextureView, String> {
+    fn build(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        plan: &FieldPlan,
+        grid: Option<TileGrid>,
+        surface_uv: &wgpu::TextureView,
+    ) -> Result<wgpu::TextureView, String> {
         let (mesh, gbuf) = plan.surface.as_ref().ok_or("The whole-map generator fields are missing their UV surface.")?;
         let size = (gbuf.width, gbuf.height);
         let limits = device.limits();
@@ -308,34 +323,31 @@ impl GeneratorFieldsGpu {
 
         // Each triangle's corners and UV island, as the CPU's TrianglePartition numbers them
         let islands = TrianglePartition::uv_islands(mesh, plan.material);
-        let corners: Vec<[u32; 8]> = mesh
-            .indices
-            .chunks_exact(3)
-            .enumerate()
-            .flat_map(|(triangle, indices)| {
-                let island = islands.index_of(triangle as u32).map_or(u32::MAX, |island| island as u32);
-                indices.iter().map(move |&index| {
-                    let position = mesh.positions.get(index as usize).copied().unwrap_or_default();
-                    let uv = mesh.uvs.get(index as usize).copied().unwrap_or_default();
-                    [position.x, position.y, position.z, uv.x, uv.y].map(f32::to_bits).into_iter().chain([island, 0, 0]).collect::<Vec<_>>()
-                })
-            })
-            .map(|words| std::array::from_fn(|index| words.get(index).copied().unwrap_or(0)))
-            .collect();
+        let mut corners: Vec<[u32; 8]> = Vec::with_capacity(mesh.indices.len());
+        for (triangle, indices) in mesh.indices.as_chunks::<3>().0.iter().enumerate() {
+            let island = islands.index_of(triangle as u32).map_or(u32::MAX, |island| island as u32);
+            for &index in indices {
+                let position = mesh.positions.get(index as usize).copied().unwrap_or_default();
+                let uv = mesh.uvs.get(index as usize).copied().unwrap_or_default();
+                corners.push([position.x.to_bits(), position.y.to_bits(), position.z.to_bits(), uv.x.to_bits(), uv.y.to_bits(), island, 0, 0]);
+            }
+        }
         let corner_bytes = (corners.len().max(1) * size_of::<[u32; 8]>()) as u64;
-        if corner_bytes > u64::from(limits.max_storage_buffer_binding_size) {
+        if corner_bytes > limits.max_storage_buffer_binding_size {
             return Err("The mesh exceeds the GPU's whole-map generator field limits.".into());
         }
-        let corners = crate::gpu_trace::buffer(device, "tc_generator_field_corners", if corners.is_empty() { &[0; 32] } else { bytemuck::cast_slice(&corners) });
+        let corners =
+            crate::gpu_trace::buffer(device, "tc_generator_field_corners", if corners.is_empty() { &[0; 32] } else { bytemuck::cast_slice(&corners) });
 
         // The occlusion bake's first component, read nearest as BakedMaps::sample_working reads it
         let (occlusion, bake) = match &plan.occlusion {
             Some((map, width, height, components)) if (*width).max(*height) <= limits.max_texture_dimension_2d => {
                 let values: Vec<f32> = map.chunks(*components).map(|texel| texel.first().copied().unwrap_or(1.0)).collect();
+                let values = values.get(..(*width * *height) as usize).ok_or("The occlusion bake is shorter than its size.")?;
                 let texture = plane(device, "tc_generator_field_occlusion", (*width, *height), 1);
                 queue.write_texture(
                     texture.as_image_copy(),
-                    bytemuck::cast_slice(&values[..(*width * *height) as usize]),
+                    bytemuck::cast_slice(values),
                     wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: None },
                     wgpu::Extent3d { width: *width, height: *height, depth_or_array_layers: 1 },
                 );
@@ -382,9 +394,13 @@ impl GeneratorFieldsGpu {
                 let table = island_table(device, request, islands.groups.len());
                 let tables = &table;
                 match &request.controls {
-                    KindControls::BorderDistance(border) => border_distance(&pass, &mut encoder, tables, border, (distances.as_ref(), &planes), &target, tile_texels),
+                    KindControls::BorderDistance(border) => {
+                        border_distance(&pass, &mut encoder, tables, border, (distances.as_ref(), &planes), &target, tile_texels)
+                    }
                     KindControls::DrippingRust(rust) => dripping_rust(&pass, &mut encoder, tables, (rust, request.seed, mesh), &planes, &target, tile_texels),
-                    KindControls::UvRandomColor(_) => pass.run(&mut encoder, &kernels.random_color, &base, ([None, None, None], tables), &target, pass.texels()),
+                    KindControls::UvRandomColor(_) => {
+                        pass.run(&mut encoder, &kernels.random_color, &base, ([None, None, None], tables), &target, pass.texels())
+                    }
                     KindControls::UvChecker(checker) => uv_checker(&pass, &mut encoder, tables, checker, distances.as_ref(), &target, tile_texels),
                     _ => return Err("A whole-map generator field has controls the GPU does not build.".to_string()),
                 }
@@ -406,7 +422,11 @@ fn border_distance(
     tile_texels: f32,
 ) {
     let reach = border.distance * recipe::REACH_PER_DISTANCE * tile_texels;
-    let radius = if border.smoothness > 0.0 { recipe::box_radius(border.smoothness * recipe::SMOOTHNESS_SIGMA_2K * tile_texels / recipe::REFERENCE_TILE_TEXELS) } else { 0 };
+    let radius = if border.smoothness > 0.0 {
+        recipe::box_radius(border.smoothness * recipe::SMOOTHNESS_SIGMA_2K * tile_texels / recipe::REFERENCE_TILE_TEXELS)
+    } else {
+        0
+    };
     let params = FieldParams { values: [[reach, 0.0, 0.0, 0.0], [0.0; 4], [0.0; 4], [0.0; 4], [0.0; 4]], ..pass.base };
     let inputs = [distances, None, None];
     if radius == 0 {
@@ -433,7 +453,8 @@ fn dripping_rust(
     let Some((_, repeats, mean, spread)) = recipe::rust_grunge() else { return };
 
     let shape = [recipe::RUST_FLOOR, recipe::RUST_GAIN, recipe::RUST_OCCLUSION, recipe::RUST_POWER];
-    let seed_params = FieldParams { words: [0, 0, seed, 0], values: [shape, [repeats, mean, spread, recipe::GRUNGE_SPREAD], [0.0; 4], [0.0; 4], [0.0; 4]], ..pass.base };
+    let seed_params =
+        FieldParams { words: [0, 0, seed, 0], values: [shape, [repeats, mean, spread, recipe::GRUNGE_SPREAD], [0.0; 4], [0.0; 4], [0.0; 4]], ..pass.base };
     pass.run(encoder, &pass.kernels.rust_seed, &seed_params, ([None, None, None], islands), &planes[0], pass.texels());
     let radius = |sigma_2k: f32, smoothness: f32| recipe::box_radius(smoothness * sigma_2k * tile_texels / recipe::REFERENCE_TILE_TEXELS);
     let mut field = pass.blur_over_cover(encoder, islands, radius(recipe::SPREADING_SIGMA_2K, rust.spreading_smoothness), planes, 0);
@@ -450,7 +471,12 @@ fn dripping_rust(
             slot[(index % TAPS_PER_VECTOR) * 2] = fraction;
             slot[(index % TAPS_PER_VECTOR) * 2 + 1] = fade;
         }
-        let params = FieldParams { words: [axis as u32, rust.drips_samples, 0, 0], values: [[low, extent, reach, 0.0], [0.0; 4], [0.0; 4], [0.0; 4], [0.0; 4]], taps, ..pass.base };
+        let params = FieldParams {
+            words: [axis as u32, rust.drips_samples, 0, 0],
+            values: [[low, extent, reach, 0.0], [0.0; 4], [0.0; 4], [0.0; 4], [0.0; 4]],
+            taps,
+            ..pass.base
+        };
         let dripped = usize::from(field == 0);
         pass.run(encoder, &pass.kernels.drips, &params, ([Some(&planes[field]), None, None], islands), &planes[dripped], pass.texels());
         field = dripped;

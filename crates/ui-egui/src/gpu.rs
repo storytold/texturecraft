@@ -2135,8 +2135,10 @@ pub(crate) mod tests {
             execute(&mut session, "effect.add.generator", &json!({"target": "mask", "layer": layer.0, "generator": name})).unwrap();
             let effects = &session.doc.project.layer(layer).unwrap().mask.as_ref().unwrap().effects;
             // P3b: the whole-map kinds compose on the GPU on their own controls
-            let whole_map = matches!(generator, GeneratorKind::UvBorderDistance | GeneratorKind::DrippingRust | GeneratorKind::UvRandomColor | GeneratorKind::UvChecker);
-            let on_gpu = whole_map || matches!(&effects.last().unwrap().kind, texturecraft_engine::core::EffectKind::Generator(added) if added.on_earlier_model());
+            let whole_map =
+                matches!(generator, GeneratorKind::UvBorderDistance | GeneratorKind::DrippingRust | GeneratorKind::UvRandomColor | GeneratorKind::UvChecker);
+            let on_gpu =
+                whole_map || matches!(&effects.last().unwrap().kind, texturecraft_engine::core::EffectKind::Generator(added) if added.on_earlier_model());
             check_mask(&mut session, &name, on_gpu);
         }
 

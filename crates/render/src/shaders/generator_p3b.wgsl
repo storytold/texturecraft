@@ -4,23 +4,22 @@
 struct Params {
     // Working atlas width and height, UV tile block width and height
     size: vec4<u32>,
-    // The kernel's words: box radius or axis, then drip samples
+    // The kernel's words (each kernel's comment names them)
     words: vec4<u32>,
     // The tile grid of a UV tile atlas (columns, rows, column, row; columns 0 without one)
     grid: vec4<f32>,
     // The occlusion bake's width and height, and 1 when there is one
     bake: vec4<u32>,
-    // The kernel's values (gpu_generator_p3b.rs names each)
+    // The kernel's values (each kernel's comment names them)
     values: array<vec4<f32>, 5>,
     // Dripping Rust's taps: share of the drip's length and fade, two per vector
     taps: array<vec4<f32>, 16>,
 }
 
+// f32 bits of the mesh position and UV, then the triangle's UV island and padding
 struct Corner {
-    // Mesh position and UV x
-    position: vec4<f32>,
-    // UV y, the triangle's UV island (on its first corner) and padding
-    extra: vec4<f32>,
+    position: vec4<u32>,
+    extra: vec4<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -74,9 +73,9 @@ fn hit_at(pixel: vec2<u32>) -> Hit {
     let b = corners[triangle * 3u + 1u];
     let c = corners[triangle * 3u + 2u];
     let extent = vec2<f32>(size());
-    let uv_a = vec2(a.position.w, a.extra.x);
-    let uv_b = vec2(b.position.w, b.extra.x);
-    let uv_c = vec2(c.position.w, c.extra.x);
+    let uv_a = bitcast<vec2<f32>>(vec2(a.position.w, a.extra.x));
+    let uv_b = bitcast<vec2<f32>>(vec2(b.position.w, b.extra.x));
+    let uv_c = bitcast<vec2<f32>>(vec2(c.position.w, c.extra.x));
     let texel_a = uv_a * extent;
     let texel_b = uv_b * extent;
     let texel_c = uv_c * extent;
@@ -88,9 +87,9 @@ fn hit_at(pixel: vec2<u32>) -> Hit {
         weights = vec2(edge(texel_c, texel_a, centre) * orientation * inverse_area, edge(texel_a, texel_b, centre) * orientation * inverse_area);
     }
     let w = 1.0 - weights.x - weights.y;
-    let position = a.position.xyz * w + b.position.xyz * weights.x + c.position.xyz * weights.y;
+    let position = bitcast<vec3<f32>>(a.position.xyz) * w + bitcast<vec3<f32>>(b.position.xyz) * weights.x + bitcast<vec3<f32>>(c.position.xyz) * weights.y;
     let uv = uv_a * w + uv_b * weights.x + uv_c * weights.y;
-    return Hit(true, bitcast<u32>(a.extra.y), uv, position);
+    return Hit(true, a.extra.y, uv, position);
 }
 
 // texel_coords' UV: a UV tile atlas's projections see the mesh's own UVs (TileGrid::from_atlas)
@@ -125,7 +124,7 @@ fn read_first(pixel: vec2<u32>) -> f32 {
     return textureLoad(first, vec2<i32>(pixel), 0).x;
 }
 
-// UV Random Color: the island's gray (0 outside the islands); values[0].x is unused
+// UV Random Color: the island's gray from the island table (0 outside the islands)
 @compute @workgroup_size(WORKGROUP, WORKGROUP)
 fn random_color(@builtin(global_invocation_id) id: vec3<u32>) {
     let pixel = id.xy;
@@ -138,7 +137,8 @@ fn random_color(@builtin(global_invocation_id) id: vec3<u32>) {
     store_value(pixel, value);
 }
 
-// One line of a block (words.x: 0 rows, 1 columns): the texel's place on it, its start and its length
+// The texel's line through its block, along its row or its column: the texel's place on it, the
+// line's start and its length
 fn block_line(pixel: vec2<u32>, along_columns: bool) -> vec3<u32> {
     let origin = (pixel / block()) * block();
     let extent = min(block(), size() - origin);
@@ -293,23 +293,28 @@ fn rust_seed(@builtin(global_invocation_id) id: vec3<u32>) {
     store_value(pixel, base + grunge.w * ((shaped - grunge.y) / grunge.z));
 }
 
+struct DripSurface {
+    island: u32,
+    axis: f32,
+}
+
 // The texel's island and its place along the drip axis (words.x) across the mesh's bounds
 // (values[0].x the low end, .y the extent); island NO_ISLAND outside the islands
-fn drip_surface(x: i32, y: i32) -> vec2<f32> {
+fn drip_surface(x: i32, y: i32) -> DripSurface {
     if x < 0 || y < 0 || x >= i32(size().x) || y >= i32(size().y) {
-        return vec2(bitcast<f32>(NO_ISLAND), 0.0);
+        return DripSurface(NO_ISLAND, 0.0);
     }
     let hit = hit_at(vec2(u32(x), u32(y)));
     if !hit.covered || hit.island == NO_ISLAND {
-        return vec2(bitcast<f32>(NO_ISLAND), 0.0);
+        return DripSurface(NO_ISLAND, 0.0);
     }
-    return vec2(bitcast<f32>(hit.island), (hit.position[params.words.x] - params.values[0].x) / params.values[0].y);
+    return DripSurface(hit.island, (hit.position[params.words.x] - params.values[0].x) / params.values[0].y);
 }
 
 // One side of the finite difference within an island: (present, value)
 fn axis_at(x: i32, y: i32, island: u32) -> vec2<f32> {
     let surface = drip_surface(x, y);
-    return vec2(select(0.0, 1.0, bitcast<u32>(surface.x) == island), surface.y);
+    return vec2(select(0.0, 1.0, surface.island == island), surface.axis);
 }
 
 fn slope(before: vec2<f32>, here: f32, after: vec2<f32>) -> f32 {
@@ -334,12 +339,12 @@ fn drips(@builtin(global_invocation_id) id: vec3<u32>) {
     let x = i32(pixel.x);
     let y = i32(pixel.y);
     let surface = drip_surface(x, y);
-    let island = bitcast<u32>(surface.x);
+    let island = surface.island;
     if island == NO_ISLAND {
         store_value(pixel, here);
         return;
     }
-    let axis_here = surface.y;
+    let axis_here = surface.axis;
     let dx = slope(axis_at(x - 1, y, island), axis_here, axis_at(x + 1, y, island));
     let dy = slope(axis_at(x, y - 1, island), axis_here, axis_at(x, y + 1, island));
     let line_length = sqrt(dx * dx + dy * dy);
