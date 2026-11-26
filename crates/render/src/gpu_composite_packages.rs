@@ -28,8 +28,8 @@
 //!   (`FilterStage::input`): P3 and P5 share that sixth word, nobody widens `FIELD_WORDS`.
 //!
 //! Binding budget (WebGPU defaults, which `Headless` requests): the composite bind group uses 6
-//! of 8 storage buffers, up to 7 of 16 sampled textures, 3 of 12 uniform buffers and up to 16
-//! bindings. New images go into existing atlases or texture arrays (`MaterialImages`,
+//! of 8 storage buffers, up to 8 of 16 sampled textures, 3 of 12 uniform buffers and up to 18
+//! bindings (16: P2's micro maps, 17: P3b's whole-map generator fields, each behind its limit gate). New images go into existing atlases or texture arrays (`MaterialImages`,
 //! `TileImageAtlas`), not new storage buffers.
 
 use std::ops::Range;

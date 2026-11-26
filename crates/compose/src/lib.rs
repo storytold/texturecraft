@@ -22,6 +22,7 @@ pub mod eval;
 mod fabric;
 mod field_cache;
 mod field_cache_key;
+pub mod field_recipe;
 pub mod fill_copies;
 pub mod fill_copy;
 mod fill_depth;

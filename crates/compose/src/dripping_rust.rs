@@ -13,25 +13,25 @@ use crate::wear;
 use crate::working_field::{REFERENCE_TILE_TEXELS, blur_blocks, box_radius};
 
 /// The rust before any grunge: `RUST_FLOOR + RUST_GAIN * max(RUST_OCCLUSION − occlusion, 0)^RUST_POWER` (fitted to the reference)
-const RUST_FLOOR: f32 = 0.315;
-const RUST_GAIN: f32 = 3.19;
-const RUST_OCCLUSION: f32 = 0.849;
-const RUST_POWER: f32 = 2.38;
+pub const RUST_FLOOR: f32 = 0.315;
+pub const RUST_GAIN: f32 = 3.19;
+pub const RUST_OCCLUSION: f32 = 0.849;
+pub const RUST_POWER: f32 = 2.38;
 
 /// How much grunge breaks the rust up: the spread of the reference's noise (measured); the pattern itself is inferred
-const GRUNGE_SPREAD: f32 = 0.19;
+pub const GRUNGE_SPREAD: f32 = 0.19;
 
 /// Blur sizes at Spreading Smoothness 1 and Drips Smoothness 1, as gaussian sigmas in texels of a 2K UV tile (fitted)
-const SPREADING_SIGMA_2K: f32 = 47.0;
-const DRIPS_SIGMA_2K: f32 = 11.5;
+pub const SPREADING_SIGMA_2K: f32 = 47.0;
+pub const DRIPS_SIGMA_2K: f32 = 11.5;
 
 /// How far a drip runs at Drips Intensity 1, in texels of a 2K UV tile, and how it fades along its length: `1 − DRIP_FADE · along^DRIP_FADE_POWER` (fitted)
-const DRIP_LENGTH_2K: f32 = 90.86;
+pub const DRIP_LENGTH_2K: f32 = 90.86;
 const DRIP_FADE: f32 = 0.898;
 const DRIP_FADE_POWER: f32 = 0.671;
 
 /// Coverage below which a blurred texel has nothing to average
-const MIN_COVERAGE: f32 = 1e-3;
+pub const MIN_COVERAGE: f32 = 1e-3;
 
 static CACHE: FieldCache = FieldCache::new();
 
@@ -133,13 +133,7 @@ fn drips(
 
         Some((y * i64::from(width) + x) as usize)
     };
-    let samples = rust.drips_samples;
-    let taps: Vec<_> = (1..=samples)
-        .map(|step| {
-            let fraction = step as f32 / samples as f32;
-            (fraction, 1.0 - DRIP_FADE * fraction.powf(DRIP_FADE_POWER))
-        })
-        .collect();
+    let taps = drip_taps(rust.drips_samples);
 
     (0..width * height)
         .into_par_iter()
@@ -182,6 +176,16 @@ fn drips(
                 }
             }
             most
+        })
+        .collect()
+}
+
+/// Each tap of a drip drawn with `samples` steps: its share of the drip's length and how much rust it keeps
+pub fn drip_taps(samples: u32) -> Vec<(f32, f32)> {
+    (1..=samples)
+        .map(|step| {
+            let fraction = step as f32 / samples as f32;
+            (fraction, 1.0 - DRIP_FADE * fraction.powf(DRIP_FADE_POWER))
         })
         .collect()
 }
