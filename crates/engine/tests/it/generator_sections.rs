@@ -167,3 +167,26 @@ fn inspect_reports_the_reference_controls_set() {
         assert!(inspected.contains(&format!("\"{key}\"")) && inspected.contains(value), "{key} with {value} in {inspected}");
     }
 }
+
+#[test]
+fn inspect_reports_direction_only_on_the_earlier_model() {
+    let mut session = session();
+    let earlier_dir = add(&mut session, json!({"generator": "direction", "direction": [1.0, 0.0, 0.0]}));
+    let light_dir = add(&mut session, json!({"generator": "direction", "lightHorizontal": 90.0}));
+    let earlier_pos = add(&mut session, json!({"generator": "position", "direction": [0.0, 0.0, 1.0]}));
+    let section_pos = add(&mut session, json!({"generator": "position", "sectionContrast": 0.25}));
+
+    let inspected = execute(&mut session, "project.inspect", &Value::Null).unwrap();
+    let effects = inspected["layers"][0]["mask"]["effects"].as_array().unwrap();
+    let gen_of = |effect_id: u64| &effects.iter().find(|entry| entry["id"] == effect_id).unwrap()["generator"];
+
+    assert_eq!(gen_of(earlier_dir)["direction"], json!([1.0, 0.0, 0.0]));
+    assert!(gen_of(earlier_dir).get("light").is_none());
+    assert!(gen_of(light_dir).get("direction").is_none());
+    assert!(gen_of(light_dir).get("light").is_some());
+
+    assert_eq!(gen_of(earlier_pos)["direction"], json!([0.0, 0.0, 1.0]));
+    assert!(gen_of(earlier_pos).get("section").is_none());
+    assert!(gen_of(section_pos).get("direction").is_none());
+    assert!(gen_of(section_pos).get("section").is_some());
+}

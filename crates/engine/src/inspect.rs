@@ -2,7 +2,7 @@
 //! without a screenshot.
 
 use serde_json::{Value, json};
-use texturecraft_core::{Effect, EffectKind, Fill, Filter, Generator, Layer, LayerKind, NormalFormat, Projection, Sampling, Source};
+use texturecraft_core::{Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, Layer, LayerKind, NormalFormat, Projection, Sampling, Source};
 
 use crate::Session;
 use crate::session::StackTarget;
@@ -161,6 +161,9 @@ fn generator_json(generator: &Generator) -> Value {
     }
     if let Some(light) = &generator.light {
         out["light"] = json!(light);
+    }
+    if generator.on_earlier_model() && matches!(generator.kind, GeneratorKind::Position | GeneratorKind::Direction) {
+        out["direction"] = json!(generator.direction);
     }
     if let Some(texture) = &generator.texture {
         out["texture"] = json!(texture);
