@@ -56,11 +56,6 @@ fn icons_id() -> Id {
     Id::unique("rail_popup_icons")
 }
 
-/// The panel whose popup title a drag left, and the title's rect, until the dock takes the drag over
-fn pending_drag_id() -> Id {
-    Id::unique("rail_popup_pending_drag")
-}
-
 /// Where the dock drew the viewport on this frame
 fn viewport_id() -> Id {
     Id::unique("rail_popup_viewport")
@@ -111,16 +106,6 @@ pub(crate) fn open(app: &mut TextureCraftApp, panel: Panel) {
         app.ui.dock.focus(panel);
     } else {
         app.ui.rail_panel = Some(panel);
-    }
-}
-
-/// Hand a drag that left the popup's title to the dock, once the dock has drawn the panel it floated
-pub(crate) fn hand_drag_to_dock(ctx: &egui::Context, dock_area: Id) {
-    let Some((panel, title)) = ctx.data(|data| data.get_temp::<(Panel, Rect)>(pending_drag_id())) else { return };
-
-    ctx.data_mut(|data| data.remove::<(Panel, Rect)>(pending_drag_id()));
-    if ctx.input(|input| input.pointer.primary_down()) {
-        craft_ui::docking::begin_drag(ctx, dock_area, panel, title);
     }
 }
 
@@ -196,13 +181,17 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
         // The floating window opens where the popup was, at its size
         app.ui.rail_panel = None;
         if let Some(rect) = shown {
-            app.ui.dock.float_at(panel, [rect.left(), rect.top(), rect.width(), rect.height()]);
+            app.ui.dock.float_at(panel, rect);
         }
     } else if let Some(title) = dragged_from {
+        // The floating window opens where the popup was
         app.ui.rail_panel = None;
-        let rect = shown.unwrap_or(title);
-        app.ui.dock.float_at(panel, [rect.left(), rect.top(), rect.width(), rect.height()]);
-        ctx.data_mut(|data| data.insert_temp(pending_drag_id(), (panel, title)));
+        let window = shown.unwrap_or(title);
+        app.ui.dock.float_at(panel, window);
+        // The window takes over the held press in the next pass, so the drag carries on and docks where it is released
+        if let Some(pointer) = ctx.input(|input| input.pointer.latest_pos()) {
+            app.docks.hand_over(panel, pointer - window.min);
+        }
     }
 }
 

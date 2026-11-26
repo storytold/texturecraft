@@ -1474,8 +1474,10 @@ fn source_channel_popup(ui: &Ui, pending: &mut Option<PendingDrop>, maps: &mut [
                 }
             }
         });
-    // The app can consume Escape before the popup sees it, so read the raw event
-    let escaped = ui.input(|input| input.raw.events.iter().any(|event| matches!(event, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })));
+    // The app's shortcuts can consume Escape before the popup sees it, so read the raw event too; the runtime keeps an
+    // Escape nothing of TextureCraft's has focus for as the window's cancel, which the framework reads
+    let escaped = crate::framework::escape_pressed(ui.ctx())
+        || ui.input(|input| input.raw.events.iter().any(|event| matches!(event, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })));
     if picked.is_some() || escaped || shown.is_none_or(|menu| menu.response.should_close()) {
         *pending = None;
     }

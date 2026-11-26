@@ -8,7 +8,10 @@ use texturecraft_engine::Session;
 use texturecraft_ui_egui::{TextureCraftApp, docking::Panel, menus};
 
 fn app() -> Harness<'static, TextureCraftApp> {
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|cc| TextureCraftApp::new(cc, Session::closed().unwrap()));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, Session::closed().unwrap()));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     h

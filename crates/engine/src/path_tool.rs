@@ -925,29 +925,29 @@ impl Session {
     }
 
     /// [`Session::put_path`] recompositing only the tiles it changed, with no undo step: returns the paint report and the document before
-    fn repaint_path(&mut self, eid: LayerId, index: usize, shape: PathShape) -> Result<(Value, Document)> {
+    fn repaint_path(&mut self, effect_id: LayerId, index: usize, shape: PathShape) -> Result<(Value, Document)> {
         let before = self.doc.clone();
-        let painted = match self.put_path(eid, index, shape) {
-            Ok(v) => v,
-            Err(e) => {
+        let painted = match self.put_path(effect_id, index, shape) {
+            Ok(report) => report,
+            Err(error) => {
                 self.doc = before;
-                return Err(e);
+                return Err(error);
             }
         };
 
         // Paths paint into the active set; a sublayer in another set recomposites in full
         let project = &self.doc.project;
-        let owner = project.effect(eid).map(|(owner, _)| owner);
+        let owner = project.effect(effect_id).map(|(owner, _)| owner);
         if let Some(owner) = owner.filter(|&owner| project.locate(owner).is_some_and(|(ts, _, _)| ts == self.ts())) {
-            let mask = project.layer(owner)?.mask.as_ref().is_some_and(|mask| mask.effects.iter().any(|effect| effect.id == eid));
-            let target = if mask { PaintTarget::Mask(eid) } else { PaintTarget::Layer(eid) };
-            let tiles = changed_tiles(&before.pixels, &self.doc.pixels, eid);
+            let mask = project.layer(owner)?.mask.as_ref().is_some_and(|mask| mask.effects.iter().any(|effect| effect.id == effect_id));
+            let target = if mask { PaintTarget::Mask(effect_id) } else { PaintTarget::Layer(effect_id) };
+            let tiles = changed_tiles(&before.pixels, &self.doc.pixels, effect_id);
             self.mark_painted(self.ts(), Some(target), tiles, true);
         } else {
             self.invalidate_changed(&before);
         }
-        self.revision = self.revision.wrapping_add(1);
-        self.modified = true;
+
+        self.mark_modified();
         Ok((painted, before))
     }
 

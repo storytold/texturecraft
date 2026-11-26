@@ -23,7 +23,11 @@ fn anchor_harness() -> (Harness<'static, TextureCraftApp>, LayerId, LayerId, Lay
     execute(&mut session, "mask.add.black", &json!({"layer": top})).unwrap();
     let reader = LayerId(execute(&mut session, "effect.add.fill", &json!({"layer": top, "anchor": anchor.0})).unwrap()["effect"].as_u64().unwrap());
     execute(&mut session, "layer.select", &json!({"layer": low, "target": anchor.0})).unwrap();
-    let mut harness = Harness::builder().with_size(PROPERTIES_WINDOW).with_step_dt(FRAME_SECONDS).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_step_dt(FRAME_SECONDS)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(STARTUP_FRAMES);
     (harness, anchor, LayerId(top.as_u64().unwrap()), reader)

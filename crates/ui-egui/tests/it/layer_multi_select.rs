@@ -15,7 +15,10 @@ fn harness() -> (Harness<'static, TextureCraftApp>, [LayerId; 4]) {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     let rows = ["Row A", "Row B", "Row C", "Row D"]
         .map(|name| LayerId(execute(&mut session, "layer.add.paint", &json!({ "name": name })).unwrap()["layer"].as_u64().unwrap()));
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     (h, rows)
 }

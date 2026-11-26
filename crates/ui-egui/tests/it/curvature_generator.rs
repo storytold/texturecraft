@@ -18,7 +18,8 @@ fn harness(render: bool) -> (Harness<'static, TextureCraftApp>, LayerId) {
     session.update();
     let builder = Harness::builder().with_size(egui::vec2(1600.0, 1200.0));
     let builder = if render { builder.wgpu() } else { builder };
-    let mut harness = builder.build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness =
+        builder.with_context_setup(texturecraft_ui_egui::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.dock.close(Panel::Layers);
     harness.state_mut().ui.dock.close(Panel::TextureSetSettings);
     harness.state_mut().ui.dock.focus(Panel::Properties);

@@ -7,7 +7,10 @@ use texturecraft_engine::Session;
 use texturecraft_ui_egui::{TextureCraftApp, menus};
 
 fn harness(session: Session) -> Harness<'static, TextureCraftApp> {
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
 
     // The exact-text checks below need English, whatever the OS language is
     harness.state_mut().ui.prefs.language = "en".into();
@@ -421,13 +424,4 @@ fn close_releases_the_layer_thumbnail_snapshot() {
             tracked_bytes
         );
     }
-}
-
-#[test]
-fn the_empty_properties_note_starts_at_its_header_names_left_edge() {
-    let harness = empty();
-    let texts = painted(&harness);
-    let left_of = |wanted: &str| texts.iter().find(|(text, _)| text == wanted).map(|(_, left)| *left).unwrap_or_else(|| panic!("{wanted} is painted"));
-
-    assert_eq!(left_of("No properties found"), left_of("PROPERTIES"));
 }

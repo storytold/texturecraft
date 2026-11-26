@@ -503,6 +503,14 @@ fn the_picker_is_a_window_beside_the_panel_that_its_title_drags_and_its_close_or
     harness.run_steps(SETTLE_FRAMES);
 
     assert!(harness.query_by_role_and_label(Role::TitleBar, "Base color").is_none(), "Escape closes it");
+
+    click(&mut harness, Role::Button, "Base color");
+    harness.ctx.memory_mut(|memory| memory.request_focus(texturecraft_ui_egui::viewport::view_3d_id()));
+    harness.run_steps(SETTLE_FRAMES);
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(SETTLE_FRAMES);
+
+    assert!(harness.query_by_role_and_label(Role::TitleBar, "Base color").is_none(), "Escape closes it with the viewport focused");
 }
 
 #[test]

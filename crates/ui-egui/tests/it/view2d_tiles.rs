@@ -12,7 +12,11 @@ const BUTTON: &str = "uvtile_info_menu_button";
 const SETTLE_FRAMES: usize = 3;
 
 fn app_with(session: Session) -> Harness<'static, TextureCraftApp> {
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_pixels_per_point(1.0).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.layout = ViewLayout::Only3D;
     harness.run_steps(4);
@@ -72,7 +76,10 @@ fn the_tile_info_button_sits_left_of_the_view_mode_picker_and_has_no_tooltip() {
 /// The app with Display Settings open from the rail
 fn display_settings_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     harness

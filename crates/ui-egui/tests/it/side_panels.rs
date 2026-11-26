@@ -24,7 +24,10 @@ const TOOLTIP_FRAMES: usize = 30;
 
 fn app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(STARTUP_FRAMES);
     harness
@@ -52,7 +55,7 @@ fn button_left_of_rail<'h>(harness: &'h Harness<'_, TextureCraftApp>, label: &st
 }
 
 fn is_floating(harness: &Harness<'_, TextureCraftApp>, panel: Panel) -> bool {
-    harness.state().ui.dock.workspace().layout.floating.iter().any(|window| window.contains(&panel))
+    harness.state().ui.dock.workspace().layout().floating.iter().any(|window| window.contains(&panel))
 }
 
 /// Hover the control labelled `label` until its tooltip shows, and tell whether that says it is not available yet
@@ -83,7 +86,7 @@ fn undock_floats_the_panel_dock_returns_it_to_the_rail_and_the_float_persists() 
     let saved = serde_json::to_value(&harness.state().ui).unwrap();
     let restored: UiState = serde_json::from_value(saved).unwrap();
     assert_eq!(restored.dock, harness.state().ui.dock);
-    assert!(restored.dock.workspace().layout.floating.iter().any(|window| window.contains(&Panel::History)));
+    assert!(restored.dock.workspace().layout().floating.iter().any(|window| window.contains(&Panel::History)));
 
     button_left_of_rail(&harness, "Dock").click();
     harness.run_steps(SETTLE_FRAMES);

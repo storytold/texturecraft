@@ -26,6 +26,7 @@ struct Globals {
     refr: vec4<f32>,     // x screen-space refraction on (1), y lods of the scene behind, z refraction depth (world units), w -
     highlight: vec4<f32>, // rgb highlighted set's edge color in the scene (before exposure and tone mapping), a opacity
     highlight_shift: vec4<f32>, // xy sideways shift of each highlight line copy (clip units), zw -
+    set_hover: vec4<f32>, // rgb hovered set's scene color, a opacity
     bake_high: vec4<f32>, // bake mode: rgb high poly color, a -
     bake_matching_error: vec4<f32>, // rgb color where the bake's rays miss the high poly, a its strength (0 hidden)
     bake_cage: vec4<f32>, // rgb cage surface color, a opacity
@@ -70,6 +71,7 @@ struct VOut {
     @location(1) nrm: vec3<f32>,
     @location(2) tan: vec4<f32>,
     @location(3) uv: vec2<f32>,
+    @location(4) @interpolate(flat) hover: u32,
 };
 
 // The vertex moved along its normal by the height channel (displacement).
@@ -81,7 +83,7 @@ fn displaced(v: VIn) -> vec3<f32> {
 }
 
 @vertex
-fn vs_mesh(v: VIn) -> VOut {
+fn vs_mesh(v: VIn, @builtin(instance_index) instance_index: u32) -> VOut {
     var o: VOut;
     let p = displaced(v);
     o.clip = g.view_proj * vec4<f32>(p, 1.0);
@@ -89,6 +91,7 @@ fn vs_mesh(v: VIn) -> VOut {
     o.nrm = v.nrm;
     o.tan = v.tan;
     o.uv = v.uv;
+    o.hover = instance_index;
     return o;
 }
 
@@ -350,16 +353,26 @@ fn unlit(c: vec4<f32>) -> Shaded {
 
 fn mesh_color(i: VOut, front: bool) -> vec4<f32> {
     let o = shade_mesh(i, front);
+
+    // The subsurface pass restores the scattering light after blurring
     if (g.scatter.w > 0.5) {
-        // The subsurface blur pass adds the scattering light back, blurred (fx.wgsl).
         return o.color - vec4<f32>(o.sss, 0.0);
     }
+
     return o.color;
 }
 
+const HOVERED_SET_INSTANCE: u32 = 1u;
+
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    return mesh_color(i, front);
+    let color = mesh_color(i, front);
+
+    if (i.hover == HOVERED_SET_INSTANCE) {
+        return vec4<f32>(mix(color.rgb, g.set_hover.rgb * color.a, g.set_hover.a), color.a);
+    }
+
+    return color;
 }
 
 // The scene behind transmissive surfaces: everything but them (what they refract).
@@ -373,17 +386,23 @@ fn fs_opaque(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     return c;
 }
 
-// The depth of field / subsurface G-buffer: rgb the scattering diffuse light (when the blur is
-// on), a the view depth (the clear value 0 marks the background).
+// G-buffer RGB holds scattering light and alpha holds view depth
+// Zero depth marks the background
+// Negative depth marks the hovered set when subsurface blur is active
 @fragment
 fn fs_gbuf(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    let z = max(dot(i.wpos - g.eye.xyz, g.fwd.xyz), 1e-4);
+    var z = max(dot(i.wpos - g.eye.xyz, g.fwd.xyz), 1e-4);
     var sss = vec3<f32>(0.0);
+
     if (g.scatter.w > 0.5) {
         sss = shade_mesh(i, front).sss;
+        if (i.hover == HOVERED_SET_INSTANCE) {
+            z = -z;
+        }
     } else if (textureSample(t_base, samp, i.uv).a < hash12(i.clip.xy)) {
         discard;
     }
+
     return vec4<f32>(sss, z);
 }
 

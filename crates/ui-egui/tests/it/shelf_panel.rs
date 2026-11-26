@@ -27,7 +27,10 @@ const REFERENCE_COLUMNS: usize = 4;
 /// The sample project with the shelf on the Materials type
 fn shelf(size: egui::Vec2) -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(size).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(size)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.shelf_tab = MATERIALS_TYPE;
     harness.run_steps(4);
     harness

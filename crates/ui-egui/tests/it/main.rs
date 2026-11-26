@@ -109,6 +109,7 @@ mod user_smart_mask;
 mod view2d_navigation;
 mod view2d_tiles;
 mod view_mode_picker;
+mod viewport_focus;
 mod window_menu_684;
 
 mod filter_card;
@@ -209,13 +210,13 @@ fn click_widget(harness: &mut Harness<'_, TextureCraftApp>, role: egui::Role, la
     click_at(harness, at);
 }
 
-/// The close button nearest the right of a docked panel's `title` (its tab or header title), on the same row
+/// The close button of a docked panel's tab `title`: in the tab's right half, on its row
 fn panel_close_button(harness: &Harness<'_, TextureCraftApp>, title: egui::Rect) -> egui::Rect {
     harness
         .get_all_by_role(egui::Role::Button)
-        .filter(|button| button.accesskit_node().label().as_deref() == Some("Close Panel"))
+        .filter(|button| button.accesskit_node().label().is_some_and(|label| label.starts_with("Close ")))
         .map(|button| button.rect())
-        .filter(|close| close.min.x > title.max.x && title.y_range().contains(close.center().y))
+        .filter(|close| close.center().x > title.center().x && title.y_range().contains(close.center().y))
         .min_by(|a, b| a.min.x.total_cmp(&b.min.x))
         .expect("a close button right of the title")
 }

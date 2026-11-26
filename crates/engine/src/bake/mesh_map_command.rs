@@ -395,20 +395,6 @@ impl Session {
             }
         }
     }
-
-    pub(crate) fn saved_bake_paint(&self) -> BTreeMap<(usize, BakePaintTarget), texturecraft_formats::BakePaintData> {
-        self.doc
-            .bake_paint
-            .iter()
-            .map(|(key, map)| (*key, texturecraft_formats::BakePaintData { width: map.width, height: map.height, values: map.values.clone() }))
-            .collect()
-    }
-
-    /// The bake meshes for a project file: (high polys, cage)
-    pub(crate) fn saved_bake_meshes(&self) -> (Vec<MeshFile>, Option<MeshFile>) {
-        let entry = |mesh: &BakeMesh| (mesh.name.clone(), mesh.bytes.as_ref().clone());
-        (self.doc.bake_meshes.high.iter().map(entry).collect(), self.doc.bake_meshes.cage.as_ref().map(entry))
-    }
 }
 
 /// `bake.highPoly.list`: the high polys and the cage (also part of `project.inspect`).

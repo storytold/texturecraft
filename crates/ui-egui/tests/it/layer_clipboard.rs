@@ -9,7 +9,10 @@ use texturecraft_ui_egui::TextureCraftApp;
 /// The sample session with its selected layer clicked in the stack, and that layer.
 fn harness() -> (Harness<'static, TextureCraftApp>, LayerId) {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     let layer = h.state().session.selected_layer().unwrap();
     let name = h.state().session.doc.project.layers[&layer].name.clone();
@@ -79,7 +82,10 @@ fn layer_shortcuts_act_on_a_selected_effect() {
     let layer = id(texturecraft_engine::execute(&mut session, "layer.add.fill", &serde_json::Value::Null).unwrap(), "layer");
     let p = serde_json::json!({"target": "content", "filter": "invert"});
     let effect = id(texturecraft_engine::execute(&mut session, "effect.add.filter", &p).unwrap(), "effect");
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     let effects = |h: &Harness<'_, TextureCraftApp>| h.state().session.doc.project.layers.get(&layer).map(|l| l.content_effects.len());
     h.event(egui::Event::Copy);

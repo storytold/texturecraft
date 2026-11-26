@@ -1,12 +1,14 @@
 //! The shelf's side panes left of the grid, toggled from the toolbar: saved searches and the folder tree
 
-use craft_ui::layout::{ResizeHandle, ResizeHandleStyle, SplitAxis, SplitLayout, SplitSize, split_rect};
+use craft_behavior::dock::SplitSize;
+use craft_behavior::flow::Axis;
 use egui::{Rect, RichText, Ui, UiBuilder};
 use egui_phosphor::regular as ic;
 use serde::{Deserialize, Serialize};
 
 use crate::TextureCraftApp;
 use crate::i18n::{n_, tr};
+use crate::pane_split::{ResizeHandle, ResizeHandleStyle, SplitLayout, split_rect};
 use crate::saved_search::SavedSearch;
 use crate::shelf::TABS;
 use crate::theme::Tokens;
@@ -93,7 +95,7 @@ fn splitter(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect) -> Option<SplitL
     // Leave room for a header and a complete row when both minima fit
     let spacing = ui.spacing();
     let minimum_points = PANE_MIN_HEIGHT_POINTS.max(2.0 * spacing.interact_size.y + spacing.item_spacing.y);
-    let axis = SplitAxis::Vertical;
+    let axis = Axis::Y;
     let size = SplitSize::Ratio(app.ui.shelf_panes_split);
     let mut layout = split_rect(rect, axis, size, SPLITTER_HEIGHT_POINTS, minimum_points)?;
     let available_points = layout.available();
@@ -103,12 +105,12 @@ fn splitter(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect) -> Option<SplitL
     if available_points > 2.0 * minimum_points {
         let colors =
             ResizeHandleStyle { hovered: visuals.widgets.hovered.bg_fill, dragged: visuals.widgets.active.bg_fill, focused: visuals.selection.bg_fill };
-        let resize = ResizeHandle::new(ui.scope_id().with("shelf_panes_splitter"), axis, layout.divider, tr("Resize Assets filter panes"), colors)
+        let delta = ResizeHandle::new(ui.scope_id().with("shelf_panes_splitter"), axis, layout.divider, tr("Resize Assets filter panes"), colors)
             .hit_margin(0.0)
             .value(layout.first_size(), minimum_points..=available_points - minimum_points)
             .show(ui);
-        if resize.delta != 0.0
-            && let Some(SplitSize::Ratio(share)) = layout.resized(size, resize.delta, minimum_points)
+        if delta != 0.0
+            && let Some(SplitSize::Ratio(share)) = layout.resized(size, delta, minimum_points)
         {
             app.ui.shelf_panes_split = share;
             layout = split_rect(rect, axis, SplitSize::Ratio(share), SPLITTER_HEIGHT_POINTS, minimum_points)?;

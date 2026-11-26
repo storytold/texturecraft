@@ -254,10 +254,10 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 
 - **Swap 3D/2D** (F4, Viewport menu and the layout dropdown, rebindable) puts the 2D view on the left and the 3D view on the right in the split layout. Painting, the divider and the views' headers work on both sides, and the choice is kept with the UI state.
 - A modern look in **four brightness levels** (dark, medium dark, medium light and light) with
-  **seven accent colors**, set in Settings › General › Appearance.
+  **seven accent colors**, set for now only through `ui.set` (`prefs.brightness`, `prefs.accent`).
 - **Its own title bar** with the app icon, menus and window buttons on Windows (and on Linux
   desktops that leave the frame to the app, such as GNOME), the macOS traffic lights over the same
-  strip, and Settings › General › Appearance › System title bar for the system's frame instead.
+  strip, and the system's frame instead with `prefs.system_title_bar` through `ui.set` (for now).
 - **Dockable, tabbed and floating panels**, saved layouts, and panels that reopen where you closed
   them. The right bar's panels (Export, Log, Display Settings, Shader Settings, History) pop out
   beside it; *Undock* makes one a floating window, and its *Dock* button puts it back on the bar.
@@ -277,14 +277,16 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **No project at launch**: empty views, panels and toolbars until you create or open one (File ›
   New project, Open, Recent projects, Open sample project); File › Close returns to that state.
 - A **data folder** of your choice for autosaves, smart materials, presets, templates and UI
-  layouts, on any drive (Settings › General › Folders; `Documents/TextureCraft` by default).
+  layouts, on any drive (Settings › General › Files › Data folder, with `Documents/TextureCraft` as
+  the default). Nightly shows its fixed profile path in the same row.
 - A **Settings window** (Edit › Settings) with General, Shortcuts and Libraries pages; changes
   apply on OK and Cancel drops them. General holds the language (or the system's), the 3D view's
   rotation, zoom and wheel speeds with inverse directions, GPU or CPU bake rays, resource limits
   (worker threads, cores kept for the UI, RAM while saving, project size on open) and the autosave
-  interval. Shortcuts rebinds any command in the sections Actions, Mouse shortcuts and Modifiers shortcuts (Delete clears a binding, a shared shortcut warns and keeps OK disabled, Reset all to default restores every key); the window reopens on the page it was closed on. Libraries adds or removes folders whose saved smart
+  interval. Reset UI restores the system language. The General page also controls the automatic
+  Bake mode map preview. Shortcuts rebinds any command in the sections Actions, Mouse shortcuts and Modifiers shortcuts (Delete clears a binding, a shared shortcut warns and keeps OK disabled, Reset all to default restores every key); the window reopens on the page it was closed on. Libraries adds or removes folders whose saved smart
   materials and masks the shelf lists.
-- The **shortcut list** (Settings › Shortcuts and Help › Shortcuts list) names the actions as the reference does and starts with its default keys (Switch to baking mode Ctrl+Shift+B, Select next and previous camera `>` and `<`, Viewers layout F1 to F4); Show mesh wireframe is a bindable command.
+- The **shortcut list** (Settings › Shortcuts and Help › Shortcuts list) names the actions as the reference does and starts with its default keys (Switch to baking mode F8, Select next and previous camera `>` and `<`, Viewers layout F1 to F4); Show mesh wireframe is a bindable command.
 - A **shortcut editor** with conflict detection, listing every menu item and every command a key can run (commands that need a path, name or similar are left out), and every shortcut shown in its tooltip.
 - **Help menu:** Release notes... opens the project's releases page. Export log... writes every
   channel to a text file with each entry's recorded UTC time, severity and source. The desktop app asks
