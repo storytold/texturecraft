@@ -368,6 +368,7 @@ mod tests {
     }
 
     /// Each generator alone in a black mask on a white fill, on the CPU and the GPU: the material and the mask preview
+    #[allow(clippy::unwrap_used)] // A test helper: a project that does not build fails the test
     fn assert_generators_match(mesh: &Arc<Mesh>, baked: &BakedMaps, cases: &[(&str, Generator, Tolerance)]) {
         let Some(mut gpu) = headless() else { return };
         let images = images();
@@ -389,18 +390,21 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unwrap_used)] // A test helper: the wear kinds have defaults
     fn wear(kind: GeneratorKind, change: impl FnOnce(&mut WearParameters)) -> Generator {
         let mut wear = WearParameters { grunge_amount: 0.0, ..WearParameters::defaults(kind).unwrap() };
         change(&mut wear);
         Generator { wear: Some(wear), ..Generator::new(kind) }
     }
 
+    #[allow(clippy::unwrap_used)] // A test helper: the section kinds have defaults
     fn section(kind: GeneratorKind, change: impl FnOnce(&mut SectionParameters)) -> Generator {
         let mut section = SectionParameters::defaults(kind).unwrap();
         change(&mut section);
         Generator { section: Some(section), ..Generator::new(kind) }
     }
 
+    #[allow(clippy::unwrap_used)] // A test helper: the Light generator has defaults
     fn light(change: impl FnOnce(&mut LightParameters)) -> Generator {
         let mut light = LightParameters::defaults(GeneratorKind::Direction).unwrap();
         change(&mut light);
