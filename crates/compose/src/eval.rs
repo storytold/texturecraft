@@ -587,8 +587,10 @@ pub fn painted_tile_margin(project: &Project, ts: usize, target: PaintTarget) ->
     let owner = project.effect(id).map_or(id, |(owner, _)| owner);
     let mut max_reach = 0;
     for layer in project.render_tree(&set.stack).iter().filter_map(|id| project.layers.get(id)) {
-        // Anchor reads and Compare masks read the stack below at the same texel
-        if layer.reads_stack() {
+        // Anchor reads, Compare masks and lighting by the layer's material (its other channels
+        // over the stack below) read the stack below at the same texel
+        let lit = layer.content_effects.iter().any(|effect| effect.visible && lights_material(&effect.kind));
+        if layer.reads_stack() || lit {
             return (!stack_reads_neighbours(project, ts)).then_some(0);
         }
         if owner == layer.id {

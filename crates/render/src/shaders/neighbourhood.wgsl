@@ -88,6 +88,15 @@ fn copy_of(point: vec2<i32>) -> vec2<i32> {
     return select(select(vec2(0), vec2(1), point >= params.bounds.zw), vec2(-1), point < params.bounds.xy);
 }
 
+// How many set periods field-local `point` lies from the set, per axis (any distance: a wrapping
+// field reaches as far as its stages do): `copy_of` past one period
+fn periodic_copy(point: vec2<i32>) -> vec2<i32> {
+    let period = max(params.bounds.zw - params.bounds.xy, vec2(1));
+    let offset = point - params.bounds.xy;
+    let truncated = offset / period;
+    return truncated - select(vec2(0), vec2(1), (offset < vec2(0)) & (truncated * period != offset));
+}
+
 // The texels [x0, y0, x1, y1) of the field a stage reads around field-local `point`: the whole
 // field for a wrapping stage, else the copy of the set the point lies in (clipped to the field)
 fn copy_segment(point: vec2<i32>) -> vec4<i32> {
@@ -286,7 +295,7 @@ fn gathered(point: vec2<f32>, original: vec4<f32>) -> vec4<f32> {
     let seed = params.mode.z;
     // The texel's home in the set: in a wrapping program a periodic copy past the set's edges
     // takes its noise and cells there, as the CPU's wrapped read of the lower stage does
-    let shift = vec2<f32>(copy_of(vec2<i32>(point) - field_origin()) * (params.bounds.zw - params.bounds.xy));
+    let shift = vec2<f32>(periodic_copy(vec2<i32>(point) - field_origin()) * (params.bounds.zw - params.bounds.xy));
     let home = point - shift;
     var acc = EMPTY;
     switch params.mode.y {

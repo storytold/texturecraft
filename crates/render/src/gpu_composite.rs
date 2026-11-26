@@ -13,8 +13,9 @@ use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, DisplayKind, ImageStore, PixelStore};
 use texturecraft_core::project::DisplaySettings;
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, ContentsOffset, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter,
-    Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Sampling, Source, ThresholdMode,
+    BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, CompareSource, ContentsOffset, CurvatureDetail, CurvatureMode, Effect, EffectKind,
+    Filter, Generator, GeneratorKind, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, ProceduralKind, Project, Projection, Sampling, Source,
+    ThresholdMode,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
@@ -1232,8 +1233,16 @@ impl FilterPlan {
         self.reach = self.reach.max(reach);
     }
 
-    fn expand(&self, region: Option<CompositeRegion>) -> Option<CompositeRegion> {
-        region.map(|region| region.expanded(self.reach))
+    /// The update `region` grown by the stages' reach on a set of `size`; None (a full update)
+    /// when a wrapping stage's reach crosses the set's edge, as an edit there changes the
+    /// opposite edge too
+    fn expand(&self, region: Option<CompositeRegion>, (width, height): (u32, u32)) -> Option<CompositeRegion> {
+        let region = region?;
+        let crosses = |min: u32, max: u32, side: u32| min < self.reach || max.saturating_add(self.reach) > side;
+        if self.wraps() && (crosses(region.min[0], region.max[0], width) || crosses(region.min[1], region.max[1], height)) {
+            return None;
+        }
+        Some(region.expanded(self.reach))
     }
 
     fn words(&self, area: u64) -> u64 {
@@ -2008,7 +2017,7 @@ impl CompositeProgram {
         if layout.as_ref().is_some_and(|layout| layout.scaled) {
             display_outputs |= display_bit(DisplayKind::Extra);
         }
-        let region = filters.expand(region);
+        let region = filters.expand(region, project.texture_sets.get(ts).map_or((0, 0), texturecraft_core::TextureSet::size));
         let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
         let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
         Ok(Self {
@@ -2092,7 +2101,7 @@ impl CompositeProgram {
         bind_generator_sources(&mut operations, &procedural.generator_sources);
         filters.bind_anchors(&mut operations);
         let udim = udim::bind(layout.as_ref(), &mut filters, &mut procedural).ok_or("The UV tile layout exceeds the GPU parameter table.")?;
-        let region = filters.expand(region);
+        let region = filters.expand(region, project.texture_sets.get(ts).map_or((0, 0), texturecraft_core::TextureSet::size));
         let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
         let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
         Ok(Self {
@@ -2352,8 +2361,9 @@ fn compile_mask(
                 let mut operation = Operation { ids: [0, COMPARE_OPCODE, compare, 0], low: [*value, *tolerance, 0.0, 0.0], ..Operation::zeroed() };
                 stack::soften_compare(&mut operation, *hardness);
 
-                // A side reading the layers below or this layer reads the material of the channel at the texel
-                if left.reads_stack() || right.reads_stack() {
+                // A side reading the layers below or this layer reads the material of the channel at
+                // the texel; any pair but the mask against the constant names its sides too
+                if left.reads_stack() || right.reads_stack() || (*left, *right) != (CompareSource::ThisMask, CompareSource::Constant) {
                     stack::read_layers(&mut operation, *left, *right, *channel);
                 }
                 operation
@@ -3320,7 +3330,7 @@ impl GpuCompositor {
             let shared = self.shared_test_kernels;
             self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::for_device(device, shared));
         }
-        let (pipeline, prepare) = self.pipelines().get(device, &self.pipeline_layout, program, self.asynchronous).ok_or(GPU_PIPELINES_PENDING)?;
+        let (pipeline, prepare) = self.pipelines().get(device, &self.pipeline_layout, program, self.asynchronous)?.ok_or(GPU_PIPELINES_PENDING)?;
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
         let (surface, vertices) = self.surface_inputs(device, queue, program)?;
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
@@ -3363,6 +3373,19 @@ impl GpuCompositor {
         }
         let scratch_limit = scratch_limit - whole_bytes;
         let whole = whole.map(|whole| whole.with_stripes(scratch_limit)).transpose()?;
+        // Color Match's Average reduces its whole field to one mean: in stripes each stripe would
+        // apply its own, so a set that needs stripes composites it on the CPU
+        if let Some(whole) = &whole
+            && whole.stripe_rows < whole.region[3] - whole.region[1]
+            && whole
+                .stages
+                .stages
+                .iter()
+                .filter_map(|&stage| program.filters.stages.get(stage)?.filter)
+                .any(crate::gpu_neighbourhood::gather::reads_whole_set_mean)
+        {
+            return Err("Color Match's Average over a set that needs stripes uses CPU compositing.".into());
+        }
         // A filtered band includes its source halo. Folder snapshots use only its output area.
         while required(band_width, band_rows) > scratch_limit {
             if band_width == 1 && band_rows == 1 {
@@ -3926,9 +3949,9 @@ impl GpuCompositor {
     }
 
     /// Whether `program`'s pipelines are compiled; starts compiling them otherwise (on worker
-    /// threads when [`Self::set_asynchronous_compile`] is on).
-    pub(crate) fn pipelines_ready(&mut self, device: &wgpu::Device, program: &CompositeProgram) -> bool {
-        self.pipelines().get(device, &self.pipeline_layout, program, self.asynchronous).is_some()
+    /// threads when [`Self::set_asynchronous_compile`] is on). An error when their compile failed.
+    pub(crate) fn pipelines_ready(&mut self, device: &wgpu::Device, program: &CompositeProgram) -> Result<bool, String> {
+        Ok(self.pipelines().get(device, &self.pipeline_layout, program, self.asynchronous)?.is_some())
     }
 
     /// Start compiling `program`'s pipelines on worker threads without compositing.

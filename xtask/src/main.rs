@@ -199,17 +199,13 @@ fn render_ci_env() -> Result<Vec<(&'static str, String)>, String> {
     Ok(defaults.into_iter().filter(|(name, _)| std::env::var_os(name).is_none()).collect())
 }
 
-/// `cargo test --workspace`. On Linux the render crate's unit tests run in a few processes,
-/// with two malloc arenas: they compile many GPU pipelines on Mesa, which keeps what it compiled
-/// until the process ends, so one process for all of them outgrows a 16 GB runner, and the
-/// default per-thread arenas fragment that memory. A MALLOC_ARENA_MAX the caller set wins. On
-/// Linux CI they run on lavapipe ([`render_ci_env`]), the groups at once.
+/// `cargo test --workspace`. The render crate's unit tests run in a few processes at once, with
+/// two malloc arenas on Linux: they compile many GPU pipelines on Mesa, which keeps what it
+/// compiled until the process ends, so one process for all of them outgrows a 16 GB runner, and
+/// the default per-thread arenas fragment that memory. A MALLOC_ARENA_MAX the caller set wins.
+/// On Linux CI they run on lavapipe ([`render_ci_env`]); the Windows gate sets up lavapipe in
+/// its own script, and its groups run at once as well, which halves the gate's longest step.
 fn cmd_test() -> Result<(), String> {
-    if !cfg!(target_os = "linux") {
-        let mut c = cargo();
-        c.args(["test", "--workspace"]);
-        return run(c, "cargo test --workspace");
-    }
     let render_env = render_ci_env()?;
     for (name, value) in &render_env {
         eprintln!("render tests with {name}={value}");

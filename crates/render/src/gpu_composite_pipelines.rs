@@ -175,28 +175,36 @@ enum Slot {
     Ready(wgpu::ComputePipeline),
     // The web compiles in place: no worker threads there
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    Compiling(Arc<Mutex<Option<wgpu::ComputePipeline>>>),
+    Compiling(Arc<Mutex<Option<Result<wgpu::ComputePipeline, String>>>>),
+    /// A worker's compile that failed (the device's error handler panicked on it): final
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Failed(String),
 }
 
 impl Slot {
-    /// The pipeline once compiled; `wait` waits for a compile in flight (a caller that compiles
-    /// in place, after a pre-warm started one on a worker thread)
-    fn ready(&mut self, wait: bool) -> Option<wgpu::ComputePipeline> {
+    /// The pipeline once compiled (None while it compiles), or why it never will be; `wait`
+    /// waits for a compile in flight (a caller that compiles in place, after a pre-warm started
+    /// one on a worker thread)
+    fn ready(&mut self, wait: bool) -> Result<Option<wgpu::ComputePipeline>, String> {
         if let Slot::Compiling(compiled) = self {
-            let pipeline = loop {
-                if let Some(pipeline) = compiled.lock().unwrap_or_else(PoisonError::into_inner).take() {
-                    break pipeline;
+            let result = loop {
+                if let Some(result) = compiled.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                    break result;
                 }
                 if !wait {
-                    return None;
+                    return Ok(None);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             };
-            *self = Slot::Ready(pipeline);
+            *self = match result {
+                Ok(pipeline) => Slot::Ready(pipeline),
+                Err(error) => Slot::Failed(error),
+            };
         }
         match self {
-            Slot::Ready(pipeline) => Some(pipeline.clone()),
-            Slot::Compiling(_) => None,
+            Slot::Ready(pipeline) => Ok(Some(pipeline.clone())),
+            Slot::Compiling(_) => Ok(None),
+            Slot::Failed(error) => Err(error.clone()),
         }
     }
 }
@@ -239,14 +247,15 @@ impl CompositePipelines {
     }
 
     /// The program's compose and prepare pipelines; None while one still compiles (new ones
-    /// compile on worker threads when `asynchronous`: the viewport keeps its last result).
+    /// compile on worker threads when `asynchronous`: the viewport keeps its last result), an
+    /// error when a worker's compile failed.
     pub(super) fn get(
         &mut self,
         device: &wgpu::Device,
         layout: &wgpu::PipelineLayout,
         program: &CompositeProgram,
         asynchronous: bool,
-    ) -> Option<(wgpu::ComputePipeline, Option<wgpu::ComputePipeline>)> {
+    ) -> Result<Option<(wgpu::ComputePipeline, Option<wgpu::ComputePipeline>)>, String> {
         let features = Features::of(program);
         let supports_curvature = self.supports_curvature;
         let supports_id = self.supports_id;
@@ -283,26 +292,33 @@ impl CompositePipelines {
                 let compiled = Arc::new(Mutex::new(None));
                 let sink = compiled.clone();
                 std::thread::spawn(move || {
-                    let pipeline = compile();
-                    *sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(pipeline);
+                    // A compile the device's error handler panics on still answers, so the slot
+                    // never waits for it forever
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(compile)).map_err(|panic| {
+                        let message = panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()));
+                        format!("GPU pipeline {label} failed to compile: {}", message.unwrap_or_default())
+                    });
+                    *sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
                 });
                 return Slot::Compiling(compiled);
             }
             Slot::Ready(compile())
         };
         let grouped = program.groups.depth != 0;
-        let render = variants.render[usize::from(grouped)].get_or_insert_with(|| pipeline("compose", "tc_gpu_composite", grouped)).ready(!asynchronous);
+        let render = variants.render[usize::from(grouped)].get_or_insert_with(|| pipeline("compose", "tc_gpu_composite", grouped)).ready(!asynchronous)?;
         // Only material anchor capture needs to walk the group structure while preparing a source.
         let grouped_capture = grouped && features.material_anchors;
         let prepare = match features.spatial {
-            true => Some(
-                variants.prepare[usize::from(grouped_capture)]
-                    .get_or_insert_with(|| pipeline("prepare_filter", "tc_spatial_source", grouped_capture))
-                    .ready(!asynchronous)?,
-            ),
+            true => match variants.prepare[usize::from(grouped_capture)]
+                .get_or_insert_with(|| pipeline("prepare_filter", "tc_spatial_source", grouped_capture))
+                .ready(!asynchronous)?
+            {
+                Some(prepare) => Some(prepare),
+                None => return Ok(None),
+            },
             false => None,
         };
-        Some((render?, prepare))
+        Ok(render.map(|render| (render, prepare)))
     }
 }
 
