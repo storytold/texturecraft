@@ -2772,6 +2772,8 @@ struct IdBakeCache {
 struct CurvatureCache {
     gbuf: Weak<UvGBuffer>,
     map: Weak<Vec<f32>>,
+    /// P2: the micro maps whose curvature the levels blur (None: the bake's own)
+    micro: Option<Weak<generator_p2::MicroMaps>>,
     size: [u32; 2],
     needed: [bool; CurvatureDetail::BLURRED_SIZES],
     levels: CurvatureLevels,
@@ -2848,12 +2850,13 @@ impl GpuCompositor {
         let array = texture(wgpu::TextureSampleType::Uint, wgpu::TextureViewDimension::D2Array);
         let float = texture(wgpu::TextureSampleType::Float { filterable: false }, wgpu::TextureViewDimension::D2);
         let limits = device.limits();
-        let supports_curvature = limits.max_sampled_textures_per_shader_stage >= 6
+        // P2: the micro detail maps (binding 16) come with the curvature levels
+        let supports_curvature = limits.max_sampled_textures_per_shader_stage >= 7
             && limits.max_uniform_buffers_per_shader_stage >= 3
-            && limits.max_bindings_per_bind_group >= 15
+            && limits.max_bindings_per_bind_group >= 17
             && limits.max_storage_textures_per_shader_stage >= 1
             && limits.max_compute_workgroup_size_x >= 64;
-        let supports_id = limits.max_sampled_textures_per_shader_stage >= 6 + u32::from(supports_curvature) && limits.max_bindings_per_bind_group >= 16;
+        let supports_id = limits.max_sampled_textures_per_shader_stage >= 6 + 2 * u32::from(supports_curvature) && limits.max_bindings_per_bind_group >= 16;
         let mut entries = vec![
             binding(0, uniform),
             binding(1, read),
@@ -3234,7 +3237,7 @@ impl GpuCompositor {
         queue: &wgpu::Queue,
         ts: usize,
         program: &CompositeProgram,
-        (baked_view, adjusted): (&wgpu::TextureView, bool),
+        (baked_view, micro): (&wgpu::TextureView, Option<&Arc<generator_p2::MicroMaps>>),
     ) -> Result<Option<CurvatureLevels>, String> {
         let source = program.baked.as_ref().and_then(|baked| baked.maps[2].as_ref().map(|map| (baked, map)));
         let Some((baked, map)) = source else {
@@ -3254,8 +3257,15 @@ impl GpuCompositor {
         let key = Arc::downgrade(gbuf);
         let map = Arc::downgrade(map);
         let size = [baked.width, baked.height];
-        // P2: a bake with micro curvature added (`adjusted`) is blurred anew, and not kept
-        if let Some(cache) = curvature.cache.get(&ts).filter(|cache| !adjusted && cache.gbuf.ptr_eq(&key) && cache.map.ptr_eq(&map) && cache.size == size)
+        // P2: levels of a bake with micro curvature added are kept for those micro maps
+        let micro = micro.map(Arc::downgrade);
+        let same_micro = |cached: &Option<Weak<generator_p2::MicroMaps>>| match (cached, &micro) {
+            (Some(cached), Some(micro)) => cached.ptr_eq(micro),
+            (None, None) => true,
+            _ => false,
+        };
+        if let Some(cache) =
+            curvature.cache.get(&ts).filter(|cache| cache.gbuf.ptr_eq(&key) && cache.map.ptr_eq(&map) && same_micro(&cache.micro) && cache.size == size)
             && needed.iter().zip(cache.needed).all(|(&required, present)| !required || present)
         {
             return Ok(Some(cache.levels.clone()));
@@ -3273,9 +3283,7 @@ impl GpuCompositor {
         let working_size = [gbuf.width, gbuf.height];
         let levels =
             gpu.build(device, queue, CurvatureInput { baked: baked_view, bake_size: size, coverage: coverage.as_ref(), working_size, needed, block, scales })?;
-        if !adjusted {
-            curvature.cache.insert(ts, CurvatureCache { gbuf: key, map, size, needed, levels: levels.clone() });
-        }
+        curvature.cache.insert(ts, CurvatureCache { gbuf: key, map, micro, size, needed, levels: levels.clone() });
         Ok(Some(levels))
     }
 
@@ -3352,8 +3360,8 @@ impl GpuCompositor {
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
         // P2: the micro detail maps, and the bake with micro curvature the detail sizes blur
         let micro = generator_p2::MicroGpu::maps(&mut self.micro, device, queue, (ts, self.default_micro_maps.is_some()), program, &baked)?;
-        let micro_bake = micro.as_ref().and_then(|maps| maps.bake.as_ref());
-        let curvature = self.curvature_inputs(device, queue, ts, program, (micro_bake.unwrap_or(&baked), micro_bake.is_some()))?;
+        let micro_bake = micro.as_ref().filter(|maps| maps.bake.is_some());
+        let curvature = self.curvature_inputs(device, queue, ts, program, (micro_bake.and_then(|maps| maps.bake.as_ref()).unwrap_or(&baked), micro_bake))?;
         let micro_maps = micro.as_ref().map(|maps| maps.maps.clone()).or_else(|| self.default_micro_maps.clone());
         let id_bake = self.id_bake_input(device, queue, ts, program.id_bake.as_ref())?;
         let [id_width, id_height] = program.id_bake.as_ref().map_or([0; 2], |id| id.size);

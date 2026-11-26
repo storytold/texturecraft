@@ -653,7 +653,8 @@ impl MicroGpu {
     ) -> Result<MicroMaps, String> {
         let plan = &program.micro;
         let limits = device.limits();
-        let tallest = occlusion_rows.max(curvature_rows);
+        // The row counts sit after the tallest map's rows, after one row where no map is baked
+        let tallest = occlusion_rows.max(curvature_rows).max(1);
         let layers = (plan.requests.len() * 2) as u32;
         if width.max(tallest + 1) > limits.max_texture_dimension_2d || layers > limits.max_texture_array_layers {
             return Err("Micro Details exceed the GPU texture dimensions.".into());
@@ -1052,10 +1053,11 @@ mod tests {
     }
 
     /// Micro Details on the earlier model match the CPU: the Sobel, Standard and Smooth curvature
-    /// (a height image, a DirectX normal image, a uniform height, an empty normal slot; Smooth's
-    /// kernel and box blurs) with the detail sizes blurring the micro curvature, and the
-    /// occlusion of a height image over at most and over more than 16 steps; a texture and a
-    /// custom grunge leave the earlier model as it is
+    /// of a height and a normal image (Sobel's normal DirectX, with the detail sizes blurring the
+    /// micro curvature; Smooth's kernel and box blurs), a uniform height and an empty normal slot,
+    /// the occlusion of a height image over at most and over more than 16 steps, a radius that
+    /// occludes nothing and no baked occlusion; a texture and a custom grunge leave the earlier
+    /// model as it is
     #[test]
     fn micro_details_match_the_cpu() {
         let Some(mut gpu) = headless() else { return };
@@ -1071,44 +1073,33 @@ mod tests {
         let height = Some(Source::Image { name: "height".into(), normal_format: NormalFormat::OpenGl });
         let normal = Some(Source::Image { name: "normal".into(), normal_format: NormalFormat::DirectX });
         let micro = |kind| MicroDetails { enabled: true, ..MicroDetails::defaults(kind).unwrap() };
+        let curvature = |micro: MicroDetails| Generator { detail: None, micro: Some(Box::new(micro)), ..earlier_generator(GeneratorKind::Curvature) };
+        let images_of = |curvature_type| MicroDetails {
+            curvature_type,
+            height_source: height.clone(),
+            normal_source: Some(Source::image("normal")),
+            ..micro(GeneratorKind::Curvature)
+        };
+        let unbaked = BakedMaps::default();
         let cases = [
             (
                 "Sobel with detail sizes",
                 Generator {
-                    micro: Some(Box::new(MicroDetails {
-                        height_source: height.clone(),
-                        normal_source: normal,
-                        curvature_intensity: 0.6,
-                        ..micro(GeneratorKind::Curvature)
-                    })),
+                    micro: Some(Box::new(MicroDetails { normal_source: normal, curvature_intensity: 0.6, ..images_of(MicroCurvatureType::Sobel) })),
                     ..earlier_generator(GeneratorKind::Curvature)
                 },
+                &baked,
             ),
+            ("Standard", curvature(images_of(MicroCurvatureType::Standard)), &baked),
+            ("Smooth", curvature(MicroDetails { height_intensity: 4.0, ..images_of(MicroCurvatureType::Smooth) }), &baked),
             (
-                "Standard of a uniform height",
-                Generator {
-                    detail: None,
-                    micro: Some(Box::new(MicroDetails {
-                        curvature_type: MicroCurvatureType::Standard,
-                        normal: false,
-                        height_source: Some(Source::Uniform([0.3, 0.5, 0.7])),
-                        ..micro(GeneratorKind::Curvature)
-                    })),
-                    ..earlier_generator(GeneratorKind::Curvature)
-                },
-            ),
-            (
-                "Smooth with an empty normal",
-                Generator {
-                    detail: None,
-                    micro: Some(Box::new(MicroDetails {
-                        curvature_type: MicroCurvatureType::Smooth,
-                        height_source: height.clone(),
-                        height_intensity: 4.0,
-                        ..micro(GeneratorKind::Curvature)
-                    })),
-                    ..earlier_generator(GeneratorKind::Curvature)
-                },
+                "a uniform height and an empty normal",
+                curvature(MicroDetails {
+                    curvature_type: MicroCurvatureType::Standard,
+                    height_source: Some(Source::Uniform([0.3, 0.5, 0.7])),
+                    ..micro(GeneratorKind::Curvature)
+                }),
+                &baked,
             ),
             (
                 "occlusion over more than 16 steps",
@@ -1121,6 +1112,37 @@ mod tests {
                     })),
                     ..earlier_generator(GeneratorKind::AmbientOcclusion)
                 },
+                &baked,
+            ),
+            (
+                "occlusion over 16 steps at most",
+                Generator {
+                    micro: Some(Box::new(MicroDetails {
+                        height: true,
+                        height_source: height.clone(),
+                        ao_radius: 0.5,
+                        ao_depth: 0.5,
+                        ..micro(GeneratorKind::Dirt)
+                    })),
+                    ..earlier_generator(GeneratorKind::Dirt)
+                },
+                &baked,
+            ),
+            (
+                "an occlusion radius too short to occlude",
+                Generator {
+                    micro: Some(Box::new(MicroDetails { height_source: height.clone(), ao_radius: 0.1, ..micro(GeneratorKind::AmbientOcclusion) })),
+                    ..earlier_generator(GeneratorKind::AmbientOcclusion)
+                },
+                &baked,
+            ),
+            (
+                "occlusion without a baked map",
+                Generator {
+                    micro: Some(Box::new(MicroDetails { height_source: height.clone(), ao_radius: 1.0, ..micro(GeneratorKind::AmbientOcclusion) })),
+                    ..earlier_generator(GeneratorKind::AmbientOcclusion)
+                },
+                &unbaked,
             ),
             (
                 "a texture and a custom grunge, which the earlier model does not read",
@@ -1130,16 +1152,10 @@ mod tests {
                     grunge: height.clone(),
                     ..earlier_generator(GeneratorKind::Curvature)
                 },
-            ),
-            (
-                "occlusion over 16 steps at most",
-                Generator {
-                    micro: Some(Box::new(MicroDetails { height: true, height_source: height, ao_radius: 0.5, ao_depth: 0.5, ..micro(GeneratorKind::Dirt) })),
-                    ..earlier_generator(GeneratorKind::Dirt)
-                },
+                &baked,
             ),
         ];
-        for (label, generator) in cases {
+        for (label, generator, baked) in cases {
             let mut project = Project::new("Micro Details", "builtin:plane");
             project.texture_sets.push(TextureSet::new("Plane", 0, TILE));
             let owner = project.alloc_id();
@@ -1151,7 +1167,7 @@ mod tests {
             project.insert_layer(0, layer, None, false).unwrap();
 
             let pixels = PixelStore::default();
-            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            let mut case = OracleCase::new(&project, &pixels, baked, &images, &mesh);
             case.mask_owner = Some(owner);
             assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, label);
         }

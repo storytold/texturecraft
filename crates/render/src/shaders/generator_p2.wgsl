@@ -21,9 +21,11 @@ fn micro_map_at(layer: u32, pixel: vec2<u32>) -> f32 {
 }
 
 // The baked occlusion (x) and curvature (y) at `pixel` with what the generator's micro details
-// add: the curvature term added, the occlusion multiplied (curvature_input, occlusion_input)
+// add: the curvature term added, the occlusion multiplied (curvature_input, occlusion_input).
+// A texel a smaller UV tile leaves outside its block's bake is uncovered, so its reading is never
+// shown.
 fn generator_micro(effect: Operation, pixel: vec2<u32>, baked: vec3<f32>) -> vec3<f32> {
-    if effect.uv.w == 0.0 || !udim_bake_valid(pixel) {
+    if effect.uv.w == 0.0 {
         return baked;
     }
     var adjusted = baked;

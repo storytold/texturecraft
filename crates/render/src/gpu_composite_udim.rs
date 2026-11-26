@@ -726,8 +726,9 @@ mod tests {
     }
 
     /// P2: Micro Details sample, blur and occlude each UV tile block of the bake on its own, the
-    /// detail sizes blur each block's micro curvature, and a micro map of its own height (the
-    /// occlusion's, shorter than the curvature's) reads at that height
+    /// detail sizes blur each block's micro curvature, a micro map of its own height (the
+    /// occlusion's, shorter than the curvature's) reads at that height, and a blurred
+    /// generator's stage reads the micro maps
     #[test]
     fn micro_details_work_per_uv_tile_block() {
         use texturecraft_core::{Generator, MicroDetails, NormalFormat};
@@ -770,9 +771,15 @@ mod tests {
             let mut layer = Layer::new(owner, "Micro", LayerKind::Fill(fill), &[Channel::BaseColor]);
             let mut mask = Mask::new(MaskBackground::Black);
             for kind in [GeneratorKind::Curvature, GeneratorKind::AmbientOcclusion] {
-                let generator = Generator { micro: Some(Box::new(micro(kind))), ..crate::gpu_composite::oracle::earlier_generator(kind) };
+                let occlusion = kind == GeneratorKind::AmbientOcclusion;
+                let mut generator = Generator { micro: Some(Box::new(micro(kind))), ..crate::gpu_composite::oracle::earlier_generator(kind) };
+
+                // The occlusion blurred: its stage reads the micro maps too
+                if occlusion {
+                    generator.global.blur = 0.5;
+                }
                 let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(generator));
-                if kind == GeneratorKind::AmbientOcclusion {
+                if occlusion {
                     generated.blend = BlendMode::Multiply;
                 }
                 mask.effects.push(generated);
