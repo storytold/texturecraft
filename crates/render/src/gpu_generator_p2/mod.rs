@@ -425,22 +425,31 @@ pub(super) fn compile_captures(plan: &mut MicroPlan, project: &Project, pixels: 
     Ok(())
 }
 
-/// The project whose Height is anchor point `anchor`'s height as its first micro height reader
-/// reads it (compose's `anchor_heights`): that reader and every draw after it hidden, under a top
-/// layer whose Height reads the anchor
+/// The project whose Height is anchor point `anchor`'s height as its micro height reader reads
+/// it (compose's `anchor_heights`): the reader's draw and every draw first made after it hidden,
+/// under a top layer whose Height reads the anchor. A reader drawn more than once (inside an
+/// instanced folder) reads a height of each draw, which the one map does not hold: that program
+/// composes on the CPU.
 fn capture_project(project: &Project, ts: usize, anchor: LayerId) -> Result<Project, &'static str> {
     let set = project.texture_sets.get(ts).ok_or("The texture set is missing.")?;
-    let order = draw_order(project, &set.stack);
+    let order = draw_order(project, &set.stack, 0);
     let reads_anchor = |id: &LayerId| {
-        let effects = project.layers.get(id).and_then(|layer| layer.mask.as_ref()).into_iter().flat_map(|mask| &mask.effects);
-        effects
+        let visible = project.layers.get(id).is_some_and(|layer| layer.visible);
+        let mask = project.layers.get(&project.mask_owner(*id)).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled && visible);
+        mask.into_iter()
+            .flat_map(|mask| &mask.effects)
             .filter(|effect| effect.visible)
             .any(|effect| matches!(&effect.kind, EffectKind::Generator(generator) if micro_height_anchor(generator) == Some(anchor)))
     };
-    let first = order.iter().position(reads_anchor).unwrap_or(order.len());
+    let readers: Vec<usize> = order.iter().enumerate().filter(|(_, id)| reads_anchor(id)).map(|(index, _)| index).collect();
+    if readers.len() > 1 {
+        return Err("A micro height reader drawn more than once uses CPU compositing.");
+    }
 
+    // Draws of a layer drawn before the reader too (an instanced folder's) stay: the instance hides them
+    let first = readers.first().copied().unwrap_or(order.len());
     let mut captured = project.clone();
-    for id in &order[first..] {
+    for id in order[first..].iter().filter(|id| order[first] == **id || !order[..first].contains(id)) {
         if let Some(layer) = captured.layers.get_mut(id) {
             layer.visible = false;
         }
@@ -466,16 +475,19 @@ fn micro_height_anchor(generator: &Generator) -> Option<LayerId> {
     }
 }
 
-/// The layers of `stack` (bottom first) in the order they draw: each folder before its children
-fn draw_order(project: &Project, stack: &[LayerId]) -> Vec<LayerId> {
+/// The layers of `stack` (bottom first) in the order they draw, as compose's `draw_order`
+/// lists them: each before its children, an instance before its source's, a hidden layer's not
+fn draw_order(project: &Project, stack: &[LayerId], depth: usize) -> Vec<LayerId> {
+    if depth > texturecraft_core::project::MAX_DEPTH {
+        return Vec::new();
+    }
+
     stack
         .iter()
         .flat_map(|id| {
-            let children = match project.layers.get(id).map(|layer| &layer.kind) {
-                Some(LayerKind::Group { children, .. }) => draw_order(project, children),
-                _ => Vec::new(),
-            };
-            std::iter::once(*id).chain(children)
+            let visible = project.layers.get(id).is_some_and(|layer| layer.visible);
+            let children = project.content_layer(*id).filter(|_| visible).map_or(&[][..], Layer::children);
+            std::iter::once(*id).chain(draw_order(project, children, depth + 1))
         })
         .collect()
 }

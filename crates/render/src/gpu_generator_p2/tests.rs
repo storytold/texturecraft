@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use texturecraft_compose::{BakedMaps, ImageRes, ImageStore, PixelStore};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, Effect, EffectKind, Fill, Generator, GeneratorKind, Layer, LayerKind, Mask, MaskBackground, MicroCurvatureType, MicroDetails,
-    NormalFormat, Procedural, ProceduralKind, Project, Source, TextureLayer, TextureSet,
+    BakedMap, BlendMode, Channel, ContentsOffset, Effect, EffectKind, Fill, Generator, GeneratorKind, Layer, LayerId, LayerKind, Mask, MaskBackground,
+    MicroCurvatureType, MicroDetails, NormalFormat, Procedural, ProceduralKind, Project, Projection, Sampling, Source, TextureLayer, TextureSet,
 };
 use texturecraft_geom::primitives;
 use texturecraft_texel::TILE;
@@ -190,7 +190,6 @@ fn micro_details_match_the_cpu() {
 fn a_micro_height_read_from_an_anchor_matches_the_cpu() {
     let Some(mut gpu) = headless() else { return };
     const BAKE: u32 = 256;
-    let mesh = Arc::new(primitives::plane(1.0, 1));
     let curvature = (0..BAKE * BAKE).map(|texel| 0.5 + 0.2 * ((texel % BAKE) as f32 * 0.07).sin() * ((texel / BAKE) as f32 * 0.05).cos()).collect();
     let baked = BakedMaps { resolution: BAKE, maps: BTreeMap::from([(BakedMap::Curvature, Arc::new(curvature))]) };
     let images = ImageStore::from([("height".to_string(), noise((53, 47), 3))]);
@@ -219,8 +218,132 @@ fn a_micro_height_read_from_an_anchor_matches_the_cpu() {
     layer.mask = Some(mask);
     project.insert_layer(0, layer, None, false).unwrap();
     let pixels = PixelStore::default();
-    let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
-    case.mask_owner = Some(owner);
 
-    assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, "a micro height read from an anchor point");
+    // A cube's UV islands leave texels uncovered, which the anchor's heights border
+    for (label, mesh) in [("plane", primitives::plane(1.0, 1)), ("cube", primitives::cube(1.0))] {
+        let mesh = Arc::new(mesh);
+        let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+        case.mask_owner = Some(owner);
+
+        assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("a micro height read from an anchor point on a {label}"));
+    }
+}
+
+/// A layer whose mask reads anchor point `anchor`'s height as a Curvature's micro height
+fn anchor_reader(project: &mut Project, anchor: LayerId) -> Layer {
+    let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.9, 0.6, 0.3]))]), ..Default::default() };
+    let mut layer = Layer::new(project.alloc_id(), "Micro", LayerKind::Fill(fill), &[Channel::BaseColor]);
+    let micro = MicroDetails {
+        enabled: true,
+        normal: false,
+        height_source: Some(Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() }),
+        ..MicroDetails::defaults(GeneratorKind::Curvature).unwrap()
+    };
+    let mut mask = Mask::new(MaskBackground::Black);
+    let generator = Generator { micro: Some(Box::new(micro)), ..earlier_generator(GeneratorKind::Curvature) };
+    mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
+    layer.mask = Some(mask);
+    layer
+}
+
+/// A height fill of the "height" image with an anchor point after it: the layer and the anchor
+fn anchored_height(project: &mut Project) -> (Layer, LayerId) {
+    let fill = Fill { sources: BTreeMap::from([(Channel::Height, Source::image("height"))]), ..Default::default() };
+    let mut layer = Layer::new(project.alloc_id(), "Height", LayerKind::Fill(fill), &[Channel::BaseColor, Channel::Height]);
+    let anchor = project.alloc_id();
+    layer.content_effects.push(Effect::new(anchor, EffectKind::Anchor));
+    (layer, anchor)
+}
+
+/// Micro height readers inside folders match the CPU (a sibling's anchor, the folder's own mask
+/// anchor), and so do readers after and between the two draws of an instanced folder's anchor; a
+/// reader inside an instanced folder, drawn twice, composes on the CPU
+#[test]
+fn micro_anchor_readers_in_folders_and_instances() {
+    let Some(mut gpu) = headless() else { return };
+    let channels = [Channel::BaseColor, Channel::Height];
+    let mesh = Arc::new(primitives::plane(1.0, 1));
+    let baked = BakedMaps {
+        resolution: 128,
+        maps: BTreeMap::from([(BakedMap::Curvature, Arc::new((0..128 * 128).map(|texel| 0.5 + 0.1 * ((texel % 128) as f32 * 0.09).sin()).collect()))]),
+    };
+    let images = ImageStore::from([("height".to_string(), noise((53, 47), 3))]);
+    let project = || {
+        let mut project = Project::new("Micro anchor", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, TILE));
+        project
+    };
+    let folder = |project: &mut Project| {
+        let id = project.alloc_id();
+        project.insert_layer(0, Layer::new(id, "Folder", LayerKind::folder(), &channels), None, false).unwrap();
+        id
+    };
+
+    // An instance of `source` in a folder that scales and turns it, so its draw publishes another height
+    let instance_of = |project: &mut Project, source: LayerId| {
+        let around = folder(project);
+        if let Some(LayerKind::Group { contents, .. }) = project.layers.get_mut(&around).map(|layer| &mut layer.kind) {
+            *contents = ContentsOffset { scale: 2.0, rotation: 30.0 };
+        }
+        let instance = project.alloc_id();
+        project.insert_layer(0, Layer::new(instance, "Instance", LayerKind::Instance { source }, &channels), Some(around), true).unwrap();
+    };
+
+    // A reader beside the anchor's layer inside a folder
+    let mut inside = project();
+    let group = folder(&mut inside);
+    let (height, anchor) = anchored_height(&mut inside);
+    inside.insert_layer(0, height, Some(group), true).unwrap();
+    let reader = anchor_reader(&mut inside, anchor);
+    let sibling = inside.insert_layer(0, reader, Some(group), true).unwrap();
+
+    // A reader inside a folder whose own mask holds the anchor
+    let mut masked = project();
+    let group = folder(&mut masked);
+    let anchor = masked.alloc_id();
+    let mut mask = Mask::new(MaskBackground::Black);
+    let fill = EffectKind::Fill { source: Source::image("height"), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE };
+    mask.effects.push(Effect::new(masked.alloc_id(), fill));
+    mask.effects.push(Effect::new(anchor, EffectKind::Anchor));
+    masked.layers.get_mut(&group).unwrap().mask = Some(mask);
+    let reader = anchor_reader(&mut masked, anchor);
+    let under_mask = masked.insert_layer(0, reader, Some(group), true).unwrap();
+
+    // An instanced folder publishes its anchor twice; the reader after both reads the last
+    let mut instanced = project();
+    let group = folder(&mut instanced);
+    let (height, anchor) = anchored_height(&mut instanced);
+    instanced.insert_layer(0, height, Some(group), true).unwrap();
+    instance_of(&mut instanced, group);
+    let reader = anchor_reader(&mut instanced, anchor);
+    let after = instanced.insert_layer(0, reader, None, false).unwrap();
+
+    // A reader between the two: it reads the first, the instance's draw after it hidden
+    let mut between = project();
+    let group = folder(&mut between);
+    let (height, anchor) = anchored_height(&mut between);
+    between.insert_layer(0, height, Some(group), true).unwrap();
+    let reader = anchor_reader(&mut between, anchor);
+    let before = between.insert_layer(0, reader, None, false).unwrap();
+    instance_of(&mut between, group);
+
+    let pixels = PixelStore::default();
+    let cases = [
+        ("inside a folder", &inside, sibling),
+        ("under its folder's mask anchor", &masked, under_mask),
+        ("after an instance", &instanced, after),
+        ("between an instance's draws", &between, before),
+    ];
+    for (label, project, owner) in cases {
+        let mut case = OracleCase::new(project, &pixels, &baked, &images, &mesh);
+        case.mask_owner = Some(owner);
+
+        assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("a micro anchor reader {label}"));
+    }
+
+    // The reader inside the instanced folder: drawn twice, it composes on the CPU
+    let reader = anchor_reader(&mut instanced, anchor);
+    instanced.insert_layer(0, reader, Some(group), true).unwrap();
+    let compiled = super::super::CompositeProgram::try_compile_region(&instanced, &pixels, 0, None);
+    assert_eq!(compiled.err(), Some("A micro height reader drawn more than once uses CPU compositing."));
 }
