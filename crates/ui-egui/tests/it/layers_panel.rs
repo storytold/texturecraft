@@ -37,6 +37,9 @@ fn thumb(h: &Harness<'_, TextureCraftApp>, name: &str, mask: bool) -> egui::Pos2
     egui::pos2(x, row.center().y)
 }
 
+/// The accessible name of the mask thumbnail of the layer "Masked fill"
+const MASK_THUMBNAIL_NAME: &str = "Select the mask (Alt+click: show it in the viewport, Shift+click: switch it on or off) (Masked fill)";
+
 /// The `label` header that follows the "Masked fill" row (other layers have groups too).
 fn header(h: &mut Harness<'_, TextureCraftApp>, label: &str) {
     let top = h.get_by_label("Masked fill").rect().top();
@@ -351,22 +354,25 @@ fn thumbnail_menus_apply_actions_to_the_clicked_layer_and_stack() {
 
 #[test]
 fn focused_mask_thumbnail_opens_and_dismisses_its_menu_from_the_keyboard() {
-    let (mut h, _) = harness();
-    let thumbnail = "Select the mask (Alt+click: show it in the viewport) (Masked fill)";
-    h.get_by_label(thumbnail).focus();
-    h.run_steps(3);
-    assert!(h.get_by_label(thumbnail).is_focused());
+    let (mut harness, _) = harness();
 
-    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F10);
-    h.run_steps(3);
-    assert!(h.query_by_label("Toggle mask").is_some());
-    h.key_press(egui::Key::ArrowDown);
-    h.run_steps(3);
-    assert!(h.get_by_label("Toggle mask").is_focused());
-    h.key_press(egui::Key::Escape);
-    h.run_steps(3);
-    assert!(h.query_by_label("Toggle mask").is_none());
-    assert!(h.get_by_label(thumbnail).is_focused());
+    harness.get_by_label(MASK_THUMBNAIL_NAME).focus();
+    harness.run_steps(3);
+    assert!(harness.get_by_label(MASK_THUMBNAIL_NAME).is_focused());
+
+    harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F10);
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Toggle mask").is_some());
+
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run_steps(3);
+    assert!(harness.get_by_label("Toggle mask").is_focused());
+
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(3);
+
+    assert!(harness.query_by_label("Toggle mask").is_none());
+    assert!(harness.get_by_label(MASK_THUMBNAIL_NAME).is_focused());
 }
 
 /// Click the eye of the top-level row `name` with `modifiers` held (the eye sits in the first 20 points after the 7-point edge).
@@ -425,12 +431,18 @@ fn alt_click_on_the_eye_solos_and_a_plain_click_still_hides() {
 }
 
 fn alt_click(h: &mut Harness<'_, TextureCraftApp>, at: egui::Pos2) {
-    h.event(egui::Event::ModifiersChanged(egui::Modifiers::ALT));
-    h.hover_at(at);
+    click_with(h, at, egui::Modifiers::ALT);
+}
+
+/// A primary click at `position` with `modifiers` held
+fn click_with(h: &mut Harness<'_, TextureCraftApp>, position: egui::Pos2, modifiers: egui::Modifiers) {
+    h.event(egui::Event::ModifiersChanged(modifiers));
+    h.hover_at(position);
     for pressed in [true, false] {
-        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::ALT });
+        h.event(egui::Event::PointerButton { pos: position, button: egui::PointerButton::Primary, pressed, modifiers });
         h.run_steps(2);
     }
+
     h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
     h.run_steps(3);
 }
@@ -460,11 +472,122 @@ fn alt_click_on_a_mask_thumbnail_shows_that_mask_alone_without_changing_the_docu
 
 #[test]
 fn alt_click_on_the_content_thumbnail_leaves_the_view_alone() {
-    let (mut h, _) = harness();
-    let at = thumb(&h, "Masked fill", false);
-    alt_click(&mut h, at);
+    let (mut h, layer) = harness();
+    let content_thumbnail = thumb(&h, "Masked fill", false);
+    let mask_thumbnail = thumb(&h, "Masked fill", true);
+
+    alt_click(&mut h, content_thumbnail);
 
     assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Material);
+
+    alt_click(&mut h, mask_thumbnail);
+
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Mask(layer));
+    assert_eq!(h.state().session.target, StackTarget::Mask);
+
+    alt_click(&mut h, content_thumbnail);
+
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Mask(layer));
+    assert_eq!(h.state().session.target, StackTarget::Content);
+}
+
+/// Whether a bypassed mask's strike is painted across the thumbnail at `position`
+fn mask_strike_shown(h: &Harness<'_, TextureCraftApp>, position: egui::Pos2) -> bool {
+    let danger = texturecraft_ui_egui::theme::Tokens::get(&h.ctx).danger;
+    shapes(h).iter().any(|shape| matches!(shape, egui::Shape::LineSegment { points, stroke } if stroke.color == danger && egui::Rect::from_two_pos(points[0], points[1]).contains(position)))
+}
+
+#[test]
+fn shift_click_on_a_mask_thumbnail_switches_the_mask_off_and_on_in_one_undo_step_each() {
+    let (mut h, layer) = harness();
+    let at = thumb(&h, "Masked fill", true);
+    let target = h.state().session.target;
+    let history = h.state().session.history_labels().len();
+    let mask = h.state().session.doc.project.layers[&layer].mask.clone().unwrap();
+
+    assert!(!mask_strike_shown(&h, at));
+    assert_eq!(h.get_by_label(MASK_THUMBNAIL_NAME).accesskit_node().description().as_deref(), Some("Mask on"));
+
+    click_with(&mut h, at, egui::Modifiers::SHIFT);
+
+    let bypassed = h.state().session.doc.project.layers[&layer].mask.as_ref().unwrap();
+    assert!(!bypassed.enabled);
+    assert_eq!(bypassed.effects, mask.effects, "the mask keeps its effects while bypassed");
+    assert_eq!(h.state().session.history_labels().len(), history + 1);
+    assert_eq!(h.state().session.target, target, "Shift+click toggles instead of selecting the mask");
+    assert!(mask_strike_shown(&h, at), "the disabled indicator shows while the mask is bypassed");
+
+    let thumbnail = h.get_by_label(MASK_THUMBNAIL_NAME);
+    assert!(thumbnail.is_focused());
+    assert_eq!(thumbnail.accesskit_node().description().as_deref(), Some("Mask off"));
+
+    click_with(&mut h, at, egui::Modifiers::SHIFT);
+
+    assert_eq!(h.state().session.doc.project.layers[&layer].mask, Some(mask), "toggling back restores the mask as it was");
+    assert_eq!(h.state().session.history_labels().len(), history + 2);
+    assert!(!mask_strike_shown(&h, at));
+    assert_eq!(h.get_by_label(MASK_THUMBNAIL_NAME).accesskit_node().description().as_deref(), Some("Mask on"));
+
+    h.state_mut().session.undo().unwrap();
+
+    assert!(!h.state().session.doc.project.layers[&layer].mask.as_ref().unwrap().enabled, "one undo undoes one toggle");
+}
+
+#[test]
+fn shift_click_on_a_mask_thumbnail_works_with_no_layer_selected() {
+    let (mut harness, layer) = harness();
+    let row = harness.get_by_label("Masked fill").rect();
+    let mask_thumbnail = thumb(&harness, "Masked fill", true);
+    let history = harness.state().session.history_labels().len();
+
+    click_with(&mut harness, row.center(), egui::Modifiers::COMMAND);
+
+    assert!(harness.state().session.selected_layers().is_empty());
+    assert!(harness.state().session.doc.project.layers[&layer].mask.as_ref().unwrap().enabled);
+
+    click_with(&mut harness, mask_thumbnail, egui::Modifiers::SHIFT);
+
+    assert!(!harness.state().session.doc.project.layers[&layer].mask.as_ref().unwrap().enabled);
+    assert!(harness.state().session.selected_layers().is_empty());
+    assert_eq!(harness.state().session.history_labels().len(), history + 1);
+}
+
+#[test]
+fn the_mask_toggle_shortcut_requires_a_selected_layer() {
+    let (mut harness, layer) = harness();
+    let row = harness.get_by_label("Masked fill").rect();
+    harness.state_mut().ui.keymap.insert("mask.toggle".into(), "F7".into());
+
+    harness.key_press(egui::Key::F7);
+    harness.run_steps(3);
+
+    assert!(!harness.state().session.doc.project.layers[&layer].mask.as_ref().unwrap().enabled);
+
+    click_with(&mut harness, row.center(), egui::Modifiers::COMMAND);
+    assert!(harness.state().session.selected_layers().is_empty());
+    let toast_count = harness.state().toasts.len();
+
+    harness.key_press(egui::Key::F7);
+    harness.run_steps(3);
+
+    assert_eq!(harness.state().toasts.len(), toast_count, "the shortcut is inactive when it has no target");
+    assert!(!harness.state().session.doc.project.layers[&layer].mask.as_ref().unwrap().enabled);
+}
+
+#[test]
+fn clicking_the_material_thumbnail_leaves_the_mask_view() {
+    let (mut h, layer) = harness();
+    let mask_thumbnail = thumb(&h, "Masked fill", true);
+    let material_thumbnail = thumb(&h, "Masked fill", false);
+
+    alt_click(&mut h, mask_thumbnail);
+
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Mask(layer));
+
+    click(&mut h, material_thumbnail);
+
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Material);
+    assert_eq!(h.state().session.target, StackTarget::Content, "the layer content is selected");
 }
 
 /// Pointer moves of the opacity cell drag, one per frame

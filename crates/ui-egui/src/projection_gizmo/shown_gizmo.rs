@@ -15,9 +15,13 @@ pub(crate) enum ShownGizmo {
 impl ShownGizmo {
     /// The gizmo of the selected fill's projection: none while the Projection row's eye hides it
     pub(crate) fn of(app: &TextureCraftApp, rect: Rect) -> Option<ShownGizmo> {
-        FrameGizmo::shown(app, rect)
+        if !app.session.doc.project.display.projection_gizmos {
+            return None;
+        }
+
+        FrameGizmo::of(app, rect)
             .map(|frame| ShownGizmo::Frame(Box::new(frame)))
-            .or_else(|| RoundGizmo::shown(app, rect).map(|round| ShownGizmo::Round(Box::new(round))))
+            .or_else(|| RoundGizmo::of(app, rect).map(|round| ShownGizmo::Round(Box::new(round))))
     }
 
     fn frame(gizmo: Option<&ShownGizmo>) -> Option<&FrameGizmo> {

@@ -9,11 +9,14 @@ use crate::{BakeSettings, BakeSyncGroup, BakedMap, Channel, ChannelFormat, Conte
 pub use crate::env_alignment::EnvAlignment;
 pub use crate::shadow_mode::ShadowMode;
 
-/// Project file format. 3: bent normal maps are in tangent space (older files hold world-space ones).
-pub const FORMAT_VERSION: u32 = 3;
+/// Latest project file format that TextureCraft can read.
+pub const FORMAT_VERSION: u32 = REBUILT_MESH_UVS_VERSION;
 
 /// First format whose baked bent normal maps are in tangent space
 pub const TANGENT_BENT_NORMAL_VERSION: u32 = 3;
+
+/// First format that can reopen a project using rebuilt mesh UVs.
+pub const REBUILT_MESH_UVS_VERSION: u32 = 4;
 
 /// Most colour swatches a project keeps
 pub const MAX_SWATCHES: usize = 64;
@@ -429,6 +432,10 @@ pub struct Project {
     /// it, so parts the file leaves unnamed get the same name (from it) as on import.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mesh_file: String,
+    /// The mesh UVs were rebuilt on import. The project file keeps the generated layout for
+    /// reopening; reimporting the mesh from a file rebuilds them again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mesh_rebuild_uvs: bool,
     /// Where the mesh file was imported from (the project's "3D mesh path"). Reimport mesh reads
     /// it again from there, so edits made to the file since are picked up. Empty when unknown
     /// (built-in meshes, web imports, projects saved before it was kept).
@@ -450,10 +457,11 @@ pub struct Project {
 impl Project {
     pub fn new(name: impl Into<String>, mesh: impl Into<String>) -> Project {
         Project {
-            format_version: FORMAT_VERSION,
+            format_version: TANGENT_BENT_NORMAL_VERSION,
             name: name.into(),
             mesh: mesh.into(),
             mesh_file: String::new(),
+            mesh_rebuild_uvs: false,
             mesh_path: String::new(),
             normal_format: NormalFormat::OpenGl,
             texture_sets: Vec::new(),
@@ -463,6 +471,11 @@ impl Project {
             cameras: Vec::new(),
             swatches: Vec::new(),
         }
+    }
+
+    /// The on-disk version that preserves the project's UV layout when read back.
+    pub fn save_format_version(&self) -> u32 {
+        if self.mesh_rebuild_uvs { self.format_version.max(REBUILT_MESH_UVS_VERSION) } else { self.format_version }
     }
 
     pub fn alloc_id(&mut self) -> LayerId {

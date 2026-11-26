@@ -165,15 +165,26 @@ fn creating_or_opening_a_project_from_the_empty_state_works() {
     assert!(harness.state().ui.windows.new_project, "New project opens its dialog from the empty state");
 
     let directory = super::temp_dir::TempDir::new("picked-sample");
-    let file = directory.join("sample.tcraft");
+    let samples_folder = directory.join("Samples");
+    std::fs::create_dir(&samples_folder).unwrap();
+    let file = samples_folder.join("Material Ball.tcraft");
     let sample = Session::new_project("Chosen sample", texturecraft_engine::geom::primitives::cube(1.0), "builtin:cube", None, 128).unwrap();
     std::fs::write(&file, sample.to_project_bytes().unwrap()).unwrap();
     let mut harness = empty();
+    harness.state_mut().samples_folder = samples_folder.clone();
     let picked = file.clone();
-    harness.state_mut().file_dialogs.set_override(Some(Box::new(move |_| texturecraft_ui_egui::file_dialogs::Answer::Paths(vec![picked.clone()]))));
+    let started_in = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let recorded = started_in.clone();
+    harness.state_mut().file_dialogs.set_override(Some(Box::new(move |request| {
+        if let texturecraft_ui_egui::file_dialogs::Request::File(dialog) = request {
+            *recorded.borrow_mut() = dialog.directory.clone();
+        }
+        texturecraft_ui_egui::file_dialogs::Answer::Paths(vec![picked.clone()])
+    })));
 
     invoke(&mut harness, "project.sample");
 
+    assert_eq!(*started_in.borrow(), Some(samples_folder), "the picker starts in the Samples folder");
     assert!(harness.state().session.project_open);
     assert_eq!(harness.state().session.doc.project.name, sample.doc.project.name, "the selected sample project opens");
 }

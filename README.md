@@ -256,6 +256,7 @@ are built, signed and published. Every bundled asset is listed with its licence 
 | Build | File |
 |---|---|
 | x86_64 | `texturecraft-<ver>-freebsd-x86_64.tar.gz` |
+| aarch64 (ARM64) | `texturecraft-<ver>-freebsd-aarch64.tar.gz` |
 
 ### Web (WebAssembly)
 

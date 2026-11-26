@@ -757,3 +757,45 @@ fn duplicate_gltf_material_names_keep_first_wins_and_order() {
     }
     assert_eq!(color_by_material.get("Dup").unwrap().factor, Vec4::new(1.0, 0.0, 0.0, 1.0));
 }
+
+#[test]
+fn a_saved_layout_reproduces_the_rebuilt_mesh_without_unwrapping() {
+    let rebuilt = import_mesh_bytes_with_uvs("a.obj", OBJ.as_bytes(), true).unwrap().mesh;
+    let layout = corner_uvs(&rebuilt);
+
+    let reopened = import_mesh_bytes_with_layout("a.obj", OBJ.as_bytes(), &layout).unwrap();
+    let short = import_mesh_bytes_with_layout("a.obj", OBJ.as_bytes(), &layout[1..]);
+    let mut non_finite = layout.clone();
+    non_finite[0].x = f32::NAN;
+
+    assert!(!reopened.report.warnings.iter().any(|warning| warning.contains("unwrap")), "{:?}", reopened.report.warnings);
+    assert_eq!((&reopened.mesh.positions, &reopened.mesh.indices, &reopened.mesh.uvs), (&rebuilt.positions, &rebuilt.indices, &rebuilt.uvs));
+    assert_eq!(reopened.mesh.normals, rebuilt.normals);
+    assert!(short.is_err(), "a layout for another mesh is refused");
+    assert!(import_mesh_bytes_with_layout("a.obj", OBJ.as_bytes(), &non_finite).is_err());
+}
+
+#[test]
+fn a_saved_layout_keeps_coincident_vertices_in_different_materials_split() {
+    // Synthetic mesh with coincident triangles in independently packed materials
+    let source = br#"#usda 1.0
+def Mesh "Overlaid" {
+    int[] faceVertexCounts = [3, 3]
+    int[] faceVertexIndices = [0, 1, 2, 0, 1, 2]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+    rel material:binding = </First>
+    def GeomSubset "second" {
+        uniform token familyName = "materialBind"
+        int[] indices = [1]
+        rel material:binding = </Second>
+    }
+}
+"#;
+    let rebuilt = import_mesh_bytes_with_uvs("overlaid.usda", source, true).unwrap().mesh;
+    let layout = corner_uvs(&rebuilt);
+
+    let reopened = import_mesh_bytes_with_layout("overlaid.usda", source, &layout).unwrap().mesh;
+
+    assert_eq!(&layout[..3], &layout[3..], "the independently packed triangles have equal UVs");
+    assert_eq!(reopened, rebuilt);
+}

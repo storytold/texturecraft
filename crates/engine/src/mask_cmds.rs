@@ -33,7 +33,7 @@ pub fn specs() -> Vec<CommandSpec> {
             has_layer,
             add_color_mask
         ),
-        cmd!("mask.toggle", "Toggle mask", ["Layers", "Mask"], None, "{layer?, enabled?}", has_layer, toggle),
+        cmd!("mask.toggle", "Toggle mask", ["Layers", "Mask"], None, "{layer?, enabled?} — defaults to the selected layer", always, toggle),
         cmd!("mask.invertBackground", "Invert mask background", ["Layers", "Mask"], None, "{layer?}", has_layer, invert_background),
         cmd!("mask.invert", "Invert mask", ["Layers", "Mask"], None, "{layer?}", has_layer, invert),
         cmd!("mask.clear", "Clear mask", ["Layers", "Mask"], None, "{layer?}", has_layer, clear),
@@ -132,6 +132,7 @@ pub fn specs() -> Vec<CommandSpec> {
 
 fn with_mask<T>(s: &mut Session, p: &Value, cmd: &str, label: &str, f: impl FnOnce(&mut Session, LayerId) -> Result<T>) -> Result<T> {
     let id = layer_param(s, cmd, p)?;
+
     s.edit(label, |s| f(s, id))
 }
 
@@ -174,13 +175,14 @@ fn mask_of(s: &mut Session, id: LayerId) -> Result<&mut Mask> {
     l.mask.as_mut().ok_or_else(|| EngineError::Other(format!("\"{name}\" has no mask")))
 }
 
-fn toggle(s: &mut Session, p: &Value) -> Result<Value> {
-    let on = with_mask(s, p, "mask.toggle", "Toggle mask", |s, id| {
-        let m = mask_of(s, id)?;
-        m.enabled = boolp(p, "enabled").unwrap_or(!m.enabled);
-        Ok(m.enabled)
+fn toggle(session: &mut Session, params: &Value) -> Result<Value> {
+    let enabled = with_mask(session, params, "mask.toggle", "Toggle mask", |session, layer| {
+        let mask = mask_of(session, layer)?;
+        mask.enabled = boolp(params, "enabled").unwrap_or(!mask.enabled);
+        Ok(mask.enabled)
     })?;
-    Ok(json!({ "enabled": on }))
+
+    Ok(json!({ "enabled": enabled }))
 }
 
 fn invert_background(s: &mut Session, p: &Value) -> Result<Value> {
