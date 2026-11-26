@@ -22,6 +22,8 @@ struct Features {
     anchors: bool,
     material_anchors: bool,
     color_selection: bool,
+    // P2: a generator reads Micro Details (gpu_generator_p2.rs)
+    generator_p2: bool,
     // The GPU port packages' WGSL files compiled in full (gpu_composite_packages.rs)
     packages: ShaderFlags,
 }
@@ -56,6 +58,7 @@ impl Features {
             if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&kind) {
                 features.generators = true;
                 features.curvature |= op.uv[1] != 0.0;
+                features.generator_p2 |= op.uv[3] != 0.0;
                 if let Some(source) = op.effects[3].checked_sub(1).and_then(|index| program.operations.get(index as usize)) {
                     features.sampled_generator_inputs |= source.ids[1] != 0;
                 }
@@ -94,7 +97,7 @@ impl Features {
             include(
                 self.authored_images,
                 include_str!("shaders/material_image.wgsl"),
-                "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }\n                 fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> { return vec4(0.0); }\n                 const MISSING_IMAGE: u32 = 0xffffffffu;\n                 fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> { return rgb; }",
+                "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }\n                 fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> { return vec4(0.0); }\n                 fn material_image_at(image: u32, uv: vec2<f32>) -> vec4<f32> { return vec4(0.0); }\n                 const MISSING_IMAGE: u32 = 0xffffffffu;\n                 fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> { return rgb; }",
             ),
             include_str!("shaders/stencil_projection.wgsl"),
             include(
@@ -106,6 +109,11 @@ impl Features {
                 self.curvature,
                 include_str!("shaders/composite_curvature_detail.wgsl"),
                 "fn generator_curvature(effect: Operation, pixel: vec2<u32>, finest: f32, mode: u32, micro: f32) -> f32 { return 0.0; }",
+            ),
+            include(
+                self.generator_p2 && supports_curvature,
+                include_str!("shaders/generator_p2.wgsl"),
+                "fn generator_micro(effect: Operation, pixel: vec2<u32>, baked: vec3<f32>) -> vec3<f32> { return baked; }",
             ),
             include(
                 self.sampled_generator_inputs,
@@ -339,6 +347,7 @@ mod tests {
             anchors: true,
             material_anchors: true,
             color_selection: true,
+            generator_p2: true,
             packages: ShaderFlags::ALL,
         });
         variants

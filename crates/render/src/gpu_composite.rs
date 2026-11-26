@@ -50,6 +50,9 @@ mod point;
 mod stack;
 #[path = "gpu_composite_udim.rs"]
 mod udim;
+// The generator GPU port's P2: Micro Details, texture and grunge
+#[path = "gpu_generator_p2.rs"]
+mod generator_p2;
 use groups::{BEGIN_GROUP, END_GROUP, GroupPlan, StackWork};
 use pipelines::CompositePipelines;
 
@@ -396,6 +399,8 @@ struct ProceduralInputs {
     bake_rows: bool,
     /// The image inputs (`register_input` references) read as colour (`register_color_input`).
     color_inputs: BTreeSet<u32>,
+    /// P2: the generators' micro details
+    micro: generator_p2::MicroPlan,
 }
 
 #[derive(Default)]
@@ -449,6 +454,7 @@ impl ProceduralInputs {
             environment_word: None,
             bake_rows: false,
             color_inputs: BTreeSet::new(),
+            micro: generator_p2::MicroPlan::default(),
         }
     }
 
@@ -1477,6 +1483,8 @@ pub struct CompositeProgram {
     udim: u32,
     /// P8: the UV tile atlas's blocks, which say where a level stage has texels to filter
     udim_layout: Option<udim::UdimLayout>,
+    /// P2: the micro details the generators read
+    micro: generator_p2::MicroPlan,
 }
 
 /// A program's late-bound environment words: where they start in the side table, the display
@@ -1595,6 +1603,7 @@ impl CompositeProgram {
     pub fn set_tile_images(&mut self, images: &ImageStore) {
         self.tile_patterns.set_images(images);
         self.material_images.set_images(images);
+        self.micro.set_images(images);
         if let Some(environment) = &mut self.environment {
             environment.set(&EnvironmentSh::of(&environment.display, images));
         }
@@ -2001,6 +2010,7 @@ impl CompositeProgram {
         operations.extend(effects);
         bind_input_sources(&mut operations, layer_count, &procedural.input_sources);
         let mut filters = FilterPlan::compile(&mut operations, layer_count, &procedural);
+        generator_p2::bind_sources(&mut procedural, operations.len() as u32);
         bind_generator_sources(&mut operations, &procedural.generator_sources);
         filters.bind_anchors(&mut operations);
         let udim = udim::bind(layout.as_ref(), &mut filters, &mut procedural).ok_or("The UV tile layout exceeds the GPU parameter table.")?;
@@ -2040,6 +2050,7 @@ impl CompositeProgram {
             bake_rows: procedural.bake_rows,
             udim,
             udim_layout: layout,
+            micro: procedural.micro,
         })
     }
 
@@ -2089,6 +2100,7 @@ impl CompositeProgram {
         operations[0].balance[1] = background;
         bind_input_sources(&mut operations, 1, &procedural.input_sources);
         let mut filters = FilterPlan::compile(&mut operations, 1, &procedural);
+        generator_p2::bind_sources(&mut procedural, operations.len() as u32);
         bind_generator_sources(&mut operations, &procedural.generator_sources);
         filters.bind_anchors(&mut operations);
         let udim = udim::bind(layout.as_ref(), &mut filters, &mut procedural).ok_or("The UV tile layout exceeds the GPU parameter table.")?;
@@ -2125,6 +2137,7 @@ impl CompositeProgram {
             bake_rows: procedural.bake_rows,
             udim,
             udim_layout: layout,
+            micro: procedural.micro,
         })
     }
 }
@@ -2543,14 +2556,10 @@ fn source_operation(
 }
 
 fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
-    // The GPU has the earlier model alone: the wear, section, light and kind controls, a texture,
-    // a grunge, Micro Details and the kinds without an earlier model compose on the CPU
-    if !generator.on_earlier_model()
-        || generator.controls.is_some()
-        || generator.texture.is_some()
-        || generator.grunge.is_some()
-        || generator.micro_in_use().is_some()
-    {
+    // The GPU has the earlier model alone: the wear, section, light and kind controls and the kinds
+    // without an earlier model compose on the CPU. P2: a texture blends on the section controls
+    // alone and a custom grunge is read by the wear controls alone, so neither changes it.
+    if !generator.on_earlier_model() || generator.controls.is_some() || generator.texture_in_use().is_some() {
         return None;
     }
     let kind = match generator.kind {
@@ -2601,9 +2610,15 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
         let levels: Vec<_> = inputs.levels.iter().map(|&resolution| generator_stage(generator, resolution, inputs)).collect();
         inputs.generator_levels.push(levels);
     }
+    // P2: the micro details' maps; detail sizes read with them blur the bake with their curvature
+    let (record, micro) = generator_p2::generator_record(generator, inputs)?;
+    op.uv[3] = record;
     if matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear)
         && let Some(detail) = &generator.detail
     {
+        if op.effects[3] == 0 && detail.blurred_sizes_in_use().contains(&true) {
+            inputs.micro.claim_levels(micro)?;
+        }
         op.uv[..2].copy_from_slice(&inputs.pack_curvature(detail, op.effects[3] == 0)?);
     }
     op.low.iter().chain(&op.projection).all(|x| x.is_finite()).then_some(op)
@@ -2784,6 +2799,10 @@ pub(crate) struct GpuCompositor {
     baked: BTreeMap<usize, BakeCache>,
     id_bakes: BTreeMap<usize, IdBakeCache>,
     curvature: Option<CurvatureResources>,
+    /// P2: the micro detail passes and maps, and the empty maps of programs without them (bound
+    /// with the curvature levels: None where the adapter has no room for them)
+    micro: Option<generator_p2::MicroGpu>,
+    default_micro_maps: Option<wgpu::TextureView>,
     default_surface: wgpu::TextureView,
     default_vertices: wgpu::Buffer,
     default_baked: wgpu::TextureView,
@@ -2852,6 +2871,8 @@ impl GpuCompositor {
         ];
         if supports_curvature {
             entries.extend([binding(13, uint), binding(14, uniform)]);
+            // P2: the micro detail maps
+            entries.push(binding(16, texture(wgpu::TextureSampleType::Float { filterable: false }, wgpu::TextureViewDimension::D2Array)));
         }
         if supports_id {
             entries.push(binding(15, uint));
@@ -2896,6 +2917,8 @@ impl GpuCompositor {
             baked: BTreeMap::new(),
             id_bakes: BTreeMap::new(),
             curvature: supports_curvature.then(|| CurvatureResources { gpu: None, empty: CurvatureLevels::empty(device), cache: BTreeMap::new() }),
+            micro: None,
+            default_micro_maps: supports_curvature.then(|| generator_p2::empty_maps(device)),
             default_surface,
             default_vertices,
             default_baked,
@@ -3211,7 +3234,7 @@ impl GpuCompositor {
         queue: &wgpu::Queue,
         ts: usize,
         program: &CompositeProgram,
-        baked_view: &wgpu::TextureView,
+        (baked_view, adjusted): (&wgpu::TextureView, bool),
     ) -> Result<Option<CurvatureLevels>, String> {
         let source = program.baked.as_ref().and_then(|baked| baked.maps[2].as_ref().map(|map| (baked, map)));
         let Some((baked, map)) = source else {
@@ -3231,7 +3254,8 @@ impl GpuCompositor {
         let key = Arc::downgrade(gbuf);
         let map = Arc::downgrade(map);
         let size = [baked.width, baked.height];
-        if let Some(cache) = curvature.cache.get(&ts).filter(|cache| cache.gbuf.ptr_eq(&key) && cache.map.ptr_eq(&map) && cache.size == size)
+        // P2: a bake with micro curvature added (`adjusted`) is blurred anew, and not kept
+        if let Some(cache) = curvature.cache.get(&ts).filter(|cache| !adjusted && cache.gbuf.ptr_eq(&key) && cache.map.ptr_eq(&map) && cache.size == size)
             && needed.iter().zip(cache.needed).all(|(&required, present)| !required || present)
         {
             return Ok(Some(cache.levels.clone()));
@@ -3249,7 +3273,9 @@ impl GpuCompositor {
         let working_size = [gbuf.width, gbuf.height];
         let levels =
             gpu.build(device, queue, CurvatureInput { baked: baked_view, bake_size: size, coverage: coverage.as_ref(), working_size, needed, block, scales })?;
-        curvature.cache.insert(ts, CurvatureCache { gbuf: key, map, size, needed, levels: levels.clone() });
+        if !adjusted {
+            curvature.cache.insert(ts, CurvatureCache { gbuf: key, map, size, needed, levels: levels.clone() });
+        }
         Ok(Some(levels))
     }
 
@@ -3324,7 +3350,11 @@ impl GpuCompositor {
         let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
         let (surface, vertices) = self.surface_inputs(device, queue, program)?;
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
-        let curvature = self.curvature_inputs(device, queue, ts, program, &baked)?;
+        // P2: the micro detail maps, and the bake with micro curvature the detail sizes blur
+        let micro = generator_p2::MicroGpu::maps(&mut self.micro, device, queue, (ts, self.default_micro_maps.is_some()), program, &baked)?;
+        let micro_bake = micro.as_ref().and_then(|maps| maps.bake.as_ref());
+        let curvature = self.curvature_inputs(device, queue, ts, program, (micro_bake.unwrap_or(&baked), micro_bake.is_some()))?;
+        let micro_maps = micro.as_ref().map(|maps| maps.maps.clone()).or_else(|| self.default_micro_maps.clone());
         let id_bake = self.id_bake_input(device, queue, ts, program.id_bake.as_ref())?;
         let [id_width, id_height] = program.id_bake.as_ref().map_or([0; 2], |id| id.size);
         let bake_words = program.baked.as_ref().map_or([0; 2], BakedInputs::uniform_words);
@@ -3574,7 +3604,12 @@ impl GpuCompositor {
                 entries.swap(count, 15);
                 count += 1;
             }
-            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("tc_composite_band"), layout: &self.bindings, entries: &entries[..count] })
+            let mut entries = entries[..count].to_vec();
+            // P2: the micro detail maps, bound with the curvature levels
+            if let Some(maps) = micro_maps.as_ref().filter(|_| curvature.is_some()) {
+                entries.push(wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(maps) });
+            }
+            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("tc_composite_band"), layout: &self.bindings, entries: &entries })
         };
         let mut packed = Vec::new();
         let mut pending_bytes = 0;
@@ -4730,8 +4765,10 @@ mod procedural_tests {
         }
     }
 
-    /// A generator on the earlier model composes on the GPU; one with the reference app's controls
-    /// (a new generator's), a kind without an earlier model or Micro Details composes on the CPU
+    /// A generator on the earlier model composes on the GPU, with Micro Details too; one with the
+    /// reference app's controls (a new generator's), a kind without an earlier model, a micro
+    /// height read from an anchor point, or detail sizes of another curvature than the program's
+    /// first reader's compose on the CPU
     #[test]
     fn generators_beyond_the_earlier_model_compose_on_the_cpu() {
         use texturecraft_core::MicroDetails;
@@ -4743,8 +4780,11 @@ mod procedural_tests {
         assert!(!gpu(&Generator::new(GeneratorKind::Dirt)), "the reference app's controls");
         assert!(!gpu(&oracle::earlier_generator(GeneratorKind::UvChecker)), "no earlier model");
         let micro = MicroDetails { enabled: true, ..MicroDetails::defaults(GeneratorKind::Curvature).unwrap() };
-        let curvature = Generator { micro: Some(Box::new(micro)), ..oracle::earlier_generator(GeneratorKind::Curvature) };
-        assert!(!gpu(&curvature), "Micro Details");
+        let curvature = Generator { micro: Some(Box::new(micro.clone())), ..oracle::earlier_generator(GeneratorKind::Curvature) };
+        assert!(gpu(&curvature), "Micro Details");
+        let anchored = MicroDetails { height_source: Some(Source::Anchor { anchor: LayerId(7), channel: Channel::Height, ramp: Vec::new() }), ..micro };
+        assert!(!gpu(&Generator { micro: Some(Box::new(anchored)), ..curvature.clone() }), "a micro height from an anchor point");
+        assert!(!gpu(&oracle::earlier_generator(GeneratorKind::Curvature)), "the bake's own detail sizes after micro curvature's");
     }
 
     /// A costly fill splits into narrower bands and more submissions at any update size; only a
@@ -5963,6 +6003,7 @@ mod paint_window_tests {
             bake_rows: false,
             udim: 0,
             udim_layout: None,
+            micro: generator_p2::MicroPlan::default(),
         };
         let region = CompositeRegion { min: [0, 0], max: [128, 128] };
         let limit = 6 * 64 * 64 * 2 + 32;

@@ -725,6 +725,67 @@ mod tests {
         }
     }
 
+    /// P2: Micro Details sample, blur and occlude each UV tile block of the bake on its own, the
+    /// detail sizes blur each block's micro curvature, and a micro map of its own height (the
+    /// occlusion's, shorter than the curvature's) reads at that height
+    #[test]
+    fn micro_details_work_per_uv_tile_block() {
+        use texturecraft_core::{Generator, MicroDetails, NormalFormat};
+
+        let Some(mut gpu) = headless() else { return };
+        const BAKE_SIDE: u32 = 512;
+        const OCCLUSION_ROWS: u32 = 384;
+        let wave = |rows: u32, phase: f32| -> Arc<Vec<f32>> {
+            Arc::new(
+                (0..BAKE_SIDE * rows)
+                    .map(|index| 0.5 + 0.2 * ((index % BAKE_SIDE) as f32 * 0.07 + phase).sin() * ((index / BAKE_SIDE) as f32 * 0.05).cos())
+                    .collect(),
+            )
+        };
+        let baked = BakedMaps {
+            resolution: BAKE_SIDE,
+            maps: BTreeMap::from([(BakedMap::Curvature, wave(BAKE_SIDE, 0.0)), (BakedMap::AmbientOcclusion, wave(OCCLUSION_ROWS, 1.3))]),
+        };
+        let noise = |side: u32, seed: u32| -> Arc<ImageRes> {
+            let hash = |texel: u32, channel: u32| {
+                ((texel.wrapping_mul(0x9e37_79b9) ^ (channel + seed).wrapping_mul(0x85eb_ca6b)).wrapping_mul(0xc2b2_ae35) >> 8) as f32 / (1 << 24) as f32
+            };
+            Arc::new(ImageRes::new(side, side, (0..side * side).map(|texel| [hash(texel, 0), hash(texel, 1), hash(texel, 2), 1.0]).collect(), false))
+        };
+        let images = ImageStore::from([("Micro height".into(), noise(61, 1)), ("Micro normal".into(), noise(53, 2))]);
+        let micro = |kind| MicroDetails {
+            enabled: true,
+            height_source: Some(Source::image("Micro height")),
+            normal_source: Some(Source::Image { name: "Micro normal".into(), normal_format: NormalFormat::DirectX }),
+            ao_radius: 0.8,
+            ao_depth: 0.4,
+            ..MicroDetails::defaults(kind).unwrap()
+        };
+        let pixels = PixelStore::default();
+
+        for scaled in [false, true] {
+            let (mut project, mesh) = atlas(scaled, &[Channel::BaseColor]);
+            let owner = project.alloc_id();
+            let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.7, 0.4, 0.2]))]), ..Fill::default() };
+            let mut layer = Layer::new(owner, "Micro", LayerKind::Fill(fill), &[Channel::BaseColor]);
+            let mut mask = Mask::new(MaskBackground::Black);
+            for kind in [GeneratorKind::Curvature, GeneratorKind::AmbientOcclusion] {
+                let generator = Generator { micro: Some(Box::new(micro(kind))), ..crate::gpu_composite::oracle::earlier_generator(kind) };
+                let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(generator));
+                if kind == GeneratorKind::AmbientOcclusion {
+                    generated.blend = BlendMode::Multiply;
+                }
+                mask.effects.push(generated);
+            }
+            layer.mask = Some(mask);
+            project.insert_layer(0, layer, None, false).unwrap();
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+
+            assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("micro details, scaled {scaled}"));
+        }
+    }
+
     /// A Color Selection reading the baked ID selects nothing where a smaller tile leaves its
     /// block without a bake, as the CPU's missing ID, also under a Blur.
     #[test]
