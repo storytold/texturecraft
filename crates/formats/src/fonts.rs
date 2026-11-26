@@ -33,19 +33,24 @@ pub fn system_fonts() -> Vec<FontFace> {
 }
 
 fn font_dirs() -> Vec<PathBuf> {
+    let (mut dirs, user) = font_folders();
+    dirs.extend(user);
+    dirs
+}
+
+/// The folders installed fonts are read from: the system's, then the user's own.
+pub fn font_folders() -> (Vec<PathBuf>, Vec<PathBuf>) {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if cfg!(windows) {
-        let mut v = vec![PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts")];
-        v.extend(std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Microsoft\\Windows\\Fonts")));
-        v
+        let system = vec![PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts")];
+        let user = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Microsoft\\Windows\\Fonts")).into_iter().collect();
+        (system, user)
     } else if cfg!(target_os = "macos") {
-        let mut v = vec![PathBuf::from("/System/Library/Fonts"), PathBuf::from("/Library/Fonts")];
-        v.extend(home.map(|h| h.join("Library/Fonts")));
-        v
+        let system = vec![PathBuf::from("/System/Library/Fonts"), PathBuf::from("/Library/Fonts")];
+        (system, home.map(|h| h.join("Library/Fonts")).into_iter().collect())
     } else {
-        let mut v = vec![PathBuf::from("/usr/share/fonts"), PathBuf::from("/usr/local/share/fonts")];
-        v.extend(home.iter().flat_map(|h| [h.join(".local/share/fonts"), h.join(".fonts")]));
-        v
+        let system = vec![PathBuf::from("/usr/share/fonts"), PathBuf::from("/usr/local/share/fonts")];
+        (system, home.iter().flat_map(|h| [h.join(".local/share/fonts"), h.join(".fonts")]).collect())
     }
 }
 

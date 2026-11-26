@@ -2,7 +2,10 @@
 
 use rayon::prelude::*;
 use texturecraft_compose::pattern::{Coords, procedural};
-use texturecraft_core::{Channel, Effect, EffectKind, Fill, Filter, Layer, LayerKind, Procedural, ProceduralKind, Project, Projection, Source, TextureSet};
+use texturecraft_core::{
+    Channel, Effect, EffectKind, Fill, Filter, Layer, LayerKind, Procedural, ProceduralKind, Project, Projection, SIZE_REFERENCE_RES, Source, TextureSet,
+    TileTransform,
+};
 use texturecraft_geom::glam::{Vec2, Vec3};
 
 use crate::materials::{Builder, build};
@@ -19,13 +22,18 @@ pub struct Sample {
 /// The view-space normal (= position on the unit sphere) of each pixel of a `size²` image,
 /// row-major, None outside the sphere.
 pub fn sphere_normals(size: usize) -> impl Iterator<Item = Option<Vec3>> {
-    let r = (size as f32 * 0.5 - 1.0).max(0.5);
-    (0..size * size).map(move |i| {
-        let (x, y) = ((i % size) as f32 + 0.5 - size as f32 * 0.5, size as f32 * 0.5 - (i / size) as f32 - 0.5);
-        let (dx, dy) = (x / r, y / r);
-        let d2 = dx * dx + dy * dy;
-        (d2 <= 1.0).then(|| Vec3::new(dx, dy, (1.0 - d2).max(0.0).sqrt()))
-    })
+    (0..size * size).map(sphere_normal_at(size))
+}
+
+fn sphere_normal_at(size: usize) -> impl Fn(usize) -> Option<Vec3> {
+    let center_px = size as f32 * 0.5;
+    let radius_px = (center_px - 1.0).max(0.5);
+    move |pixel_index| {
+        let (x, y) = ((pixel_index % size) as f32 + 0.5 - center_px, center_px - (pixel_index / size) as f32 - 0.5);
+        let (dx, dy) = (x / radius_px, y / radius_px);
+        let length_squared = dx * dx + dy * dy;
+        (length_squared <= 1.0).then(|| Vec3::new(dx, dy, (1.0 - length_squared).max(0.0).sqrt()))
+    }
 }
 
 fn coords(n: Vec3) -> Coords {
@@ -36,7 +44,7 @@ fn coords(n: Vec3) -> Coords {
 fn source(s: &Source, proj: &Projection, c: &Coords) -> Option<[f32; 3]> {
     match s {
         Source::Uniform(v) => Some(*v),
-        Source::Procedural { pattern, low, high } => {
+        Source::Procedural { pattern, low, high, .. } => {
             let t = procedural(pattern, proj, c);
             Some([0, 1, 2].map(|k| low[k] + (high[k] - low[k]) * t))
         }
@@ -53,11 +61,11 @@ pub fn material(id: &str, size: usize) -> Option<Vec<Option<Sample>>> {
     let layers = build(&mut Builder { p: &mut project, channels: CHANNELS.to_vec() }, plain.id).ok()?;
 
     // Pixels evaluate independently and big previews take long on one core
-    let normals: Vec<_> = sphere_normals(size).collect();
-    let samples = normals
+    let normal_at = sphere_normal_at(size);
+    let samples = (0..size * size)
         .into_par_iter()
-        .map(|normal| {
-            let at = coords(normal?);
+        .map(|pixel_index| {
+            let at = coords(normal_at(pixel_index)?);
             let mut values = CHANNELS.map(Channel::default_value);
             for layer in layers.iter().filter(|layer| layer.visible) {
                 // Plain materials are unmasked fills
@@ -83,16 +91,16 @@ pub fn material(id: &str, size: usize) -> Option<Vec<Option<Sample>>> {
 /// `f` with its reach in texels multiplied by `k` (previews show at a fraction of 2K).
 fn magnified(f: Filter, k: f32) -> Filter {
     match f {
-        Filter::Blur { radius } => Filter::Blur { radius: radius * k },
+        Filter::Blur { radius, wrap } => Filter::Blur { radius: radius * k, wrap },
         Filter::DirectionalBlur { radius, angle } => Filter::DirectionalBlur { radius: radius * k, angle },
-        Filter::SlopeBlur { radius, scale, seed } => Filter::SlopeBlur { radius: radius * k, scale, seed },
-        Filter::Warp { intensity, scale, seed } => Filter::Warp { intensity: intensity * k, scale, seed },
-        Filter::HighPass { radius } => Filter::HighPass { radius: radius * k },
+        Filter::SlopeBlur { radius, scale, seed, divider } => Filter::SlopeBlur { radius: radius * k, scale, seed, divider },
+        Filter::Warp { intensity, scale, seed, divider } => Filter::Warp { intensity: intensity * k, scale, seed, divider },
+        Filter::HighPass { radius, space, alpha } => Filter::HighPass { radius: radius * k, space, alpha },
         Filter::EdgeDetect { width } => Filter::EdgeDetect { width: width * k },
-        Filter::Bevel { width } => Filter::Bevel { width: width * k },
-        Filter::Mosaic { size } => Filter::Mosaic { size: size * k },
+        Filter::Bevel { width, wrap } => Filter::Bevel { width: width * k, wrap },
+        Filter::Mosaic { size, alpha } => Filter::Mosaic { size: size * k, alpha },
         Filter::Glow { radius, amount } => Filter::Glow { radius: radius * k, amount },
-        Filter::DirectionalWarp { intensity, angle, scale, seed } => Filter::DirectionalWarp { intensity: intensity * k, angle, scale, seed },
+        Filter::DirectionalWarp { intensity, angle, scale, seed, divider } => Filter::DirectionalWarp { intensity: intensity * k, angle, scale, seed, divider },
         f => f,
     }
 }
@@ -103,16 +111,33 @@ fn magnified(f: Filter, k: f32) -> Filter {
 pub fn filter(id: &str, size: usize) -> Option<Vec<Option<Sample>>> {
     let res = u32::try_from(size).ok()?.max(1);
     let kind = match crate::filter_lib::build(id, &serde_json::Value::Null).ok()? {
-        EffectKind::Filter(f) => EffectKind::Filter(magnified(f, 2048.0 / res as f32)),
+        // Transform changes nothing as the library adds it: its picture shows it scaled and turned
+        EffectKind::Filter(Filter::Transform(transform)) => {
+            EffectKind::Filter(Filter::Transform(TileTransform { scaling: [2.0, 2.0], rotation: 30.0, ..transform }))
+        }
+        EffectKind::Filter(f) => EffectKind::Filter(magnified(f, SIZE_REFERENCE_RES / res as f32)),
         k => k,
     };
+
+    // The filters that shape a mask's edge read where values cross 0.5: they get black and white shapes, where the clouds would leave them black
+    let shapes = matches!(kind, EffectKind::Filter(Filter::BevelSmooth(_) | Filter::DirectionalDistance(_)));
+    render_filter_preview(kind, size, res, shapes)
+}
+
+fn render_filter_preview(kind: EffectKind, size: usize, res: u32, shapes: bool) -> Option<Vec<Option<Sample>>> {
     let mesh = texturecraft_geom::primitives::plane(2.0, 2);
     let gbuf = texturecraft_geom::UvGBuffer::new(&mesh, 0, res, res);
     let mut p = Project::new("preview", "");
     p.texture_sets.push(TextureSet::new("preview", 0, res));
-    let procedural = |kind, scale, low: [f32; 3], high: [f32; 3]| Source::Procedural { pattern: Procedural { scale, ..Procedural::new(kind) }, low, high };
+    let procedural =
+        |kind, scale, low: [f32; 3], high: [f32; 3]| Source::Procedural { pattern: Procedural { scale, ..Procedural::new(kind) }, low, high, ramp: Vec::new() };
     let mut fill = Fill::default();
-    fill.sources.insert(Channel::BaseColor, procedural(ProceduralKind::Clouds, 2.0, [0.05, 0.2, 0.55], [0.95, 0.55, 0.1]));
+    let base = if shapes {
+        procedural(ProceduralKind::Checker, 3.0, [0.0; 3], [1.0; 3])
+    } else {
+        procedural(ProceduralKind::Clouds, 2.0, [0.05, 0.2, 0.55], [0.95, 0.55, 0.1])
+    };
+    fill.sources.insert(Channel::BaseColor, base);
     fill.sources.insert(Channel::Roughness, procedural(ProceduralKind::Checker, 4.0, [0.25; 3], [0.7; 3]));
     fill.sources.insert(Channel::Height, procedural(ProceduralKind::Cells, 3.0, [-0.12; 3], [0.12; 3]));
     let mut layer = Layer::new(p.alloc_id(), "sample", LayerKind::Fill(fill), &CHANNELS);
@@ -185,5 +210,21 @@ mod tests {
         }
         let (plain, warped) = (filter("levels", size).unwrap(), filter("warp", size).unwrap());
         assert!(plain != warped, "the warp shows in its preview");
+    }
+
+    #[test]
+    fn the_edge_shaping_filters_show_their_shapes_not_black() {
+        const SIDE_PX: u32 = 32;
+        let size = SIDE_PX as usize;
+
+        // Use the same checker input with an inactive filter
+        let checker = render_filter_preview(EffectKind::Filter(Filter::InvertOff), size, SIDE_PX, true).unwrap();
+        for id in ["bevelSmooth", "directionalDistance"] {
+            let pixels = filter(id, size).unwrap();
+            assert!(pixels != checker, "{id}: the preview shows the unchanged checker");
+            let lit: Vec<f32> = pixels.into_iter().flatten().map(|sample| sample.base.iter().sum::<f32>() / 3.0).collect();
+            let bright = lit.iter().filter(|value| **value > 0.25).count();
+            assert!(bright * 5 > lit.len(), "{id}: {bright} of {} texels lit", lit.len());
+        }
     }
 }

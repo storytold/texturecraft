@@ -49,7 +49,7 @@ pub(crate) fn make_instance(s: &mut Session, source: LayerId, ts: usize) -> Resu
     let sel = s.selected.get(&ts).copied().filter(|l| s.doc.project.locate(*l).is_some_and(|(t, _, _)| t == ts));
     let inside = sel.and_then(|l| s.doc.project.layer(l).ok()).is_some_and(Layer::is_group);
     s.doc.project.insert_layer(ts, Layer::new(id, name, LayerKind::Instance { source: src_id }, &[]), sel, inside)?;
-    s.selected.insert(ts, id);
+    s.select_one(ts, id);
     if ts == s.ts() {
         s.target = StackTarget::Content;
     }
@@ -98,7 +98,7 @@ pub(crate) fn detach(s: &mut Session, src: &Document, inst: LayerId) -> Result<L
     }
     s.doc.project.remove_layer(inst)?;
     if s.selected.get(&ts) == Some(&inst) {
-        s.selected.insert(ts, copy);
+        s.select_one(ts, copy);
     }
     Ok(copy)
 }

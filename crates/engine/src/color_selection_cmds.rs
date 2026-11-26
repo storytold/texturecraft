@@ -1,11 +1,11 @@
 //! Color selection effects: the ID colors they select, picked from the ID mesh map
 
 use serde_json::{Value, json};
-use texturecraft_core::{BakedMap, EffectKind, LayerId};
+use texturecraft_core::{BakedMap, ColorSelection, EffectKind, LayerId, SelectionBackground};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_geom::surface_at;
 
-use crate::commands::{CommandSpec, bad, f32p, has_layer};
+use crate::commands::{CommandSpec, bad, f32p, has_layer, strp};
 use crate::mask_cmds::effect_id;
 use crate::tool_cmds::viewport_of;
 use crate::{Result, Session, cmd};
@@ -19,29 +19,51 @@ pub fn specs() -> Vec<CommandSpec> {
         "Pick ID color",
         [],
         None,
-        "{effect?: a color selection (default: the selected effect), x?, y?: viewport pixels, viewport?: [w,h] | uv?: [u,v] texture set atlas UV (the 2D view), index?: replace this color instead of adding one} → {color: [r,g,b] as the ID map stores it, index} — samples the ID mesh map under the point",
+        "{effect?: a color selection (default: the selected effect), x?, y?: viewport pixels, viewport?: [w,h] | uv?: [u,v] texture set atlas UV (the 2D view), index?: replace this color instead of adding one} → {color: [r,g,b] as the ID map stores it, index} — samples the selected ID image or the texture set’s baked ID mesh map under the point",
         has_layer,
         pick
     )]
 }
 
-/// Applies `effect.set`'s `colors` and `tolerance` params to a color selection
-pub(crate) fn apply_params(params: &Value, colors: &mut Vec<[f32; 3]>, tolerance: &mut f32) -> Result<()> {
+/// Applies `effect.set`'s color selection params; `id_map` is the checked `idMap` ([`id_map_param`])
+pub(crate) fn apply_params(params: &Value, selection: &mut ColorSelection, id_map: Option<Option<String>>) -> Result<()> {
+    const CMD: &str = "effect.set";
     if let Some(list) = params.get("colors") {
-        *colors = colors_param(list)?;
+        selection.colors = colors_param(list)?;
     }
-    if let Some(value) = f32p(params, "tolerance") {
-        *tolerance = value.clamp(0.0, 1.0);
+    for (key, value) in [("tolerance", &mut selection.tolerance), ("output", &mut selection.output), ("hardness", &mut selection.hardness)] {
+        if let Some(given) = f32p(params, key) {
+            *value = given.clamp(0.0, 1.0);
+        }
+    }
+    if let Some(id) = strp(params, "background") {
+        selection.background =
+            SelectionBackground::from_id(id).ok_or_else(|| bad(CMD, format!("unknown background \"{id}\": transparent, black, white or gray")))?;
+    }
+    if let Some(id_map) = id_map {
+        selection.id_map = id_map;
     }
     Ok(())
 }
 
-/// A non-empty `[[r, g, b], ...]` list of finite values, clamped to 0..1
+/// `effect.set`'s `idMap`: absent, null (the ID mesh map) or the name of an image resource
+pub(crate) fn id_map_param(session: &Session, params: &Value) -> Result<Option<Option<String>>> {
+    const CMD: &str = "effect.set";
+    match params.get("idMap") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(name)) if session.images.contains_key(name) => Ok(Some(Some(name.clone()))),
+        Some(Value::String(name)) => Err(bad(CMD, format!("no image resource \"{name}\": import it first"))),
+        Some(_) => Err(bad(CMD, "`idMap` must be an image resource name or null")),
+    }
+}
+
+/// A `[[r, g, b], ...]` list (empty selects nothing) of finite values, clamped to 0..1
 fn colors_param(list: &Value) -> Result<Vec<[f32; 3]>> {
     const CMD: &str = "effect.set";
     let items = list.as_array().ok_or_else(|| bad(CMD, "`colors` must be a list of [r, g, b]"))?;
-    if items.is_empty() || items.len() > MAX_SELECTED_COLORS {
-        return Err(bad(CMD, format!("`colors` needs 1 to {MAX_SELECTED_COLORS} colors")));
+    if items.len() > MAX_SELECTED_COLORS {
+        return Err(bad(CMD, format!("`colors` holds at most {MAX_SELECTED_COLORS} colors")));
     }
 
     items
@@ -57,9 +79,9 @@ fn colors_param(list: &Value) -> Result<Vec<[f32; 3]>> {
 fn pick(session: &mut Session, params: &Value) -> Result<Value> {
     const CMD: &str = "effect.colorSelection.pick";
     let effect = effect_id(session, params, CMD)?;
-    let (owner, color_count) = match session.doc.project.effect(effect) {
+    let (owner, color_count, id_map) = match session.doc.project.effect(effect) {
         Some((owner, found)) => match &found.kind {
-            EffectKind::ColorSelection { colors, .. } => (owner, colors.len()),
+            EffectKind::ColorSelection(selection) => (owner, selection.colors.len(), selection.id_map.clone()),
             other => return Err(bad(CMD, format!("{} is not a color selection", other.name()))),
         },
         None => return Err(bad(CMD, format!("no effect {}", effect.0))),
@@ -76,13 +98,13 @@ fn pick(session: &mut Session, params: &Value) -> Result<Value> {
         None => None,
     };
 
-    let color = id_color_at(session, params, owner)?;
+    let color = id_color_at(session, params, owner, id_map.as_deref())?;
     session.edit("Pick ID color", |session| {
         let edited = session.doc.project.effect_mut(effect).ok_or_else(|| bad(CMD, format!("no effect {}", effect.0)))?;
-        if let EffectKind::ColorSelection { colors, .. } = &mut edited.kind {
-            match index.and_then(|index| colors.get_mut(index)) {
+        if let EffectKind::ColorSelection(selection) = &mut edited.kind {
+            match index.and_then(|index| selection.colors.get_mut(index)) {
                 Some(slot) => *slot = color,
-                None => colors.push(color),
+                None => selection.colors.push(color),
             }
         }
         Ok(())
@@ -90,15 +112,19 @@ fn pick(session: &mut Session, params: &Value) -> Result<Value> {
     Ok(json!({ "color": color, "index": index.unwrap_or(color_count) }))
 }
 
-/// The ID map color of the texel a color selection on `owner` reads at the picked point
-fn id_color_at(session: &Session, params: &Value, owner: LayerId) -> Result<[f32; 3]> {
+/// The ID map color of the texel a color selection on `owner` reading `id_map` (none: the ID mesh map) reads at the picked point
+fn id_color_at(session: &Session, params: &Value, owner: LayerId, id_map: Option<&str>) -> Result<[f32; 3]> {
     const CMD: &str = "effect.colorSelection.pick";
     let (set_index, _, _) = session.doc.project.locate(owner).ok_or_else(|| bad(CMD, "the effect's layer is not in a texture set"))?;
     let set = session.doc.project.texture_set(set_index)?;
     let baked = session.baked(set_index).filter(|baked| baked.maps.contains_key(&BakedMap::Id));
-    let Some(baked) = baked else {
-        return Err(bad(CMD, format!("texture set \"{}\" has no ID map: bake one, or set one with textureSet.meshMap.set", set.name)));
+    let image = match id_map {
+        Some(name) => Some(session.images.get(name).ok_or_else(|| bad(CMD, format!("the ID map image \"{name}\" is gone: choose another")))?),
+        None => None,
     };
+    if image.is_none() && baked.is_none() {
+        return Err(bad(CMD, format!("texture set \"{}\" has no ID map: bake one, or set one with textureSet.meshMap.set", set.name)));
+    }
 
     let uv = match params.get("uv") {
         Some(uv) => uv_param(uv)?,
@@ -112,6 +138,7 @@ fn id_color_at(session: &Session, params: &Value, owner: LayerId) -> Result<[f32
             if material != set.material {
                 return Err(bad(CMD, "that surface belongs to another texture set"));
             }
+
             uv
         }
     };
@@ -122,7 +149,18 @@ fn id_color_at(session: &Session, params: &Value, owner: LayerId) -> Result<[f32
     if !texel.iter().zip([size.0, size.1]).all(|(position, extent)| (0.0..extent as f32).contains(position)) {
         return Err(bad(CMD, "that point is outside the texture set's UV space"));
     }
-    baked.sample_working(BakedMap::Id, texel[0] as u32, texel[1] as u32, size, &set.block_scales()).ok_or_else(|| bad(CMD, "no ID color there"))
+
+    let (x, y) = (texel[0] as u32, texel[1] as u32);
+    let color = match (image, baked) {
+        (Some(image), _) => {
+            // The texel's centre, as the mask reads it
+            let [red, green, blue, _] = image.sample_nearest((x as f32 + 0.5) / size.0.max(1) as f32, (y as f32 + 0.5) / size.1.max(1) as f32);
+            Some([red, green, blue])
+        }
+        (None, Some(baked)) => baked.sample_working(BakedMap::Id, x, y, size, &set.block_scales()),
+        (None, None) => None,
+    };
+    color.ok_or_else(|| bad(CMD, "no ID color there"))
 }
 
 /// The UV and mesh material under viewport pixel `screen`; hidden texture sets don't stop the ray

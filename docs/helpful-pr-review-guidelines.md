@@ -8,7 +8,7 @@ Use these preferences when reviewing and improving a PR. Follow repository requi
 - Review-only requests call for findings; requests to fix or improve also authorize focused local edits
 - A review may conclude that no changes are needed. If the PR meets the applicable standards and no actionable issues are found, leave it unchanged. Do not invent findings, add unnecessary tests, or make edits merely to produce a diff. Report what was checked and any remaining validation limits
 - Apply all review standards across the entire affected method, including existing code and relevant tests
-- Complete naming, spacing, and comment cleanup throughout it
+- Read and apply [CODE_STYLE.md](../CODE_STYLE.md) throughout that scope
 - Make additional correctness or performance changes when supported by evidence and appropriate validation
 - Separate substantial changes that address an independent problem, explaining why
 - Apply the same scope to standalone functions and inspect relevant callers when verifying behavior
@@ -27,6 +27,7 @@ Use these preferences when reviewing and improving a PR. Follow repository requi
 ## Optimization and simplicity
 
 - Prefer the smallest complete solution that is efficient and easy to understand
+- Keep control flow direct and share repeated logic when it makes the code simpler
 - Look for repeated calculations, expensive iterations, unnecessary allocations, and redundant data access
 - For loops, batches, and streaming operations, trace allocations and buffer lifetimes across multiple iterations, including outputs retained from earlier iterations. Identify work that belongs once per operation rather than once per item, using the full selection when making retention decisions
 - Consider caching, batching, and parallelism when measurements justify their complexity and memory cost
@@ -34,39 +35,6 @@ Use these preferences when reviewing and improving a PR. Follow repository requi
 - Compare before and after with the same inputs, build settings, and environment; account for measurement variation and cold or warm state where relevant
 - Check what the compiler already optimizes before replacing clear arithmetic with micro-optimizations
 - Avoid speculative optimization, unnecessary dependencies, and abstractions that add more code than clarity
-
-## Clarity, naming, and spacing
-
-- Clean up the functions or methods being changed and their relevant tests within the scope above
-- Use descriptive names that explain purpose; include units where useful
-- Avoid cryptic abbreviations, misleading names, and unexplained production constants
-- Keep control flow direct and share repeated logic when it makes the code simpler
-- Use a single blank line to separate logical steps, such as input preparation, validation, computation, mutation, and result construction, when those steps are distinct
-- Keep closely related statements together; avoid spacing that fragments a single operation or inserts a blank line after every declaration
-- Put a blank line after a multiline early-exit guard, including `if` and `let ... else`, before the next statement
-- Keep comments attached to the code they explain; put a blank line before a comment introducing a new step, with no blank line between the comment and that step
-- Keep documentation and attributes attached to their declarations
-- Separate function definitions with one blank line; avoid extra empty lines immediately inside braces or between every field, argument, or statement
-- Group tests into preparation, action, and verification with blank lines where those phases are distinct; keep related assertions together
-- Apply this spacing consistently throughout affected functions, methods, and tests, and follow the repository's formatter for mechanical formatting
-
-## Source organization
-
-- Keep each class, enum, or struct in its own source file, with its implementation beside it
-- Spell out the full type name in the filename; use the language's filename convention, such as `mesh_curvature_settings.rs` for `MeshCurvatureSettings` in Rust
-- Use singular folder names, such as `map`, `setting`, or `tracing`
-- Group related types into focused modules and share helpers where useful without collecting unrelated types into one large file
-- Apply these preferences to new types and source organization changes within scope; follow mandatory repository layout rules and leave unrelated existing structure alone
-
-## Comments
-
-- Use short, single-line comments; adjacent comment lines should each express a concise point
-- Avoid block comments and wrapped prose in ordinary implementation comments
-- Explain intent or a non-obvious constraint rather than narrating the code
-- No trailing punctuation on ordinary code comments
-- Preserve explanations of guards and invariants; remove stale or redundant comments without losing necessary rationale
-- API documentation, required license headers, and examples may use their conventional multiline formatting and punctuation
-- Apply these standards to both production code and tests
 
 ## Validation and reporting
 

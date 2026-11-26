@@ -6,4 +6,7 @@ pub(crate) struct CageGpu {
     pub(crate) corner_count: u32,
     pub(crate) edges: wgpu::Buffer,
     pub(crate) edge_index_count: u32,
+    /// Corner pairs along the low poly's hard edges without a UV seam
+    pub(crate) missing_seams: wgpu::Buffer,
+    pub(crate) missing_seam_index_count: u32,
 }

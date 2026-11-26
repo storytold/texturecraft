@@ -95,6 +95,24 @@ fn the_view_follows_each_map_and_the_previous_mode_comes_back() {
 }
 
 #[test]
+fn a_deferred_image_view_that_was_removed_during_the_bake_comes_back_as_the_material() {
+    let mut session = session();
+    let png = texturecraft_formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
+    let name = session.import_resource_bytes("stone.png", png).unwrap();
+    session.bake_preview_begin(vec![(0, order(&session))]);
+
+    // The image is chosen during the bake, then a mesh map is pinned over it
+    execute(&mut session, "viewport.view", &json!({"mode": "image", "image": name})).unwrap();
+    execute(&mut session, "viewport.view", &json!({"mode": format!("map:{}", BakedMap::AmbientOcclusion.id())})).unwrap();
+    assert_eq!(session.view, ViewMode::MeshMap(BakedMap::AmbientOcclusion));
+    execute(&mut session, "resource.remove", &json!({"name": name})).unwrap();
+
+    session.bake_preview_end();
+
+    assert_eq!((session.view, session.view_image.as_deref()), (ViewMode::Material, None), "a removed image is not restored");
+}
+
+#[test]
 fn pinning_material_and_follow() {
     let mut session = session();
     let maps = order(&session);

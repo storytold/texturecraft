@@ -15,7 +15,7 @@ usage: cargo xtask <command>
 commands:
   layers          enforce the crate dependency layering (xtask/src/layers.rs)
   wasm            cargo check --target wasm32-unknown-unknown for the wasm crates and the web app
-  ci              fmt --check, clippy -D warnings, test, layers, wasm (stops at the first failure)
+  ci              fmt --check, layers, clippy -D warnings, test, wasm (stops at the first failure)
   version [set X.Y.Z[-pre]]
                   print the workspace version, or set it (Cargo.toml + Cargo.lock)
   ico <out.ico> <in.png>...
@@ -154,13 +154,21 @@ fn cmd_ci() -> Result<(), String> {
         }
     };
     type Step = (&'static str, Box<dyn Fn() -> Result<(), String>>);
-    let steps: Vec<Step> = vec![
+    // Reject invalid dependency layering before spending time compiling and running the workspace.
+    let mut steps: Vec<Step> = vec![
         ("fmt", Box::new(cargo_step(&["fmt", "--all", "--", "--check"]))),
+        ("layers", Box::new(cmd_layers)),
         ("clippy", Box::new(cargo_step(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))),
         ("test", Box::new(cargo_step(&["test", "--workspace"]))),
-        ("layers", Box::new(cmd_layers)),
-        ("wasm", Box::new(cmd_wasm)),
     ];
+    // The check compiles for wasm32 and gives the same answer on any host, so the non-Windows legs
+    // cover it and the slower Windows leg skips it. A skipped step is not in the list, so the
+    // summary never reports it as ok.
+    if cfg!(windows) {
+        eprintln!("ci: wasm check not run on Windows (the other hosts cover it)");
+    } else {
+        steps.push(("wasm", Box::new(cmd_wasm)));
+    }
     for (i, (name, step)) in steps.iter().enumerate() {
         eprintln!("\n=== ci: {name} ===");
         if let Err(e) = step() {

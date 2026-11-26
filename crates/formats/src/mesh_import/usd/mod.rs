@@ -14,14 +14,12 @@
 //! Not composed: external references, payloads, sublayers and variant sets (each warns once),
 //! inherits and specializes. Time-sampled values use their first sample.
 
-pub(crate) mod codec;
 #[cfg(test)]
 mod tests;
-mod usda;
-mod usdc;
 
 use std::collections::HashMap;
 
+use craft_usd::scene::{Layer, MAX_DEPTH, PrimSpec, Prop, SceneError, Specifier, Val};
 use texturecraft_geom::glam::{DMat4, DQuat, DVec3, DVec4, Mat3, Mat4, Vec2, Vec3, Vec4};
 
 use super::external::below;
@@ -29,104 +27,8 @@ use super::{Corner, MAX_MESH_FILE_BYTES, MAX_TEXTURE_BYTES, MAX_ZIP_ENTRIES, Pol
 use crate::{FormatError, Result, malformed};
 
 pub(crate) const KIND: &str = "USD";
-/// Memory budget for decoded values (numbers are held as f64).
-const MAX_DECODED_BYTES: usize = 1 << 31;
-/// Deepest prim nesting and reference chain followed.
-const MAX_DEPTH: usize = 128;
 /// Composed prims visited (bounds exponential instancing through references).
 const MAX_PRIM_VISITS: usize = 1_000_000;
-
-/// A decoded value: numbers (scalars, vectors, quaternions as w x y z, matrices row-major and
-/// bools all flattened), tokens / strings / asset paths, or paths.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Val {
-    Num(Vec<f64>),
-    Tok(Vec<String>),
-    Path(Vec<String>),
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Prop {
-    /// Declared type (`point3f[]`, `texCoord2f[]`, `rel`, ...).
-    pub type_name: String,
-    pub value: Option<Val>,
-    pub interpolation: Option<String>,
-    /// The first connection source (`name.connect`): an attribute path.
-    pub connect: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) enum Specifier {
-    #[default]
-    Def,
-    Over,
-    Class,
-}
-
-/// One prim spec of a layer.
-#[derive(Debug, Default)]
-pub(crate) struct PrimSpec {
-    pub name: String,
-    pub path: String,
-    pub type_name: String,
-    pub specifier: Specifier,
-    pub active: Option<bool>,
-    pub props: HashMap<String, Prop>,
-    pub children: Vec<usize>,
-    /// Internal references: absolute prim paths in this layer.
-    pub references: Vec<String>,
-}
-
-/// A parsed layer: prim specs (index 0 is the pseudo-root) and stage metadata.
-#[derive(Debug)]
-pub(crate) struct Layer {
-    pub prims: Vec<PrimSpec>,
-    pub meters_per_unit: Option<f64>,
-    pub up_axis: Option<String>,
-    pub warnings: Vec<String>,
-}
-
-impl Layer {
-    pub fn new() -> Layer {
-        Layer { prims: vec![PrimSpec { path: "/".into(), ..PrimSpec::default() }], meters_per_unit: None, up_axis: None, warnings: Vec::new() }
-    }
-
-    /// Add a prim spec named `name` under prim `parent`.
-    pub fn add_prim(&mut self, parent: usize, name: &str) -> usize {
-        let path = match self.prims.get(parent) {
-            Some(p) if p.path == "/" => format!("/{name}"),
-            Some(p) => format!("{}/{name}", p.path),
-            None => format!("/{name}"),
-        };
-        let id = self.prims.len();
-        self.prims.push(PrimSpec { name: name.into(), path, ..PrimSpec::default() });
-        if let Some(p) = self.prims.get_mut(parent) {
-            p.children.push(id);
-        }
-        id
-    }
-
-    pub fn warn(&mut self, msg: &str) {
-        if !self.warnings.iter().any(|w| w == msg) {
-            self.warnings.push(msg.into());
-        }
-    }
-}
-
-/// Charges decoded data against [`MAX_DECODED_BYTES`].
-pub(crate) struct Budget(usize);
-
-impl Budget {
-    pub fn new() -> Budget {
-        Budget(MAX_DECODED_BYTES)
-    }
-
-    pub fn take(&mut self, bytes: usize) -> Result<()> {
-        self.0 =
-            self.0.checked_sub(bytes).ok_or_else(|| FormatError::TooLarge(format!("the USD file decodes to more than {} MiB", MAX_DECODED_BYTES >> 20)))?;
-        Ok(())
-    }
-}
 
 pub(crate) fn read(file_name: &str, bytes: &[u8]) -> Result<RawMesh> {
     crate::guard(KIND, || {
@@ -141,14 +43,12 @@ pub(crate) fn read(file_name: &str, bytes: &[u8]) -> Result<RawMesh> {
 
 /// A `.usda` / `.usdc` / `.usd` layer, by content.
 fn read_layer(bytes: &[u8]) -> Result<Layer> {
-    let mut budget = Budget::new();
-    if bytes.starts_with(codec::MAGIC) {
-        usdc::read(bytes, &mut budget)
-    } else if bytes.trim_ascii_start().starts_with(b"#usda") {
-        usda::read(bytes, &mut budget)
-    } else {
-        Err(malformed(KIND, "neither a USD text layer (#usda) nor a Crate binary (PXR-USDC)"))
-    }
+    craft_usd::scene::read_layer(bytes).map_err(|e| match e {
+        SceneError::Malformed(m) => malformed(KIND, m),
+        SceneError::TooLarge(m) => FormatError::TooLarge(m),
+        SceneError::Unsupported(m) => FormatError::Unsupported(m),
+        SceneError::Invalid(m) => FormatError::Invalid(m),
+    })
 }
 
 /// A `.usdz` package: its files, and the folder of the layer read (asset paths are relative
@@ -576,6 +476,7 @@ impl<'a> Stage<'a> {
                     p: m.transform_point3(Vec3::from(p)),
                     n: normals.as_ref().and_then(|pv| pv.get::<3>(at)).map(|v| nm * Vec3::from(v)),
                     uv: uvs.as_ref().and_then(|pv| pv.get::<2>(at)).map(|[u, v]| Vec2::new(u, 1.0 - v)),
+                    color: None,
                 });
             }
             if flip {

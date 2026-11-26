@@ -22,6 +22,12 @@ const EDGE_TOLERANCE: f32 = 1e-4;
 /// [`EyeDepth::bias`] as a fraction of the scene radius.
 const BIAS_PER_RADIUS: f32 = 0.004;
 
+/// Extra tolerance for depth variation across a coarse screen pixel.
+const DISTANCE_TOLERANCE_FRACTION: f32 = 0.002;
+
+/// Query points closer to the camera plane cannot be projected reliably.
+const MIN_QUERY_CLIP_W: f32 = 1e-6;
+
 /// Distance from the eye to the nearest surface per screen pixel (f32::MAX where empty).
 #[derive(Clone, Debug)]
 pub struct EyeDepth {
@@ -29,6 +35,8 @@ pub struct EyeDepth {
     pub height: u32,
     pub view_proj: Mat4,
     pub eye: Vec3,
+    /// Parallel direction toward the camera in an orthographic view.
+    pub orthographic_to_eye: Option<Vec3>,
     pub dist: Vec<f32>,
     /// The nearest triangle per screen pixel ([`NO_TRI`] where empty); empty unless rendered with [`EyeDepth::render_with_triangles`].
     pub triangle: Vec<u32>,
@@ -69,10 +77,12 @@ impl EyeDepth {
         let (width, height) = (width.clamp(1, MAX_SIZE), height.clamp(1, MAX_SIZE));
         let size = Vec2::new(width as f32, height as f32);
         let eye = camera.eye();
+
         // Brush depth closes seams, but expanding triangle IDs can expose hidden faces at silhouettes
         let edge_tolerance = if record_triangles { 0.0 } else { EDGE_TOLERANCE };
 
         let screen: Vec<Option<Vec2>> = mesh.positions.iter().map(|position| screen_point(view_proj, *position, size)).collect();
+
         // Inverse view depth is affine in perspective and avoids the precision loss of normalized clip depth
         let vertex_depth: Vec<f32> = mesh.positions.iter().map(|position| depth_key(-(view * position.extend(1.0)).z)).collect();
 
@@ -156,36 +166,85 @@ impl EyeDepth {
             }
         });
 
-        EyeDepth { width, height, view_proj, eye, dist, triangle, bias: mesh.radius() * BIAS_PER_RADIUS }
+        EyeDepth {
+            width,
+            height,
+            view_proj,
+            eye,
+            orthographic_to_eye: camera.ortho.then(|| -camera.forward()),
+            dist,
+            triangle,
+            bias: mesh.radius() * BIAS_PER_RADIUS,
+        }
     }
 
-    /// Whether world point `p` is visible (not hidden behind other geometry, inside the view).
-    pub fn visible(&self, p: Vec3) -> bool {
-        let c = self.view_proj * p.extend(1.0);
-        if c.w <= 1e-6 {
-            return false;
+    /// Whether a world point is visible (not hidden behind other geometry, inside the view).
+    pub fn visible(&self, point: Vec3) -> bool {
+        self.visibility(point).0
+    }
+
+    /// Whether a world point inside the view lies no farther than the farthest surface in its
+    /// pixel's neighbourhood, or has an empty pixel beside it: then the buffer alone can't tell
+    /// whether it is hidden (on a surface turned far from the camera, neighbouring pixels of the
+    /// same surface are much nearer, and where such a surface ends between pixel centres its edge
+    /// lies beyond every finite neighbour), while a point behind every surface all around it is
+    /// hidden for sure.
+    pub fn uncertain(&self, point: Vec3) -> bool {
+        self.visibility(point).1
+    }
+
+    /// Reuse the same depth neighbourhood for the fast and exact-test gates.
+    pub(crate) fn visibility(&self, point: Vec3) -> (bool, bool) {
+        let Some((near, far, has_empty)) = self.neighbourhood(point) else { return (false, false) };
+
+        let distance = point.distance(self.eye);
+        let visible = distance <= near + self.bias;
+        let uncertain = has_empty || (far < f32::MAX && distance <= far + self.tolerance(far));
+
+        (visible, uncertain)
+    }
+
+    /// Allowance at an eye distance: a bias that grows with distance (depth buffer resolution).
+    fn tolerance(&self, distance: f32) -> f32 {
+        self.bias + distance * DISTANCE_TOLERANCE_FRACTION
+    }
+
+    /// The nearest and farthest surface among the pixel a point lands in and its neighbours (f32::MAX
+    /// for both where they are all empty), and whether any of those pixels is empty, or None
+    /// outside the view or behind the camera.
+    fn neighbourhood(&self, point: Vec3) -> Option<(f32, f32, bool)> {
+        let clip = self.view_proj * point.extend(1.0);
+        if clip.w <= MIN_QUERY_CLIP_W {
+            return None;
         }
-        let (nx, ny) = (c.x / c.w, c.y / c.w);
+
+        let (nx, ny) = (clip.x / clip.w, clip.y / clip.w);
         if nx.abs() > 1.0 || ny.abs() > 1.0 {
-            return false;
+            return None;
         }
+
         let x = (((nx * 0.5 + 0.5) * self.width as f32) as u32).min(self.width - 1);
         let y = (((0.5 - ny * 0.5) * self.height as f32) as u32).min(self.height - 1);
-        // Conservative: the nearest surface among the pixel and its neighbours.
-        let mut near = f32::MAX;
+        let (mut near, mut far, mut has_empty) = (f32::MAX, f32::MIN, false);
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {
                 let (sx, sy) = (x as i32 + dx, y as i32 + dy);
                 if sx < 0 || sy < 0 || sx >= self.width as i32 || sy >= self.height as i32 {
                     continue;
                 }
-                if let Some(d) = self.dist.get((sy as u32 * self.width + sx as u32) as usize) {
-                    near = near.min(*d);
+
+                if let Some(&surface_distance) = self.dist.get((sy as u32 * self.width + sx as u32) as usize) {
+                    near = near.min(surface_distance);
+                    if surface_distance < f32::MAX {
+                        far = far.max(surface_distance);
+                    } else {
+                        has_empty = true;
+                    }
                 }
             }
         }
-        // Allow a bias that grows with distance (depth buffer resolution).
-        p.distance(self.eye) <= near + self.bias + near * 0.002
+
+        Some((near, if far == f32::MIN { f32::MAX } else { far }, has_empty))
     }
 }
 
@@ -195,16 +254,40 @@ mod tests {
     use texturecraft_geom::primitives;
 
     #[test]
+    fn foreground_depth_outside_bias_needs_an_exact_test() {
+        let depth = EyeDepth {
+            width: 3,
+            height: 3,
+            view_proj: Mat4::IDENTITY,
+            eye: Vec3::new(0.0, 0.0, 10.0),
+            orthographic_to_eye: None,
+            dist: vec![9.985; 9],
+            triangle: Vec::new(),
+            bias: 0.005,
+        };
+
+        assert_eq!(depth.visibility(Vec3::ZERO), (false, true));
+    }
+
+    #[test]
     fn front_of_sphere_is_visible_back_is_not() {
-        let m = primitives::sphere(1.0, 64, 32);
-        let mut cam = OrbitCamera::default();
-        cam.yaw = 0.0;
-        cam.pitch = 0.0;
-        cam.frame(Vec3::splat(-1.0), Vec3::splat(1.0));
-        let d = EyeDepth::render(&m, &cam, 256, 256);
-        let toward = (cam.eye() - cam.target).normalize();
-        assert!(d.visible(toward * 1.0));
-        assert!(!d.visible(-toward * 1.0));
-        assert!(!d.visible(Vec3::new(100.0, 0.0, 0.0)));
+        let mesh = primitives::sphere(1.0, 64, 32);
+        let mut camera = OrbitCamera { yaw: 0.0, pitch: 0.0, ..Default::default() };
+        camera.frame(Vec3::splat(-1.0), Vec3::splat(1.0));
+        let toward = (camera.eye() - camera.target).normalize();
+
+        let depth = EyeDepth::render(&mesh, &camera, 256, 256);
+
+        assert!(depth.visible(toward));
+        assert!(!depth.visible(-toward));
+        assert!(!depth.visible(Vec3::new(100.0, 0.0, 0.0)));
+
+        // The far side is behind every surface around it: hidden for sure, no exact test needed
+        assert!(!depth.uncertain(-toward));
+        assert!(depth.uncertain(toward));
+        assert!(!depth.uncertain(Vec3::new(100.0, 0.0, 0.0)), "outside the view");
+
+        // Beside empty pixels (a silhouette) the buffer can't prove a point hidden
+        assert!(depth.uncertain(Vec3::new(0.0, 1.0, 0.0)), "on the silhouette");
     }
 }

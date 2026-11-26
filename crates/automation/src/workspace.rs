@@ -238,7 +238,7 @@ mod tests {
         for id in ["file.open", "file.new", "file.save", "file.saveAs", "file.saveCopy", "file.exportTextures"] {
             assert!(authorize_command(id, &json!({})).is_err(), "{id}");
         }
-        for id in ["resource.import", "material.save", "material.load", "anything.new"] {
+        for id in ["resource.import", "material.save", "material.load", "mask.smart.create", "mask.smart.apply", "anything.new"] {
             assert!(authorize_command(id, &json!({"path": "/etc/x"})).is_err(), "{id}");
             assert!(authorize_command(id, &json!({"dir": "/etc"})).is_err(), "{id}");
         }

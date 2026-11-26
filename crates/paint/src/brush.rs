@@ -5,6 +5,7 @@ use texturecraft_compose::ImageRes;
 use texturecraft_geom::glam::{Mat3, Vec3};
 use texturecraft_texel::noise;
 
+use crate::alpha_params::AlphaParams;
 use crate::alphas::AlphaImage;
 
 /// How the stamp plane is oriented.
@@ -93,23 +94,35 @@ pub struct Shape<'a> {
     pub alpha: BrushAlpha,
     pub image: Option<&'a ImageRes>,
     pub library: Option<&'a AlphaImage>,
+    /// Extent, roundness, contrast and invert shared by every kind of alpha
+    pub params: AlphaParams,
     /// Mip level of `library` to sample (set per stamp by [`Shape::at_radius`]).
     pub level: usize,
 }
 
 impl Shape<'_> {
-    /// Shape value at local stamp coordinates (see [`BrushAlpha::sample`]).
+    /// Shape value at local stamp coordinates (see [`BrushAlpha::sample`]), placed and graded by
+    /// the [`AlphaParams`]: the same for image, library and procedural alphas.
     pub fn sample(&self, lx: f32, ly: f32, hardness: f32, seed: u32) -> f32 {
-        match (self.image, self.library) {
-            (Some(img), _) => image_alpha(img, lx, ly),
-            (None, Some(lib)) => lib.sample(self.level, lx, ly),
-            (None, None) => self.alpha.sample(lx, ly, hardness, seed),
-        }
+        let (x, y) = self.params.place(lx, ly);
+        let value = match (self.image, self.library) {
+            (Some(img), _) => image_alpha(img, x, y),
+            (None, Some(lib)) => lib.sample(self.level, x, y),
+            (None, None) if self.alpha == BrushAlpha::Round && self.params.roundness < 1.0 => {
+                // Between the square's edge distance (0) and the circle's (1)
+                let (square, circle) = (x.abs().max(y.abs()), (x * x + y * y).sqrt());
+                1.0 - smoothstep(hardness.min(0.999), 1.0, square + (circle - square) * self.params.roundness)
+            }
+            (None, None) => self.alpha.sample(x, y, hardness, seed),
+        };
+        self.params.grade(value, lx, ly)
     }
 
     /// This shape for a stamp `radius` texels wide (picks the library alpha's mip level).
     pub fn at_radius(self, radius: f32) -> Self {
-        Shape { level: self.library.map_or(0, |l| l.level_for(radius)), ..self }
+        // A shrunk alpha covers fewer texels, so it wants a finer mip level
+        let covered = radius * self.params.size_x.min(self.params.size_y);
+        Shape { level: self.library.map_or(0, |l| l.level_for(covered)), ..self }
     }
 }
 
@@ -130,33 +143,82 @@ pub(crate) fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Mirror and radial symmetry through the mesh center.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Largest symmetry offset kept from a command or a file (world units), far beyond any mesh
+const MAX_SYMMETRY_OFFSET: f32 = 1.0e6;
+
+/// Mirror and radial symmetry through the mesh center, optionally moved by `offset`
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Symmetry {
+    /// The toolbar's Symmetry toggle: off keeps the settings below but paints no copies
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
     pub x: bool,
     pub y: bool,
     pub z: bool,
-    /// Radial symmetry: copies spread evenly around `axis` (0 or 1: off; at most 32).
+    /// Radial copies around `axis`, spread over `angle_span` (0 or 1: off; at most [`MAX_RADIAL_COPIES`])
     #[serde(default)]
     pub radial: u8,
-    /// Axis of radial symmetry: 0 = X, 1 = Y, 2 = Z.
+    /// Axis of radial symmetry (0 = X, 1 = Y, 2 = Z), independent of the mirror axes
     #[serde(default = "radial_axis")]
     pub axis: u8,
+    /// Where the mirror planes and the radial axis cross, relative to the mesh center (world units)
+    #[serde(default)]
+    pub offset: [f32; 3],
+    /// Degrees the radial copies spread over: a full turn spaces them evenly, less puts the first and last copy at its ends
+    #[serde(default = "full_turn")]
+    pub angle_span: f32,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 fn radial_axis() -> u8 {
     1
 }
 
+fn full_turn() -> f32 {
+    FULL_TURN_DEGREES
+}
+
+// A full turn is the angle span every crate measures turns against
+pub use texturecraft_core::FULL_TURN_DEGREES;
+
+/// Most radial copies a brush paints
+pub const MAX_RADIAL_COPIES: u8 = 32;
+
+/// [`Symmetry::axis`] of the last axis, Z
+const LAST_AXIS: u8 = 2;
+
 impl Default for Symmetry {
     fn default() -> Self {
-        Symmetry { x: false, y: false, z: false, radial: 0, axis: radial_axis() }
+        Symmetry { enabled: enabled_by_default(), x: false, y: false, z: false, radial: 0, axis: radial_axis(), offset: [0.0; 3], angle_span: full_turn() }
     }
 }
 
 impl Symmetry {
+    /// Whether symmetry is on with an axis to mirror on or radial copies
     pub fn any(&self) -> bool {
-        self.x || self.y || self.z || self.radial > 1
+        self.enabled && (self.x || self.y || self.z || self.radial > 1)
+    }
+
+    /// Whether radial symmetry is on (see [`Symmetry::radial_on`] for whether it paints copies)
+    pub fn radial_mode(&self) -> bool {
+        self.enabled && self.radial > 1
+    }
+
+    /// Whether radial copies are painted: with no angle to spread over they would all land on the stroke
+    pub fn radial_on(&self) -> bool {
+        self.radial_mode() && self.angle_span > 0.0
+    }
+
+    /// Rotation (radians) of radial copy number `copy` (0 = the stroke itself) around the axis
+    pub fn radial_angle(&self, copy: u8) -> f32 {
+        if self.angle_span >= FULL_TURN_DEGREES {
+            f32::from(copy) * std::f32::consts::TAU / f32::from(self.radial.max(1))
+        } else {
+            f32::from(copy) * self.angle_span.to_radians() / f32::from(self.radial.saturating_sub(1).max(1))
+        }
     }
 
     /// Mirror scales in stroke order, including identity, without allocating
@@ -172,26 +234,39 @@ impl Symmetry {
             Vec3::NEG_ONE,
         ]
         .into_iter()
-        .filter(|sign| (sign.x > 0.0 || self.x) && (sign.y > 0.0 || self.y) && (sign.z > 0.0 || self.z))
+        .filter(|sign| *sign == Vec3::ONE || (self.enabled && (sign.x > 0.0 || self.x) && (sign.y > 0.0 || self.y) && (sign.z > 0.0 || self.z)))
     }
 
-    /// Linear maps (through the mesh center) taking a point to each of its symmetry copies,
-    /// the identity first. Mirrors come first, then radial rotations of the point and its mirrors.
+    /// The point the mirror planes and the radial axis pass through, for a mesh centered at `center`
+    pub fn origin(&self, center: Vec3) -> Vec3 {
+        center + Vec3::from(self.offset)
+    }
+
+    /// [`Symmetry::axis`] as an index (0 = X, 1 = Y, 2 = Z), out-of-range values read as Z
+    pub fn axis_index(&self) -> usize {
+        usize::from(self.axis.min(LAST_AXIS))
+    }
+
+    /// Axis of radial symmetry as a unit vector
+    pub fn radial_axis(&self) -> Vec3 {
+        [Vec3::X, Vec3::Y, Vec3::Z][self.axis_index()]
+    }
+
+    /// Linear maps `m` taking a point to its copies as `origin + m * (p - origin)`: identity, mirrors, then their radial turns
     pub fn transforms(&self) -> Vec<Mat3> {
-        let mut out: Vec<Mat3> = self.mirror_signs().map(Mat3::from_diagonal).collect();
+        let mut maps: Vec<Mat3> = self.mirror_signs().map(Mat3::from_diagonal).collect();
 
-        if self.radial > 1 {
-            let axis = [Vec3::X, Vec3::Y, Vec3::Z].get(self.axis as usize).copied().unwrap_or(Vec3::Y);
-            let base = out.clone();
-            out.reserve(base.len().saturating_mul(usize::from(self.radial - 1)));
+        if self.radial_on() {
+            let mirrors = maps.clone();
+            maps.reserve(mirrors.len().saturating_mul(usize::from(self.radial - 1)));
 
-            for k in 1..self.radial {
-                let r = Mat3::from_axis_angle(axis, f32::from(k) * std::f32::consts::TAU / f32::from(self.radial));
-                out.extend(base.iter().map(|m| r * *m));
+            for copy in 1..self.radial {
+                let turn = Mat3::from_axis_angle(self.radial_axis(), self.radial_angle(copy));
+                maps.extend(mirrors.iter().map(|mirror| turn * *mirror));
             }
         }
 
-        out
+        maps
     }
 }
 
@@ -249,6 +324,9 @@ pub struct BrushSettings {
     /// Built-in library alpha id used as the stamp shape (see [`crate::alphas`]).
     #[serde(default)]
     pub alpha_library: Option<String>,
+    /// Extent, roundness, contrast and invert of whichever alpha is used.
+    #[serde(default)]
+    pub alpha_params: AlphaParams,
     /// Only paint surfaces facing the camera.
     pub backface_culling: bool,
     /// Half-depth of the stamp volume relative to the radius (thinner = less bleed into folds).
@@ -281,6 +359,7 @@ impl Default for BrushSettings {
             alpha: BrushAlpha::Round,
             alpha_image: None,
             alpha_library: None,
+            alpha_params: AlphaParams::default(),
             backface_culling: true,
             depth: 1.0,
             symmetry: Symmetry::default(),
@@ -291,30 +370,45 @@ impl Default for BrushSettings {
 }
 
 impl BrushSettings {
-    /// Clamp every value into its valid range (input from UI, CLI or agents).
+    /// Radius of a 2D (UV) stamp as a fraction of the UV square, for pen `pressure` 0..1: twice the
+    /// brush size, shrunk towards `min_size` by a light pen. Painting and the 2D cursor share it.
+    pub fn uv_stamp_radius(&self, pressure: f32) -> f32 {
+        let p = pressure.clamp(0.0, 1.0);
+        self.size * 2.0 * if p < 1.0 { self.min_size + (1.0 - self.min_size) * p } else { 1.0 }
+    }
+
+    /// Clamp every value into its valid range (input from UI, CLI or agents)
     pub fn sanitized(&self) -> BrushSettings {
-        let f = |v: f32, lo: f32, hi: f32, d: f32| if v.is_finite() { v.clamp(lo, hi) } else { d };
+        let clamp_finite = |value: f32, min: f32, max: f32, default: f32| if value.is_finite() { value.clamp(min, max) } else { default };
+
         BrushSettings {
-            size: f(self.size, 0.0005, 0.5, 0.02),
-            min_size: f(self.min_size, 0.0, 1.0, 0.05),
-            flow: f(self.flow, 0.0, 1.0, 1.0),
-            opacity: f(self.opacity, 0.0, 1.0, 1.0),
-            spacing: f(self.spacing, 0.01, 10.0, 0.1),
-            hardness: f(self.hardness, 0.0, 0.999, 0.5),
-            angle: f(self.angle, -360.0, 360.0, 0.0),
-            angle_fade: (f(self.angle_fade.0, 0.0, 90.0, 70.0), f(self.angle_fade.1, 0.0, 90.0, 85.0)),
-            lazy: f(self.lazy, 0.0, 500.0, 0.0),
-            jitter_size: f(self.jitter_size, 0.0, 1.0, 0.0),
-            jitter_angle: f(self.jitter_angle, 0.0, 1.0, 0.0),
-            jitter_flow: f(self.jitter_flow, 0.0, 1.0, 0.0),
-            jitter_position: f(self.jitter_position, 0.0, 4.0, 0.0),
-            depth: f(self.depth, 0.05, 4.0, 1.0),
-            symmetry: Symmetry { radial: self.symmetry.radial.min(32), axis: self.symmetry.axis.min(2), ..self.symmetry },
+            size: clamp_finite(self.size, 0.0005, 0.5, 0.02),
+            min_size: clamp_finite(self.min_size, 0.0, 1.0, 0.05),
+            flow: clamp_finite(self.flow, 0.0, 1.0, 1.0),
+            opacity: clamp_finite(self.opacity, 0.0, 1.0, 1.0),
+            spacing: clamp_finite(self.spacing, 0.01, 10.0, 0.1),
+            hardness: clamp_finite(self.hardness, 0.0, 0.999, 0.5),
+            angle: clamp_finite(self.angle, -360.0, 360.0, 0.0),
+            angle_fade: (clamp_finite(self.angle_fade.0, 0.0, 90.0, 70.0), clamp_finite(self.angle_fade.1, 0.0, 90.0, 85.0)),
+            lazy: clamp_finite(self.lazy, 0.0, 500.0, 0.0),
+            jitter_size: clamp_finite(self.jitter_size, 0.0, 1.0, 0.0),
+            jitter_angle: clamp_finite(self.jitter_angle, 0.0, 1.0, 0.0),
+            jitter_flow: clamp_finite(self.jitter_flow, 0.0, 1.0, 0.0),
+            jitter_position: clamp_finite(self.jitter_position, 0.0, 4.0, 0.0),
+            depth: clamp_finite(self.depth, 0.05, 4.0, 1.0),
+            alpha_params: self.alpha_params.sanitized(),
+            symmetry: Symmetry {
+                radial: self.symmetry.radial.min(MAX_RADIAL_COPIES),
+                axis: self.symmetry.axis.min(LAST_AXIS),
+                offset: self.symmetry.offset.map(|value| clamp_finite(value, -MAX_SYMMETRY_OFFSET, MAX_SYMMETRY_OFFSET, 0.0)),
+                angle_span: clamp_finite(self.symmetry.angle_span, 0.0, FULL_TURN_DEGREES, FULL_TURN_DEGREES),
+                ..self.symmetry
+            },
             particles: Particles {
                 enabled: self.particles.enabled,
                 count: self.particles.count.clamp(1, 16),
                 lifetime: self.particles.lifetime.clamp(1, 128),
-                gravity: f(self.particles.gravity, 0.0, 2.0, 1.0),
+                gravity: clamp_finite(self.particles.gravity, 0.0, 2.0, 1.0),
             },
             ..self.clone()
         }
@@ -323,6 +417,15 @@ impl BrushSettings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn uv_stamp_radius_follows_pen_pressure() {
+        let b = BrushSettings { size: 0.1, min_size: 0.5, ..BrushSettings::default() };
+        assert!((b.uv_stamp_radius(1.0) - 0.2).abs() < 1e-6);
+        assert!((b.uv_stamp_radius(0.5) - 0.15).abs() < 1e-6);
+        assert!((b.uv_stamp_radius(0.0) - 0.1).abs() < 1e-6);
+        assert!((b.uv_stamp_radius(7.0) - 0.2).abs() < 1e-6, "pressure clamps to 1");
+    }
+
     use super::*;
 
     #[test]
@@ -341,9 +444,10 @@ mod tests {
 
     #[test]
     fn image_alpha_follows_the_image_and_is_zero_outside() {
-        // Left half white, right half black (2×1 image, sampled at texel centers).
-        let img = ImageRes { width: 2, height: 1, rgba: vec![[1.0; 4], [0.0, 0.0, 0.0, 1.0]], srgb: true };
-        let shape = Shape { alpha: BrushAlpha::Round, image: Some(&img), library: None, level: 0 };
+        // Left half white, right half black (2×1 image, sampled at texel centers)
+        let img = ImageRes::new(2, 1, vec![[1.0; 4], [0.0, 0.0, 0.0, 1.0]], true);
+        let shape = Shape { alpha: BrushAlpha::Round, image: Some(&img), library: None, params: AlphaParams::default(), level: 0 };
+
         assert!(shape.sample(-0.5, 0.0, 0.5, 0) > 0.99);
         assert!(shape.sample(0.5, 0.0, 0.5, 0) < 0.01);
         assert_eq!(shape.sample(1.5, 0.0, 0.5, 0), 0.0);
@@ -357,5 +461,118 @@ mod tests {
         assert_eq!(b.flow, 1.0);
         assert!(b.hardness < 1.0);
         assert!(b.spacing > 0.0);
+    }
+
+    /// A grid over the stamp square and beyond it
+    fn grid() -> impl Iterator<Item = (f32, f32)> {
+        (-30..=30).flat_map(|i| (-30..=30).map(move |j| (i as f32 / 20.0, j as f32 / 20.0)))
+    }
+
+    /// Width and height (in grid steps) of the area where `shape` is above zero
+    fn extent(shape: &Shape, hardness: f32) -> (usize, usize) {
+        let (mut xs, mut ys) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+        for (x, y) in grid().filter(|&(x, y)| shape.sample(x, y, hardness, 1) > 0.0) {
+            xs.insert((x * 20.0) as i32);
+            ys.insert((y * 20.0) as i32);
+        }
+        (xs.len(), ys.len())
+    }
+
+    fn procedural(alpha: BrushAlpha, params: AlphaParams) -> Shape<'static> {
+        Shape { alpha, image: None, library: None, params, level: 0 }
+    }
+
+    #[test]
+    fn default_parameters_reproduce_every_alpha_exactly() {
+        let img = ImageRes::new(3, 2, vec![[1.0; 4], [0.3, 0.3, 0.3, 1.0], [0.0, 0.0, 0.0, 1.0], [0.6, 0.6, 0.6, 1.0], [0.9; 4], [0.1, 0.1, 0.1, 1.0]], true);
+        let library = crate::alphas::library().first().map(|alpha| alpha.image());
+        let kinds = BrushAlpha::ALL.map(|alpha| Shape { alpha, image: None, library: None, params: AlphaParams::default(), level: 0 });
+        for shape in kinds.into_iter().chain([
+            Shape { alpha: BrushAlpha::Round, image: Some(&img), library: None, params: AlphaParams::default(), level: 0 },
+            Shape { alpha: BrushAlpha::Round, image: None, library, params: AlphaParams::default(), level: 0 },
+        ]) {
+            for (x, y) in grid() {
+                let before = match (shape.image, shape.library) {
+                    (Some(img), _) => image_alpha(img, x, y),
+                    (None, Some(lib)) => lib.sample(shape.level, x, y),
+                    (None, None) => shape.alpha.sample(x, y, 0.4, 7),
+                };
+
+                assert_eq!(shape.sample(x, y, 0.4, 7).to_bits(), before.to_bits(), "{:?} at ({x}, {y})", shape.alpha);
+            }
+        }
+    }
+
+    #[test]
+    fn size_x_half_halves_the_width_and_keeps_the_height() {
+        for alpha in [BrushAlpha::Round, BrushAlpha::Square] {
+            let (width, height) = extent(&procedural(alpha, AlphaParams::default()), 0.5);
+            let (narrow_width, narrow_height) = extent(&procedural(alpha, AlphaParams { size_x: 0.5, ..AlphaParams::default() }), 0.5);
+            assert_eq!(narrow_height, height, "{alpha:?}");
+            assert!((narrow_width as f32 - width as f32 / 2.0).abs() <= 2.0, "{alpha:?}: {narrow_width} of {width}");
+
+            let (flat_width, flat_height) = extent(&procedural(alpha, AlphaParams { size_y: 0.25, ..AlphaParams::default() }), 0.5);
+            assert_eq!(flat_width, width, "{alpha:?}");
+            assert!((flat_height as f32 - height as f32 / 4.0).abs() <= 2.0, "{alpha:?}: {flat_height} of {height}");
+        }
+    }
+
+    #[test]
+    fn sizes_apply_to_image_and_library_alphas_too() {
+        let img = ImageRes::new(1, 1, vec![[1.0; 4]], true);
+        let params = AlphaParams { size_x: 0.5, ..AlphaParams::default() };
+        let image = Shape { alpha: BrushAlpha::Round, image: Some(&img), library: None, params, level: 0 };
+
+        assert_eq!((image.sample(0.4, 0.0, 0.5, 0) > 0.99, image.sample(0.6, 0.0, 0.5, 0)), (true, 0.0));
+
+        let library = crate::alphas::find("square").map(|alpha| alpha.image());
+        let shape = |params| Shape { alpha: BrushAlpha::Round, image: None, library, params, level: 0 };
+        assert!(shape(AlphaParams::default()).sample(0.7, 0.0, 0.5, 0) > 0.5, "a library square is wide open");
+        assert_eq!(shape(params).sample(0.7, 0.0, 0.5, 0), 0.0);
+    }
+
+    #[test]
+    fn invert_flips_values_inside_the_stamp_square_only() {
+        let invert = AlphaParams { invert: true, ..AlphaParams::default() };
+        for alpha in BrushAlpha::ALL {
+            for (x, y) in grid() {
+                let (plain, inverted) = (procedural(alpha, AlphaParams::default()).sample(x, y, 0.5, 3), procedural(alpha, invert).sample(x, y, 0.5, 3));
+                let expected = if x.abs() <= 1.0 && y.abs() <= 1.0 { 1.0 - plain } else { 0.0 };
+                assert!((inverted - expected).abs() < 1e-6, "{alpha:?} at ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn roundness_zero_turns_the_round_shape_into_a_square_footprint() {
+        let square = AlphaParams { roundness: 0.0, ..AlphaParams::default() };
+        assert_eq!(procedural(BrushAlpha::Round, AlphaParams::default()).sample(0.9, 0.9, 0.5, 0), 0.0, "a circle leaves the corner empty");
+        assert!(procedural(BrushAlpha::Round, square).sample(0.9, 0.9, 0.5, 0) > 0.0);
+        assert_eq!(extent(&procedural(BrushAlpha::Round, square), 0.99), extent(&procedural(BrushAlpha::Square, AlphaParams::default()), 0.99));
+
+        let half = AlphaParams { roundness: 0.5, ..AlphaParams::default() };
+        let (round, rounded) = (procedural(BrushAlpha::Round, AlphaParams::default()), procedural(BrushAlpha::Round, half));
+        assert!(rounded.sample(0.75, 0.75, 0.5, 0) > round.sample(0.75, 0.75, 0.5, 0), "between circle and square");
+
+        // Other shapes have no roundness
+        let star = |params| procedural(BrushAlpha::Star, params).sample(0.3, 0.2, 0.5, 0);
+        assert_eq!(star(square), star(AlphaParams::default()));
+    }
+
+    #[test]
+    fn contrast_steepens_the_values_around_one_half() {
+        let sharp = AlphaParams { contrast: 4.0, ..AlphaParams::default() };
+        let (soft, hard) = (procedural(BrushAlpha::Round, AlphaParams::default()), procedural(BrushAlpha::Round, sharp));
+        let [low, high] = [0.8, 0.3].map(|x| (soft.sample(x, 0.0, 0.0, 0), hard.sample(x, 0.0, 0.0, 0)));
+        assert!(low.0 < 0.5 && low.1 < low.0, "dark values get darker: {low:?}");
+        assert!(high.0 > 0.5 && high.1 > high.0, "light values get lighter: {high:?}");
+        assert_eq!(hard.sample(1.2, 0.0, 0.0, 0), 0.0, "outside the shape stays empty");
+    }
+
+    #[test]
+    fn sanitize_clamps_alpha_parameters() {
+        let wild = AlphaParams { size_x: 0.0, size_y: f32::NAN, roundness: 3.0, contrast: -2.0, invert: true };
+        let clean = BrushSettings { alpha_params: wild, ..BrushSettings::default() }.sanitized().alpha_params;
+        assert_eq!(clean, AlphaParams { size_x: crate::alpha_params::MIN_ALPHA_SIZE, size_y: 1.0, roundness: 1.0, contrast: 1.0, invert: true });
     }
 }
