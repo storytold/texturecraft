@@ -51,7 +51,7 @@ mod stack;
 #[path = "gpu_composite_udim.rs"]
 mod udim;
 // The generator GPU port's P2: Micro Details, texture and grunge
-#[path = "gpu_generator_p2.rs"]
+#[path = "gpu_generator_p2/mod.rs"]
 mod generator_p2;
 use groups::{BEGIN_GROUP, END_GROUP, GroupPlan, StackWork};
 use pipelines::CompositePipelines;
