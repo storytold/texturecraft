@@ -881,4 +881,20 @@ mod tests {
         assert!(with_value, "a mask stroke painting one gray is recorded");
         assert!(!with_image, "a replay could not repaint the image's gray");
     }
+
+    #[test]
+    fn recorded_strokes_survive_save_and_reopen() {
+        let mut session = Session::new_project("Saved replay", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        execute(&mut session, "layer.add.paint", &json!({})).unwrap();
+        execute(&mut session, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [1.0, 0.0, 0.0]})).unwrap();
+        session.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+        session.end_stroke().unwrap();
+
+        let saved = session.project_file();
+        let bytes = crate::formats::save_project_bytes(&saved).unwrap();
+        let reopened = Session::from_project_file(crate::formats::load_project_bytes(&bytes).unwrap()).unwrap();
+
+        assert!(saved.stroke_replay.is_some(), "the save carries the recorded stroke");
+        assert!(reopened.project_file().stroke_replay.is_some(), "the reopened project still records it");
+    }
 }
