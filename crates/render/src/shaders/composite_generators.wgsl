@@ -3,6 +3,10 @@ fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
     if effect.ids.y <= 46u && effect.ext.x != 0u {
         return p1_generator_ramp(effect, texel);
     }
+    // P3a and P3b: the generators with their own controls (gpu_generator_p3a.rs)
+    if effect.ids.y == GENERATOR_KIND_OPCODE {
+        return generator_p3a_ramp(effect, texel);
+    }
     let surface = texel.surface;
     var baked = texel.baked;
     if effect.effects.w != 0u {

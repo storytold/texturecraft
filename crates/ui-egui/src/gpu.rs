@@ -2126,8 +2126,9 @@ pub(crate) mod tests {
             execute(&mut session, "mask.smart.apply", &json!({"name": mask.id, "layer": layer.0})).unwrap();
             check_mask(&mut session, mask.id, true);
         }
-        // A default generator on the earlier model (ThinAreas) or on the section or light controls
-        // composes on the GPU; the wear kinds' grunge and the kinds with only their own controls on the CPU
+        // A default generator on the earlier model (ThinAreas), on the section or light controls, or of
+        // a kind P3a ports composes on the GPU; the wear kinds' grunge and the other kinds on the CPU
+        let p3a = [GeneratorKind::ThreeDDistance, GeneratorKind::ThreeDLinearGradient, GeneratorKind::GrayscaleConversion, GeneratorKind::WorldSpaceNormals];
         for generator in GeneratorKind::ALL {
             execute(&mut session, "mask.remove", &json!({"layer": layer.0})).unwrap();
             execute(&mut session, "mask.add.black", &json!({"layer": layer.0})).unwrap();
@@ -2137,6 +2138,7 @@ pub(crate) mod tests {
             let section_or_light =
                 matches!(generator, GeneratorKind::Curvature | GeneratorKind::AmbientOcclusion | GeneratorKind::Position | GeneratorKind::Direction);
             let on_gpu = section_or_light
+                || p3a.contains(&generator)
                 || matches!(&effects.last().unwrap().kind, texturecraft_engine::core::EffectKind::Generator(added) if added.on_earlier_model());
             check_mask(&mut session, &name, on_gpu);
         }

@@ -1,7 +1,9 @@
-//! The wear, section and light controls of the generators with an earlier model on the GPU, as
-//! compose's `generator_ramp` evaluates them (wear.rs, wear_scan.rs, sections.rs).
+//! The wear, section and light controls on the GPU, of any kind that carries them (World Space
+//! Normals always does), as compose's `generator_ramp` evaluates them (wear.rs, wear_scan.rs,
+//! sections.rs).
 //!
-//! The operation keeps its kind's opcode (40..46) and `Operation::ext[0]` holds the offset of its
+//! A kind with an earlier model keeps its opcode, the others take their model's (wear 40, light
+//! 46, section 45); `Operation::ext[0]` holds the offset of its
 //! side-table words (`P1_*` in generator_p1.wgsl): a nonzero offset means the controls. Its
 //! sources (replaced inputs) follow each other in the generator sources, the first in
 //! `effects[2]`. A section adjusts its signal before the generator's stage, or after it when the
@@ -14,7 +16,6 @@ use texturecraft_compose::generator_terms;
 use texturecraft_core::{
     AxisBlend, BakedMap, ChannelKind, Filter, Generator, GeneratorKind, LightParameters, Projection, Sampling, SectionParameters, Source, WearParameters,
 };
-use texturecraft_geom::Mesh;
 
 use super::{FIRST_GENERATOR, NeighbourhoodFilter, Operation, ProceduralInputs, TilePatterns, bind_tile_source, source_operation};
 
@@ -28,7 +29,6 @@ const LIGHT: u32 = 3;
 // Words of every controls operation (generator_p1.wgsl)
 const MODEL_WORD: usize = 0;
 const FLAGS_WORD: usize = 1;
-const BOUNDS_WORD: usize = 2;
 const SOURCE_COUNT_WORD: usize = 3;
 const ROLES_WORD: usize = 4;
 const ROLE_COUNT: usize = 3;
@@ -41,34 +41,55 @@ const TWO_STAGES: u32 = 4;
 const STAGE_DISTANCE_SHIFT: u32 = 8;
 const NO_LEVEL: u32 = u32::MAX;
 
-/// The mesh's bounds the stand-in for P3a's mesh extent reads: low, high, centre and radius
-const BOUNDS_WORDS: usize = 10;
-/// The shortest mesh radius the UV surface normalises positions by (`GpuCompositor::uv_surface`)
-const MIN_MESH_RADIUS: f32 = 1e-4;
+// The section's signal (its last word)
+const CURVATURE_SIGNAL: u32 = 0;
+const OCCLUSION_SIGNAL: u32 = 1;
+const POSITION_SIGNAL: u32 = 2;
+const WORLD_NORMAL_SIGNAL: u32 = 3;
+const NO_SIGNAL: u32 = 4;
 
 // Section flags (the first section parameter)
 const HAS_BALANCE: u32 = 1;
 const LINEAR_BALANCE: u32 = 2;
 const HAS_BRIGHTNESS: u32 = 4;
 
+/// Whether the CPU computes `generator` on its wear, light or section controls, ahead of its kind's own
+pub(super) fn takes(generator: &Generator) -> bool {
+    wear_controls(generator).is_some() || generator.light.is_some() || generator.section_controls().is_some()
+}
+
+/// The wear controls the CPU computes with: the generator's own, Fiber Glass Edge Wear's defaults without them
+fn wear_controls(generator: &Generator) -> Option<WearParameters> {
+    generator.wear.or_else(|| WearParameters::defaults(generator.kind).filter(|_| generator.kind == GeneratorKind::FiberGlassEdgeWear))
+}
+
+/// Whether `op` is an operation on the controls, which reads the mesh's bounds from `low.xyz` and `high.xyz`
+/// (written by `generator_p3a::bind_bounds`)
+pub(super) fn reads_bounds(op: &Operation) -> bool {
+    (FIRST_GENERATOR..=LAST_CONTROLS_OPCODE).contains(&op.ids[1]) && op.ext[0] != 0
+}
+
 /// The operation of `generator` on its wear, section or light controls, None for anything the GPU
 /// does not evaluate as the CPU does (the caller keeps the texture, grunge and Micro Details declines)
 pub(super) fn operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
+    // The kinds with an earlier model keep their opcode; the others take their model's
+    let wear = wear_controls(generator);
     let opcode = match generator.kind {
         GeneratorKind::EdgeWear | GeneratorKind::FiberGlassEdgeWear => 40,
         GeneratorKind::Dirt => 41,
+        GeneratorKind::ThinAreas => 42,
         GeneratorKind::Curvature => 43,
         GeneratorKind::AmbientOcclusion => 44,
-        GeneratorKind::Position => 45,
         GeneratorKind::Direction => 46,
-        _ => return None,
+        _ if wear.is_some() => 40,
+        _ if generator.light.is_some() => 46,
+        _ => 45,
     };
     let mut words = vec![0u32; PARAMETERS_WORD];
     let mut sources = Vec::new();
     let mut late_adjust = false;
 
     // The CPU picks the wear controls first, then the light's, then the section's
-    let wear = generator.wear.or_else(|| WearParameters::defaults(generator.kind).filter(|_| generator.kind == GeneratorKind::FiberGlassEdgeWear));
     if let Some(wear) = wear {
         wear_words(generator, &wear, &mut words, &mut sources, inputs)?;
     } else if let Some(light) = &generator.light {
@@ -76,12 +97,6 @@ pub(super) fn operation(generator: &Generator, inputs: &mut ProceduralInputs, pa
     } else {
         let section = generator.section_controls()?;
         late_adjust = section_words(generator, &section, &mut words, &mut sources, inputs)?;
-    }
-
-    // The bounds-normalised position the section's Position and the light read
-    if matches!(generator.kind, GeneratorKind::Position | GeneratorKind::Direction) {
-        words[BOUNDS_WORD] = words.len() as u32;
-        words.extend([0; BOUNDS_WORDS]);
     }
 
     let (first_source, count) = push_sources(&sources, inputs, patterns)?;
@@ -198,11 +213,11 @@ fn wear_words<'a>(
     sources: &mut Vec<Input<'a>>,
     inputs: &mut ProceduralInputs,
 ) -> Option<()> {
+    // Every kind but Fiber Glass Edge Wear and Dirt wears like the metal edges (compose's wear.rs)
     let variant = match generator.kind {
-        GeneratorKind::EdgeWear => 0,
         GeneratorKind::FiberGlassEdgeWear => 1,
         GeneratorKind::Dirt => 2,
-        _ => return None,
+        _ => 0,
     };
 
     // P2: the grunge (its own pattern or a custom one) plugs in at `generator_grunge`; without it the grunge term is 0
@@ -241,15 +256,20 @@ fn section_words<'a>(
     sources: &mut Vec<Input<'a>>,
     inputs: &mut ProceduralInputs,
 ) -> Option<bool> {
+    // The signal and the map it reads; the other kinds' section signal is 0 (compose's section_signal)
     let kind = generator.kind;
-    let signal_map = match kind {
-        GeneratorKind::Curvature => BakedMap::Curvature,
-        GeneratorKind::AmbientOcclusion => BakedMap::AmbientOcclusion,
-        GeneratorKind::Position => BakedMap::Position,
-        _ => return None,
+    let (signal, signal_map) = match kind {
+        GeneratorKind::Curvature => (CURVATURE_SIGNAL, Some(BakedMap::Curvature)),
+        GeneratorKind::AmbientOcclusion => (OCCLUSION_SIGNAL, Some(BakedMap::AmbientOcclusion)),
+        GeneratorKind::Position => (POSITION_SIGNAL, Some(BakedMap::Position)),
+        GeneratorKind::WorldSpaceNormals => (WORLD_NORMAL_SIGNAL, Some(BakedMap::WorldNormal)),
+        _ => (NO_SIGNAL, None),
     };
     words[MODEL_WORD] = SECTION;
-    role_word(words, sources, input(generator, signal_map, 0));
+    role_word(words, sources, signal_map.and_then(|map| input(generator, map, 0)));
+    if kind == GeneratorKind::WorldSpaceNormals && !generator.inputs.contains_key(&BakedMap::WorldNormal) {
+        inputs.read_bake_rows();
+    }
 
     let mut flags = 0;
     if SectionParameters::has_balance(kind) {
@@ -284,6 +304,7 @@ fn section_words<'a>(
         };
         words.extend([u32::from(axis.invert), blend, axis.weight.to_bits()]);
     }
+    words.push(signal);
     (power.is_finite() && section.axes.iter().all(|axis| axis.weight.is_finite())).then_some(true)
 }
 
@@ -296,10 +317,6 @@ fn light_words<'a>(
     sources: &mut Vec<Input<'a>>,
     inputs: &mut ProceduralInputs,
 ) -> Option<()> {
-    if generator.kind != GeneratorKind::Direction {
-        return None;
-    }
-
     words[MODEL_WORD] = LIGHT;
     role_word(words, sources, input(generator, BakedMap::WorldNormal, 0));
     role_word(words, sources, input(generator, BakedMap::Position, 1));
@@ -319,25 +336,6 @@ fn light_words<'a>(
     words.extend(values.map(f32::to_bits));
     words.push(u32::from(generator.invert));
     Some(())
-}
-
-/// P1 stand-in for P3a's mesh extent (replace at integration): write `mesh`'s bounds into the
-/// words of every controls operation that reads them
-pub(super) fn set_bounds(operations: &[Operation], ramp_words: &mut [u32], mesh: &Mesh) {
-    let (low, high) = mesh.bounds();
-    let center = (low + high) * 0.5;
-    let radius = ((high - low).length() * 0.5).max(MIN_MESH_RADIUS);
-    let bounds = [low.x, low.y, low.z, high.x, high.y, high.z, center.x, center.y, center.z, radius].map(f32::to_bits);
-    for op in operations.iter().filter(|op| (FIRST_GENERATOR..=LAST_CONTROLS_OPCODE).contains(&op.ids[1]) && op.ext[0] != 0) {
-        let Some(table) = (op.ext[0] as usize).checked_sub(super::LOOKUP_WORDS as usize) else { continue };
-        let Some(&bounds_word) = ramp_words.get(table + BOUNDS_WORD) else { continue };
-        if bounds_word == 0 {
-            continue;
-        }
-        if let Some(target) = ramp_words.get_mut(table + bounds_word as usize..table + bounds_word as usize + BOUNDS_WORDS) {
-            target.copy_from_slice(&bounds);
-        }
-    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

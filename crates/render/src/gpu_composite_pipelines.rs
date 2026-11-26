@@ -101,7 +101,7 @@ impl Features {
             include(
                 self.authored_images,
                 include_str!("shaders/material_image.wgsl"),
-                "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }\n                 fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> { return vec4(0.0); }\n                 const MISSING_IMAGE: u32 = 0xffffffffu;\n                 fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> { return rgb; }",
+                "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }\n                 fn material_image_at(image: u32, uv: vec2<f32>) -> vec4<f32> { return vec4(0.0); }\n                 fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> { return vec4(0.0); }\n                 const MISSING_IMAGE: u32 = 0xffffffffu;\n                 fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> { return rgb; }",
             ),
             include_str!("shaders/stencil_projection.wgsl"),
             include(
@@ -129,6 +129,7 @@ impl Features {
                 include_str!("shaders/composite_generators.wgsl"),
                 "fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 { return 0.0; }\n                 fn finish_generator(effect: Operation, ramp: f32) -> f32 { return ramp; }",
             ),
+            include(self.generators, include_str!("shaders/generator_p3a.wgsl"), ""),
             include(
                 self.spatial,
                 include_str!("shaders/composite_spatial.wgsl"),
@@ -334,6 +335,8 @@ mod tests {
             .flat_map(|packages| [false, true].map(|spatial| Features { spatial, mask_effects: true, content_effects: true, packages, ..Features::default() }))
             .collect();
         variants.push(Features { mask_preview: true, spatial: true, mask_effects: true, packages: ShaderFlags::ALL, ..Features::default() });
+        // Generators without authored images: Grayscale Conversion's image read is a stub
+        variants.push(Features { generators: true, mask_effects: true, ..Features::default() });
         variants.push(Features {
             patterns: true,
             extended_patterns: true,

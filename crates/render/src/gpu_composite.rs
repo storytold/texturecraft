@@ -52,6 +52,9 @@ mod point;
 mod stack;
 #[path = "gpu_composite_udim.rs"]
 mod udim;
+// GPU generators P3a: the kinds that read per-texel inputs alone
+#[path = "gpu_generator_p3a.rs"]
+mod generator_p3a;
 use groups::{BEGIN_GROUP, END_GROUP, GroupPlan, StackWork};
 use pipelines::CompositePipelines;
 
@@ -1670,12 +1673,12 @@ impl CompositeProgram {
     pub fn set_surface_inputs(&mut self, mesh: &Arc<Mesh>, gbuf: &Arc<UvGBuffer>, baked: Option<&BakedMaps>) -> Result<(), &'static str> {
         // P1's projector depth grids, before the atlas reads them
         self.material_images.set_surface(mesh);
-        // P1 stand-in for P3a's mesh extent: the bounds the generator controls read
-        generator_p1::set_bounds(&self.operations, &mut self.ramp_words, mesh);
         if self.needs_surface || !self.geometry.parts.is_empty() {
             self.surface = Some((mesh.clone(), gbuf.clone()));
         }
         self.geometry.resolve(mesh);
+        // P3a and P1: the mesh's bounds the 3D generators and the generator controls scale their position by
+        generator_p3a::bind_bounds(&mut self.operations, mesh);
         // Texels no triangle covers keep the channels' defaults, as the CPU leaves them
         let partly_covered = gbuf.tri.contains(&NO_TRI);
         if self.mask_preview || ((partly_covered || !self.filters.stages.is_empty() || !self.geometry.parts.is_empty()) && self.coverage.is_none()) {
@@ -2575,14 +2578,24 @@ fn source_operation(
 }
 
 fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
-    // A texture, a grunge, Micro Details and the kinds with only their own controls compose on the CPU
-    if generator.kind_controls().is_some() || generator.texture.is_some() || generator.grunge.is_some() || generator.micro_in_use().is_some() {
+    // A texture, a grunge and Micro Details compose on the CPU (P2)
+    if generator.texture.is_some() || generator.grunge.is_some() || generator.micro_in_use().is_some() {
         return None;
     }
 
-    // P1: the wear, section and light controls
-    if !generator.on_earlier_model() {
+    // P1: the wear, section and light controls, which the CPU computes ahead of a kind's own
+    if generator_p1::takes(generator) {
         return generator_p1::operation(generator, inputs, patterns);
+    }
+
+    // P3a: 3D Distance, 3D Linear Gradient and Grayscale Conversion
+    if generator_p3a::ports(generator.kind) {
+        return generator_p3a::generator_operation(generator, inputs, patterns);
+    }
+
+    // The kinds with only their own controls P3a does not port compose on the CPU
+    if generator.kind_controls().is_some() || !generator.on_earlier_model() {
+        return None;
     }
     let kind = match generator.kind {
         GeneratorKind::EdgeWear => 40,
@@ -4774,9 +4787,9 @@ mod procedural_tests {
         }
     }
 
-    /// A generator on the earlier model and new section and light generators (also with a section
-    /// blur before a global blur) compose on the GPU; the wear's grunge, World Space Normals, the
-    /// kinds with only their own controls and Micro Details compose on the CPU
+    /// A generator on the earlier model, new section and light generators (also with a section
+    /// blur before a global blur) and the kinds P3a ports compose on the GPU; the wear's grunge,
+    /// the kinds with only their own controls P3a does not port and Micro Details on the CPU
     #[test]
     fn generators_beyond_the_earlier_model_compose_on_the_cpu() {
         use texturecraft_core::{MicroDetails, SectionParameters, WearParameters};
@@ -4794,7 +4807,9 @@ mod procedural_tests {
         let mut twice_blurred = Generator { section: Some(section), ..Generator::new(GeneratorKind::AmbientOcclusion) };
         twice_blurred.global.blur = 0.5;
         assert!(gpu(&twice_blurred), "a section blur before a global blur");
-        assert!(!gpu(&Generator::new(GeneratorKind::WorldSpaceNormals)), "World Space Normals");
+        for kind in [GeneratorKind::ThreeDDistance, GeneratorKind::ThreeDLinearGradient, GeneratorKind::GrayscaleConversion, GeneratorKind::WorldSpaceNormals] {
+            assert!(gpu(&Generator::new(kind)), "{kind:?} (P3a)");
+        }
         assert!(!gpu(&oracle::earlier_generator(GeneratorKind::UvChecker)), "only its own controls");
         let micro = MicroDetails { enabled: true, ..MicroDetails::defaults(GeneratorKind::Curvature).unwrap() };
         let curvature = Generator { micro: Some(Box::new(micro)), ..oracle::earlier_generator(GeneratorKind::Curvature) };

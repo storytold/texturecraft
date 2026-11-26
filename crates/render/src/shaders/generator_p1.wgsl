@@ -1,6 +1,6 @@
-// The wear, section and light controls of the generators with an earlier model (compose's wear.rs,
-// wear_scan.rs and sections.rs). An operation on opcodes 40..46 with a side-table offset in ext.x
-// computes with them; gpu_generator_p1.rs packs its words (the P1_* offsets below).
+// The wear, section and light controls (compose's wear.rs, wear_scan.rs and sections.rs), of any
+// kind. An operation on opcodes 40..46 with a side-table offset in ext.x computes with them;
+// gpu_generator_p1.rs packs its words (the P1_* offsets below).
 
 const P1_WEAR: u32 = 1u;
 const P1_SECTION: u32 = 2u;
@@ -9,7 +9,6 @@ const P1_LIGHT: u32 = 3u;
 // Words of every controls operation
 const P1_MODEL: u32 = 0u;
 const P1_FLAGS: u32 = 1u;
-const P1_BOUNDS: u32 = 2u;
 const P1_SOURCE_COUNT: u32 = 3u;
 // The source of each role (relative index plus one, 0: none): wear curvature and occlusion,
 // the section's signal input, the light's normal and position
@@ -58,19 +57,13 @@ fn p1_role(op: Operation, sources: array<vec4<f32>, 2>, role: u32, fallback: vec
     return select(fallback, read[min(max(slot, 1u), P1_MAX_SOURCES) - 1u], slot != 0u);
 }
 
-// P1 stand-in for P3a's mesh extent (replace at integration): this texel's world position
-// across the mesh's bounds, 0..1 on each axis (0 where uncovered), as compose's bounds_position
+// This texel's world position across the mesh's bounds, 0..1 on each axis (0 where uncovered), as
+// compose's bounds_position: low.xyz + position × high.xyz (generator_p3a::bind_bounds)
 fn generator_bounds_position(op: Operation, texel: LayerTexel) -> vec3<f32> {
-    let at = op.ext.x + p1_word(op, P1_BOUNDS);
-    let low = bitcast<vec3<f32>>(vec3(srgb[at], srgb[at + 1u], srgb[at + 2u]));
-    let high = bitcast<vec3<f32>>(vec3(srgb[at + 3u], srgb[at + 4u], srgb[at + 5u]));
-    let center = bitcast<vec3<f32>>(vec3(srgb[at + 6u], srgb[at + 7u], srgb[at + 8u]));
-    let radius = bitcast<f32>(srgb[at + 9u]);
     if !texel.surface.valid {
         return vec3(0.0);
     }
-    let world = texel.surface.position * radius + center;
-    return clamp((world - low) / max(high - low, vec3(1e-6)), vec3(0.0), vec3(1.0));
+    return clamp(op.low.xyz + texel.surface.position * op.high.xyz, vec3(0.0), vec3(1.0));
 }
 
 // The generator's Position input, else the position across the mesh's bounds
@@ -203,11 +196,12 @@ fn p1_blurred_curvature(op: Operation, pixel: vec2<u32>, curvature: f32) -> f32 
     return narrower + (wider - narrower) * weight;
 }
 
-// The section's signal: curvature at its detail sizes, occlusion or the position's axes
+// The section's signal: curvature at its detail sizes, occlusion, the axes of the position or
+// the world normal, or 0 for the kinds without one (P1_PARAMETERS + 17)
 fn p1_section_signal(op: Operation, texel: LayerTexel, sources: array<vec4<f32>, 2>) -> f32 {
     let base = P1_PARAMETERS;
-    switch op.ids.y {
-        case 43u: {
+    switch p1_word(op, base + 17u) {
+        case 0u: {
             let replaced = p1_word(op, P1_ROLES) != 0u;
             let finest = p1_role(op, sources, 0u, vec4(texel.baked.y)).x;
             var detail = op;
@@ -215,16 +209,29 @@ fn p1_section_signal(op: Operation, texel: LayerTexel, sources: array<vec4<f32>,
             detail.effects.w = select(0u, 1u, replaced);
             return generator_curvature(detail, texel.pixel, finest, p1_word(op, base + 7u), 0.0);
         }
-        case 44u: {
+        case 1u: {
             return p1_role(op, sources, 0u, vec4(texel.baked.x)).x;
         }
-        default: {
+        case 2u: {
             return p1_axes_signal(op, p1_position(op, texel, sources, 0u));
+        }
+        case 3u: {
+            // The stored world normal when baked, else the surface's, as 0..1 channels
+            var channels = texel.surface.normal * 0.5 + 0.5;
+            if p1_word(op, P1_ROLES) != 0u {
+                channels = p1_role(op, sources, 0u, vec4(0.0)).xyz;
+            } else if bake_has(BAKED_WORLD_NORMAL) && udim_bake_valid(texel.pixel) {
+                channels = bitcast<vec3<f32>>(baked_block_at(texel.pixel, 1u).yzw);
+            }
+            return p1_axes_signal(op, channels);
+        }
+        default: {
+            return 0.0;
         }
     }
 }
 
-// The three channels combined by the section's axes (compose's axes_signal; P3a has the same as p3a_axes_signal)
+// The three channels combined by the section's axes (compose's axes_signal)
 fn p1_axes_signal(op: Operation, channels: vec3<f32>) -> f32 {
     let base = P1_PARAMETERS + 8u;
     var value = 0.0;
