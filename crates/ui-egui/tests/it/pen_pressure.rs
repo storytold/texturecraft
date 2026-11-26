@@ -230,3 +230,73 @@ fn unforced_touch_start_and_end_in_one_frame_clear_old_pen_pressure() {
         })
         .drop_without_applying_deltas();
 }
+
+#[test]
+fn a_tablet_feed_supplies_pressure_without_touch_force() {
+    let context = egui::Context::default();
+    let feed = texturecraft_ui_egui::pen_feed::PenFeed::new(texturecraft_ui_egui::pen_feed::TabletReader::Reading("test"));
+    feed.install(&context);
+    let position = pos2(100.0, 100.0);
+    let button = |pressed| Event::PointerButton { pos: position, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    let pressure_with = |reading: Option<f32>, events: Vec<Event>| {
+        feed.set(reading);
+        let mut input = egui::RawInput::default();
+        input.events = events;
+        let mut pressure = f32::NAN;
+        context.run_ui(input, |ui| pressure = texturecraft_ui_egui::viewport::pen_pressure(ui)).drop_without_applying_deltas();
+        pressure
+    };
+
+    let hover = pressure_with(Some(0.0), vec![Event::PointerMoved(position)]);
+    let press = pressure_with(Some(0.3), vec![button(true)]);
+    let lifting = pressure_with(Some(0.0), Vec::new());
+    let released = pressure_with(Some(0.0), vec![button(false)]);
+    let mouse = pressure_with(None, vec![button(true)]);
+
+    assert_eq!(hover, 1.0, "a hovering pen previews the full brush, like a mouse");
+    assert!(0.0 < press && press < hover, "a light press paints below full pressure: {press}");
+    assert_eq!(lifting, press, "a lifting pen's zero reading keeps the stroke's contact pressure");
+    assert_eq!(released, press, "the release frame keeps it too");
+    assert_eq!(mouse, 1.0, "a mouse press after the pen paints at full pressure");
+}
+
+#[test]
+fn a_tablet_tap_between_two_frames_keeps_its_contact_pressure() {
+    let context = egui::Context::default();
+    let feed = texturecraft_ui_egui::pen_feed::PenFeed::new(texturecraft_ui_egui::pen_feed::TabletReader::Reading("test"));
+    feed.install(&context);
+    let position = pos2(100.0, 100.0);
+    let button = |pressed| Event::PointerButton { pos: position, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    let frame = |events: Vec<Event>| {
+        let mut input = egui::RawInput::default();
+        input.events = events;
+        let (mut paint, mut cursor) = (f32::NAN, f32::NAN);
+        context
+            .run_ui(input, |ui| {
+                // The 2D view reads it for the stroke and again for the brush cursor
+                paint = texturecraft_ui_egui::viewport::pen_pressure(ui);
+                cursor = texturecraft_ui_egui::viewport::pen_pressure(ui);
+            })
+            .drop_without_applying_deltas();
+        assert_eq!(paint, cursor, "every read in a frame gets the same pressure");
+        paint
+    };
+
+    feed.set(Some(0.4));
+    feed.set(Some(0.0));
+    let tap = frame(vec![button(true), button(false)]);
+    assert!(0.0 < tap && tap < 1.0, "the tap paints with its contact pressure, not the lift's 0: {tap}");
+
+    feed.set(Some(0.5));
+    feed.set(Some(0.0));
+    let press = frame(vec![button(true)]);
+    let still_down = frame(Vec::new());
+    let _ = frame(vec![button(false)]);
+    assert!(press > 0.0, "the press frame uses the contact reading: {press}");
+    assert_eq!(still_down, press, "the stroke keeps its contact pressure while the pen reads 0");
+
+    let hover = frame(vec![Event::PointerMoved(position)]);
+    let late_press = frame(vec![button(true)]);
+    assert_eq!(hover, 1.0);
+    assert!(late_press < tap, "a press read before its pressure arrives doesn't reuse the earlier tap's: {late_press}");
+}

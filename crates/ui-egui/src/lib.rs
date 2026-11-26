@@ -109,6 +109,7 @@ mod path_surface_cache;
 mod pattern_panel;
 mod pattern_target;
 pub mod pbr_import;
+pub mod pen_feed;
 mod picker_group;
 mod picker_tab;
 mod placed_fill_slot;

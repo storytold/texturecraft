@@ -5102,6 +5102,7 @@ dependencies = [
  "winit",
  "winresource",
  "winsafe",
+ "x11rb",
 ]
 
 [[package]]

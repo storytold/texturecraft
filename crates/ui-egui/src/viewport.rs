@@ -2006,7 +2006,8 @@ pub(crate) fn brush_cursor(app: &TextureCraftApp, ui: &Ui, rect: Rect, position:
 
 /// This frame's pen pressure (0..1), or 1 without a pen. Pressure arrives as touch force: the
 /// windowing layer reports it for Windows Ink pens, and in the browser for pens that send touch
-/// events (tablets and phones); other pens come through as a mouse.
+/// events (tablets and phones). Without touch force, an installed [`crate::pen_feed::PenFeed`]
+/// supplies it (the desktop app's X11 tablet reader); other pens come through as a mouse.
 /// shortcut: the windowing layer reports no pen tilt, so tilt can't drive the brush angle yet.
 pub fn pen_pressure(ui: &Ui) -> f32 {
     let pressure_id = egui::Id::unique("pen_pressure");
@@ -2065,6 +2066,39 @@ pub fn pen_pressure(ui: &Ui) -> f32 {
         _ => {
             let (primary_pressed, primary_active) =
                 ui.input(|input| (input.pointer.primary_pressed(), input.pointer.primary_down() || input.pointer.primary_released()));
+
+            if let Some(feed) = crate::pen_feed::PenFeed::installed(ui.ctx()) {
+                // Both views and the brush cursor ask each frame; the first answer is the frame's
+                let frame = ui.ctx().cumulative_frame_nr();
+                let frame_id = pressure_id.with("tablet_frame");
+                if let Some((asked, pressure)) = ui.data(|data| data.get_temp::<(u64, f32)>(frame_id))
+                    && asked == frame
+                {
+                    return pressure;
+                }
+                let (latest, contact) = feed.take_sample();
+                if let Some(tablet) = latest {
+                    let pressure = if !primary_active {
+                        ui.data_mut(|data| data.remove_temp::<f32>(pressure_id));
+                        1.0
+                    } else if tablet > 0.0 {
+                        tablet
+                    } else if let Some(last) = ui.data(|data| data.get_temp::<f32>(pressure_id)).filter(|_| !primary_pressed) {
+                        // A lifting pen reads 0 before its release: keep the stroke's last contact pressure
+                        last
+                    } else {
+                        // A tap whose press and lift both arrived since the last frame
+                        contact.unwrap_or(tablet)
+                    };
+                    ui.data_mut(|data| {
+                        if primary_active {
+                            data.insert_temp(pressure_id, pressure);
+                        }
+                        data.insert_temp(frame_id, (frame, pressure));
+                    });
+                    return pressure;
+                }
+            }
 
             // A fresh mouse press must not inherit the previous pen's pressure
             if primary_active && !primary_pressed {

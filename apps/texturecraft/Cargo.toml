@@ -35,6 +35,13 @@ winsafe = { version = "0.0.29", default-features = false, features = ["user", "s
 # The update helper is a copy of this program (`main`).
 craft-update = { workspace = true }
 
+# Pen pressure on X11: XInput2 raw tablet events over a pure-Rust X connection (src/tablet.rs;
+# already in the lockfile through winit).
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", default-features = false, features = ["xinput"] }
+# Tells a native Wayland window (no tablet input for an X client) from an X11 one.
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+
 # Quit (Cmd+Q) asks about unsaved changes (src/main.rs); winit's own Quit does not.
 [target.'cfg(target_os = "macos")'.dependencies]
 craft-menu = { workspace = true }

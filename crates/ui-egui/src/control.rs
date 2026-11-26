@@ -180,6 +180,7 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
                 "fps": app.fps,
                 "uiMs": app.ui_ms,
                 "titleBar": app.title_bar.name(),
+                "tablet": crate::pen_feed::PenFeed::inspect(ctx),
                 "baking": app.bake_progress(),
                 "bakeStatus": app.bake_status(),
                 "bakePreview": texturecraft_engine::bake_preview::preview_json(&app.session),

@@ -14,6 +14,8 @@ mod launch_profile;
 mod nightly_session;
 mod process_identity;
 mod profile_root;
+#[cfg(target_os = "linux")]
+mod tablet;
 mod window_frame;
 
 use std::ffi::OsString;
@@ -444,6 +446,8 @@ fn main() {
                 log::warn!("the app menu could not be installed: {e}");
             }
             let window_frame = window_frame::service(cc, matches!(title_bar, TitleBar::App(_)));
+            #[cfg(target_os = "linux")]
+            tablet::start(&cc.egui_ctx, cc.winit_window().is_some_and(|window| tablet::native_wayland(window)));
             let mut app = TextureCraftApp::new(cc, session);
             app.title_bar = title_bar;
             app.set_startup_update_check(checks_for_updates_at_start(control));

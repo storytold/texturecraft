@@ -318,6 +318,13 @@ fn about(app: &mut TextureCraftApp, ctx: &egui::Context) {
             ui.add_space(6.0);
             ui.label(tr("3D texture painting: layers, masks, smart materials, mesh map baking and export."));
             ui.label(tr("Free and open source (MIT OR Apache-2.0), written in Rust."));
+            if let Some(feed) = crate::pen_feed::PenFeed::installed(ctx) {
+                let status = match feed.reader() {
+                    crate::pen_feed::TabletReader::Reading(interface) => trf("Pen pressure: {interface}", &[("interface", &interface)]),
+                    crate::pen_feed::TabletReader::Unavailable(reason) => trf("Pen pressure unavailable: {reason}", &[("reason", &reason)]),
+                };
+                ui.label(RichText::new(status).color(tk.text_dim));
+            }
             ui.add_space(6.0);
             ui.hyperlink_to(tr("Join the ArtCraft community on Discord"), "https://discord.gg/artcraft");
             ui.hyperlink_to("getartcraft.com/apps/texturecraft", "https://getartcraft.com/apps/texturecraft");
