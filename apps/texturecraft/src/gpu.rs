@@ -11,6 +11,7 @@
 //! 4. Power preference: [`wgpu::PowerPreference::HighPerformance`] (default for 3D painting) prefers discrete GPUs,
 //!    [`wgpu::PowerPreference::LowPower`] prefers integrated GPUs, and [`wgpu::PowerPreference::None`] preserves system order.
 //! 5. Backend preference: native backends (Vulkan, Metal, DX12) before OpenGL.
+//!    On Windows, prefer Vulkan when the candidates otherwise rank equally.
 
 use std::sync::Arc;
 
@@ -98,9 +99,10 @@ pub fn pick_adapter_index(candidates: &[Candidate], named_filter: Option<&str>, 
             // Native backends before OpenGL (except when preserving system order).
             let backend_rank = match (power, c.backend) {
                 (PowerPreference::None, _) => 0,
+                (_, Backend::Dx12) if cfg!(windows) => 1,
                 (_, Backend::Vulkan | Backend::Metal | Backend::Dx12) => 0,
-                (_, Backend::Gl) => 1,
-                _ => 2,
+                (_, Backend::Gl) => 2,
+                _ => 3,
             };
 
             // Power preference ranking.
@@ -143,6 +145,15 @@ pub fn configure(options: &mut NativeOptions, cli_gpu: Option<String>, cli_power
 
     if let WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup {
         create.power_preference = effective_power;
+        let device_descriptor = create.device_descriptor.clone();
+        create.device_descriptor = Arc::new(move |adapter| {
+            let mut descriptor = device_descriptor(adapter);
+            // The compositor sizes its bands and working buffers against the device's limits, so
+            // request everything the adapter reports, as `texturecraft_render::device_limits`
+            // does for headless devices. Negotiating a limit allocates nothing.
+            descriptor.required_limits = adapter.limits();
+            descriptor
+        });
 
         let filter = effective_filter.clone();
         create.native_adapter_selector = Some(Arc::new(move |adapters, surface| {
@@ -224,6 +235,20 @@ mod tests {
 
         let selected = pick_adapter_index(&candidates, None, PowerPreference::None);
         assert_eq!(selected, Some(0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_prefers_vulkan_and_keeps_dx12_available() {
+        let dx12 = dummy_candidate("Discrete GPU", DeviceType::DiscreteGpu, Backend::Dx12, true);
+        let vulkan = dummy_candidate("Discrete GPU", DeviceType::DiscreteGpu, Backend::Vulkan, true);
+        let mut candidates = [dx12, vulkan];
+        let power = PowerPreference::HighPerformance;
+        assert_eq!(pick_adapter_index(&candidates, None, power), Some(1));
+        assert_eq!(pick_adapter_index(&candidates, Some("dx12"), power), Some(0));
+        assert_eq!(pick_adapter_index(&candidates, None, PowerPreference::None), Some(0));
+        candidates[1].surface_supported = false;
+        assert_eq!(pick_adapter_index(&candidates, None, power), Some(0));
     }
 
     #[test]

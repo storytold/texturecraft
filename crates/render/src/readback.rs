@@ -1,4 +1,4 @@
-//! Reading RGBA8 textures back to the CPU: blocking (headless renders, screenshots) or without
+//! Reading color textures back to the CPU: blocking (headless renders, screenshots) or without
 //! stalling (the app polls until the copy is mapped).
 
 use std::sync::{Arc, Mutex, PoisonError};
@@ -8,6 +8,8 @@ pub struct Readback {
     buf: wgpu::Buffer,
     width: u32,
     height: u32,
+    /// Useful bytes per image row.
+    line: u32,
     /// Bytes per buffer row (padded to the copy alignment).
     row: u32,
     /// Set by the map callback: whether mapping worked.
@@ -18,7 +20,7 @@ impl Readback {
     /// Encode the copy of mip 0 of `texture` (an RGBA8 format) into a mappable buffer.
     pub fn new(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture) -> Readback {
         let (width, height) = (texture.width(), texture.height());
-        Readback::encode(device, encoder, texture, 0, width, height)
+        Readback::encode(device, encoder, texture, 0, (width, height), 4)
     }
 
     /// [`Readback::new`] for mip `level` of `texture`; None when `texture` has no such level.
@@ -27,13 +29,19 @@ impl Readback {
             return None;
         }
 
-        let (width, height) = ((texture.width() >> level).max(1), (texture.height() >> level).max(1));
-        Some(Readback::encode(device, encoder, texture, level, width, height))
+        let format = texture.format();
+        if format.block_dimensions() != (1, 1) || format.is_depth_stencil_format() {
+            return None;
+        }
+        let size = ((texture.width() >> level).max(1), (texture.height() >> level).max(1));
+        Some(Readback::encode(device, encoder, texture, level, size, format.block_copy_size(None)?))
     }
 
     /// Encode the copy of mip `level` (`width` × `height`, an existing level) of `texture`.
-    fn encode(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture, level: u32, width: u32, height: u32) -> Readback {
-        let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    fn encode(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture, level: u32, size: (u32, u32), texel_bytes: u32) -> Readback {
+        let (width, height) = size;
+        let line = width * texel_bytes;
+        let row = line.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tc_read"),
             size: u64::from(row) * u64::from(height),
@@ -48,7 +56,7 @@ impl Readback {
             },
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
-        Readback { buf, width, height, row, mapped: Arc::new(Mutex::new(None)) }
+        Readback { buf, width, height, line, row, mapped: Arc::new(Mutex::new(None)) }
     }
 
     /// Start mapping; call once, after the encoder holding the copy was submitted.
@@ -65,7 +73,7 @@ impl Readback {
 
     fn pixels(&self) -> Option<(u32, u32, Vec<u8>)> {
         let data = self.buf.slice(..).get_mapped_range().ok()?;
-        let line = (self.width * 4) as usize;
+        let line = self.line as usize;
         let mut out = Vec::with_capacity(line * self.height as usize);
         for y in 0..self.height as usize {
             let start = y * self.row as usize;
@@ -83,10 +91,18 @@ impl Readback {
     pub fn blocking_level(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, level: u32) -> Option<(u32, u32, Vec<u8>)> {
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_read") });
         let r = Readback::new_level(device, &mut enc, texture, level)?;
-        queue.submit([enc.finish()]);
+        let submitted = queue.submit([enc.finish()]);
         r.map();
-        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-        r.take().flatten()
+        // Another thread polling the same device may run the map callback: wait until it ran
+        loop {
+            if device.poll(wgpu::PollType::Wait { submission_index: Some(submitted.clone()), timeout: None }).is_err() {
+                return None;
+            }
+            if let Some(pixels) = r.take() {
+                return pixels;
+            }
+            std::thread::yield_now();
+        }
     }
 }
 

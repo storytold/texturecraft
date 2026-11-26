@@ -23,6 +23,21 @@ type CacheEntry = (String, Option<Weak<ImageRes>>, [[f32; 3]; 9]);
 static CACHE: Mutex<Option<CacheEntry>> = Mutex::new(None);
 
 impl EnvironmentSh {
+    /// Coefficients and turn as they are, for a reader that brings its own (the GPU compositor's tests)
+    pub fn new(coefficients: [[f32; 3]; 9], rotation: f32) -> EnvironmentSh {
+        EnvironmentSh { coefficients, rotation }
+    }
+
+    /// The nine RGB spherical-harmonic coefficients of the diffuse light, in the order of `sh_basis`
+    pub fn coefficients(&self) -> [[f32; 3]; 9] {
+        self.coefficients
+    }
+
+    /// The viewport's environment rotation (radians)
+    pub fn rotation(&self) -> f32 {
+        self.rotation
+    }
+
     /// The diffuse light of the environment `display` shows (an imported image from `images`), worked out once per environment
     pub fn of(display: &DisplaySettings, images: &ImageStore) -> EnvironmentSh {
         let image = display.environment_resource().and_then(|name| images.get(name));

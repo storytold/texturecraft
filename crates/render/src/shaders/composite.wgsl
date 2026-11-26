@@ -1,0 +1,972 @@
+// UV fill compositor. Noise and color conversions follow texel/src/{noise,tile}.rs.
+struct Operation {
+    ids: vec4<u32>,
+    low: vec4<f32>,
+    high: vec4<f32>,
+    projection: vec4<f32>,
+    uv: vec4<f32>,
+    balance: vec4<f32>,
+    effects: vec4<u32>,
+    procedural: vec4<u32>,
+    // Layer: first content field slot, content and mask field flags. Marker:
+    // relative content slot or absolute mask field slot.
+    spatial: vec4<u32>,
+    // Geometry lookup offset, Height operation plus one, contrast and offset.
+    constraints: vec4<u32>,
+    // GPU port packages: side-table offset (0: none, read with `param`), P1 projection flags,
+    // P2/P3/P6/P7 flag bytes, P8 word. Zero for every operation the packages do not emit.
+    ext: vec4<u32>,
+}
+
+struct Params {
+    // Width, row count, top row, reserved texels per map.
+    band: vec4<u32>,
+    // Source width, source height, display sampling step, output mode (roughness or glossiness).
+    source: vec4<u32>,
+    // Layer count, scratch row pitch, DisplayKind output bits, left column.
+    program: vec4<u32>,
+    coverage: vec4<u32>,
+    // Origin and size in tiles, or a sentinel in x for per-image windows.
+    paint_window: vec4<u32>,
+    // Source origin and size of the neighborhood fields.
+    filter_region: vec4<u32>,
+    // Field word offset, destination slot, layer index, first excluded effect.
+    // The high bit of the last word selects the mask stack.
+    filter_stage: vec4<u32>,
+    filter_chunk: vec4<u32>,
+    // Original ID bake dimensions, both zero when absent; bake rows per block (0: one block, the
+    // whole texture) and the second block's presence bits (bake_has).
+    id_bake: vec4<u32>,
+    // Channel, start of anchor owner's draws, content cut, mask preview draw.
+    anchor: vec4<u32>,
+    anchor_default: vec4<f32>,
+    // Words per field texel (5, or 6 with the input word), input word present, the prepare
+    // pass's input operation plus one, the prepare pass's stage flags (bit 0: the stage wraps).
+    // The fields' origin, filter_region.xy, is i32 bits: it lies below zero with a wrapping stage.
+    field_layout: vec4<u32>,
+    // One vec4 per GPU port package, P1 to P8, written by its `band_uniform` in Rust.
+    packages: array<vec4<u32>, 8>,
+    // The whole-set pre-pass's outputs the bands read instead of a band field: stage slot plus
+    // one (0: none), their first word in the scratch buffer, and the region they cover in source
+    // texels (origin as i32 bits, size). FilterPlan::whole_set in Rust.
+    whole_slots: vec4<u32>,
+    whole_bases: vec4<u32>,
+    whole_rect: vec4<u32>,
+    // In a pre-pass with compact slots (WholePass::compact in Rust): its first stage slot, its
+    // stage count, the program's first working field, and 1 when active. Zero in the bands.
+    whole_compact: vec4<u32>,
+    // While preparing a lit Base Color's material and its first mask (FilterPlan::
+    // add_lit_mask_views): the layer's mask base plus one, the first mask's base plus one, and
+    // the This Layer stages (plus one) of the first and of the layer's mask. Zero otherwise.
+    mask_view: vec4<u32>,
+}
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> layers: array<Operation>;
+@group(0) @binding(2) var<storage, read> srgb: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output: array<u32>;
+@group(0) @binding(4) var<storage, read> paint: array<u32>;
+@group(0) @binding(5) var<storage, read> uv_coverage: array<u32>;
+@group(0) @binding(6) var surface_uv: texture_2d<u32>;
+struct SurfaceVertex {
+    position: vec4<f32>,
+    normal: vec4<f32>,
+}
+// Three vertices per triangle (position and U, normal and V), then their tangents (xyz and the
+// bitangent sign) two per element: GpuCompositor::uv_surface.
+@group(0) @binding(7) var<storage, read> surface_vertices: array<SurfaceVertex>;
+@group(0) @binding(8) var bake_maps: texture_2d<u32>;
+@group(0) @binding(9) var brush_alpha: texture_2d<u32>;
+@group(0) @binding(10) var tile_images: texture_2d_array<u32>;
+@group(0) @binding(11) var brush_stencil_image: texture_2d<f32>;
+@group(0) @binding(12) var<uniform> brush_stencil: StencilProjection;
+
+const NO_PAINT_IMAGE = 0xffffffffu;
+const PROJECTED_BRUSH: u32 = 4u;
+const GEOMETRY_MASKS: u32 = 8u;
+const IMAGE_SOURCE_OPCODE: u32 = 14u;
+const DECAL_PROJECTION: u32 = 9u;
+const UV_TILE_PROJECTION: u32 = 10u;
+const SPATIAL_FILTER_OPCODE: u32 = 36u;
+const COLOR_SELECTION_OPCODE: u32 = 38u;
+
+struct Surface {
+    position: vec3<f32>,
+    normal: vec3<f32>,
+    valid: bool,
+    // The MikkTSpace tangent (unit xyz) and the bitangent sign in w, as the CPU g-buffer's
+    // surface_at gives them: xyz interpolated and normalised, the sign of the triangle's first vertex.
+    tangent: vec4<f32>,
+}
+
+const NO_SURFACE = Surface(vec3(0.0), vec3(0.0, 1.0, 0.0), false, vec4(1.0, 0.0, 0.0, 1.0));
+
+// The tangent of vertex `vertex` from the block after the vertices.
+fn surface_tangent(vertex: u32) -> vec4<f32> {
+    let vertices = arrayLength(&surface_vertices) * 2u / 3u;
+    let pair = surface_vertices[vertices + vertex / 2u];
+    return select(pair.position, pair.normal, (vertex & 1u) == 1u);
+}
+
+// glam's Vec3::any_orthonormal_vector: the tangent the CPU takes where the interpolated one vanishes.
+fn any_orthonormal(n: vec3<f32>) -> vec3<f32> {
+    let sign = select(1.0, -1.0, (bitcast<u32>(n.z) >> 31u) == 1u);
+    let a = -1.0 / (sign + n.z);
+    let b = n.x * n.y * a;
+    return vec3(b, sign + n.y * n.y * a, -n.y);
+}
+
+fn edge(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> f32 {
+    let ab = b - a;
+    let ap = p - a;
+    return ab.x * ap.y - ab.y * ap.x;
+}
+
+fn surface_at(pixel: vec2<u32>) -> Surface {
+    if (params.coverage.w & 1u) == 0u || any(pixel >= params.source.xy) {
+        return NO_SURFACE;
+    }
+    let hit = textureLoad(surface_uv, vec2<i32>(pixel), 0).xy;
+    if hit.x == 0xffffffffu {
+        return NO_SURFACE;
+    }
+    let a = surface_vertices[hit.x * 3u];
+    let b = surface_vertices[hit.x * 3u + 1u];
+    let c = surface_vertices[hit.x * 3u + 2u];
+    // Reconstruct the working position from the original UVs. Packed barycentrics can
+    // cross a hard procedural cell boundary at high frequencies.
+    let size = vec2<f32>(params.source.xy);
+    let uv_a = vec2(a.position.w, a.normal.w) * size;
+    let uv_b = vec2(b.position.w, b.normal.w) * size;
+    let uv_c = vec2(c.position.w, c.normal.w) * size;
+    let center = vec2<f32>(pixel) + 0.5;
+    let area = edge(uv_a, uv_b, uv_c);
+    var weight = unpack2x16unorm(hit.y);
+    if abs(area) >= 1e-12 {
+        weight = vec2(edge(uv_c, uv_a, center), edge(uv_a, uv_b, center)) * (1.0 / area);
+    }
+    let w = 1.0 - weight.x - weight.y;
+    let position = a.position.xyz * w + b.position.xyz * weight.x + c.position.xyz * weight.y;
+    let normal = a.normal.xyz * w + b.normal.xyz * weight.x + c.normal.xyz * weight.y;
+    let unit = select(normal / max(length(normal), 1e-6), vec3(0.0, 1.0, 0.0), dot(normal, normal) <= 1e-12);
+    let ta = surface_tangent(hit.x * 3u);
+    let tangent = ta.xyz * w + surface_tangent(hit.x * 3u + 1u).xyz * weight.x + surface_tangent(hit.x * 3u + 2u).xyz * weight.y;
+    let length_squared = dot(tangent, tangent);
+    let direction = select(any_orthonormal(unit), tangent * inverseSqrt(length_squared), length_squared > 0.0 && length_squared < 3.4e38);
+    return Surface(position, unit, true, vec4(direction, select(1.0, -1.0, ta.w < 0.0)));
+}
+
+// One row block of the bake texture: the whole texture, or params.id_bake.z rows when the
+// program has the second block (BakedInputs::blocks in Rust).
+fn bake_block_size() -> vec2<u32> {
+    let size = textureDimensions(bake_maps);
+    return vec2(size.x, select(params.id_bake.z, size.y, params.id_bake.z == 0u));
+}
+
+fn bake_pixel_at(pixel: vec2<u32>) -> vec2<u32> {
+    let size = bake_block_size();
+    // P8: a UV tile smaller than its atlas block reads its own share of the bake (BlockScales::bake_uv)
+    let uv = udim_bake_uv((vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy)).xy;
+    return min(vec2<u32>(uv * vec2<f32>(size)), size - 1u);
+}
+
+// The second bake row block's maps (ProceduralInputs::read_bake_rows): bits of params.id_bake.w.
+const BAKED_HEIGHT: u32 = 1u;
+const BAKED_WORLD_NORMAL: u32 = 2u;
+
+fn bake_has(maps: u32) -> bool {
+    return (params.id_bake.w & maps) == maps;
+}
+
+// Row block `block` at the texel: 0 the built-in maps (baked_at), 1 the baked Height in x and the
+// stored World Normal in yzw (f32 bits; zeros where bake_has says a map is missing).
+fn baked_block_at(pixel: vec2<u32>, block: u32) -> vec4<u32> {
+    // P8: no bake where a smaller UV tile leaves its block empty
+    if !udim_bake_valid(pixel) {
+        return udim_absent_bake(block);
+    }
+    // P8: maps of different heights in rows of their own (params.packages[7].y)
+    if params.packages[7].y != 0u {
+        return udim_separate_bake(pixel, block);
+    }
+    let at = bake_pixel_at(pixel) + vec2(0u, block * bake_block_size().y);
+    return textureLoad(bake_maps, vec2<i32>(at), 0);
+}
+
+fn baked_at(pixel: vec2<u32>) -> vec4<u32> {
+    return baked_block_at(pixel, 0u);
+}
+
+fn unpack_baked_normal(packed: u32) -> vec3<f32> {
+    let components = vec3<f32>(vec3(packed, packed >> 10u, packed >> 20u) & vec3(1023u)) / 1022.0;
+    return vec3(components.xy, components.z * components.z);
+}
+
+fn paint_ramp_color(word: u32) -> vec3<f32> {
+    return bitcast<vec3<f32>>(vec3(srgb[word], srgb[word + 1u], srgb[word + 2u]));
+}
+
+fn gradient_color(op: Operation, t: f32) -> vec3<f32> {
+    let last = op.procedural.z - 1u;
+    let pos = filter_unit(t) * f32(last);
+    let index = min(u32(pos), last);
+    let offset = op.procedural.y;
+    let first = paint_ramp_color(offset + index * 3u);
+    let second = paint_ramp_color(offset + min(index + 1u, last) * 3u);
+    return first + (second - first) * (pos - f32(index));
+}
+
+fn wrap_coordinate(coordinate: i32, period: i32) -> i32 {
+    // Use unsigned remainder so negative operands are consistent across shader backends.
+    let bits = bitcast<u32>(coordinate);
+    let negative = coordinate < 0;
+    let magnitude = select(bits, 0u - bits, negative);
+    let remainder = i32(magnitude % u32(period));
+    return select(remainder, period - remainder, negative && remainder != 0);
+}
+
+fn azimuth(y: f32, x: f32) -> f32 {
+    if x == 0.0 && y == 0.0 { return 0.5; }
+    return atan2(y, x) / 6.283185307 + 0.5;
+}
+
+// acos within about one ulp of Rust's f32 acos (Cephes acosf). A backend's own acos can be far
+// coarser (llvmpipe's is off by about 1e-5), which moves a nearest texel read across a texel edge
+fn polar_angle(cosine: f32) -> f32 {
+    let x = clamp(cosine, -1.0, 1.0);
+    if x > 0.5 {
+        return 2.0 * asin_small(sqrt(0.5 * (1.0 - x)));
+    }
+    if x < -0.5 {
+        return 3.141592654 - 2.0 * asin_small(sqrt(0.5 * (1.0 + x)));
+    }
+    return 1.570796327 - asin_small(x);
+}
+
+// asin of |x| <= 0.5 (Cephes asinf's polynomial)
+fn asin_small(x: f32) -> f32 {
+    let z = x * x;
+    let p = (((4.2163199048e-2 * z + 2.4181311049e-2) * z + 4.5470025998e-2) * z + 7.4953002686e-2) * z + 1.6666752422e-1;
+    return p * z * x + x;
+}
+fn triplanar_weights(normal: vec3<f32>, sharpness: f32) -> vec3<f32> {
+    let axes = abs(normal);
+    let strongest = max(axes.x, max(axes.y, axes.z));
+    if strongest <= 0.0 {
+        return vec3(0.0);
+    }
+    // Keep the strongest axis at one to preserve normalized blends at high sharpness.
+    let weights = pow(axes / strongest, vec3(sharpness));
+    return weights / (weights.x + weights.y + weights.z);
+}
+
+fn value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> {
+    if enable_anchor_reads && layer.ids.y == 15u {
+        let pixel = vec2<u32>(uv * vec2<f32>(params.source.xy));
+        var color = layer.low.rgb;
+        if layer.ids.z != 0u {
+            let captured = filter_value(layer.ids.z - 1u, pixel);
+            color = select(color, captured.rgb, captured.a > 0.0);
+        }
+        if layer.procedural.z > 0u {
+            let lightness = luminance(color);
+            let t = select(lightness, lightness * 0.5 + 0.5, (layer.ids.w & 2u) != 0u);
+            return gradient_color(layer, t);
+        }
+        return select(color, vec3(luminance(color)), (layer.ids.w & 1u) != 0u);
+    }
+    if layer.ids.y == 0u {
+        return layer.low.rgb;
+    }
+    if enable_authored_images && layer.ids.y == IMAGE_SOURCE_OPCODE {
+        return authored_image_value(layer, uv, surface);
+    }
+    return procedural_value(layer, uv, surface);
+}
+
+fn fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
+    // P8: a reduced pattern's texels per repeat follow the UV tile at the texel
+    let placed = udim_placed(layer, uv);
+    // P1 (composite_projection.wgsl) evaluates fills that carry projection or sampling flags
+    if placed.ext.y != 0u {
+        return projection_fill_value(placed, uv, surface);
+    }
+    if !enable_authored_images || placed.procedural.w != DECAL_PROJECTION {
+        // P8: the mesh's own UV on a UV tile atlas, so projections repeat per tile
+        return vec4(value(placed, udim_value_uv(placed, uv), surface), 1.0);
+    }
+    return decal_fill_value(placed, uv, surface);
+}
+
+fn stored_sample(layer: Operation, table: u32, origin: vec2<u32>, size: vec2<u32>, pixel: vec2<u32>, empty: vec4<f32>) -> vec4<f32> {
+    let atlas_tile = pixel / 64u;
+    if any(atlas_tile < origin) {
+        return empty;
+    }
+    let tile = atlas_tile - origin;
+    if any(tile >= size) {
+        return empty;
+    }
+    let local = pixel % 64u;
+    let offset = paint[table + tile.y * size.x + tile.x];
+    if offset == 0u {
+        return empty;
+    }
+    let texel = offset + (local.y * 64u + local.x) * (layer.ids.w / 2u);
+    let first = paint[texel];
+    if layer.ids.w == 4u {
+        let second = paint[texel + 1u];
+        return vec4<f32>(vec4(first & 65535u, first >> 16u, second & 65535u, second >> 16u));
+    }
+    return vec4(vec3(f32(first & 65535u)), f32(first >> 16u));
+}
+
+fn resampled_sample(layer: Operation, image: u32, pixel: vec2<u32>, empty: vec4<f32>) -> vec4<f32> {
+    let texels = vec2(paint[image], paint[image + 1u]);
+    let origin = vec2(paint[image + 2u], paint[image + 3u]);
+    let window = vec2(paint[image + 4u], paint[image + 5u]);
+    let table = image + 6u;
+    if all(texels == params.source.xy) {
+        return stored_sample(layer, table, origin, window, pixel, empty);
+    }
+    let pos = max((vec2<f32>(pixel) + 0.5) * vec2<f32>(texels) / vec2<f32>(params.source.xy) - 0.5, vec2(0.0));
+    // The weights from the same floor as the texels (sample_field in neighbourhood.wgsl)
+    let cell = floor(pos);
+    let base = vec2<u32>(cell);
+    let weights = clamp(pos - cell, vec2(0.0), vec2(1.0));
+    let last = texels - 1u;
+    let a = stored_sample(layer, table, origin, window, min(base, last), empty);
+    let b = stored_sample(layer, table, origin, window, min(base + vec2(1u, 0u), last), empty);
+    let c = stored_sample(layer, table, origin, window, min(base + vec2(0u, 1u), last), empty);
+    let d = stored_sample(layer, table, origin, window, min(base + 1u, last), empty);
+    let top = a * (1.0 - weights.x) + b * weights.x;
+    let bottom = c * (1.0 - weights.x) + d * weights.x;
+    return min(floor(top * (1.0 - weights.y) + bottom * weights.y + 0.5), vec4(65535.0));
+}
+
+fn stored_paint(layer: Operation, pixel: vec2<u32>) -> vec4<f32> {
+    let signed = layer.ids.x == 6u;
+    // An empty signed texel holds the rounded 16-bit encoding of signed zero.
+    let empty = vec4(vec3(select(0.0, 32768.0, signed)), 0.0);
+    var raw = empty;
+    if layer.ids.z != NO_PAINT_IMAGE {
+        let image = paint[layer.ids.z];
+        if params.paint_window.x == 0xffffffffu {
+            raw = resampled_sample(layer, image, pixel, empty);
+        } else {
+            raw = stored_sample(layer, image, params.paint_window.xy, params.paint_window.zw, pixel, empty);
+        }
+    }
+    let p = raw / 65535.0;
+    return vec4(select(p.rgb, p.rgb * 2.0 - 1.0, signed), p.a);
+}
+
+struct ProjectedBrush {
+    rgba: vec4<f32>,
+    coverage: f32,
+}
+
+fn brush_coverage(pixel: vec2<u32>) -> f32 {
+    return f32(textureLoad(brush_alpha, vec2<i32>(pixel), 0).x) / 65535.0;
+}
+
+fn sample_brush_projection(pixel: vec2<u32>, surface: Surface) -> ProjectedBrush {
+    let coverage = brush_coverage(pixel);
+    if coverage <= 0.0 { return ProjectedBrush(vec4(0.0), 0.0); }
+    return ProjectedBrush(stencil_sample(brush_stencil_image, brush_stencil, surface.position), coverage);
+}
+
+fn painted(layer: Operation, pixel: vec2<u32>, projected: ProjectedBrush) -> vec4<f32> {
+    var stored = stored_paint(layer, pixel);
+    if layer.projection.w > 0.0 {
+        var m = projected.coverage * layer.uv.w * projected.rgba.a;
+        if (params.coverage.w & PROJECTED_BRUSH) == 0u {
+            m = brush_coverage(pixel) * layer.uv.w;
+        }
+        if m > 0.0 && (layer.ext.z & BRUSH_OP_BITS) != 0u {
+            // P7 (composite_brush.wgsl) previews the live stroke modes it flags, at the texel's
+            // pixel and UV (a mask stroke's image value, MaskGray::at)
+            let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
+            stored = live_brush_paint(layer, stored, m, projected, pixel, uv);
+        } else if m > 0.0 {
+            // Match the paint commit's premultiplied over and 16-bit channel encoding.
+            let value = select(layer.uv.xxx, layer.uv.xyz, layer.ids.w == 4u);
+            let pigment = select(value, projected.rgba.rgb, layer.projection.w == 2.0);
+            let remaining = 1.0 - m;
+            let premul = pigment * m + stored.rgb * remaining;
+            let signed = layer.ids.x == 6u;
+            let encode = select(premul, premul * 0.5 + 0.5, signed);
+            let quantized = floor(clamp(encode, vec3(0.0), vec3(1.0)) * 65535.0 + 0.5) / 65535.0;
+            let rgb = select(quantized, quantized * 2.0 - 1.0, signed);
+            let coverage = f32(to_u16(m + stored.a * remaining)) / 65535.0;
+            stored = vec4(rgb, coverage);
+        }
+    }
+    if stored.a == 0.0 {
+        return vec4(0.0);
+    }
+    return vec4(stored.rgb / stored.a, stored.a);
+}
+
+fn shift_unit(x: f32, amount: f32) -> f32 {
+    let a = clamp(amount, -1.0, 1.0);
+    return select(x * (1.0 + a), x + (1.0 - x) * a, a >= 0.0);
+}
+
+fn hue_to_rgb(p: f32, q: f32, hue: f32) -> f32 {
+    let t = fract(hue);
+    if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
+    if t < 0.5 { return q; }
+    if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+    return p;
+}
+
+fn hsl_adjust(rgb: vec3<f32>, args: vec3<f32>) -> vec3<f32> {
+    let c = clamp(rgb, vec3(0.0), vec3(1.0));
+    let maximum = max(c.r, max(c.g, c.b));
+    let minimum = min(c.r, min(c.g, c.b));
+    let d = maximum - minimum;
+    let lightness = (maximum + minimum) * 0.5;
+    let light = shift_unit(lightness, args.z);
+    if d <= 1e-6 { return vec3(light); }
+    let saturation = d / select(maximum + minimum, 2.0 - maximum - minimum, lightness > 0.5);
+    let sat = shift_unit(saturation, args.y);
+    if sat <= 0.0 { return vec3(light); }
+    var hue = (c.r - c.g) / d + 4.0;
+    if maximum == c.r {
+        let turns = (c.g - c.b) / d / 6.0;
+        hue = fract(turns) * 6.0;
+    } else if maximum == c.g {
+        hue = (c.b - c.r) / d + 2.0;
+    }
+    let h = hue / 6.0 + args.x;
+    let q = select(light + sat - light * sat, light * (1.0 + sat), light < 0.5);
+    let p = 2.0 * light - q;
+    return vec3(hue_to_rgb(p, q, h + 1.0 / 3.0), hue_to_rgb(p, q, h), hue_to_rgb(p, q, h - 1.0 / 3.0));
+}
+
+fn filter_unit(x: f32) -> f32 {
+    return select(0.0, clamp(x, 0.0, 1.0), abs(x) <= 3.402823466e38);
+}
+
+fn color_balance_shift(op: Operation, lightness: f32) -> vec3<f32> {
+    let l = filter_unit(lightness);
+    let s = 1.0 - l;
+    return op.low.xyz * (s * s) + op.high.xyz * (2.0 * l * s) + op.projection.xyz * (l * l);
+}
+
+fn replace_color(op: Operation, c: vec3<f32>) -> vec3<f32> {
+    let d = distance(c, op.low.xyz) / sqrt(3.0);
+    let tolerance = op.projection.x;
+    let softness = op.projection.y;
+    var amount = 0.0;
+    if d <= tolerance {
+        amount = 1.0;
+    } else if d < tolerance + softness {
+        let x = 1.0 - (d - tolerance) / max(softness, 1e-6);
+        amount = x * x * (3.0 - 2.0 * x);
+    }
+    let color = c + (op.high.xyz - op.low.xyz) * amount;
+    return vec3(filter_unit(color.r), filter_unit(color.g), filter_unit(color.b));
+}
+
+fn scalar_filter(op: Operation, x: f32) -> f32 {
+    switch op.ids.y {
+        case 20u: {
+            // Levels: high.z is 1 when it clamps; unclamped, values outside the input range stay on the line through it
+            let range = op.low.y - op.low.x;
+            let between = (x - op.low.x) / select(1e-5, range, range > 0.0);
+            var t = between;
+            if op.high.z > 0.5 || (between >= 0.0 && between <= 1.0) {
+                t = pow(clamp(between, 0.0, 1.0), 1.0 / max(op.low.z, 1e-3));
+            }
+            return lerp(op.high.x, op.high.y, t);
+        }
+        case 21u: { return 1.0 - x; }
+        case 22u: {
+            // Threshold: ids.z picks at or above, above, below, or at or below the level
+            var passes = x >= op.low.x;
+            if op.ids.z == 1u { passes = x > op.low.x; }
+            if op.ids.z == 2u { passes = x < op.low.x; }
+            if op.ids.z == 3u { passes = x <= op.low.x; }
+            return select(0.0, 1.0, passes);
+        }
+        case 23u: { return clamp((x - 0.5) * (1.0 + clamp(op.low.x, -1.0, 1.0)) + 0.5 + op.low.y, 0.0, 1.0); }
+        case 24u: {
+            let steps = max(floor(clamp(op.low.x, 2.0, 64.0) + 0.5) - 1.0, 1.0);
+            return floor(clamp(x, 0.0, 1.0) * steps + 0.5) / steps;
+        }
+        case 25u: { return clamp(x, op.low.x, op.low.y); }
+        case 26u: {
+            if op.low.y >= 1.0 { return select(0.0, 1.0, x >= op.low.x); }
+            let width = max(1.0 - clamp(op.low.y, 0.0, 1.0), 1e-3);
+            return clamp((x - op.low.x) / width + 0.5, 0.0, 1.0);
+        }
+        case 27u: { return clamp(op.low.y + (x - op.low.y) * op.low.x, 0.0, 1.0); }
+        case 28u: {
+            var t = clamp(x, 0.0, 1.0) + clamp(op.low.x, -1.0, 1.0);
+            if t > 1.0 { t -= 1.0; }
+            if t < 0.0 { t += 1.0; }
+            return clamp(t, 0.0, 1.0);
+        }
+        case 31u: { return shift_unit(clamp(x, 0.0, 1.0), op.low.z); }
+        case 32u: {
+            let shift = color_balance_shift(op, x);
+            return filter_unit(x + (shift.x + shift.y + shift.z) / 3.0);
+        }
+        case 33u: {
+            if op.procedural.z > 0u { return luminance(gradient_color(op, x)); }
+            return x;
+        }
+        case 37u: {
+            var passes = abs(x - op.low.x) <= op.low.y;
+            if op.ids.z == 0u { passes = x < op.low.x; }
+            if op.ids.z == 2u { passes = x > op.low.x; }
+            return select(0.0, 1.0, passes);
+        }
+        // Opcodes without a scalar form here, and the GPU port packages' opcodes
+        default: { return extended_scalar_filter(op, x); }
+    }
+}
+
+fn effect_color(op: Operation, c: vec3<f32>, channel: u32, surface: Surface, baked_ao: f32) -> vec3<f32> {
+    if is_extended_effect(op.ids.y) {
+        return extended_effect_color(op, c, channel, surface, baked_ao);
+    }
+    if op.ids.y == 35u {
+        if channel != 0u { return c; }
+        let facing = max(0.0, dot(surface.normal, op.high.xyz));
+        let ao = select(1.0, clamp(baked_ao, 0.0, 1.0), abs(baked_ao) <= 3.402823466e38);
+        let light = op.low.y * (1.0 + (ao - 1.0) * op.low.z) + op.low.x * facing;
+        let factor = select(1.0, max(0.0, light), abs(light) <= 3.402823466e38);
+        return clamp(c * factor, vec3(0.0), vec3(1.0));
+    }
+    if channel == 7u || channel == 11u {
+        return select(c, vec3(c.x, 1.0 - c.y, c.z), op.ids.y == 30u);
+    }
+    if channel == 0u || (channel >= 8u && channel <= 10u) {
+        if op.ids.y == 29u { return vec3(dot(c, vec3(0.3, 0.59, 0.11))); }
+        if op.ids.y == 31u { return hsl_adjust(c, op.low.xyz); }
+        if op.ids.y == 32u {
+            let color = c + color_balance_shift(op, luminance(c));
+            return vec3(filter_unit(color.r), filter_unit(color.g), filter_unit(color.b));
+        }
+        if op.ids.y == 33u {
+            if op.procedural.z > 0u { return gradient_color(op, luminance(c)); }
+            return c;
+        }
+        if op.ids.y == 34u { return replace_color(op, c); }
+        return vec3(scalar_filter(op, c.r), scalar_filter(op, c.g), scalar_filter(op, c.b));
+    }
+    if channel == 6u {
+        return vec3(scalar_filter(op, c.x * 0.5 + 0.5) * 2.0 - 1.0);
+    }
+    return vec3(scalar_filter(op, c.x));
+}
+
+fn burn(a: f32, b: f32) -> f32 {
+    if a >= 1.0 { return 1.0; }
+    if b <= 0.0 { return 0.0; }
+    return 1.0 - min((1.0 - a) / b, 1.0);
+}
+
+fn dodge(a: f32, b: f32) -> f32 {
+    if a <= 0.0 { return 0.0; }
+    if b >= 1.0 { return 1.0; }
+    return min(a / (1.0 - b), 1.0);
+}
+
+fn overlay(a: f32, b: f32) -> f32 {
+    return select(1.0 - 2.0 * (1.0 - a) * (1.0 - b), 2.0 * a * b, a < 0.5);
+}
+
+// Most stacks only use the basic modes. Keep the other blend math out
+// of those pipelines, where it would be inlined at every blend site.
+override enable_extended_blend_modes: bool = false;
+
+fn blend_scalar(mode: u32, a: f32, b: f32) -> f32 {
+    switch mode {
+        case 1u: { return a; }
+        case 3u: { return a * b; }
+        case 4u: { return a / max(b, 1e-6); }
+        case 5u: { return b / max(a, 1e-6); }
+        case 6u: { return min(a, b); }
+        case 7u: { return max(a, b); }
+        case 8u: { return a + b; }
+        default: {}
+    }
+    if enable_extended_blend_modes {
+        switch mode {
+            case 9u: { return a - b; }
+            case 10u: { return b - a; }
+            case 11u: { return abs(a - b); }
+            case 12u: { return a + b - 2.0 * a * b; }
+            case 13u: { return a + 2.0 * b - 1.0; }
+            case 14u: { return overlay(a, b); }
+            case 15u: { return 1.0 - (1.0 - a) * (1.0 - b); }
+            case 16u: { return a + b - 1.0; }
+            case 17u: { return burn(a, b); }
+            case 18u: { return dodge(a, b); }
+            case 19u: {
+                let x = clamp(a, 0.0, 1.0);
+                let y = clamp(b, 0.0, 1.0);
+                if y <= 0.5 { return x - (1.0 - 2.0 * y) * x * (1.0 - x); }
+                let d = select(sqrt(x), ((16.0 * x - 12.0) * x + 4.0) * x, x <= 0.25);
+                return x + (2.0 * y - 1.0) * (d - x);
+            }
+            case 20u: { return overlay(b, a); }
+            case 21u: { return select(dodge(a, 2.0 * (b - 0.5)), burn(a, 2.0 * b), b < 0.5); }
+            case 22u: { return select(max(a, 2.0 * b - 1.0), min(a, 2.0 * b), b < 0.5); }
+            default: {}
+        }
+    }
+    return b;
+}
+
+fn luminance(c: vec3<f32>) -> f32 { return dot(c, vec3(0.3, 0.59, 0.11)); }
+fn maximum(c: vec3<f32>) -> f32 { return max(c.x, max(c.y, c.z)); }
+fn minimum(c: vec3<f32>) -> f32 { return min(c.x, min(c.y, c.z)); }
+
+fn with_luminance(color: vec3<f32>, luminance_goal: f32) -> vec3<f32> {
+    var c = color + luminance_goal - luminance(color);
+    let l = luminance(c);
+    let lo = minimum(c);
+    let hi = maximum(c);
+    if lo < 0.0 && l - lo > 1e-6 { c = l + (c - l) * l / (l - lo); }
+    if hi > 1.0 && hi - l > 1e-6 { c = l + (c - l) * (1.0 - l) / (hi - l); }
+    return c;
+}
+
+fn rnm(a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
+    let t = a * 2.0 - vec3(1.0, 1.0, 0.0);
+    let u = (b * 2.0 - 1.0) * vec3(-1.0, -1.0, 1.0);
+    let n = t * dot(t, u) - u * t.z;
+    return n / max(length(n), 1e-6) * 0.5 + 0.5;
+}
+
+fn blend_rgb(mode: u32, a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
+    if enable_extended_blend_modes {
+        switch mode {
+            case 23u: { return b * luminance(a); }
+            case 24u: {
+                let lo = minimum(a);
+                let width = maximum(a) - lo;
+                var saturated = vec3(0.0);
+                if width > 1e-6 { saturated = (a - lo) * (maximum(b) - minimum(b)) / width; }
+                return with_luminance(saturated, luminance(a));
+            }
+            case 25u: { return with_luminance(b, luminance(a)); }
+            case 26u: {
+                let max_a = maximum(a);
+                let max_b = maximum(b);
+                if max_a <= 1e-6 { return vec3(max_b); }
+                return a * max_b / max_a;
+            }
+            case 27u: {
+                let p = a * 2.0 - 1.0;
+                let q = b * 2.0 - 1.0;
+                let n = vec3(p.xy + q.xy, p.z * q.z);
+                return n / max(length(n), 1e-6) * 0.5 + 0.5;
+            }
+            case 28u: { return rnm(a,b); }
+            case 29u: { return rnm(b,a); }
+            default: {}
+        }
+    }
+    return vec3(blend_scalar(mode, a.x, b.x), blend_scalar(mode, a.y, b.y), blend_scalar(mode, a.z, b.z));
+}
+
+struct LayerTexel {
+    pixel: vec2<u32>,
+    uv: vec2<f32>,
+    surface: Surface,
+    baked: vec3<f32>,
+    projected: ProjectedBrush,
+}
+
+fn color_selection(effect: Operation, pixel: vec2<u32>) -> f32 {
+    // P8: no baked ID where a smaller UV tile leaves its block empty
+    if params.id_bake.x == 0u || effect.procedural.z == 0u || !udim_bake_valid(pixel) { return 0.0; }
+    let color = id_color_at(pixel);
+    for (var i = 0u; i < effect.procedural.z; i++) {
+        let at = effect.procedural.y + i * 3u;
+        let picked = bitcast<vec3<f32>>(vec3(srgb[at], srgb[at + 1u], srgb[at + 2u]));
+        if all(abs(color - picked) <= vec3(effect.low.x)) { return 1.0; }
+    }
+    return 0.0;
+}
+
+fn base_content(layer: Operation, texel: LayerTexel) -> vec4<f32> {
+    if layer.ids.y == 10u {
+        return painted(layer, texel.pixel, texel.projected);
+    }
+    return fill_value(layer, texel.uv, texel.surface);
+}
+
+fn geometry_allows(offset: u32, triangle: u32) -> bool {
+    if offset == 0u || triangle == 0xffffffffu { return true; }
+    return (srgb[offset + triangle / 32u] & (1u << (triangle % 32u))) != 0u;
+}
+
+fn uv_texel_covered(pixel: vec2<u32>) -> bool {
+    let word = uv_coverage[pixel.y * params.coverage.y + pixel.x / 32u];
+    return (word & (1u << (pixel.x % 32u))) != 0u;
+}
+
+fn to_u16(v: f32) -> u32 {
+    return u32(clamp(v, 0.0, 1.0) * 65535.0 + 0.5);
+}
+
+fn quantized_color(color: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(vec3<u32>(to_u16(color.r), to_u16(color.g), to_u16(color.b))) / 65535.0;
+}
+
+fn pack_srgb(color: vec3<f32>, alpha: f32) -> u32 {
+    return srgb[to_u16(color.r) >> 4u]
+        | (srgb[to_u16(color.g) >> 4u] << 8u)
+        | (srgb[to_u16(color.b) >> 4u] << 16u)
+        | ((to_u16(alpha) >> 8u) << 24u);
+}
+
+fn writes_display(kind: u32) -> bool {
+    return (params.program.z & (1u << kind)) != 0u;
+}
+
+fn display_index(kind: u32, index: u32) -> u32 {
+    // Normal (2) and Height (3) use two words per pixel. The remaining display
+    // outputs use one. The Rust band layout omits all inactive outputs.
+    let earlier = params.program.z & ((1u << kind) - 1u);
+    let offset = countOneBits(earlier) + countOneBits(earlier & 12u);
+    return offset * params.band.w + select(index, 2u * index, kind == 2u || kind == 3u);
+}
+
+// Find a covered source within the padding radius. The CPU padding's breadth-first
+// search breaks equal Chebyshev distances in row-major source order.
+fn padded_source(pixel: vec2<u32>) -> vec2<u32> {
+    let pitch = params.coverage.y;
+    let radius = params.coverage.z;
+    if uv_texel_covered(pixel) {
+        return pixel;
+    }
+
+    let left = pixel.x - min(pixel.x, radius);
+    let right = min(pixel.x + radius, params.source.x - 1u);
+    let start_word = left / 32u;
+    let start_bit = left % 32u;
+    let center = pixel.x - left;
+    let column_mask = (1u << (right - left + 1u)) - 1u;
+    let lower_columns = (1u << (center + 1u)) - 1u;
+    let top = pixel.y - min(pixel.y, radius);
+    let bottom = min(pixel.y + radius, params.source.y - 1u);
+    var best = params.source.xy;
+    var distance = radius + 1u;
+
+    for (var row = top; row <= bottom; row++) {
+        let dy = max(row, pixel.y) - min(row, pixel.y);
+        if dy >= distance {
+            continue;
+        }
+        let index = row * pitch + start_word;
+        var bits = uv_coverage[index] >> start_bit;
+        if right / 32u != start_word {
+            bits |= uv_coverage[index + 1u] << (32u - start_bit);
+        }
+        bits &= column_mask;
+        if bits == 0u {
+            continue;
+        }
+
+        let lower = bits & lower_columns;
+        let upper = bits & (0xffffffffu << center);
+        var dx = radius + 1u;
+        if lower != 0u {
+            dx = center - firstLeadingBit(lower);
+        }
+        if upper != 0u {
+            dx = min(dx, firstTrailingBit(upper) - center);
+        }
+        let candidate = max(dx, dy);
+        if candidate < distance {
+            distance = candidate;
+            let first = center - min(center, distance);
+            best = vec2(left + firstTrailingBit(bits & (0xffffffffu << first)), row);
+        }
+    }
+    return best;
+}
+
+// Keep mask preview evaluation out of the material pipeline.
+override composite_mask_preview: bool = false;
+
+@compute @workgroup_size(8, 8)
+fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= params.band.x || id.y >= params.band.y {
+        return;
+    }
+    let display_pixel = vec2(id.x + params.program.w, id.y + params.band.z);
+    let sample_pixel = display_pixel * params.source.z;
+    var pixel = sample_pixel;
+    if params.coverage.x != 0u {
+        pixel = padded_source(pixel);
+    }
+    let covered = all(pixel < params.source.xy);
+    let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(params.source.xy);
+    let surface = surface_at(pixel);
+    var projected = ProjectedBrush(vec4(0.0), 0.0);
+    if covered && (params.coverage.w & PROJECTED_BRUSH) != 0u {
+        projected = sample_brush_projection(pixel, surface);
+    }
+    var mask_bakes = vec3(1.0, 0.5, 1.0);
+    var display_ao = 1.0;
+    var baked_normal = 0u;
+    if (params.coverage.w & 2u) != 0u {
+        let display_bake = baked_at(sample_pixel);
+        let scalars = bitcast<vec3<f32>>(display_bake.xyz);
+        display_ao = scalars.x;
+        baked_normal = display_bake.w;
+        if covered {
+            mask_bakes = scalars;
+            if any(pixel != sample_pixel) { mask_bakes = bitcast<vec3<f32>>(baked_at(pixel).xyz); }
+        }
+    }
+    let index = id.y * params.program.y + id.x;
+    let texel = LayerTexel(pixel, uv, surface, mask_bakes, projected);
+    if composite_mask_preview && !covered {
+        output[index] = 0xff000000u;
+        return;
+    }
+    var base = vec3(0.5);
+    var normal = vec3(0.5, 0.5, 1.0);
+    var scalars = array<f32, 6>(1.0, 1.0, 0.5, 0.0, 0.5, 0.0);
+    // Grouped by the destination slots assigned by Rust.
+    var lobe_colors = array<vec3<f32>, 4>(vec3(1.0), vec3(0.04), vec3(0.0), vec3(0.5, 0.5, 1.0));
+    var lobe_values = array<f32, 9>(0.0, 0.5, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.5);
+    var last_mask = 0xffffffffu;
+    var mask_value = 1.0;
+    var triangle = 0xffffffffu;
+    if covered && (params.coverage.w & GEOMETRY_MASKS) != 0u {
+        triangle = textureLoad(surface_uv, vec2<i32>(pixel), 0).x;
+    }
+    var group_depth = 0u;
+    // The mask preview runs the loop over its one layer, for its mask alone: every mask goes
+    // through the one layer_mask call below, which the driver inlines once
+    var first = 0u;
+    var end = params.program.x;
+    if composite_mask_preview {
+        first = params.anchor.w;
+        end = first + 1u;
+    }
+    for (var i = first; covered && i < end; i++) {
+        let layer = layers[i];
+        let group = composite_groups && layer.ids.y == BEGIN_GROUP;
+        if composite_groups && layer.ids.y == END_GROUP {
+            group_depth -= 1u;
+            let mixed = mix_group_parent(group_depth, index, layer.ids.z, MaterialValues(base, normal, scalars, lobe_colors, lobe_values));
+            base = mixed.base;
+            normal = mixed.normal;
+            scalars = mixed.scalars;
+            lobe_colors = mixed.lobe_colors;
+            lobe_values = mixed.lobe_values;
+            continue;
+        }
+        if !group && (layer.ids.x == 0xffffffffu || !geometry_allows(layer.constraints.x, triangle)) && !composite_mask_preview { continue; }
+        // A folder's mask, or a layer's mask when its mask range changes
+        if composite_mask_preview || group || (layer.effects.y != 0u && last_mask != layer.effects.x) {
+            var mask = 0.0;
+            if composite_mask_preview || !group || geometry_allows(layer.constraints.x, triangle) {
+                mask = layer_mask(layer, texel, layer.effects.y);
+                if !composite_mask_preview {
+                    mask = mask_with_height(layer, texel, mask);
+                }
+            }
+            if composite_mask_preview {
+                output[index] = (u32(mask * 255.0 + 0.5) * 0x00010101u) | 0xff000000u;
+                return;
+            }
+            if !group {
+                last_mask = layer.effects.x;
+                mask_value = mask;
+            } else {
+                if mask <= 0.0 {
+                    // The instruction stores the first operation after its END_GROUP.
+                    i = layer.ids.w - 1u;
+                    continue;
+                }
+                save_group_parent(group_depth, index, mask, MaterialValues(base, normal, scalars, lobe_colors, lobe_values));
+                group_depth += 1u;
+                continue;
+            }
+        }
+        let mode = u32(layer.balance.z);
+        var weight = layer.low.w;
+        if layer.effects.y == 0u {
+            weight *= layer.balance.y;
+        } else {
+            weight *= mask_value;
+        }
+        if weight <= 0.0 { continue; }
+        let content = layer_content(layer, texel, layer.effects.w);
+        weight *= select(content.a, 1.0, mode == 2u && content.a > 0.0);
+        if weight <= 0.0 { continue; }
+        let source = content.rgb;
+        let destination = layer.ids.x;
+        if destination == 0u {
+            base += (blend_rgb(mode, base, source) - base) * weight;
+        } else if destination == 7u {
+            normal += (blend_rgb(mode, normal, source) - normal) * weight;
+        } else if destination >= 12u {
+            let slot = destination - 12u;
+            let old = lobe_values[slot];
+            lobe_values[slot] = lerp(old, blend_scalar(mode, old, source.x), weight);
+        } else if destination >= 8u {
+            let slot = destination - 8u;
+            let old = lobe_colors[slot];
+            lobe_colors[slot] = mix(old, blend_rgb(mode, old, source), weight);
+        } else {
+            let old = scalars[destination - 1u];
+            scalars[destination - 1u] = lerp(old, blend_scalar(mode, old, source.x), weight);
+        }
+    }
+    output[index] = pack_srgb(base, scalars[0]);
+    let ao = clamp(display_ao * f32(to_u16(scalars[1])) / 65535.0, 0.0, 1.0);
+    let roughness = select(to_u16(scalars[2]) >> 8u, 255u - (to_u16(lobe_values[8]) >> 8u), params.source.w != 0u);
+    output[index + params.band.w] = u32(ao * 255.0 + 0.5)
+        | (roughness << 8u)
+        | ((to_u16(scalars[3]) >> 8u) << 16u)
+        | ((to_u16(scalars[4]) >> 8u) << 24u);
+    if writes_display(2u) {
+        var detail = quantized_color(normal);
+        if (baked_normal & (1u << 30u)) != 0u {
+            detail = rnm(unpack_baked_normal(baked_normal), detail);
+        }
+        let packed = detail * 2.0 - 1.0;
+        let normal_index = display_index(2u, index);
+        output[normal_index] = pack2x16float(packed.xy);
+        output[normal_index + 1u] = pack2x16float(vec2(packed.z, f32(to_u16(lobe_values[1])) / 65535.0));
+    }
+    if writes_display(3u) {
+        let height = f32(to_u16(scalars[5] * 0.5 + 0.5)) * (2.0 / 65535.0) - 1.0;
+        let f0 = quantized_color(lobe_colors[1]);
+        let height_index = display_index(3u, index);
+        output[height_index] = pack2x16float(vec2(height, f0.r));
+        output[height_index + 1u] = pack2x16float(f0.gb);
+    }
+    if writes_display(4u) {
+        output[display_index(4u, index)] = pack_srgb(lobe_colors[2], lobe_values[2]);
+    }
+    if writes_display(5u) {
+        output[display_index(5u, index)] = (to_u16(lobe_values[3]) >> 8u)
+            | ((to_u16(lobe_values[4]) >> 8u) << 8u)
+            | ((to_u16(lobe_values[5]) >> 8u) << 16u)
+            | ((to_u16(lobe_values[6]) >> 8u) << 24u);
+    }
+    if writes_display(6u) {
+        output[display_index(6u, index)] = pack_srgb(lobe_colors[0], lobe_values[0]);
+    }
+    if writes_display(7u) {
+        // P8: the alpha holds the UV tile's scale (zero but in a smaller tile of a UV tile atlas)
+        let signed_xy = quantized_color(lobe_colors[3]).xy * 2.0 - 1.0;
+        let packed = vec2<u32>(clamp(128.0 + 127.0 * signed_xy, vec2(0.0), vec2(255.0)) + 0.5);
+        output[display_index(7u, index)] = packed.x | (packed.y << 8u) | ((to_u16(lobe_values[7]) >> 8u) << 16u) | (udim_extra_scale(sample_pixel) << 24u);
+    }
+}

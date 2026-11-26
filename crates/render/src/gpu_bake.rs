@@ -468,6 +468,7 @@ mod tests {
 
     #[test]
     fn gpu_respects_secondary_ray_filters_and_ground_plane() {
+        let _turn = crate::headless::serial::Turn::take();
         let Some(gpu) = gpu() else { return };
 
         let mut mesh = primitives::material_ball();
@@ -496,6 +497,7 @@ mod tests {
 
     #[test]
     fn gpu_bake_matches_the_cpu() {
+        let _turn = crate::headless::serial::Turn::take();
         let Some(gpu) = gpu() else { return };
 
         // Low poly: the material ball (self-occluding); every ray map with its own settings
@@ -564,6 +566,7 @@ mod tests {
     #[test]
     #[ignore]
     fn gpu_bake_speed() {
+        let _turn = crate::headless::serial::Turn::take();
         let Some(g) = gpu() else { return };
         let ball = primitives::material_ball();
         let rays = RaySettings { rays: 64, ..RaySettings::default() };

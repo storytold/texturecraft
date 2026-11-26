@@ -173,9 +173,6 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 
 /// Accumulate `stamps` into `canvas` ("over": `m = a + m·(1 − a)`).
 pub fn rasterize(canvas: &mut StrokeCanvas, context: &RasterCtx, stamps: &[Stamp]) {
-    // Broad-phase padding for rotated stamp footprints
-    const STAMP_QUERY_PADDING: f32 = 1.42;
-
     // Keep small batches serial to avoid scheduling overhead
     const PARALLEL_TRIANGLE_THRESHOLD: usize = 16;
 
@@ -196,7 +193,7 @@ pub fn rasterize(canvas: &mut StrokeCanvas, context: &RasterCtx, stamps: &[Stamp
             continue;
         }
 
-        let extent = Vec3::splat(stamp.radius * stamp.depth.max(1.0) * STAMP_QUERY_PADDING);
+        let extent = stamp.world_extent();
         triangles.clear();
         context.bvh.query_box(stamp.center - extent, stamp.center + extent, |triangle| triangles.push(triangle));
 

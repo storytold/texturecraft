@@ -276,3 +276,19 @@ fn budgeted_updates_spread_work_and_end_identical() {
     assert!(s.caches[0].composite == full, "chunked compositing gives the same pixels");
     assert!(s.memory().composites > 0);
 }
+
+#[test]
+fn a_resampled_instance_refreshes_when_its_source_stroke_commits() {
+    let mut s = session();
+    let paint = s.selected_layer().unwrap();
+    execute(&mut s, "textureSet.resolution", &json!({"ts": 1, "resolution": 128})).unwrap();
+    execute(&mut s, "layer.instance", &json!({"layer": paint.0, "ts": 1})).unwrap();
+    execute(&mut s, "textureSet.select", &json!({"ts": 0})).unwrap();
+    execute(&mut s, "layer.select", &json!({"layer": paint.0})).unwrap();
+    s.update();
+    s.begin_stroke_uv([0.5, 0.5].into(), 1.0).unwrap();
+    assert!(s.stroke_tiles() > 0);
+    assert!(s.caches[1].dirty.is_empty(), "only equal-size instances display live paint");
+    s.end_stroke().unwrap();
+    assert!(!s.caches[1].dirty.is_empty(), "committed source pixels must be resampled");
+}

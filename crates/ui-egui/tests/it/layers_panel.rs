@@ -579,7 +579,7 @@ fn alt_click_on_a_mask_thumbnail_shows_that_mask_alone_without_changing_the_docu
 
     alt_click(&mut h, at);
     assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Mask(layer));
-    let gray = h.state().session.mask_view_rgba(layer, 64).unwrap();
+    let gray = h.state().session.mask_view_rgba(layer, (64, 64)).unwrap();
     assert!(gray.chunks(4).all(|px| px[0] == px[1] && px[1] == px[2] && px[3] == 255), "the mask is shown in gray");
     assert!(gray.chunks(4).any(|px| px[0] != gray[0]), "the position generator shapes the mask");
     assert_eq!(h.state().session.history_labels().len(), history, "view only: no history step");

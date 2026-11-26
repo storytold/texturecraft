@@ -6,6 +6,12 @@ pub use crate::log_entry::LogEntry;
 pub use crate::log_level::LogLevel;
 pub use crate::session_log::SessionLog;
 
+/// Set the optional file for desktop diagnostics before opening a project.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_performance_log_path(path: std::path::PathBuf) {
+    crate::session_log::set_performance_log_path(path);
+}
+
 /// The source of entries that came without one (plain `push`)
 pub const DEFAULT_SOURCE: &str = "TextureCraft";
 

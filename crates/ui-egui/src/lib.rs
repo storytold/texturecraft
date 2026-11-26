@@ -56,6 +56,8 @@ mod generator_section_rows;
 mod generator_slot;
 mod generator_wear_rows;
 pub mod gpu;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod gpu_port_gate;
 mod gray_slider;
 mod grid_tile;
 #[cfg(not(target_arch = "wasm32"))]
@@ -219,6 +221,13 @@ pub const UPDATE_APP: craft_update::App = craft_update::App {
 pub struct ResizeJob {
     pub progress: Arc<Progress>,
     pub rx: std::sync::mpsc::Receiver<texturecraft_engine::Result<texturecraft_engine::ResizeOutput>>,
+    project: u64,
+}
+
+impl Drop for ResizeJob {
+    fn drop(&mut self) {
+        self.progress.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 mod link_bake_input;
@@ -949,7 +958,20 @@ impl TextureCraftApp {
             Ok(task) => {
                 let progress = Arc::new(Progress::new());
                 let p = progress.clone();
-                self.resize = Some(ResizeJob { progress, rx: spawn_worker("texturecraft-resize", move || task.run(&p)) });
+                #[cfg(not(target_arch = "wasm32"))]
+                let gpu = self
+                    .render_state
+                    .as_ref()
+                    .filter(|_| self.ui.prefs.gpu_compositing && self.gpu.as_ref().is_some_and(gpu::GpuLink::supports_gpu_resize))
+                    .map(|state| (state.device.clone(), state.queue.clone()));
+                let rx = spawn_worker("texturecraft-resize", move || {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some((device, queue)) = gpu {
+                        return resize_on_gpu(task, &p, &device, &queue);
+                    }
+                    task.run(&p)
+                });
+                self.resize = Some(ResizeJob { progress, rx, project: self.session.project_id });
             }
             Err(e) => self.toast(e.to_string(), true),
         }
@@ -960,7 +982,7 @@ impl TextureCraftApp {
         let Some(job) = &self.resize else { return };
 
         // Nothing to resize without a project (a result that arrives after Close is dropped)
-        if !self.session.project_open {
+        if !self.session.project_open || self.session.project_id != job.project {
             self.resize = None;
             return;
         }
@@ -976,6 +998,13 @@ impl TextureCraftApp {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(texturecraft_engine::EngineError::Other(i18n::tr("The resize worker stopped").into())),
         };
         self.resize = None;
+        if let Ok(output) = &result
+            && !output.matches_session(&self.session)
+        {
+            let (ts, resolution) = output.target();
+            self.start_resize(ts, resolution);
+            return;
+        }
         if let Err(e) = result.and_then(|out| self.session.apply_resize(out)) {
             self.toast(e.to_string(), true);
         }
@@ -1011,6 +1040,23 @@ impl TextureCraftApp {
             .unwrap_or(0.0);
         Some(((done as f32 + current) / job.total.max(1) as f32).clamp(0.0, 1.0))
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resize_on_gpu(
+    task: texturecraft_engine::ResizeTask,
+    progress: &Progress,
+    device: &texturecraft_render::wgpu::Device,
+    queue: &texturecraft_render::wgpu::Queue,
+) -> texturecraft_engine::Result<texturecraft_engine::ResizeOutput> {
+    use texturecraft_render::gpu_resize::PaintResampler;
+    let mut resampler = None;
+    task.run_with_resampler(progress, |image, size, empty| {
+        Some(match resampler.get_or_insert_with(|| PaintResampler::new(device, queue)) {
+            Ok(resampler) => resampler.resize(image, size, empty, || progress.cancel.load(Ordering::Relaxed)),
+            Err(error) => Err(error.clone()),
+        })
+    })
 }
 
 /// Run `f` on a worker thread named `name`; its result arrives on the returned channel.
@@ -1184,7 +1230,16 @@ impl eframe::App for TextureCraftApp {
         }
         self.step_camera_glide(ctx);
         self.ui.prefs.apply_resource_limits();
-
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let paint_view = self.session.quick_mask.editing
+                || !matches!(self.session.view, texturecraft_engine::ViewMode::MeshMap(_) | texturecraft_engine::ViewMode::Image);
+            self.session.brush_device = if self.ui.prefs.gpu_compositing && self.ui.mode == state::Mode::Painting && paint_view && self.session.solo.is_none() {
+                self.gpu.as_ref().and_then(|gpu| gpu.brush_device(&self.session))
+            } else {
+                None
+            };
+        }
         control::poll(self, ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.run_file_dialog_answers();

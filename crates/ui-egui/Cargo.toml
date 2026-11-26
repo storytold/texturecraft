@@ -71,6 +71,8 @@ web-sys = { version = "0.3", features = ["Window", "Document", "HtmlElement", "H
 
 [dev-dependencies]
 craft-zip = { workspace = true }
+# GPU tests share one device and its compiled pipelines on software adapters (llvmpipe, lavapipe)
+texturecraft-render = { workspace = true, features = ["test-support"] }
 zip = { workspace = true }
 
 # winit needs a window system on Linux, so the crate's own tests build with X11.

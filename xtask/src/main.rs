@@ -145,6 +145,146 @@ fn cmd_wasm() -> Result<(), String> {
     if failed == 0 { Ok(()) } else { Err(format!("{failed} package(s) failed the wasm check")) }
 }
 
+/// The render crate's unit test modules that compile the most GPU pipelines, in groups tested in
+/// a process each on Linux, all at once (Mesa keeps what a process compiled until it ends: on
+/// lavapipe each group peaks under about 4 GB); the rest of its unit tests run in one more
+/// process after them.
+const RENDER_TEST_GROUPS: &[&[&str]] = &[
+    &["gpu_composite::procedural_tests::", "gpu_composite::fill_projection::", "gpu_composite::lighting::", "gpu_composite::point::", "gpu_composite::brush::"],
+    &[
+        "gpu_composite::stack::",
+        "gpu_composite::packages::",
+        "gpu_composite::pipelines::",
+        "gpu_neighbourhood::gather::",
+        "gpu_neighbourhood::box_family::",
+        "gpu_neighbourhood::tests::",
+    ],
+    &["gpu_composite::udim::"],
+];
+
+/// Where Ubuntu's mesa-vulkan-drivers puts the Vulkan driver files
+const VULKAN_DRIVER_DIR: &str = "/usr/share/vulkan/icd.d";
+
+/// The environment of the render crate's tests on Linux CI (`CI` set): Mesa's lavapipe through
+/// Vulkan alone (its driver file the only one the loader sees), with LLVM's optimisation passes
+/// off, as they cost more than the tests' shaders then run. A variable the caller set wins. An
+/// error when lavapipe is missing, so the tests cannot fall back to another adapter or skip.
+fn render_ci_env() -> Result<Vec<(&'static str, String)>, String> {
+    if !cfg!(target_os = "linux") || std::env::var_os("CI").is_none() {
+        return Ok(Vec::new());
+    }
+    // A driver file the caller named under either variable, else lavapipe's from the system
+    let set = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let given = set("VK_DRIVER_FILES").or_else(|| set("VK_ICD_FILENAMES"));
+    let driver =
+        match given {
+            Some(files) => files,
+            None => {
+                let found =
+                    std::fs::read_dir(VULKAN_DRIVER_DIR).into_iter().flatten().flatten().map(|entry| entry.path()).find(|path| {
+                        path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("lvp_icd") && name.ends_with(".json"))
+                    });
+                let Some(found) = found else {
+                    return Err(format!("CI runs the render tests on lavapipe, but {VULKAN_DRIVER_DIR} has no lvp_icd*.json (install mesa-vulkan-drivers)"));
+                };
+                found.display().to_string()
+            }
+        };
+    let defaults = [
+        ("WGPU_BACKEND", "vulkan".to_owned()),
+        ("VK_DRIVER_FILES", driver.clone()),
+        ("VK_ICD_FILENAMES", driver),
+        ("GALLIVM_PERF", "nopt".to_owned()),
+        // Each group's adapter on two threads: the groups run at once
+        ("LP_NUM_THREADS", "2".to_owned()),
+        ("TC_CI_LAVAPIPE", "1".to_owned()),
+    ];
+    // A variable the caller set wins; an empty one counts as unset
+    Ok(defaults.into_iter().filter(|(name, _)| std::env::var_os(name).is_none_or(|value| value.is_empty())).collect())
+}
+
+/// `cargo test --workspace`. The render crate's unit tests run in a few processes at once, with
+/// two malloc arenas on Linux: they compile many GPU pipelines on Mesa, which keeps what it
+/// compiled until the process ends, so one process for all of them outgrows a 16 GB runner, and
+/// the default per-thread arenas fragment that memory. A MALLOC_ARENA_MAX the caller set wins.
+/// On Linux CI they run on lavapipe ([`render_ci_env`]); the Windows gate sets up lavapipe in
+/// its own script, and its groups run at once as well, which halves the gate's longest step.
+fn cmd_test() -> Result<(), String> {
+    let render_env = render_ci_env()?;
+    for (name, value) in &render_env {
+        eprintln!("render tests with {name}={value}");
+    }
+    let test = |args: &[&str], filter: &[&str], env: &[(&str, String)]| {
+        let mut c = cargo();
+        c.arg("test").args(args);
+        if !filter.is_empty() {
+            c.arg("--").args(filter);
+        }
+        if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+            c.env("MALLOC_ARENA_MAX", "2");
+        }
+        c.envs(env.iter().map(|(name, value)| (name, value)));
+        let what = format!("cargo test {} {}", args.join(" "), if filter.is_empty() { String::new() } else { format!("-- {}", filter.join(" ")) });
+        (c, what.trim_end().to_owned())
+    };
+    const RENDER: &str = "texturecraft-render";
+    let mut failed = Vec::new();
+    for (c, what) in [
+        test(&["--workspace", "--exclude", RENDER], &[], &[]),
+        test(&["-p", RENDER, "--doc"], &[], &render_env),
+        test(&["-p", RENDER, "--test", "*"], &[], &render_env),
+    ] {
+        failed.extend(run(c, &what).err());
+    }
+    // Built once before the groups start, so they do not wait on each other's build
+    let (c, what) = test(&["-p", RENDER, "--lib", "--no-run"], &[], &[]);
+    if let Err(error) = run(c, &what) {
+        failed.push(error);
+        return Err(failed.join("; "));
+    }
+    let groups = RENDER_TEST_GROUPS.iter().map(|group| test(&["-p", RENDER, "--lib"], group, &render_env)).collect();
+    failed.extend(run_at_once(groups).err());
+    let rest: Vec<&str> = RENDER_TEST_GROUPS.iter().copied().flatten().flat_map(|module| ["--skip", module]).collect();
+    let (c, what) = test(&["-p", RENDER, "--lib"], &rest, &render_env);
+    failed.extend(run(c, &what).err());
+    if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
+}
+
+/// Runs `commands` at once, each with its output captured and printed whole when it ends, then
+/// each one's exit; an error naming every command that failed.
+fn run_at_once(commands: Vec<(Command, String)>) -> Result<(), String> {
+    let printing = std::sync::Mutex::new(());
+    let results: Vec<(String, Result<(), String>)> = std::thread::scope(|scope| {
+        let runs: Vec<_> = commands
+            .into_iter()
+            .enumerate()
+            .map(|(index, (mut command, what))| {
+                eprintln!("$ [{}] {what}", index + 1);
+                let printing = &printing;
+                scope.spawn(move || {
+                    let result = match command.output() {
+                        Ok(output) => {
+                            let _turn = printing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            eprintln!("\n===== [{}] {what}: {} =====", index + 1, output.status);
+                            eprint!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                            if output.status.success() { Ok(()) } else { Err(format!("{what}: exited with {}", output.status)) }
+                        }
+                        Err(error) => Err(format!("{what}: failed to spawn: {error}")),
+                    };
+                    (what, result)
+                })
+            })
+            .collect();
+        runs.into_iter().map(|run| run.join().unwrap_or_else(|_| (String::from("a command"), Err(String::from("its thread panicked"))))).collect()
+    });
+    eprintln!();
+    for (index, (what, result)) in results.iter().enumerate() {
+        eprintln!("  [{}] {:<4} {what}", index + 1, if result.is_ok() { "ok" } else { "FAIL" });
+    }
+    let failed: Vec<String> = results.into_iter().filter_map(|(_, result)| result.err()).collect();
+    if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
+}
+
 fn cmd_ci() -> Result<(), String> {
     let cargo_step = |args: &'static [&'static str]| {
         move || {
@@ -159,7 +299,7 @@ fn cmd_ci() -> Result<(), String> {
         ("fmt", Box::new(cargo_step(&["fmt", "--all", "--", "--check"]))),
         ("layers", Box::new(cmd_layers)),
         ("clippy", Box::new(cargo_step(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))),
-        ("test", Box::new(cargo_step(&["test", "--workspace"]))),
+        ("test", Box::new(cmd_test)),
     ];
     // The check compiles for wasm32 and gives the same answer on any host, so the non-Windows legs
     // cover it and the slower Windows leg skips it. A skipped step is not in the list, so the

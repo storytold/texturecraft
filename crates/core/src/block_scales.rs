@@ -8,6 +8,12 @@ pub struct BlockScales {
 }
 
 impl BlockScales {
+    /// Preserve the UV layout when the working atlas is sampled at a lower resolution.
+    pub fn at_reduced_resolution(mut self, divisor: u32) -> Self {
+        self.block = (self.block / divisor.max(1)).max(1);
+        self
+    }
+
     /// Working atlas UV → uniform bake atlas UV, excluding unused portions of tile blocks
     pub fn bake_uv(&self, uv: [f32; 2], working_size: (u32, u32)) -> Option<[f32; 2]> {
         if working_size.0 == 0 || working_size.1 == 0 || uv.iter().any(|value| !value.is_finite() || !(0.0..1.0).contains(value)) {
