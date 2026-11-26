@@ -33,9 +33,11 @@ struct Params {
 @group(0) @binding(0) var<uniform> P: Params;
 // Triangle rows: w words (part key, 0, 0), last row (0, 0, 0, original index).
 // Transfer: per ray (origin, tmax), (direction, part key or NONE).
-// Hemisphere: per query (pos, rotation u), (normal, rotation v), (geometric normal, part key), (BVH root, 0, 0, 0).
+// Hemisphere: per query (pos, rotation u), (normal, rotation v), (geometric normal, part key),
+// (BVH root, ray subset, subsets, 0): the query casts rays subset, subset + subsets, … of the texel's P.rays.
 @group(0) @binding(3) var<storage, read> items: array<vec4<u32>>;
-// Transfer: (t, u, v, original triangle or NONE); hemisphere: (value, bent normal).
+// Transfer: (t, u, v, original triangle or NONE); hemisphere: (value, bent normal, or its unnormalized
+// sum for one of several subsets).
 @group(0) @binding(4) var<storage, read_write> results: array<vec4<u32>>;
 
 var<private> want_key: u32;
@@ -85,7 +87,8 @@ fn hemisphere_main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocati
     let r0 = items[k * 4u];
     let r1 = items[k * 4u + 1u];
     let r2 = items[k * 4u + 2u];
-    let root = items[k * 4u + 3u].x;
+    let r3 = items[k * 4u + 3u];
+    let root = r3.x;
     let nrm = bitcast<vec3<f32>>(r1.xyz);
     let rot = vec2<f32>(bitcast<f32>(r0.w), bitcast<f32>(r1.w));
     let occlusion = P.kind == 0u;
@@ -100,7 +103,7 @@ fn hemisphere_main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocati
     var sum = 0.0;
     var bent = vec3<f32>(0.0);
     var n = 0u;
-    for (var i = lane; valid && i < P.rays; i += P.lanes) {
+    for (var i = r3.y + lane * r3.z; valid && i < P.rays; i += P.lanes * r3.z) {
         let u1 = fract(f32(i) / f32(P.rays) + rot.x);
         let u2 = fract(f32(reverseBits(i)) / 4294967296.0 + rot.y);
         var r: f32;
@@ -155,10 +158,16 @@ fn hemisphere_main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocati
     sum = red[li].x;
     bent = red[li].yzw;
     n = red_n[li];
+    if (n == 0u && r3.z > 1u) {
+        // A ray subset with every ray below the surface has no estimate: NaN, skipped by the texel average.
+        results[P.out + k] = vec4<u32>(0x7fc00000u);
+        return;
+    }
     var out = vec4<f32>(1.0, 0.0, 0.0, 0.0);
     if (occlusion) {
         let l2 = dot(bent, bent);
-        let bn = select(nrm, bent * inverseSqrt(l2), l2 > 1e-30);
+        // A subset's unnormalized sum: the texel normalizes the sum of its subsets' (Hemisphere::evaluate)
+        let bn = select(select(nrm, bent * inverseSqrt(l2), l2 > 1e-30), bent, r3.z > 1u);
         out = vec4<f32>(select(1.0, clamp(1.0 - sum / f32(n), 0.0, 1.0), n > 0u), bn);
     } else {
         out.x = select(P.dmax, sum / f32(n), n > 0u);
