@@ -14,7 +14,7 @@ use super::micro_key::MicroKey;
 use super::micro_maps::MicroMaps;
 use super::micro_slot::MicroSlot;
 use super::params::Params;
-use super::run::Run;
+use super::run::{Run, Scratch};
 use super::slot_data::SlotData;
 use super::{LINE_WORKGROUP, WORKGROUP, block_groups, dispatch, single_blocks, texture};
 use crate::gpu_curvature::CurvatureLevels;
@@ -192,6 +192,7 @@ impl MicroGpu {
         let dummy = Dummies::new(device);
         let capture_layout = capture_layout(program, captures);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_micro") });
+        let scratch = Scratch::default();
 
         for (index, request) in plan.requests.iter().enumerate() {
             // Images not resolved yet (`set_tile_images`) read as not loaded
@@ -243,7 +244,7 @@ impl MicroGpu {
                 let groups = if capture.is_some() { single_blocks(groups) } else { groups };
                 for group in groups {
                     let capture = capture.map(|heights| (heights, &capture_layout, [width, rows]));
-                    let run = Run { gpu: self, device, slots: &slots, dummy: &dummy, target: &maps_view, group: &group, layer, capture };
+                    let run = Run { gpu: self, device, slots: &slots, dummy: &dummy, target: &maps_view, group: &group, layer, capture, scratch: &scratch };
                     run.fits(limits.max_storage_buffer_binding_size.min(limits.max_buffer_size))?;
                     if offset == 0 {
                         run.curvature(&mut encoder, request);

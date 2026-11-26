@@ -151,11 +151,18 @@ pub(super) fn runs_over(layout: Option<&UdimLayout>, level: u32, field_rect: [u3
         .any(|by| columns.clone().any(|bx| bx < layout.grid.cols && levels.get((by * layout.grid.cols + bx) as usize) == Some(&level)))
 }
 
-/// Whether level stage `output` filters the field its base stage prepared, unchanged since: no
+/// Whether level stage `output` filters the field its base stage prepared, unchanged since: the
+/// base stage prepared into the shared field (a direct one writes its output instead) and no
 /// stage of its group before it averaged that field into cells.
 pub(super) fn reuses_base_field(stages: &[FilterStage], output: usize) -> bool {
     let level = stages.get(output).map_or(0, |stage| stage.level as usize);
-    level != 0 && output >= level && stages[output - level..output].iter().all(|stage| stage.cell <= 1 || stage.filter.is_none())
+    if level == 0 || output < level {
+        return false;
+    }
+
+    let base = &stages[output - level];
+    let base_prepared_shared = base.filter.is_some() || base.cell > 1;
+    base_prepared_shared && stages[output - level..output].iter().all(|stage| stage.cell <= 1 || stage.filter.is_none())
 }
 
 /// Pack a UV tile atlas's record into the side table and return its offset (`udim_record` in
@@ -554,7 +561,8 @@ mod tests {
     }
 
     /// A mask generator at a coarser resolution and blurred takes each tile's cells and blur, also
-    /// on its section controls, which adjust between the cells and the blur (P1's second stage).
+    /// on its section controls, which adjust between the cells and the blur (P1's second stage),
+    /// and a textured section blur's direct second stage at each tile scale.
     #[test]
     fn a_reduced_generator_takes_each_tiles_cells() {
         let Some(mut gpu) = headless() else { return };
@@ -567,11 +575,18 @@ mod tests {
         section.global = generator.global;
         section.resolution = generator.resolution;
         section.inputs = generator.inputs.clone();
+
+        // A section blur with a texture and no global blur: a direct second stage at every scale, whose levels prepare their own field
+        let mut textured = Generator::new(GeneratorKind::AmbientOcclusion);
+        textured.section = textured.section.map(|section| texturecraft_core::SectionParameters { blur: 16.0, balance: 0.4, ..section });
+        let texture = texturecraft_core::TextureLayer { enabled: true, source: Some(Source::image("Occlusion")), opacity: 0.6, ..Default::default() };
+        textured.texture = Some(Box::new(texture));
+        textured.inputs = generator.inputs.clone();
         let occlusion: Vec<[f32; 4]> = (0..64).map(|texel| [0.1 + 0.8 * ((texel % 8 + texel / 8 * 3) % 8) as f32 / 7.0; 4]).collect();
         let images = ImageStore::from([("Occlusion".into(), Arc::new(ImageRes::new(8, 8, occlusion, false)))]);
         let baked = BakedMaps::default();
 
-        for (label, generator) in [("reduced generator", generator), ("reduced section", section)] {
+        for (label, generator) in [("reduced generator", generator), ("reduced section", section), ("textured section blur", textured)] {
             for scaled in [false, true] {
                 let (mut project, mesh, pixels, owner, _) = painted(scaled, &[]);
                 let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(generator.clone()));

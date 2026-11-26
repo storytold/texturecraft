@@ -106,7 +106,8 @@ fn p2_slot_color(record: u32, texel: LayerTexel, position: vec3<f32>, normal: ve
     if operation != 0u {
         return generator_read(operation);
     }
-    let uv = texel.uv;
+    // The mesh's own UV on a UV tile atlas, as the CPU's coords read it
+    let uv = udim_mesh_uv(texel.uv);
     let image_word = srgb[record + P2_SLOT_IMAGE];
     if image_word == 0u {
         return bitcast<vec3<f32>>(vec3(srgb[record + P2_SLOT_COLOR], srgb[record + P2_SLOT_COLOR + 1u], srgb[record + P2_SLOT_COLOR + 2u]));

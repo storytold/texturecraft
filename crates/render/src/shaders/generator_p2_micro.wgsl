@@ -60,10 +60,20 @@ fn block_size() -> vec2<i32> {
     return vec2<i32>(params.block.xy);
 }
 
+// `coordinate` wrapped into 0..period with an unsigned remainder: a signed one is undefined for a
+// negative operand on some backends (GLSL), as composite.wgsl's wrap_coordinate notes
+fn micro_wrap(coordinate: i32, period: i32) -> i32 {
+    let bits = bitcast<u32>(coordinate);
+    let negative = coordinate < 0;
+    let magnitude = select(bits, 0u - bits, negative);
+    let remainder = i32(magnitude % u32(period));
+    return select(remainder, period - remainder, negative && remainder != 0);
+}
+
 fn wrapped(at: vec2<i32>) -> u32 {
     let size = block_size();
-    let x = ((at.x % size.x) + size.x) % size.x;
-    let y = ((at.y % size.y) + size.y) % size.y;
+    let x = micro_wrap(at.x, size.x);
+    let y = micro_wrap(at.y, size.y);
     return u32(y * size.x + x);
 }
 
@@ -75,8 +85,8 @@ fn slot_sample(start: u32, size: vec2<u32>, channels: u32, channel: u32, uv: vec
     let weight = texel - corner;
     let extent = vec2<i32>(size);
     let left = vec2<i32>(corner);
-    let low = ((left % extent) + extent) % extent;
-    let high = (((left + 1) % extent) + extent) % extent;
+    let low = vec2(micro_wrap(left.x, extent.x), micro_wrap(left.y, extent.y));
+    let high = vec2(micro_wrap(left.x + 1, extent.x), micro_wrap(left.y + 1, extent.y));
     let read = start + channel;
     let top_left = slots[read + u32(low.y * extent.x + low.x) * channels];
     let top_right = slots[read + u32(low.y * extent.x + high.x) * channels];
@@ -220,7 +230,7 @@ fn blur(@builtin(global_invocation_id) id: vec3<u32>) {
         for (var position = 0; position < span; position++) {
             var sum = 0.0;
             for (var offset = -reach; offset <= reach; offset++) {
-                let along = (((position + offset) % span) + span) % span;
+                let along = micro_wrap(position + offset, span);
                 let at = select(vec2(along, line), vec2(line, along), columns);
                 let tap = u32(offset + reach);
                 sum += read_line(source, wrapped(at)) * params.kernel[tap / 4u][tap % 4u];
@@ -232,13 +242,13 @@ fn blur(@builtin(global_invocation_id) id: vec3<u32>) {
     let window = f32(2 * radius + 1);
     var sum = 0.0;
     for (var offset = -radius; offset <= radius; offset++) {
-        let along = ((offset % span) + span) % span;
+        let along = micro_wrap(offset, span);
         sum += read_line(source, wrapped(select(vec2(along, line), vec2(line, along), columns)));
     }
     for (var position = 0; position < span; position++) {
         write_line(destination, wrapped(select(vec2(position, line), vec2(line, position), columns)), sum / window);
-        let entering = (((position + radius + 1) % span) + span) % span;
-        let leaving = (((position - radius) % span) + span) % span;
+        let entering = micro_wrap(position + radius + 1, span);
+        let leaving = micro_wrap(position - radius, span);
         let added = read_line(source, wrapped(select(vec2(entering, line), vec2(line, entering), columns)));
         let removed = read_line(source, wrapped(select(vec2(leaving, line), vec2(line, leaving), columns)));
         sum += added - removed;

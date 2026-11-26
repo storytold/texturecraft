@@ -14,6 +14,11 @@ use super::{
     WORKGROUP, dispatch, gaussian_kernel, occlusion_taps, type_constants,
 };
 
+/// The scratch fields of each block size, shared by every run of one build: the recorded passes
+/// run in order and each first writes what it reads, so one set per size serves them all, and the
+/// scratch stays that of the distinct block sizes instead of growing with every run
+pub(super) type Scratch = std::cell::RefCell<std::collections::BTreeMap<[u32; 2], [wgpu::Buffer; 6]>>;
+
 /// The passes of one request's map over one block size
 pub(super) struct Run<'a> {
     pub(super) gpu: &'a MicroGpu,
@@ -25,6 +30,7 @@ pub(super) struct Run<'a> {
     pub(super) layer: u32,
     /// The anchor heights the height slot reads, where they lie, and the map's size
     pub(super) capture: Option<(&'a wgpu::TextureView, &'a CaptureLayout, [u32; 2])>,
+    pub(super) scratch: &'a Scratch,
 }
 
 impl Run<'_> {
@@ -47,10 +53,13 @@ impl Run<'_> {
                 mapped_at_creation: false,
             })
         };
-        Fields {
-            slots: &self.slots.buffer,
-            fields: [buffer(texels * 4), buffer(texels * 4), buffer(texels * 4), buffer(texels * 4), buffer(texels * 8), buffer(texels * 8)],
-        }
+        let fields = self
+            .scratch
+            .borrow_mut()
+            .entry(self.group.size)
+            .or_insert_with(|| [buffer(texels * 4), buffer(texels * 4), buffer(texels * 4), buffer(texels * 4), buffer(texels * 8), buffer(texels * 8)])
+            .clone();
+        Fields { slots: &self.slots.buffer, fields }
     }
 
     /// The parameters every pass of this block size shares
