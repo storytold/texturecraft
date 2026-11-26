@@ -141,7 +141,7 @@ mod tests {
             .collect()
     }
 
-    /// The field kernels and the composite's field read validate and write GLSL, without an adapter
+    /// The field kernels parse and validate without an adapter (the composite's field read is in the pipelines' naga check)
     #[test]
     fn field_shaders_validate_without_an_adapter() {
         let source = [include_str!("shaders/noise.wgsl"), include_str!("shaders/generator_p3b.wgsl")].join("\n");
@@ -238,8 +238,11 @@ mod tests {
         assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, "Border Distance and Checker on UV tiles");
     }
 
-    /// Dripping Rust from a baked occlusion: grunge, both blurs over the cover, drips down a strip
-    /// that rises gently to a ridge, falls steeply past it and lies flat along the axis at one end
+    /// Dripping Rust over a strip that rises gently to a ridge, falls steeply past it and lies
+    /// flat along the axis at its low end, in the material and the mask preview: from a baked
+    /// occlusion dark just below the ridge on both sides (grunge, both blurs over the cover, drips
+    /// that the ridge stops), with one tap landing halfway between texels, and on its defaults
+    /// without a bake
     #[test]
     fn dripping_rust_matches_the_cpu_over_a_ridge() {
         let Some(mut gpu) = headless() else { return };
@@ -255,24 +258,37 @@ mod tests {
             };
         }
         let mesh = Arc::new(mesh);
-        let occlusion: Vec<f32> = (0..BAKE * BAKE).map(|texel| 0.35 + 0.55 * ((texel % BAKE) as f32 / BAKE as f32)).collect();
+        // The plane's rows run along z: dark bands on the gentle side below the ridge and just past it on the steep side
+        let dark = |row: u32| (BAKE * 2 / 5..BAKE * 12 / 25).contains(&row) || (BAKE / 2 + 1..BAKE * 14 / 25).contains(&row);
+        let occlusion: Vec<f32> = (0..BAKE * BAKE).map(|texel| if dark(texel / BAKE) { 0.3 } else { 0.95 }).collect();
         let baked = BakedMaps { resolution: BAKE, maps: BTreeMap::from([(BakedMap::AmbientOcclusion, Arc::new(occlusion))]) };
-        let mut project = Project::new("Rust", "builtin:plane");
-        project.texture_sets.push(TextureSet::new("Strip", 0, 128));
         let rust = DrippingRustParameters {
             spreading: 0.6,
             contrast: 0.4,
             spreading_smoothness: 0.6,
             drips_intensity: 1.0,
-            drips_smoothness: 0.3,
+            drips_smoothness: 1.0,
             drips_samples: 12,
             axis: 1,
         };
-        masked_fills(&mut project, vec![(Channel::BaseColor, generator(KindControls::DrippingRust(rust)))]);
+        // One tap 1.5 texels up the rows of a 256 texel tile: reach is intensity × 90.86 / 8 (DRIP_LENGTH_2K)
+        let half_tap = DrippingRustParameters { drips_intensity: 12.0 / 90.86, drips_samples: 1, spreading_smoothness: 0.0, drips_smoothness: 0.0, ..rust };
         let (pixels, images) = (PixelStore::default(), ImageStore::default());
-        let case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+        let cases = [
+            ("Dripping Rust from a bake", rust, baked.clone()),
+            ("Dripping Rust with a tap between texels", half_tap, baked),
+            ("Dripping Rust without a bake", DrippingRustParameters::default(), BakedMaps::default()),
+        ];
 
-        assert_matches_cpu(&mut gpu, &case, Tolerance::TRANSCENDENTAL, "Dripping Rust");
+        for (label, rust, baked) in cases {
+            let mut project = Project::new("Rust", "builtin:plane");
+            project.texture_sets.push(TextureSet::new("Strip", 0, 256));
+            let layers = masked_fills(&mut project, vec![(Channel::BaseColor, generator(KindControls::DrippingRust(rust)))]);
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = layers.first().copied();
+
+            assert_matches_cpu(&mut gpu, &case, Tolerance::TRANSCENDENTAL, label);
+        }
     }
 }
 

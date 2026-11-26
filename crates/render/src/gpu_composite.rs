@@ -3038,6 +3038,9 @@ impl GpuCompositor {
         if let Some(curvature) = &mut self.curvature {
             curvature.cache.retain(|&ts, _| ts < count);
         }
+        if let Some(fields) = &mut self.generator_fields {
+            fields.retain_texture_sets(count);
+        }
         self.tile_images.retain(|&ts, _| ts < count);
     }
 
@@ -3047,6 +3050,9 @@ impl GpuCompositor {
         self.id_bakes.retain(|_, cache| cache.data.strong_count() != 0);
         if let Some(curvature) = &mut self.curvature {
             curvature.cache.retain(|_, cache| cache.map.strong_count() != 0 && cache.gbuf.strong_count() != 0);
+        }
+        if let Some(fields) = &mut self.generator_fields {
+            fields.release_unused();
         }
     }
 
@@ -3063,6 +3069,9 @@ impl GpuCompositor {
         self.id_bakes.remove(&ts);
         if let Some(curvature) = &mut self.curvature {
             curvature.cache.remove(&ts);
+        }
+        if let Some(fields) = &mut self.generator_fields {
+            fields.release(ts);
         }
         self.tile_images.remove(&ts);
     }
@@ -3356,7 +3365,10 @@ impl GpuCompositor {
         let id_bake = self.id_bake_input(device, queue, ts, program.id_bake.as_ref())?;
         // P3b: the whole-map generator fields, one array layer each
         let generator_fields = match &mut self.generator_fields {
-            Some(fields) => Some(fields.fields(device, queue, &program.p3b_fields, program.udim_layout.as_ref().map(|layout| layout.grid), &surface)?),
+            Some(fields) => {
+                let grid = program.udim_layout.as_ref().map(|layout| layout.grid);
+                Some(fields.fields((device, queue), (ts, program.mask_preview), &program.p3b_fields, grid, &surface)?)
+            }
             None if !program.p3b_fields.requests.is_empty() => return Err("The GPU adapter cannot bind the whole-map generator fields.".into()),
             None => None,
         };

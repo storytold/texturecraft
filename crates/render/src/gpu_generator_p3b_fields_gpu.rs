@@ -2,6 +2,7 @@
 //! of shaders/generator_p3b.wgsl, one array layer per field, kept while the program reads the
 //! same fields of the same mesh, coverage and bake.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
 use texturecraft_compose::field_recipe as recipe;
@@ -43,11 +44,12 @@ struct Kernels {
 }
 
 /// The compositor's whole-map field builder: its kernels once a program needs them, an empty
-/// array for programs without fields, and the last fields built
+/// array for programs without fields, and the fields built last for each texture set's material
+/// and mask preview
 pub(crate) struct GeneratorFieldsGpu {
     kernels: Option<Kernels>,
     empty: wgpu::TextureView,
-    built: Option<Built>,
+    built: BTreeMap<(usize, bool), Built>,
 }
 
 /// One build's fixed inputs: the device, the shared bindings and the base uniform
@@ -265,19 +267,35 @@ impl GeneratorFieldsGpu {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
         let empty = plane(device, "tc_generator_fields_empty", (1, 1), 1)
             .create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
-        Self { kernels: None, empty, built: None }
+        Self { kernels: None, empty, built: BTreeMap::new() }
+    }
+
+    /// Drop the fields of texture sets from `count` on
+    pub(crate) fn retain_texture_sets(&mut self, count: usize) {
+        self.built.retain(|&(ts, _), _| ts < count);
+    }
+
+    /// Drop the fields of texture set `ts`
+    pub(crate) fn release(&mut self, ts: usize) {
+        self.built.retain(|&(built, _), _| built != ts);
+    }
+
+    /// Drop the fields whose mesh or UV coverage is gone
+    pub(crate) fn release_unused(&mut self) {
+        self.built.retain(|_, built| built.0.strong_count() != 0 && built.1.strong_count() != 0);
     }
 
     /// The fields `plan` asks for as one array, a layer each (an empty array without any)
     pub(crate) fn fields(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        (device, queue): (&wgpu::Device, &wgpu::Queue),
+        key: (usize, bool),
         plan: &FieldPlan,
         grid: Option<TileGrid>,
         surface_uv: &wgpu::TextureView,
     ) -> Result<wgpu::TextureView, String> {
         if plan.requests.is_empty() {
+            self.built.remove(&key);
             return Ok(self.empty.clone());
         }
 
@@ -295,13 +313,13 @@ impl GeneratorFieldsGpu {
                 && built.4 == plan.material
                 && built.5 == grid
         };
-        if let Some(built) = self.built.as_ref().filter(same) {
+        if let Some(built) = self.built.get(&key).filter(same) {
             return Ok(built.6.clone());
         }
 
-        self.built = None;
+        self.built.remove(&key);
         let view = self.build(device, queue, plan, grid, surface_uv)?;
-        self.built = Some((Arc::downgrade(mesh), Arc::downgrade(gbuf), occlusion, plan.requests.clone(), plan.material, grid, view.clone()));
+        self.built.insert(key, (Arc::downgrade(mesh), Arc::downgrade(gbuf), occlusion, plan.requests.clone(), plan.material, grid, view.clone()));
         Ok(view)
     }
 
