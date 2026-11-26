@@ -103,6 +103,7 @@ struct GlobalsRaw {
     refr: [f32; 4],
     highlight: [f32; 4],
     highlight_shift: [f32; 4],
+    set_hover: [f32; 4],
     bake_high: [f32; 4],
     bake_matching_error: [f32; 4],
     bake_cage: [f32; 4],
@@ -139,6 +140,9 @@ const HIGHLIGHT_WIDTH_PX: f32 = 1.5;
 
 /// Opacity of the highlighted set's edge lines
 const HIGHLIGHT_OPACITY: f32 = 0.9;
+
+/// Opacity of the texture-set hover tint over the shaded material.
+const SET_HOVER_OPACITY: f32 = 0.35;
 
 /// Copies of each highlight line, shifted diagonally to the four corners of its extra width (`vs_wire_highlight`)
 const HIGHLIGHT_SHIFTS: u32 = 4;
@@ -200,6 +204,8 @@ pub struct Shade {
     pub wireframe_opacity: f32,
     /// One texture set's mesh edges in a highlight color over the 3D view (the set under a shelf drag)
     pub highlight: Option<SetHighlight>,
+    /// The texture set whose visible surfaces are tinted in the 3D view.
+    pub set_hover: Option<SetHighlight>,
     /// Specular/glossiness shading: base color is the diffuse color and the Specular channel the
     /// F0 color (roughness arrives as 1 - glossiness from the display conversion).
     pub spec_gloss: bool,
@@ -328,6 +334,7 @@ impl Default for Shade {
             wireframe_3d: false,
             wireframe_opacity: 0.4,
             highlight: None,
+            set_hover: None,
             spec_gloss: false,
             parallax: false,
             taa: false,
@@ -402,7 +409,23 @@ fn display_dims(size: (u32, u32), shift: u32) -> (u32, u32) {
 /// Side of the square aux (mesh map / mask / quick mask) texture of a set of `size` texels; it
 /// stretches over the set like its other textures.
 pub fn aux_size(size: (u32, u32)) -> u32 {
-    size.0.max(size.1).clamp(1, 2048)
+    size.0.max(size.1).clamp(1, MAX_AUX_SIDE)
+}
+
+/// The longest side of an aux texture.
+const MAX_AUX_SIDE: u32 = 2048;
+
+/// Width and height of the mask view's aux texture for a set of `size` texels: the set halved
+/// until its longer side fits [`aux_size`]'s limit, so a set of UV tiles shows each tile as the
+/// square its block is. Output texel (x, y) shows the set's texel (x · width / mask width, y ·
+/// height / mask height), as `texturecraft_compose::mask_image_sized` samples it.
+pub fn mask_view_extent(size: (u32, u32)) -> (u32, u32) {
+    display_dims(size, mask_view_shift(size))
+}
+
+/// How many times [`mask_view_extent`] halves a set of `size` texels.
+fn mask_view_shift(size: (u32, u32)) -> u32 {
+    size.0.max(size.1).max(1).div_ceil(MAX_AUX_SIDE).next_power_of_two().trailing_zeros()
 }
 
 impl Tex {
@@ -690,6 +713,11 @@ pub struct Renderer {
     dof_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     compositor: Option<GpuCompositor>,
+    /// The compositor compiles new pipelines on worker threads (`set_asynchronous_compile`)
+    asynchronous_compile: bool,
+    /// The compositor takes the pipelines the tests on the shared device share
+    /// ([`Renderer::share_test_pipelines`])
+    shared_test_pipelines: bool,
     quick_mask: Option<QuickMaskGpu>,
     #[cfg(not(target_arch = "wasm32"))]
     brush: Option<crate::gpu_brush::BrushPipeline>,
@@ -1341,6 +1369,8 @@ impl Renderer {
             accum_pipeline,
             mip_pipelines: HashMap::new(),
             compositor: None,
+            asynchronous_compile: false,
+            shared_test_pipelines: false,
             quick_mask: None,
             #[cfg(not(target_arch = "wasm32"))]
             brush: None,
@@ -1394,7 +1424,7 @@ impl Renderer {
         let img = match imported {
             Some(img) => img,
             None if !self.env_is_imported && self.env_name == name => return,
-            None => ibl::environment(name, 512),
+            None => ibl::environment(name, texturecraft_compose::environment_sky::VIEWPORT_WIDTH),
         };
 
         let levels = ibl::prefilter(&img, ENV_LEVELS);
@@ -1700,8 +1730,9 @@ impl Renderer {
         if !GpuCompositor::supports(device) {
             return Err("adapter limits do not support the GPU brush".into());
         }
+        let compile = (self.asynchronous_compile, self.shared_test_pipelines);
         let (compositor, brush, stroke) = crate::gpu_trace::scoped(device, "GPU brush startup", || {
-            let mut compositor = self.compositor.take().unwrap_or_else(|| GpuCompositor::new(device));
+            let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, compile));
             let mut brush = self.brush.take().unwrap_or_else(|| crate::gpu_brush::BrushPipeline::new(device));
             let stroke = compositor.uv_surface(device, queue, &input.mesh, &input.uv).and_then(|surface| brush.begin(device, queue, input, surface));
             (compositor, brush, stroke)
@@ -1716,6 +1747,58 @@ impl Renderer {
         if let Some(compositor) = &mut self.compositor {
             compositor.release_inputs(ts);
         }
+    }
+
+    /// Bytes of the GPU compositor's last update: its working buffer and its paint upload buffer.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn composite_update_bytes(&self) -> [u64; 2] {
+        self.compositor.as_ref().map_or([0; 2], |compositor| compositor.update_bytes())
+    }
+
+    /// A compositor compiling on worker threads when `asynchronous`, and taking the tests' shared
+    /// pipelines when `shared`
+    fn new_compositor(device: &wgpu::Device, (asynchronous, shared): (bool, bool)) -> GpuCompositor {
+        let mut compositor = GpuCompositor::new_with(device, shared);
+        compositor.set_asynchronous_compile(asynchronous);
+        compositor
+    }
+
+    /// Let the compositor take the compiled pipelines the tests on the shared device share
+    /// ([`crate::headless::Headless::for_tests`])
+    #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+    pub(crate) fn share_test_pipelines(&mut self) {
+        self.shared_test_pipelines = true;
+    }
+
+    /// Compile new composite pipelines on worker threads: `composite_on_gpu` then answers
+    /// [`crate::gpu_composite::GPU_PIPELINES_PENDING`] until they are ready, leaving the set's
+    /// textures as they are. Off by default (tests); never on wasm.
+    pub fn set_asynchronous_compile(&mut self, asynchronous: bool) {
+        self.asynchronous_compile = asynchronous;
+        if let Some(compositor) = &mut self.compositor {
+            compositor.set_asynchronous_compile(asynchronous);
+        }
+    }
+
+    /// Start compiling `program`'s pipelines on worker threads (the current project's variants
+    /// at load), so its first composite does not wait for them.
+    pub fn prewarm_composite(&mut self, device: &wgpu::Device, program: &CompositeProgram) {
+        // Only with asynchronous compiles (the viewport): tests and wasm compile in place
+        if !self.asynchronous_compile || cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
+            return;
+        }
+        let compile = (self.asynchronous_compile, self.shared_test_pipelines);
+        self.compositor.get_or_insert_with(|| Self::new_compositor(device, compile)).prewarm(device, program);
+    }
+
+    /// Whether `program`'s pipelines are compiled (starting them otherwise): with asynchronous
+    /// compiles, a composite first waits for this. An error when their compile failed.
+    fn composite_pipelines_ready(&mut self, device: &wgpu::Device, program: &CompositeProgram) -> Result<bool, String> {
+        if !self.asynchronous_compile || cfg!(target_arch = "wasm32") || !GpuCompositor::supports(device) {
+            return Ok(true);
+        }
+        let compile = (true, self.shared_test_pipelines);
+        self.compositor.get_or_insert_with(|| Self::new_compositor(device, compile)).pipelines_ready(device, program)
     }
 
     /// Composite a supported layer stack or standalone mask into the viewport's textures.
@@ -1733,7 +1816,8 @@ impl Renderer {
         match &self.compositor {
             Some(compositor) => Ok(compositor.warmup(device)),
             None => {
-                let compositor = crate::gpu_trace::scoped(device, "GPU material layout", || GpuCompositor::new(device))?;
+                let compile = (self.asynchronous_compile, self.shared_test_pipelines);
+                let compositor = crate::gpu_trace::scoped(device, "GPU material layout", || Self::new_compositor(device, compile))?;
                 let warmup = compositor.warmup(device);
                 self.compositor = Some(compositor);
                 Ok(warmup)
@@ -1750,6 +1834,10 @@ impl Renderer {
         program: &CompositeProgram,
         timing: Option<&mut CompositeTiming>,
     ) -> Result<(), String> {
+        // New pipelines compile on worker threads: the set keeps its textures meanwhile
+        if !program.is_neutral() && !self.composite_pipelines_ready(device, program)? {
+            return Err(crate::gpu_composite::GPU_PIPELINES_PENDING.into());
+        }
         if program.is_mask_preview() {
             return self.composite_mask_preview(device, queue, ts, program);
         }
@@ -1767,9 +1855,11 @@ impl Renderer {
             })?;
             let set = &mut self.sets[ts];
             set.pending_seed = None;
+            // A replaced slot's earlier allocation failure no longer holds: later tiles may grow it
             for (i, texture) in textures.into_iter().enumerate() {
                 set.tex[i] = texture;
                 set.pending[i] = None;
+                set.failed[i] = false;
                 set.mips_dirty[i] = MipsDirty::Clean;
             }
             set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
@@ -1782,10 +1872,17 @@ impl Renderer {
             return Err("GPU composition is unavailable on this device or for this layout".into());
         }
 
+        // A composed map whose texture has another extent (a seeded overview, a placeholder) gets a
+        // new texture: a regional update would leave it neutral outside the region, so it
+        // composes the whole set
+        let resized =
+            DisplayKind::ALL.iter().zip(&set.tex).any(|(&kind, old)| program.writes_display(kind) && (old.texture.width(), old.texture.height()) != size);
+        let region = if resized { None } else { program.region };
         let mut submitted = None;
         let mut in_place = [false; DisplayKind::ALL.len()];
+        let compile = (self.asynchronous_compile, self.shared_test_pipelines);
         let result = crate::gpu_trace::scoped(device, "viewport GPU composite", || {
-            let mut compositor = self.compositor.take().unwrap_or_else(|| GpuCompositor::new(device));
+            let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, compile));
             let mut maps: Vec<_> = DisplayKind::ALL
                 .iter()
                 .zip(&self.default_texels)
@@ -1797,7 +1894,7 @@ impl Renderer {
                     if extent == (old.texture.width(), old.texture.height()) && (composed || size != (1, 1)) {
                         in_place[kind as usize] = composed;
                         old.clone()
-                    } else if composed && program.region.is_none() {
+                    } else if composed && region.is_none() {
                         Tex::new(device, "tc_composite", extent.0, extent.1, display_format(kind), mip_count(extent.0.max(extent.1)))
                     } else {
                         neutral_tex(device, queue, extent, display_format(kind), mip_count(extent.0.max(extent.1)), neutral)
@@ -1808,7 +1905,7 @@ impl Renderer {
             compositor.compose(
                 (device, queue),
                 program,
-                (ts, set.size, set.shift, program.region),
+                (ts, set.size, set.shift, region),
                 &targets.each_ref().map(|target| &target.texture),
                 &mut submitted,
                 timing,
@@ -1827,7 +1924,7 @@ impl Renderer {
         };
         self.compositor = Some(compositor);
         if let Some(set) = self.sets.get_mut(ts) {
-            let region = program.region.map(|r| r.viewport(set.shift, size));
+            let region = region.map(|r| r.viewport(set.shift, size));
             for ((mips, old), new) in set.mips_dirty.iter_mut().zip(&set.tex).zip(&textures).take(DisplayKind::ALL.len()) {
                 if let Some(region) = region
                     && old.texture == new.texture
@@ -1841,6 +1938,7 @@ impl Renderer {
             }
             set.tex = textures;
             set.pending.iter_mut().take(DisplayKind::ALL.len()).for_each(|slot| *slot = None);
+            set.failed.iter_mut().take(DisplayKind::ALL.len()).for_each(|failed| *failed = false);
             set.pending_seed = None;
             set.bind_group = set_bind_group(device, &self.set_bgl, &self.sampler, &set.tex);
             set.resize_from = None;
@@ -1856,19 +1954,23 @@ impl Renderer {
         let set = self.sets.get(ts).ok_or("texture set does not exist")?;
         let slot = DisplayKind::ALL.len();
         let old = set.tex.get(slot).ok_or("The GPU aux texture is missing.")?;
-        let size = aux_size(set.size);
-        // Classic texture sets use the same power-of-two sampling in both axes.
-        let step = set.size.0 / size;
-        if !step.is_power_of_two() || set.size != (size * step, size * step) {
+        let shift = mask_view_shift(set.size);
+        let (width, height) = mask_view_extent(set.size);
+        // The GPU reads every 2^shift-th texel: the CPU's nearest texel only when both sides divide
+        if (width << shift, height << shift) != set.size {
             return Err("The mask preview layout uses CPU compositing.".into());
         }
-        let shift = step.trailing_zeros();
-        let reuse = (old.texture.width(), old.texture.height()) == (size, size);
+        let reuse = (old.texture.width(), old.texture.height()) == (width, height);
         let region = if reuse { program.region } else { None };
         let mut submitted = None;
+        let compile = (self.asynchronous_compile, self.shared_test_pipelines);
         let result = crate::gpu_trace::scoped(device, "viewport GPU mask preview", || {
-            let mut compositor = self.compositor.take().unwrap_or_else(|| GpuCompositor::new(device));
-            let tex = if reuse { old.clone() } else { Tex::new(device, "tc_gpu_mask_preview", size, size, wgpu::TextureFormat::Rgba8Unorm, mip_count(size)) };
+            let mut compositor = self.compositor.take().unwrap_or_else(|| Self::new_compositor(device, compile));
+            let tex = if reuse {
+                old.clone()
+            } else {
+                Tex::new(device, "tc_gpu_mask_preview", width, height, wgpu::TextureFormat::Rgba8Unorm, mip_count(width.max(height)))
+            };
             compositor.compose((device, queue), program, (ts, set.size, shift, region), &[&tex.texture], &mut submitted, None)?;
             Ok::<_, String>((compositor, tex))
         })
@@ -1887,7 +1989,7 @@ impl Renderer {
         if reuse {
             let dirty = &mut set.mips_dirty[slot];
             if let Some(region) = region {
-                let region = region.viewport(shift, (size, size));
+                let region = region.viewport(shift, (width, height));
                 if tex.mips > 1 {
                     dirty.add(region.min[0], region.min[1], region.max[0], region.max[1]);
                 }
@@ -2162,23 +2264,38 @@ impl Renderer {
     /// Upload the aux (mesh map / debug) texture of a set: RGBA8, `size × size` with `size` from
     /// [`aux_size`]. The first upload allocates it.
     pub fn upload_aux(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, size: u32, rgba: &[u8]) {
+        self.upload_aux_sized(device, queue, texture_set, (size, size), rgba);
+    }
+
+    /// [`Renderer::upload_aux`] at `extent` (width, height): `aux_size` × `aux_size`, or the
+    /// mask view's [`mask_view_extent`].
+    pub fn upload_aux_sized(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, extent: (u32, u32), rgba: &[u8]) {
         let Some(set) = self.sets.get_mut(texture_set) else { return };
-        let desired_size = aux_size(set.size);
+        let square = aux_size(set.size);
         let aux_index = set.tex.len().saturating_sub(1);
         let Some(texture) = set.tex.last() else { return };
-        if size != desired_size || rgba.len() < (size as usize) * (size as usize) * 4 {
+        let (width, height) = extent;
+        let known = extent == (square, square) || extent == mask_view_extent(set.size);
+        if !known || rgba.len() < (width as usize) * (height as usize) * 4 {
             return;
         }
 
+        // A pending allocation of another extent (a mesh map view still allocating when the mask
+        // view takes the slot) is retired: this upload sizes the slot anew
+        let pending_extent = set.pending.get(aux_index).and_then(Option::as_ref).map(|p| (p.tex.texture.width(), p.tex.texture.height()));
+        if pending_extent.is_some_and(|pending| pending != extent) {
+            set.pending[aux_index] = None;
+        }
         let allocation_pending = set.pending.get(aux_index).is_some_and(Option::is_some);
-        if !allocation_pending && texture.texture.width() != size {
+        if !allocation_pending && (texture.texture.width(), texture.texture.height()) != extent {
             if set.failed.get(aux_index).copied().unwrap_or(true) {
                 return;
             }
 
-            let allocation_label = format!("texture set {} (mesh map view, {size}×{size})", texture_set + 1);
-            let full_texture =
-                checked(device, &allocation_label, || neutral_tex(device, queue, (size, size), wgpu::TextureFormat::Rgba8Unorm, mip_count(size), &AUX_NEUTRAL));
+            let allocation_label = format!("texture set {} (mesh map view, {width}×{height})", texture_set + 1);
+            let full_texture = checked(device, &allocation_label, || {
+                neutral_tex(device, queue, extent, wgpu::TextureFormat::Rgba8Unorm, mip_count(width.max(height)), &AUX_NEUTRAL)
+            });
             if !grow(set, texture_set, aux_index, full_texture, (device, &self.set_bgl, &self.sampler), &mut self.memory_failures) {
                 return;
             }
@@ -2523,8 +2640,8 @@ impl Renderer {
         ranges: &'a [(u32, u32, usize)],
         visible: &'a [bool],
         only: Option<usize>,
-    ) -> impl Iterator<Item = (std::ops::Range<u32>, &'a SetGpu)> + 'a {
-        drawable_ranges(ranges, &self.material_sets, visible, only).filter_map(|(range, ts)| Some((range, self.sets.get(ts)?)))
+    ) -> impl Iterator<Item = (std::ops::Range<u32>, usize, &'a SetGpu)> + 'a {
+        drawable_ranges(ranges, &self.material_sets, visible, only).filter_map(|(range, texture_set)| Some((range, texture_set, self.sets.get(texture_set)?)))
     }
 
     /// Keep the key-light shadow map current; returns its view-projection. `light` points to
@@ -2587,7 +2704,7 @@ impl Renderer {
             for geo in std::iter::once(geo).chain(extra.iter().map(|p| &p.geo)) {
                 pass.set_vertex_buffer(0, geo.vb.slice(..));
                 pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
-                for (range, set) in self.drawable(&geo.draws, visible, None) {
+                for (range, _, set) in self.drawable(&geo.draws, visible, None) {
                     pass.set_bind_group(1, set.display_bind_group(), &[]);
                     pass.draw_indexed(range, 0, 0..1);
                 }
@@ -2710,8 +2827,9 @@ impl Renderer {
             fwd: [fwd.x, fwd.y, fwd.z, height_normal_globals(s.height_normal)[1]],
             disp: [disp[0], disp[1], disp[2], height_normal_globals(s.height_normal)[0]],
             refr: [if refraction { 1.0 } else { 0.0 }, (BEHIND_LEVELS - 1) as f32, REFRACTION_DEPTH * radius, 0.0],
-            highlight: highlight_globals(s, data),
+            highlight: highlight_globals(s.highlight, HIGHLIGHT_OPACITY, s, data),
             highlight_shift: highlight_shift(frame.size),
+            set_hover: highlight_globals(s.set_hover, SET_HOVER_OPACITY, s, data),
             ..bake_globals(s.bake)
         };
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
@@ -2720,11 +2838,12 @@ impl Renderer {
             b: [fx(s.vignette), fx(s.sharpen), fx(s.grain), BLOOM_THRESHOLD],
             c: dof_c,
             d: sss_d,
-            e: [flag(cam.ortho), sample as f32, 0.0, 0.0],
+            e: [flag(cam.ortho), sample as f32, raw.set_hover[3], 0.0],
             back_top: [s.background[0][0], s.background[0][1], s.background[0][2], 0.0],
             back_bottom: [s.background[1][0], s.background[1][1], s.background[1][2], 0.0],
         };
         let Some(v) = self.targets(device, frame.view_id, frame.size, bloom, fx_on, refraction) else { return };
+
         queue.write_buffer(&v.globals, 0, bytemuck::bytes_of(&raw));
         queue.write_buffer(&v.post_buf, 0, bytemuck::bytes_of(&post));
         upload_overlay(device, queue, v, &frame.overlay, (!data).then_some(s.exposure_ev));
@@ -2797,13 +2916,16 @@ impl Renderer {
         pass.set_bind_group(0, globals_bg, &[]);
         pass.set_bind_group(2, &self.refr_black, &[]);
         let geo = self.geometry(m, frame);
+        // Instance index 1 lets the G-buffer mark the hovered set for the scattering composite
+        let hover_set = frame.shade.set_hover.filter(|_| frame.kind == ViewKind::Scene).map(|hover| hover.set);
         let extra = if std::ptr::eq(geo, &m.geo) { m.extra.as_slice() } else { &[] };
         for geo in std::iter::once(geo).chain(extra.iter().map(|p| &p.geo)) {
             pass.set_vertex_buffer(0, geo.vb.slice(..));
             pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&geo.draws, &frame.visible, None) {
+            for (range, texture_set, set) in self.drawable(&geo.draws, &frame.visible, None) {
                 pass.set_bind_group(1, set.display_bind_group(), &[]);
-                pass.draw_indexed(range, 0, 0..1);
+                let first_instance = u32::from(hover_set == Some(texture_set));
+                pass.draw_indexed(range, 0, first_instance..first_instance + 1);
             }
         }
     }
@@ -2929,30 +3051,33 @@ impl Renderer {
         let bake = frame.shade.bake.filter(|_| uv_set.is_none());
         let low_poly_shown = bake.is_none_or(|bake| bake.low_poly.shown);
         let (highlight, highlight_set) = highlight.filter(|(_, set)| low_poly_shown && uv_set.is_none_or(|only| only == *set)).unzip();
+        let hover_set = frame.shade.set_hover.filter(|_| uv_set.is_none()).map(|hover| hover.set);
 
         // The wireframe and the highlight draw the mesh's own edges (displaced in the vertex shader too)
         let passes = [
-            (low_poly_shown.then_some(mesh_pipeline), &geometry.vb, &geometry.ib, &geometry.draws, uv_set, 1),
-            (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, uv_set, 1),
-            (highlight, &mesh.geo.vb, &mesh.lines, &mesh.line_draws, highlight_set, HIGHLIGHT_SHIFTS),
+            (low_poly_shown.then_some(mesh_pipeline), &geometry.vb, &geometry.ib, &geometry.draws, uv_set, 1, hover_set),
+            (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, uv_set, 1, None),
+            (highlight, &mesh.geo.vb, &mesh.lines, &mesh.line_draws, highlight_set, HIGHLIGHT_SHIFTS, None),
         ];
         let extra = if std::ptr::eq(geometry, &mesh.geo) { mesh.extra.as_slice() } else { &[] };
         let extra_passes = extra.iter().flat_map(|part| {
             [
-                (low_poly_shown.then_some(mesh_pipeline), &part.geo.vb, &part.geo.ib, &part.geo.draws, uv_set, 1),
-                (wire.filter(|_| low_poly_shown), &part.geo.vb, &part.lines, &part.line_draws, uv_set, 1),
-                (highlight, &part.geo.vb, &part.lines, &part.line_draws, highlight_set, HIGHLIGHT_SHIFTS),
+                (low_poly_shown.then_some(mesh_pipeline), &part.geo.vb, &part.geo.ib, &part.geo.draws, uv_set, 1, hover_set),
+                (wire.filter(|_| low_poly_shown), &part.geo.vb, &part.lines, &part.line_draws, uv_set, 1, None),
+                (highlight, &part.geo.vb, &part.lines, &part.line_draws, highlight_set, HIGHLIGHT_SHIFTS, None),
             ]
         });
-        for (pipeline, vertices, indices, ranges, only_set, instances) in passes.into_iter().chain(extra_passes) {
+        for (pipeline, vertices, indices, ranges, only_set, instances, hover_set) in passes.into_iter().chain(extra_passes) {
             let Some(pipeline) = pipeline else { continue };
 
             pass.set_pipeline(pipeline);
             pass.set_vertex_buffer(0, vertices.slice(..));
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(ranges, &frame.visible, only_set) {
+            for (range, texture_set, set) in self.drawable(ranges, &frame.visible, only_set) {
+                // Instance index 1 lets the mesh shader tint the hovered draw
+                let first_instance = u32::from(hover_set == Some(texture_set));
                 pass.set_bind_group(1, set.display_bind_group(), &[]);
-                pass.draw_indexed(range, 0, 0..instances);
+                pass.draw_indexed(range, 0, first_instance..first_instance + instances);
             }
         }
 
@@ -2966,7 +3091,7 @@ impl Renderer {
             pass.set_pipeline(&self.uv_missing_seam_pipeline);
             pass.set_vertex_buffer(0, mesh.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, Some(texture_set)) {
+            for (range, _, set) in self.drawable(&seams.line_draws, &frame.visible, Some(texture_set)) {
                 pass.set_bind_group(1, set.display_bind_group(), &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
@@ -3000,7 +3125,7 @@ impl Renderer {
             pass.set_pipeline(&self.missing_seam_pipeline);
             pass.set_vertex_buffer(0, low_poly.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, None) {
+            for (range, _, set) in self.drawable(&seams.line_draws, &frame.visible, None) {
                 pass.set_bind_group(1, set.display_bind_group(), &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
@@ -3137,12 +3262,12 @@ fn upload_overlay(device: &wgpu::Device, queue: &wgpu::Queue, view: &mut ViewTar
     }
 }
 
-/// Globals `highlight`: the highlight's color and opacity, all zero without one. Data views skip exposure and tone mapping, so they take the color as it is
-fn highlight_globals(shade: &Shade, data: bool) -> [f32; 4] {
-    let Some(highlight) = shade.highlight else { return [0.0; 4] };
+/// The highlight's color and opacity. Data views take the color as it is.
+fn highlight_globals(highlight: Option<SetHighlight>, opacity: f32, shade: &Shade, data: bool) -> [f32; 4] {
+    let Some(highlight) = highlight else { return [0.0; 4] };
 
     let [r, g, b] = if data { highlight.color } else { highlight.scene_color(shade.exposure_ev, shade.aces) };
-    [r, g, b, HIGHLIGHT_OPACITY]
+    [r, g, b, opacity]
 }
 
 /// The globals of bake mode's overlays and neutral material for `bake` (all zero without it)
@@ -3191,6 +3316,26 @@ mod tests {
             let shade = Shade::from_project(&project);
             assert_eq!(shade.height_normal, rule);
             assert_eq!(height_normal_globals(shade.height_normal), [filter, MEASURED_SLOPE]);
+        }
+    }
+
+    /// The mask view halves a set until its longer side fits 2048 texels, keeping its shape: a
+    /// classic square set as before, a grid of UV tiles one square per block.
+    #[test]
+    fn the_mask_view_halves_a_set_until_it_fits() {
+        let cases = [
+            ((1024, 1024), (1024, 1024)),
+            ((4096, 4096), (2048, 2048)),
+            ((128, 64), (128, 64)),
+            ((3072, 1024), (1536, 512)),
+            ((6144, 4096), (1536, 1024)),
+            ((3000, 3000), (1500, 1500)),
+        ];
+
+        for (size, extent) in cases {
+            assert_eq!(mask_view_extent(size), extent, "{size:?}");
+            let shift = mask_view_shift(size);
+            assert_eq!((extent.0 << shift, extent.1 << shift), size, "{size:?}: every 2^shift-th texel, as the CPU samples it");
         }
     }
 
@@ -3374,8 +3519,8 @@ mod tests {
         let color = [0.8, 0.25, 0.08];
         let shade = Shade { highlight: Some(SetHighlight { set: 0, color }), exposure_ev: 1.0, ..Shade::default() };
 
-        assert_eq!(highlight_globals(&shade, true), [0.8, 0.25, 0.08, HIGHLIGHT_OPACITY]);
-        assert_ne!(highlight_globals(&shade, false)[..3], color, "the material view undoes exposure and tone mapping");
+        assert_eq!(highlight_globals(shade.highlight, HIGHLIGHT_OPACITY, &shade, true), [0.8, 0.25, 0.08, HIGHLIGHT_OPACITY]);
+        assert_ne!(highlight_globals(shade.highlight, HIGHLIGHT_OPACITY, &shade, false)[..3], color, "the material view undoes exposure and tone mapping");
     }
 
     #[test]

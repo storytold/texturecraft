@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use texturecraft_compose::{BakedMaps, GraphStore, ImageStore, Inputs};
 use texturecraft_geom::{Bvh, Mesh};
+use web_time::Instant;
 
 use crate::commands::{CommandSpec, always, bad, boolp, channel_param, f32p, normal_format_param, strp, u64p};
 use crate::session::{Document, SetCache, StackTarget, check_resolution};
@@ -191,7 +192,7 @@ impl ResizeTask {
         mut accelerate: impl FnMut(&texturecraft_texel::TileImage, (u32, u32), &[u16]) -> Resampled,
         view: Option<(&ResizeProgress, impl FnOnce(&Inputs) -> bool)>,
     ) -> Result<ResizeOutput> {
-        let start = chrono::Utc::now();
+        let start = Instant::now();
         let ResizeTask { ts, resolution, mut doc, mesh, source, bvh, images, solo, lookup_budget, from } = self;
         let set = doc.project.texture_set_mut(ts)?;
         let old = set.clone();
@@ -224,9 +225,9 @@ impl ResizeTask {
                     return image.clone();
                 }
                 if old.uv_tiles.is_empty() && image.allocated_count() > 0 && (image.width(), image.height()) != size {
-                    let submitted = chrono::Utc::now();
+                    let submitted = Instant::now();
                     if let Some(result) = accelerate(image, size, empty) {
-                        gpu_ms += (chrono::Utc::now() - submitted).num_milliseconds();
+                        gpu_ms += submitted.elapsed().as_millis();
                         match result {
                             Ok(resized) => {
                                 gpu_images += 1;
@@ -247,12 +248,12 @@ impl ResizeTask {
             return Err(crate::EngineError::Other("Texture set resize was cancelled".into()));
         }
         progress.done.store(3_000, std::sync::atomic::Ordering::Relaxed);
-        let resampled = chrono::Utc::now();
+        let resampled = Instant::now();
         let set = doc.project.texture_set(ts)?;
         let new_mesh = (crate::session::uv_layout(&old) != crate::session::uv_layout(set)).then(|| crate::session::tiled_mesh(&source, &doc.project));
         let display_mesh = new_mesh.as_ref().unwrap_or(&mesh);
         let mut cache = SetCache::new(display_mesh, set, if replay.is_empty() { lookup_budget } else { usize::MAX });
-        let cache_built = chrono::Utc::now();
+        let cache_built = Instant::now();
         if !replay.is_empty() {
             let deferred = replay.deferred_count();
             let replayed = replay.run(&mut doc.pixels, &mut doc.stroke_replays, &cache.gbuf, &scene, progress)?;
@@ -260,7 +261,7 @@ impl ResizeTask {
                 log.warn("Paint", format!("{deferred} paint targets exceeded the resize replay budget. Their raster pixels were resampled and their paint operations were retained."));
             }
             if replayed > 0 {
-                log.performance(format!("Replayed {replayed} recorded paint strokes in {} ms", (chrono::Utc::now() - cache_built).num_milliseconds()));
+                log.performance(format!("Replayed {replayed} recorded paint strokes in {} ms", cache_built.elapsed().as_millis()));
             }
         }
         if cancelled() {
@@ -275,15 +276,15 @@ impl ResizeTask {
             ts + 1,
             old.resolution,
             resolution,
-            (resampled - start).num_milliseconds(),
+            resampled.duration_since(start).as_millis(),
             gpu_images,
             gpu_ms,
-            (cache_built - resampled).num_milliseconds(),
+            cache_built.duration_since(resampled).as_millis(),
         ));
 
         let mut graphs = None;
         if let Some((progress, gpu_can_compose)) = view {
-            let started = chrono::Utc::now();
+            let started = Instant::now();
             let view_project = solo.and_then(|solo| texturecraft_compose::solo_project(&doc.project, solo.layer, solo.ignore_mask));
             let project = view_project.as_ref().unwrap_or(&doc.project);
             let set = project.texture_set(ts)?;
@@ -321,7 +322,7 @@ impl ResizeTask {
                 "Resize view for texture set {} at {resolution}: {} in {} ms, {} graph renders, {} cached graph results",
                 ts + 1,
                 if prepared_display { "CPU view prepared" } else { "GPU inputs prepared" },
-                (chrono::Utc::now() - started).num_milliseconds(),
+                started.elapsed().as_millis(),
                 prepared.renders(),
                 prepared.resize_cache_hits(),
             ));

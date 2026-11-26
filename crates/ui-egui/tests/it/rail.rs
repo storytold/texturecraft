@@ -7,17 +7,12 @@ use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::docking::Panel;
 use texturecraft_ui_egui::state::ViewLayout;
 
+use crate::{BAKE_RESOLUTION, SETTLE_FRAMES, STARTUP_FRAMES, TEXTURE_RESOLUTION, click_at};
+
 const WINDOW_SIZE: egui::Vec2 = egui::vec2(1600.0, 960.0);
 
 /// The rail is the last 38 points of the window; the popup's own buttons sit left of it
 const RAIL_LEFT_EDGE: f32 = WINDOW_SIZE.x - 38.0;
-
-// Small texture and bake sizes keep the sample session fast; the rail doesn't depend on them
-const TEXTURE_RESOLUTION: u32 = 256;
-const BAKE_RESOLUTION: u32 = 64;
-
-/// Frames for the first layout and fonts to settle
-const STARTUP_FRAMES: usize = 4;
 
 /// Where a drag out of the popup ends: in the viewport, clear of every panel
 const INTO_THE_VIEWPORT: egui::Vec2 = egui::vec2(-500.0, 100.0);
@@ -27,9 +22,6 @@ const DRAG_STEPS: usize = 6;
 
 /// Frames between a drag's events: the press must land before the moves, and each move be seen
 const FRAMES_PER_DRAG_EVENT: usize = 2;
-
-/// Frames for a click to reach the rail, the popup and the dock
-const SETTLE_FRAMES: usize = 3;
 
 // A setting only Shader Settings shows, and one only Display Settings shows
 const SHADER_SETTING: &str = "Index of refraction";
@@ -41,7 +33,10 @@ fn app() -> Harness<'static, TextureCraftApp> {
 
 fn app_of_size(size: egui::Vec2) -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(TEXTURE_RESOLUTION, BAKE_RESOLUTION).unwrap();
-    let mut harness = Harness::builder().with_size(size).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(size)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
 
     // The labels below are English; a first run would speak the system's language
     harness.state_mut().ui.prefs.language = "en".into();
@@ -60,16 +55,8 @@ fn rail_icon<'h>(harness: &'h Harness<'_, TextureCraftApp>, name: &str) -> Optio
 }
 
 fn click_rail(harness: &mut Harness<'_, TextureCraftApp>, name: &str) {
-    rail_icon(harness, name).expect("the panel's icon on the rail").click();
-    harness.run_steps(SETTLE_FRAMES);
-}
-
-fn click_at(harness: &mut Harness<'_, TextureCraftApp>, position: Pos2) {
-    harness.hover_at(position);
-    harness.event(Event::PointerButton { pos: position, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
-    harness.run_steps(1);
-    harness.event(Event::PointerButton { pos: position, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
-    harness.run_steps(SETTLE_FRAMES);
+    let at = rail_icon(harness, name).expect("the panel's icon on the rail").rect().center();
+    click_at(harness, at);
 }
 
 /// Drag with the primary button from `from` to `to` in a few moves
@@ -90,10 +77,15 @@ fn drag(harness: &mut Harness<'_, TextureCraftApp>, from: Pos2, to: Pos2) {
 
 /// The popup's Close button, left of the rail (the window's own Close sits above the rail)
 fn popup_close_button(harness: &Harness<'_, TextureCraftApp>) -> Option<egui::Rect> {
-    harness
-        .query_all(by().role(Role::Button))
-        .find(|button| button.rect().max.x < RAIL_LEFT_EDGE && button.accesskit_node().label().as_deref() == Some("Close"))
-        .map(|button| button.rect())
+    let labelled = |label: &'static str| {
+        harness
+            .query_all(by().role(Role::Button))
+            .filter(move |button| button.rect().max.x < RAIL_LEFT_EDGE && button.accesskit_node().label().as_deref() == Some(label))
+            .map(|button| button.rect())
+    };
+    // The popup's title row holds Undock then Close; a floating panel window's Close has no Undock beside it
+    let undock: Vec<egui::Rect> = labelled("Undock").collect();
+    labelled("Close").find(|close| undock.iter().any(|undock| undock.right() <= close.left() && undock.y_range().contains(close.center().y)))
 }
 
 /// The title of the popup open on the panel named `name`: that name in capitals, level with the popup's Close button
@@ -197,11 +189,15 @@ fn dragging_the_title_onto_a_tab_strip_docks_the_panel_there() {
     let mut harness = app();
 
     click_rail(&mut harness, "Log");
-    let title = popup_title(&harness, "Log").center();
-    let properties_tab = harness.get_by_label("Properties - Paint").rect().center();
-    drag(&mut harness, title, properties_tab);
+    let title = popup_title(&harness, "Log");
 
-    let layout = &harness.state().ui.dock.workspace().layout;
+    // The popup covers the Properties strip and stays put while dragged: drop on the Texture Sets strip above it
+    let texture_sets_tab = harness.get_by_role_and_label(egui::Role::Tab, "Texture Sets").rect();
+    assert!(texture_sets_tab.bottom() < title.top(), "the Texture Sets strip {texture_sets_tab:?} is under the popup at {title:?}");
+
+    drag(&mut harness, title.center(), texture_sets_tab.center());
+
+    let layout = harness.state().ui.dock.workspace().layout();
     assert!(layout.contains(&Panel::Log) && !layout.floating.iter().any(|window| window.contains(&Panel::Log)), "the Log is docked");
 }
 

@@ -10,7 +10,10 @@ use texturecraft_ui_egui::state::{ConsoleLine, ExportJob};
 /// The Export textures window writing into a scratch folder of its own for `name`
 fn harness(name: &str) -> (Harness<'static, TextureCraftApp>, std::path::PathBuf) {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     let dir = std::env::temp_dir().join(format!("tc-export-progress-{name}-{}", std::process::id()));
@@ -124,7 +127,10 @@ fn the_list_is_a_tree_per_texture_set_with_the_console_beside_it() {
     h.state_mut().ui.export.tab = 2;
     h.run_steps(4);
     let set = h.state().session.doc.project.texture_sets[0].name.clone();
-    assert!(h.query_by_label(&set).is_some());
+    assert!(
+        h.query_by_role_and_label(egui::Role::DisclosureTriangle, &set).is_some(),
+        "the export tree has a node for the set (the dock list row carries the same name)"
+    );
     assert!(h.query_all_by_label("256x256 (Texture Set size)").next().is_some());
     assert!(h.query_all_by_label("png").next().is_some() && h.query_all_by_label("16 bits").next().is_some());
     assert!(h.query_by_label("Include all").is_none() && h.query_by_label("Reset all").is_none());
@@ -139,14 +145,13 @@ fn the_list_is_a_tree_per_texture_set_with_the_console_beside_it() {
     h.run_steps(30);
     assert!(h.query_by_label(&dir.join(&file).display().to_string()).is_some());
 
-    // The console's toggle hides it
-    let toggle = h.get_by_label(egui_phosphor::regular::CARET_DOUBLE_RIGHT).rect().center();
-    h.hover_at(toggle);
-    h.run_steps(30);
-    assert!(h.query_by_label("Hide Console").is_some());
-    click(&mut h, egui_phosphor::regular::CARET_DOUBLE_RIGHT);
-    h.run_steps(2);
+    // The strip at the console's edge hides it, then shows it again
+    h.get_by_role_and_label(egui::Role::Button, "Hide Console").click();
+    h.run_steps(4);
     assert!(h.state().ui.export.console_hidden && h.query_by_label("CONSOLE").is_none());
+    h.get_by_role_and_label(egui::Role::Button, "Show Console").click();
+    h.run_steps(4);
+    assert!(!h.state().ui.export.console_hidden);
 }
 
 #[test]

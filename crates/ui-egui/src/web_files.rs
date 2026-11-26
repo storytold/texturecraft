@@ -9,6 +9,7 @@ use std::sync::{Mutex, PoisonError};
 
 use texturecraft_engine::Session;
 use texturecraft_engine::core::PROJECT_EXT;
+#[cfg(any(target_arch = "wasm32", test))]
 use texturecraft_engine::formats::ExportedFile;
 use texturecraft_engine::formats::export::sanitize_file_stem;
 use texturecraft_engine::formats::mesh_import::MESH_EXTENSIONS;
@@ -103,16 +104,17 @@ fn apply_picked(app: &mut TextureCraftApp, picked: Vec<(String, Vec<u8>, Pick)>)
     }
 }
 
-/// Bake mode: add high-definition meshes (or load the cage) with the native file dialog. The
-/// meshes load on a later frame, when the dialog answers.
+/// Bake mode: add high polys (they load on a worker) or load the cage with the native file dialog, once it answers
 #[cfg(not(target_arch = "wasm32"))]
 pub fn import_bake_mesh(app: &mut TextureCraftApp, _ctx: &egui::Context, cage: bool) {
     use crate::file_dialogs::{Bound, FileDialog};
     let dialog = if cage { FileDialog::open() } else { FileDialog::open_many() };
     app.ask_file(dialog.filter(tr("Meshes"), &MESH_EXTENSIONS), Bound::Project, move |app, paths| {
-        for p in paths {
-            let cmd = if cage { "bake.cage.set" } else { "bake.highPoly.add" };
-            app.run(cmd, serde_json::json!({ "path": p.display().to_string() }));
+        let mut paths = paths.iter().map(|path| path.display().to_string());
+        if !cage {
+            app.load_high_polys(paths);
+        } else if let Some(path) = paths.next() {
+            app.run("bake.cage.set", serde_json::json!({ "path": path }));
         }
     });
 }
@@ -239,22 +241,20 @@ pub fn project_file_name(app: &TextureCraftApp) -> String {
 }
 
 /// Pack exported textures into one zip archive.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg(any(target_arch = "wasm32", test))]
 fn zip_files(files: Vec<ExportedFile>) -> Result<Vec<u8>, String> {
-    use std::io::Write as _;
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(true);
+    let mut zip = craft_zip::Writer::new();
     for f in files {
-        zip.start_file(f.name.as_str(), opts).map_err(|e| e.to_string())?;
-        zip.write_all(&f.bytes).map_err(|e| e.to_string())?;
+        // add_with reserves ZIP64 headers up front, even for small entries.
+        zip.add_with(&f.name, craft_zip::Compression::Deflated, |out| out.write_all(&f.bytes)).map_err(|e| e.to_string())?;
     }
-    Ok(zip.finish().map_err(|e| e.to_string())?.into_inner())
+    zip.finish().map_err(|e| e.to_string())
 }
 
 #[cfg(target_arch = "wasm32")]
 pub use web::{
     download, export_mesh, export_textures, import_bake_mesh, import_environment, import_images, import_material, import_preset, import_project, open,
-    pick_new_project_mesh, save_project, sync_unsaved, unsaved,
+    open_sample_project, pick_new_project_mesh, save_project, sync_unsaved, unsaved,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -279,6 +279,11 @@ mod web {
     /// File › Open: the browser's file picker; the file loads on a later frame (see [`poll`]).
     pub fn open(ctx: &egui::Context) {
         pick(ctx, tr("Projects and meshes"), OPEN_EXTS, false, Pick::Open);
+    }
+
+    /// File > Open Sample Project: choose a saved TextureCraft project.
+    pub fn open_sample_project(ctx: &egui::Context) {
+        pick(ctx, tr("TextureCraft project"), &[PROJECT_EXT], false, Pick::Open);
     }
 
     /// File › Import project: pick a project file to convert; it loads on a later frame and asks with the notice.
@@ -447,7 +452,8 @@ mod tests {
     #[test]
     fn mesh_picks_only_update_the_current_new_project_request() {
         let session = Session::closed().unwrap();
-        let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
         let app = harness.state_mut();
         crate::new_project_advanced::open(app);
         app.ui.new_project.mesh_request_id = 2;
@@ -469,7 +475,8 @@ mod tests {
     #[test]
     fn environment_pick_after_close_does_not_edit_the_placeholder() {
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
-        let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
         let png = texturecraft_engine::formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
         let old_project_id = harness.state().session.project_id;
 
@@ -491,7 +498,8 @@ mod tests {
     #[test]
     fn environment_pick_from_replaced_project_does_not_edit_the_new_project() {
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
-        let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
         let png = texturecraft_engine::formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
         let old_project_id = harness.state().session.project_id;
 
@@ -509,7 +517,8 @@ mod tests {
     #[test]
     fn bake_mesh_picks_after_close_do_not_edit_the_placeholder() {
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
-        let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
         let old_project_id = harness.state().session.project_id;
         assert!(harness.state_mut().run("file.close", serde_json::Value::Null).is_some());
         let cage = harness.state().session.mesh_obj_bytes().unwrap();
@@ -519,8 +528,8 @@ mod tests {
             vec![("high.obj".into(), cage.clone(), Pick::HighPoly(old_project_id)), ("cage.obj".into(), cage, Pick::Cage(old_project_id))],
         );
 
-        assert!(harness.state().session.bake_meshes.high.is_empty());
-        assert!(harness.state().session.bake_meshes.cage.is_none());
+        assert!(harness.state().session.doc.bake_meshes.high.is_empty());
+        assert!(harness.state().session.doc.bake_meshes.cage.is_none());
         assert!(!harness.state().session.modified);
         assert_eq!(harness.state().toasts.iter().filter(|toast| toast.error).count(), 2);
 
@@ -533,24 +542,31 @@ mod tests {
             vec![("high.obj".into(), mesh.clone(), Pick::HighPoly(project_id)), ("cage.obj".into(), mesh, Pick::Cage(project_id))],
         );
 
-        assert_eq!(harness.state().session.bake_meshes.high.len(), 1);
-        assert!(harness.state().session.bake_meshes.cage.is_some());
+        assert_eq!(harness.state().session.doc.bake_meshes.high.len(), 1);
+        assert!(harness.state().session.doc.bake_meshes.cage.is_some());
     }
 
     #[test]
     fn zip_round_trips_every_export_file() {
         let file = |name: &str, bytes: &[u8]| ExportedFile { name: name.into(), bytes: bytes.to_vec(), width: 1, height: 1, warnings: Vec::new() };
         let normal = [7u8; 4096];
-        let expected = [("a_BaseColor.png", b"one".as_slice()), ("a_Normal.png", normal.as_slice())];
+        let expected = [("z_BaseColor.png", b"one".as_slice()), ("a_Normal.png", normal.as_slice())];
         let files = expected.iter().map(|(name, bytes)| file(name, bytes)).collect();
 
         let bytes = zip_files(files).unwrap();
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
 
         assert_eq!(zip.len(), expected.len());
-        for (name, expected_bytes) in expected {
+        for (index, (name, expected_bytes)) in expected.into_iter().enumerate() {
+            let mut entry = zip.by_index(index).unwrap();
+            assert_eq!(entry.name().unwrap(), name);
+            assert_eq!(entry.compression(), zip::CompressionMethod::Deflated);
+            let header = entry.header_start() as usize;
+            let name_len = u16::from_le_bytes(bytes[header + 26..header + 28].try_into().unwrap()) as usize;
+            let extra = header + 30 + name_len;
+            assert_eq!(&bytes[extra..extra + 4], &[1, 0, 16, 0], "expected a ZIP64 size extra field");
             let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut zip.by_name(name).unwrap(), &mut out).unwrap();
+            std::io::Read::read_to_end(&mut entry, &mut out).unwrap();
             assert_eq!(out, expected_bytes);
         }
     }

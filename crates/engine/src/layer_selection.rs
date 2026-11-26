@@ -104,8 +104,9 @@ fn push_rows(project: &Project, list: &[LayerId], expanded_only: bool, depth: us
 
     for id in list.iter().rev() {
         let Some(layer) = project.layers.get(id) else { continue };
+
         rows.push(*id);
-        if let LayerKind::Group { children, collapsed } = &layer.kind
+        if let LayerKind::Group { children, collapsed, .. } = &layer.kind
             && !(expanded_only && *collapsed)
         {
             push_rows(project, children, expanded_only, depth + 1, rows);

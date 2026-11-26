@@ -17,10 +17,7 @@ impl VertexReach {
     /// Whether the ray misses the vertex (or may not hit its part) at `frontal` and `rear` world units of cage distance; with `ignore_backface` it also misses a vertex whose triangles face away from the ray
     pub fn missed(&self, frontal: f32, rear: f32, ignore_backface: bool) -> bool {
         let origin = self.start.origin(self.low_position, frontal);
-        let (direction, front) = match self.start {
-            RayStart::CageMesh(offset) => (offset.normalize_or_zero(), offset.length()),
-            RayStart::Distance { up, scale } => (-up, frontal * scale),
-        };
+        let (direction, front, rear) = self.start.span(frontal, rear);
         let along_ray = (self.high_position - origin).dot(direction);
 
         !self.name_matches || !(0.0..=front + rear).contains(&along_ray) || (ignore_backface && self.high_facing.dot(direction) > 0.0)

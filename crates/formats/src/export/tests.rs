@@ -438,6 +438,69 @@ fn jpeg_texture_export_keeps_full_chroma() {
 }
 
 #[test]
+fn jpeg_grayscale_and_depth_policy_preserve_8bit_output() {
+    let mut fx = Fx::new(&[Channel::Roughness]);
+    fx.set_all(Channel::Roughness, |_, _| [0.4; 3]);
+    let mut preset = builtin_preset("Separate maps").unwrap();
+    preset.maps = vec![
+        MapSpec {
+            file: "gray".into(),
+            format: FileFormat::Jpeg,
+            bit_depth: 8,
+            channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 })],
+            inverted: Vec::new(),
+        },
+        MapSpec {
+            file: "gray_alpha".into(),
+            format: FileFormat::Jpeg,
+            bit_depth: 8,
+            channels: vec![(Dest::L, SourceRef::Channel { channel: Channel::Roughness, component: 0 }), (Dest::A, SourceRef::Constant(0.5))],
+            inverted: Vec::new(),
+        },
+    ];
+    for depth in [8, 16, 32] {
+        let mut opts = ExportOptions::new(preset.clone());
+        opts.bit_depth_override = Some(depth);
+        let planned = list_outputs(&fx.project, 0, "m", &opts).unwrap();
+        assert!(planned.iter().all(|p| p.bit_depth == 8), "JPEG always plans 8-bit even for override {depth}");
+        let files = fx.render(&opts);
+        assert_eq!(files.len(), 2);
+        for file in &files {
+            // SOF0 header for 1-component 8-bit baseline JPEG: FF C0 00 0B 08 HH HH WW WW 01
+            let sof0 = [0xff, 0xc0, 0, 11, 8, 0, RES as u8, 0, RES as u8, 1];
+            assert!(file.bytes.windows(sof0.len()).any(|w| w == sof0), "missing 8-bit 1-component JPEG SOF0 in {}", file.name);
+        }
+        assert!(files[1].warnings.iter().any(|w| w.contains("alpha")));
+    }
+}
+
+#[test]
+fn format_extension_aliases_and_repeated_names_policy() {
+    for (alias, expected) in [
+        ("jpeg", FileFormat::Jpeg),
+        ("jpg", FileFormat::Jpeg),
+        (".JPG", FileFormat::Jpeg),
+        ("tiff", FileFormat::Tiff),
+        ("tif", FileFormat::Tiff),
+        (".TIF", FileFormat::Tiff),
+        ("targa", FileFormat::Tga),
+        ("tga", FileFormat::Tga),
+        (".TGA", FileFormat::Tga),
+    ] {
+        assert_eq!(FileFormat::from_extension(alias), Some(expected), "alias `{alias}`");
+    }
+
+    let mut files = vec![
+        ExportedFile { name: "Mesh_BaseColor.png".into(), bytes: vec![1], width: 1, height: 1, warnings: Vec::new() },
+        ExportedFile { name: "mesh_basecolor.png".into(), bytes: vec![2], width: 1, height: 1, warnings: Vec::new() },
+    ];
+    crate::skip_repeated_names(&mut files);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].bytes, vec![1]);
+    assert!(files[0].warnings.iter().any(|w| w.contains("mesh_basecolor.png")));
+}
+
+#[test]
 fn list_outputs_matches_render_and_presets_round_trip() {
     let fx = Fx::new(&default_channels());
     for preset in builtin_presets() {
@@ -483,6 +546,20 @@ fn write_files_is_atomic_and_refuses_paths() {
     assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
     let evil = ExportedFile { name: "../evil.png".into(), ..files[0].clone() };
     assert!(write_files(&[evil], &dir).is_err());
+
+    // Batch failure: invalid second entry or directory target must publish nothing and preserve existing files.
+    let sentinel = ExportedFile { name: files[0].name.clone(), bytes: b"new-bytes".to_vec(), ..files[0].clone() };
+    let bad_second = ExportedFile { name: "../bad.png".into(), ..files[1].clone() };
+    assert!(write_files(&[sentinel.clone(), bad_second], &dir).is_err());
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), files[0].bytes);
+
+    let blocked_dir = dir.join("blocked.png");
+    std::fs::create_dir_all(&blocked_dir).unwrap();
+    let dir_target = ExportedFile { name: "blocked.png".into(), ..files[1].clone() };
+    assert!(write_files(&[sentinel, dir_target], &dir).is_err());
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), files[0].bytes);
+    assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -512,7 +589,7 @@ fn validation_rejects_bad_presets() {
         p.validate().is_err()
     };
     let long = "x".repeat(300);
-    for file in ["a/b", r"a\b", "..", "x..y", "$meshes_$foo", "$", "", " ", "a\u{7}b", long.as_str()] {
+    for file in ["/a", "a/", "a//b", r"a\b", "..", "x..y", "a/../b", "$meshes_$foo", "$", "", " ", "a\u{7}b", long.as_str()] {
         assert!(refused(&|p| p.maps[0].file = file.into()), "file template {file:?} must be refused");
     }
     assert!(refused(&|p| p.name = "  ".into()));
@@ -673,6 +750,9 @@ fn the_udim_name_is_the_file_name_with_its_tile_number_as_placeholder() {
 
     // The length limit cuts the longer placeholder where it doesn't cut the tile number: none then
     assert_eq!(udim_names(format!("{}_$udim_$textureSet", "a".repeat(MAX_STEM - 10))), [None, None]);
+
+    // A folder stays in the placeholder name
+    assert_eq!(udim_names("Base/$textureSet_$udim".into()), [Some("Base/Body_<UDIM>.png".to_string()), Some("Base/Body_<UDIM>.png".to_string())]);
 }
 
 #[test]
@@ -1275,4 +1355,247 @@ fn diffusion_padding_fills_beyond_the_dilation_smoothly() {
             assert!((0.19..=0.81).contains(&v(x, y)), "({x},{y}) {}", v(x, y));
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn folder_templates_write_their_folders_inside_the_output_directory() {
+    let fx = Fx::new(&default_channels());
+    let dir = std::env::temp_dir().join(format!("tc-formats-export-folders-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rough = |file: &str| gray_map(file, SourceRef::Channel { channel: Channel::Roughness, component: 0 });
+    let preset = ExportPreset { name: "t".into(), maps: vec![rough("$project.ts/$textureSet/roughness"), rough("Roughness/$textureSet_Roughness")] };
+    let files = fx.render(&ExportOptions::new(preset));
+
+    write_files(&files, &dir).unwrap();
+
+    assert!(dir.join("My_Project.ts/Body_Set/roughness.png").is_file(), "{:?}", files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>());
+    assert!(dir.join("Roughness/Body_Set_Roughness.png").is_file());
+    for name in ["../evil.png", "/evil.png", "a//evil.png", r"a\evil.png"] {
+        let evil = ExportedFile { name: name.into(), ..files[0].clone() };
+        assert!(write_files(&[evil], &dir).is_err(), "{name}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn file_names_in_different_folders_do_not_collide_and_the_same_path_does() {
+    let fx = Fx::new(&default_channels());
+    let rough = |file: &str| gray_map(file, SourceRef::Channel { channel: Channel::Roughness, component: 0 });
+    let preset = ExportPreset { name: "t".into(), maps: vec![rough("a/x"), rough("b/x"), rough("A/x")] };
+
+    let names: Vec<String> = list_outputs(&fx.project, 0, "sphere", &ExportOptions::new(preset)).unwrap().into_iter().map(|p| p.name).collect();
+
+    assert_eq!(names, ["a/x.png", "b/x.png", "A/x_2.png"]);
+}
+
+/// A set whose channels hold distinct constants, to see where a template writes each of them
+fn packing_fixture() -> Fx {
+    let mut channels = default_channels();
+    channels.extend([Channel::AmbientOcclusion, Channel::Opacity, Channel::Emissive]);
+    let mut fx = Fx::new(&channels);
+    fx.set_all(Channel::AmbientOcclusion, |_, _| [0.6; 3]);
+    fx.set_all(Channel::Roughness, |_, _| [0.4; 3]);
+    fx.set_all(Channel::Metallic, |_, _| [0.8; 3]);
+    fx.set_all(Channel::Opacity, |_, _| [0.9; 3]);
+    fx.set_all(Channel::Emissive, |_, _| [0.3; 3]);
+    fx
+}
+
+/// The 8-bit value of an image position as RGBA
+fn pixel(file: &ExportedFile) -> [i32; 4] {
+    decode(file).to_rgba8().get_pixel(3, 3).0.map(i32::from)
+}
+
+fn byte(value: f32) -> i32 {
+    (value * 255.0).round() as i32
+}
+
+fn assert_close(actual: [i32; 4], expected: [i32; 4], what: &str) {
+    assert!(actual.iter().zip(expected).all(|(a, e)| (a - e).abs() <= 1), "{what}: {actual:?} instead of {expected:?}");
+}
+
+#[test]
+fn packed_templates_write_occlusion_roughness_and_metallic_where_the_spec_says() {
+    let fx = packing_fixture();
+    let expected = [byte(0.6), byte(0.4), byte(0.8)];
+
+    for (template, file) in
+        [("glTF PBR Metal Roughness", "OcclusionRoughnessMetallic"), ("Unreal Engine (Packed)", "OcclusionRoughnessMetallic"), ("Godot 4 (ORM)", "orm")]
+    {
+        let files = fx.render_preset(template);
+
+        let [r, g, b, _] = pixel(find(&files, file));
+        assert_close([r, g, b, 0], [expected[0], expected[1], expected[2], 0], &format!("{template}: R occlusion, G roughness, B metallic"));
+    }
+}
+
+#[test]
+fn unity_templates_write_smoothness_in_the_alpha_of_the_metallic_map() {
+    let fx = packing_fixture();
+    let smoothness = byte(1.0 - 0.4);
+
+    let hdrp = pixel(find(&fx.render_preset("Unity HDRP (Mask Map)"), "MaskMap"));
+    let urp = pixel(find(&fx.render_preset("Unity URP Lit (Metallic Smoothness)"), "MetallicMap"));
+
+    assert_close(hdrp, [byte(0.8), byte(0.6), 0, smoothness], "HDRP mask map: R metallic, G occlusion, B detail mask, A smoothness");
+    assert_close(urp, [byte(0.8), 0, 0, smoothness], "URP metallic map: R metallic, A smoothness");
+}
+
+#[test]
+fn the_usd_preview_surface_template_writes_one_map_per_input_named_like_it() {
+    let fx = packing_fixture();
+
+    let files = fx.render_preset("USD Preview Surface (separate maps)");
+
+    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    for (input, expected) in [("roughness", byte(0.4)), ("metallic", byte(0.8)), ("occlusion", byte(0.6)), ("opacity", byte(0.9))] {
+        let file = find(&files, &format!("_{input}.png"));
+        assert_eq!(decode(file).color(), image::ColorType::L8, "{input} is one 8-bit channel: {names:?}");
+        assert_close(pixel(file), [expected, expected, expected, 255], input);
+    }
+    for input in ["diffuseColor", "emissiveColor", "normal"] {
+        assert_eq!(decode(find(&files, &format!("_{input}.png"))).color(), image::ColorType::Rgb8, "{input} is a colour map: {names:?}");
+    }
+    assert!(!names.iter().any(|name| name.contains("clearcoat")), "sets without the coat write no coat maps: {names:?}");
+}
+
+#[test]
+fn only_the_unreal_template_writes_a_directx_normal_map() {
+    let mut fx = packing_fixture();
+    let tilt = Vec3::new(0.3, 0.4, 0.0);
+    let tilt = Vec3::new(tilt.x, tilt.y, (1.0 - tilt.length_squared()).sqrt());
+    fx.set_all(Channel::Normal, |_, _| (tilt * 0.5 + Vec3::splat(0.5)).to_array());
+    let open_gl_green = byte(tilt.y * 0.5 + 0.5);
+
+    for (template, file, flipped) in [
+        ("glTF PBR Metal Roughness", "_Normal.png", false),
+        ("Unreal Engine (Packed)", "_Normal.png", true),
+        ("Unity HDRP (Mask Map)", "_Normal.png", false),
+        ("Unity URP Lit (Metallic Smoothness)", "NormalMap", false),
+        ("Godot 4 (ORM)", "normal", false),
+        ("USD Preview Surface (separate maps)", "_normal.png", false),
+    ] {
+        let green = pixel(find(&fx.render_preset(template), file))[1];
+
+        let want = if flipped { 255 - open_gl_green } else { open_gl_green };
+        assert!((green - want).abs() <= 1, "{template}: green {green} instead of {want}");
+    }
+}
+
+#[test]
+fn spec_templates_write_8_bit_png_files_with_the_expected_colour_encoding() {
+    let fx = packing_fixture();
+    let base = fx.comp.value(Channel::BaseColor, 3, 3).map(|v| byte(linear_to_srgb(v)));
+
+    for template in ["glTF PBR Metal Roughness", "Unreal Engine (Packed)", "Unity HDRP (Mask Map)", "Unity URP Lit (Metallic Smoothness)", "Godot 4 (ORM)"] {
+        let files = fx.render_preset(template);
+
+        let color = files.iter().find(|f| ["BaseColor", "BaseMap", "albedo"].iter().any(|stem| f.name.contains(stem))).unwrap();
+
+        assert!(files.iter().all(|f| f.name.ends_with(".png")), "{template}: {:?}", files.iter().map(|f| &f.name).collect::<Vec<_>>());
+        let [r, g, b, a] = pixel(color);
+        assert_close([r, g, b, 0], [base[0], base[1], base[2], 0], &format!("{template}: sRGB-encoded base color"));
+        assert!((a - byte(0.9)).abs() <= 1, "{template}: opacity in alpha");
+    }
+}
+
+#[test]
+fn a_slash_in_a_project_or_texture_set_name_does_not_make_a_folder() {
+    let mut fx = Fx::new(&default_channels());
+    fx.project.name = "Wood/Oak".into();
+    fx.project.texture_sets[0].name = "Body/Hull".into();
+    let preset =
+        ExportPreset { name: "t".into(), maps: vec![gray_map("$project_$textureSet", SourceRef::Channel { channel: Channel::Roughness, component: 0 })] };
+
+    let names: Vec<String> = list_outputs(&fx.project, 0, "sphere", &ExportOptions::new(preset)).unwrap().into_iter().map(|p| p.name).collect();
+
+    assert_eq!(names, ["Wood_Oak_Body_Hull.png"]);
+}
+
+#[test]
+fn file_and_folder_ancestor_conflicts_are_rejected_before_writing() {
+    let fx = Fx::new(&default_channels());
+    let rough = |file: &str| gray_map(file, SourceRef::Channel { channel: Channel::Roughness, component: 0 });
+    for maps in [vec![rough("a"), rough("a.png/b")], vec![rough("a.png/b"), rough("A")]] {
+        let preset = ExportPreset { name: "t".into(), maps };
+        assert!(list_outputs(&fx.project, 0, "sphere", &ExportOptions::new(preset)).is_err());
+    }
+
+    let ok = ExportPreset { name: "t".into(), maps: vec![rough("a/x"), rough("b/x")] };
+    let valid_files = fx.render(&ExportOptions::new(ok));
+    assert_eq!(valid_files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["a/x.png", "b/x.png"]);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let dir = std::env::temp_dir().join(format!("tc-formats-conflict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = ExportedFile { name: "a.png".into(), ..valid_files[0].clone() };
+        let nested_b = ExportedFile { name: "a.png/b.png".into(), ..valid_files[1].clone() };
+        let upper_a = ExportedFile { name: "A.PNG".into(), ..valid_files[0].clone() };
+        for pair in [[file_a, nested_b.clone()], [nested_b, upper_a]] {
+            assert!(write_files(&pair, &dir).is_err());
+            assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "conflict must not create folders or files");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[test]
+fn folder_templates_reject_symlink_escapes_before_creating_subfolders() {
+    let fx = Fx::new(&default_channels());
+    let files = fx.render_preset("Unreal Engine (Packed)");
+    let base = std::env::temp_dir().join(format!("tc-formats-symlink-escape-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = base.join("out");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+
+    let nested = ExportedFile { name: "link/new/map.png".into(), ..files[0].clone() };
+    assert!(write_files(&[nested], &dir).is_err());
+    assert!(!outside.join("new").exists(), "must not create directories through an escaping symlink");
+
+    let direct = ExportedFile { name: "link/map.png".into(), ..files[0].clone() };
+    assert!(write_files(&[direct], &dir).is_err());
+    assert!(!outside.join("map.png").exists());
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[test]
+fn folder_templates_reject_in_tree_symlink_aliases() {
+    let fx = Fx::new(&default_channels());
+    let files = fx.render_preset("Unreal Engine (Packed)");
+    let dir = std::env::temp_dir().join(format!("tc-formats-symlink-alias-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::os::unix::fs::symlink(dir.join("a"), dir.join("b")).unwrap();
+
+    let one = ExportedFile { name: "a/map.png".into(), ..files[0].clone() };
+    let two = ExportedFile { name: "b/map.png".into(), ..files[1].clone() };
+    assert!(write_files(&[one, two], &dir).is_err());
+    assert!(!dir.join("a").join("map.png").exists());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn write_files_accepts_a_long_nested_folder_and_stem() {
+    let fx = Fx::new(&default_channels());
+    let files = fx.render_preset("Unreal Engine (Packed)");
+    let folder = "a".repeat(200);
+    let stem = "b".repeat(200);
+    let name = format!("{folder}/{stem}.png");
+    let dir = std::env::temp_dir().join(format!("tc-formats-export-long-nested-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let paths = write_files(&[ExportedFile { name: name.clone(), ..files[0].clone() }], &dir).unwrap();
+    assert_eq!(paths, [dir.join(&folder).join(format!("{stem}.png"))]);
+    assert!(paths[0].is_file());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

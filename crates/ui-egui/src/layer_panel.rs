@@ -1,12 +1,13 @@
 //! State behind the Layers panel: the thumbnail service, the GPU textures made from its pictures,
-//! which effect groups are folded, and the one place the preview size is decided.
+//! which effect stack is open, and the one place the preview size is decided.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use egui::{Context, TextureHandle, TextureId, TextureOptions};
 use texturecraft_engine::Session;
 use texturecraft_engine::compose::ThumbTarget;
+use texturecraft_engine::core::LayerId;
 use texturecraft_engine::thumbs::{CACHE_ENTRIES, ThumbService};
 
 use crate::TextureCraftApp;
@@ -42,20 +43,23 @@ pub struct LayerPanel {
     frame: u64,
     /// Whether this frame's pictures are begun and not yet finished by [`LayerPanel::end`]
     pictures_begun: bool,
-    /// Folded effect groups: (layer, true for the mask's). A view setting; the document is not touched.
-    pub(crate) folded: HashSet<(u64, bool)>,
+    /// The open stack, with `true` for a layer's mask. This belongs to the panel view.
+    pub(crate) expanded_effects: Option<(LayerId, bool)>,
 }
 
 /// How soon to look again for pictures still rendering (milliseconds)
 const POLL_INTERVAL_MS: u64 = 40;
 
 impl LayerPanel {
+    pub(crate) fn toggle_effects(&mut self, stack: Option<(LayerId, bool)>) {
+        self.expanded_effects = stack.filter(|stack| Some(*stack) != self.expanded_effects);
+    }
+
     /// Start drawing the panel for this frame.
     pub(crate) fn begin(&mut self, session: &Session, now: f64) {
         self.begin_pictures(session, now);
 
-        // Deleted layer IDs must not accumulate in panel state
-        self.folded.retain(|(layer, _)| session.doc.project.layers.contains_key(&texturecraft_engine::core::LayerId(*layer)));
+        self.expanded_effects = self.expanded_effects.filter(|(layer, _)| session.doc.project.layers.contains_key(layer));
     }
 
     /// Advance the picture frame once, whether the panel or a picture outside it asks first
@@ -115,22 +119,22 @@ impl LayerPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use texturecraft_engine::core::{Channel, LayerId};
+    use texturecraft_engine::core::Channel;
     use texturecraft_engine::geom::primitives;
 
     #[test]
-    fn deleted_layers_release_their_fold_state() {
+    fn deleted_layers_close_their_effect_stack() {
         let mut session = Session::new_project("thumb", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
         let layer = session.selected_layer().unwrap();
         let mut panel = LayerPanel::default();
-        panel.folded.extend([(layer.0, false), (layer.0, true)]);
+        panel.expanded_effects = Some((layer, false));
         panel.begin(&session, 0.0);
-        assert_eq!(panel.folded.len(), 2, "existing layers keep their view settings");
+        assert_eq!(panel.expanded_effects, Some((layer, false)), "existing layers keep their view settings");
 
         texturecraft_engine::execute(&mut session, "layer.remove", &serde_json::json!({"layer": layer.0})).unwrap();
         panel.begin(&session, 1.0);
 
-        assert!(panel.folded.is_empty(), "deleted layer IDs must not accumulate in view state");
+        assert_eq!(panel.expanded_effects, None, "the deleted layer leaves no open stack");
     }
 
     #[test]

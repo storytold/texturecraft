@@ -36,7 +36,7 @@ fn fe(e: texturecraft_formats::FormatError) -> EngineError {
     EngineError::Other(e.to_string())
 }
 
-/// Image resources a layer subtree uses (fill sources and their patterns, mask fills and generator inputs)
+/// Image resources a layer subtree uses (fill sources and their patterns, mask or content effects and the images its paths paint with)
 pub(crate) fn images_used(project: &Project, id: LayerId, out: &mut Vec<String>, depth: usize) {
     if depth > texturecraft_core::project::MAX_DEPTH {
         return;
@@ -46,11 +46,17 @@ pub(crate) fn images_used(project: &Project, id: LayerId, out: &mut Vec<String>,
 
     if let LayerKind::Fill(fill) = &layer.kind {
         out.extend(fill.sources.values().flat_map(Source::images).map(str::to_string));
-        out.extend(fill.link.as_ref().map(|link| link.package.clone()));
+        if let Some(link) = &fill.link {
+            out.push(link.package.clone());
+            out.extend(link.outputs.values().cloned());
+        }
     }
+
     for effect in layer.mask.iter().flat_map(|mask| mask.effects.iter()).chain(&layer.content_effects) {
-        out.extend(effect.kind.images_read().map(str::to_string));
+        out.extend(effect.images_read().map(str::to_string));
+        out.extend(crate::path_tool::path_images(&effect.kind));
     }
+
     // images feeding graph inputs
     for g in layer.graphs().into_iter().flat_map(|g| g.graphs()) {
         out.extend(g.inputs.values().filter_map(|i| match i {
@@ -72,6 +78,7 @@ pub(crate) fn one_set_document(src_set: &TextureSet, name: &str) -> Document {
     set.channels = src_set.channels.clone();
     project.texture_sets.push(set);
     Document {
+        bake_meshes: Default::default(),
         bake_paint: BTreeMap::new(),
         project,
         pixels: PixelStore::default(),
@@ -102,12 +109,13 @@ impl Session {
         images_used(&mini.project, root, &mut used, 0);
         let resources = used.into_iter().filter_map(|name| self.doc.resources.get(&name).map(|bytes| (name, Arc::clone(bytes)))).collect();
 
-        let snapshot = texturecraft_formats::ProjectFile {
+        let snapshot = texturecraft_formats::ProjectFile::<Arc<Vec<u8>>> {
             project: mini.project,
             pixels: mini.pixels,
             stroke_replay: None,
             baked: BTreeMap::new(),
             mesh: None,
+            mesh_uvs: None,
             high_poly: Vec::new(),
             cage: None,
             bake_paint: BTreeMap::new(),
@@ -142,8 +150,10 @@ impl Session {
             .first()
             .and_then(|t| t.stack.last().copied())
             .ok_or_else(|| EngineError::Other("the smart material file has no layer".into()))?;
+
         let resources: BTreeMap<String, Arc<Vec<u8>>> = project_file.resources.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
         let source = Document {
+            bake_meshes: Default::default(),
             bake_paint: BTreeMap::new(),
             project: project_file.project,
             pixels: project_file.pixels,
@@ -153,10 +163,12 @@ impl Session {
             graphs: project_file.graphs,
             strokes: project_file.strokes,
         };
+
         let id = self.edit("Add smart material", |s| {
             for (name, bytes) in &source.resources {
                 s.doc.resources.entry(name.clone()).or_insert_with(|| Arc::clone(bytes));
             }
+
             let ts = s.ts();
             let sel = s.selected_layer();
             let inside = sel.and_then(|l| s.doc.project.layer(l).ok()).is_some_and(|l| l.is_group());
@@ -166,6 +178,7 @@ impl Session {
             s.target = StackTarget::Content;
             Ok(id)
         })?;
+
         self.sync_images();
         Ok(id)
     }

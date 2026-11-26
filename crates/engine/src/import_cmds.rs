@@ -92,6 +92,7 @@ impl Session {
             cage: None,
             bake_paint: Default::default(),
             thumbnail: None,
+            mesh_uvs: None,
             resources: imported.resources,
             graphs: imported.graphs,
             strokes: imported.strokes,

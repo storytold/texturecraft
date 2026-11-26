@@ -46,7 +46,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use texturecraft_compose::PixelStore;
+use texturecraft_compose::{MaskGray, PixelStore};
 use texturecraft_core::{Channel, ChannelKind};
 use texturecraft_geom::glam::{Mat3, Mat4, Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, NO_TRI, OrbitCamera, SubMesh, UvGBuffer};
@@ -507,7 +507,7 @@ fn commit(pixels: &mut PixelStore, set: &SetMesh, target: ReplayTarget, step: &R
                 let grey = |x: u32, y: u32| places.read(set, m, ChannelKind::Scalar, x, y).map(|(v, a)| (v[0], a));
                 commit_mask_texels(pixels, id, set.size(), &grey, source(1.0));
             }
-            None => commit_mask(pixels, id, set.size(), step.mask_value, source(1.0), &mut Staging::default()),
+            None => commit_mask(pixels, id, set.size(), &MaskGray::Value(step.mask_value), source(1.0), &mut Staging::default()),
         },
         ReplayTarget::Content(id) => {
             // channels with their own opacity commit apart

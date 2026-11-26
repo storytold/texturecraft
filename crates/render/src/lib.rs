@@ -56,6 +56,16 @@ pub use cage_geometry::CageGeometry;
 pub use craft_material_graph_wgpu as gpu_graph;
 pub use neutral_material::NeutralMaterial;
 pub use overlay_quad::OverlayQuad;
-pub use renderer::{COLOR_FORMAT, DEFAULT_BACKGROUND, Frame, MSAA, Renderer, Shade, UV_VIEW_MAX_ZOOM, UV_VIEW_MIN_ZOOM, ViewKind, aux_size, uv_view_scale};
+pub use renderer::{
+    COLOR_FORMAT, DEFAULT_BACKGROUND, Frame, MSAA, Renderer, Shade, UV_VIEW_MAX_ZOOM, UV_VIEW_MIN_ZOOM, ViewKind, aux_size, mask_view_extent, uv_view_scale,
+};
 pub use set_highlight::SetHighlight;
 pub use wgpu;
+
+/// The limits to request at device creation: everything the adapter reports. The compositor
+/// sizes its bands and working buffers against the device's limits (and a later user-set
+/// memory limit, `gpu_composite::user_memory_limit`), so it gets the adapter's full range;
+/// software adapters keep their own reported values.
+pub fn device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    adapter.limits()
+}

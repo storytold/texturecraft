@@ -1,5 +1,6 @@
 //! File > Import resources...: a window to collect files, set what each is for, and import them
-//! together. Images become project resources; materials load as smart materials.
+//! together. Images become project resources; materials load as smart materials and MaterialX
+//! documents as fill layers.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,11 +14,14 @@ use crate::i18n::{tr, trf};
 use crate::state::{ImportResources, ImportRow, ResourceUsage};
 use crate::web_files::{IMAGE_EXTS, MATERIAL_EXTS};
 use crate::widgets::primary_button;
+use crate::windows::MATERIALX_EXT;
 
 /// Width of the window
 const WINDOW_WIDTH_POINTS: f32 = 640.0;
 /// Height of the file list
 const LIST_HEIGHT_POINTS: f32 = 300.0;
+// Initial space for the title, file controls, destination and footer
+const WINDOW_CHROME_HEIGHT_POINTS: f32 = 200.0;
 /// Width of a row's prefix field and usage dropdown
 const PREFIX_WIDTH_POINTS: f32 = 160.0;
 const USAGE_WIDTH_POINTS: f32 = 110.0;
@@ -25,6 +29,8 @@ const USAGE_WIDTH_POINTS: f32 = 110.0;
 const TARGET_WIDTH_POINTS: f32 = 190.0;
 /// Keep space for the file name in a narrow row
 const MIN_NAME_WIDTH_POINTS: f32 = 40.0;
+const CONTROL_GAP_POINTS: f32 = 4.0;
+const SECTION_GAP_POINTS: f32 = 8.0;
 
 /// Opens the window with an empty list (an open window stays as it is)
 pub(crate) fn open(app: &mut TextureCraftApp) {
@@ -59,9 +65,17 @@ pub(crate) fn keys_in(app: &mut TextureCraftApp, input: &mut egui::InputState, n
     }
 }
 
-/// Whether the file is a material (loaded as a smart material, so it has no usage or prefix)
+fn extension_of(row: &ImportRow) -> Option<&str> {
+    row.path.extension().and_then(|extension| extension.to_str())
+}
+
+fn is_smart_material_extension(extension: &str) -> bool {
+    MATERIAL_EXTS.iter().any(|material_extension| extension.eq_ignore_ascii_case(material_extension))
+}
+
+/// Whether the file is a material (a smart material or a MaterialX document, so it has no usage or prefix)
 fn is_material(row: &ImportRow) -> bool {
-    row.path.extension().and_then(|e| e.to_str()).is_some_and(|e| MATERIAL_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+    extension_of(row).is_some_and(|extension| extension.eq_ignore_ascii_case(MATERIALX_EXT) || is_smart_material_extension(extension))
 }
 
 fn file_name(row: &ImportRow) -> String {
@@ -114,113 +128,148 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let (mut import, mut cancel, mut add) = (std::mem::take(&mut window.confirm), false, false);
     let mut remove = false;
 
-    crate::windows::dialog("import_resources", tr("Import resources"), &mut open).default_width(WINDOW_WIDTH_POINTS).show(ctx, |ui| {
-        ui.set_min_width(WINDOW_WIDTH_POINTS);
-        ui.horizontal(|ui| {
-            ui.label(tr("Choose files and assign their roles"));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_enabled_ui(!window.selected.is_empty(), |ui| {
-                    remove = ui.button(tr("Remove selected resources")).clicked();
-                });
-                add = ui.button(tr("Add resources")).clicked();
-            });
-        });
-        ui.add_space(4.0);
-
-        let all_label = trf("All files ({count})", &[("count", &window.rows.len())]);
-        let filter_text = match window.filter {
-            None => all_label.clone(),
-            Some(usage) => trf("{usage} ({count})", &[("usage", &usage.name()), ("count", &window.rows.iter().filter(|row| row.usage == usage).count())]),
-        };
-        egui::ComboBox::from_id_salt("import_filter").width(ui.available_width()).selected_text(filter_text).show_ui(ui, |ui| {
-            if ui.selectable_label(window.filter.is_none(), &all_label).clicked() {
-                window.filter = None;
-            }
-
-            // Only usages some row has, so the list is never empty by filter
-            for usage in ResourceUsage::ALL {
-                let count = window.rows.iter().filter(|row| row.usage == usage).count();
-                if count > 0 && ui.selectable_label(window.filter == Some(usage), format!("{} ({count})", usage.name())).clicked() {
-                    window.filter = Some(usage);
-                }
-            }
-        });
-        ui.add_space(4.0);
-
-        let filter = window.filter;
-        let visible = |row: &ImportRow| filter.is_none_or(|usage| row.usage == usage);
-        let modifiers = ui.input(|i| i.modifiers);
-        let mut clicked = None;
-
-        egui::ScrollArea::vertical().min_scrolled_height(LIST_HEIGHT_POINTS).max_height(LIST_HEIGHT_POINTS).auto_shrink([false, false]).show(ui, |ui| {
-            for row in window.rows.iter_mut().filter(|row| visible(row)) {
-                let material = is_material(row);
-                let selected = window.selected.contains(&row.id);
+    crate::windows::dialog(ctx, "import_resources", tr("Import Resources"), &mut open)
+        .default_size(egui::vec2(WINDOW_WIDTH_POINTS, LIST_HEIGHT_POINTS + WINDOW_CHROME_HEIGHT_POINTS))
+        .show(ctx, |ui| {
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 ui.horizontal(|ui| {
-                    let name_width =
-                        (ui.available_width() - PREFIX_WIDTH_POINTS - USAGE_WIDTH_POINTS - 2.0 * ui.spacing().item_spacing.x).max(MIN_NAME_WIDTH_POINTS);
-                    let name = ui.add_sized([name_width, ui.spacing().interact_size.y], egui::Button::selectable(selected, file_name(row)).truncate());
-                    if name.on_hover_text(row.path.display().to_string()).clicked() {
-                        clicked = Some(row.id);
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        cancel = ui.button(tr("Cancel")).clicked();
+                        import |= ui.add_enabled(app.session.project_open && !window.rows.is_empty(), primary_button(ui, tr("Import"))).clicked();
+                    });
+                });
+                ui.add_space(CONTROL_GAP_POINTS);
+                if !app.session.project_open {
+                    ui.label(tr("Open a project to import resources. Importing into the asset library is not available yet."));
+                }
 
-                    let prefix = ui.add_enabled(
-                        !material,
-                        egui::TextEdit::singleline(&mut row.prefix).hint_text(tr("Optional prefix/path...")).desired_width(PREFIX_WIDTH_POINTS),
-                    );
-                    if material {
-                        prefix.on_disabled_hover_text(tr("Materials keep their own name"));
-                    } else {
-                        prefix.on_hover_text(tr("Put in front of the resource's name. Characters other than letters, digits and _ . - become _"));
-                    }
-
-                    ui.add_enabled_ui(!material, |ui| {
-                        egui::ComboBox::from_id_salt(("import_usage", row.id)).width(USAGE_WIDTH_POINTS).selected_text(row.usage.name()).show_ui(ui, |ui| {
-                            for usage in ResourceUsage::ALL {
-                                let item = ui.add_enabled(usage.available(), egui::Button::selectable(row.usage == usage, usage.name()));
-                                if usage.available() {
-                                    if item.clicked() {
-                                        row.usage = usage;
-                                        ui.close();
-                                    }
-                                } else {
-                                    item.on_disabled_hover_text(tr("Not available yet"));
-                                }
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("import_target").width(TARGET_WIDTH_POINTS).selected_text(tr("Open project")).show_ui(ui, |ui| {
+                            if ui.selectable_label(true, tr("Open project")).clicked() {
+                                ui.close();
                             }
+
+                            ui.add_enabled(false, egui::Button::selectable(false, tr("Asset library"))).on_disabled_hover_text(tr("Not available yet"));
                         });
-                    })
-                    .response
-                    .on_disabled_hover_text(tr("Materials need no usage"));
+                        ui.label(tr("Destination"));
+                    });
                 });
-            }
-        });
+                ui.add_space(SECTION_GAP_POINTS);
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(tr("Choose files and assign their roles"));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_enabled_ui(!window.selected.is_empty(), |ui| {
+                                remove = ui.button(tr("Remove selected resources")).clicked();
+                            });
+                            add = ui.button(tr("Add resources")).clicked();
+                        });
+                    });
+                    ui.add_space(CONTROL_GAP_POINTS);
 
-        if let Some(id) = clicked {
-            let visible: Vec<u64> = if modifiers.shift { window.rows.iter().filter(|row| visible(row)).map(|row| row.id).collect() } else { Vec::new() };
-            click_row(&mut window, &visible, id, modifiers);
-        }
+                    let all_label = trf("All files ({count})", &[("count", &window.rows.len())]);
+                    let filter_text = match window.filter {
+                        None => all_label.clone(),
+                        Some(usage) => {
+                            trf("{usage} ({count})", &[("usage", &usage.name()), ("count", &window.rows.iter().filter(|row| row.usage == usage).count())])
+                        }
+                    };
+                    egui::ComboBox::from_id_salt("import_filter").width(ui.available_width()).selected_text(filter_text).show_ui(ui, |ui| {
+                        if ui.selectable_label(window.filter.is_none(), &all_label).clicked() {
+                            window.filter = None;
+                        }
 
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                egui::ComboBox::from_id_salt("import_target").width(TARGET_WIDTH_POINTS).selected_text(tr("Open project")).show_ui(ui, |ui| {
-                    if ui.selectable_label(true, tr("Open project")).clicked() {
-                        ui.close();
+                        // Only usages some row has, so the list is never empty by filter
+                        for usage in ResourceUsage::ALL {
+                            let count = window.rows.iter().filter(|row| row.usage == usage).count();
+                            if count > 0 && ui.selectable_label(window.filter == Some(usage), format!("{} ({count})", usage.name())).clicked() {
+                                window.filter = Some(usage);
+                            }
+                        }
+                    });
+                    ui.add_space(CONTROL_GAP_POINTS);
+
+                    let filter = window.filter;
+                    let visible = |row: &ImportRow| filter.is_none_or(|usage| row.usage == usage);
+                    let modifiers = ui.input(|i| i.modifiers);
+                    let mut clicked_row = None;
+                    let mut selected_usage = None;
+
+                    let list_height = ui.available_height().max(0.0);
+                    egui::ScrollArea::both().min_scrolled_width(0.0).min_scrolled_height(0.0).max_height(list_height).auto_shrink([false, false]).show(
+                        ui,
+                        |ui| {
+                            for row in window.rows.iter_mut().filter(|row| visible(row)) {
+                                let material = is_material(row);
+                                let selected = window.selected.contains(&row.id);
+
+                                ui.horizontal(|ui| {
+                                    let name_width = (ui.available_width() - PREFIX_WIDTH_POINTS - USAGE_WIDTH_POINTS - 2.0 * ui.spacing().item_spacing.x)
+                                        .max(MIN_NAME_WIDTH_POINTS);
+                                    let name =
+                                        ui.add_sized([name_width, ui.spacing().interact_size.y], egui::Button::selectable(selected, file_name(row)).truncate());
+                                    if name.on_hover_text(row.path.display().to_string()).clicked() {
+                                        clicked_row = Some(row.id);
+                                    }
+
+                                    let prefix = ui.add_enabled(
+                                        !material,
+                                        egui::TextEdit::singleline(&mut row.prefix).hint_text(tr("Optional prefix/path...")).desired_width(PREFIX_WIDTH_POINTS),
+                                    );
+                                    if material {
+                                        prefix.on_disabled_hover_text(tr("Materials keep their own name"));
+                                    } else {
+                                        prefix
+                                            .on_hover_text(tr("Put in front of the resource's name. Characters other than letters, digits and _ . - become _"));
+                                    }
+
+                                    ui.add_enabled_ui(!material, |ui| {
+                                        egui::ComboBox::from_id_salt(("import_usage", row.id))
+                                            .width(USAGE_WIDTH_POINTS)
+                                            .selected_text(row.usage.name())
+                                            .show_ui(ui, |ui| {
+                                                for usage in ResourceUsage::ALL {
+                                                    let available = usage.available();
+                                                    let item = ui.add_enabled(available, egui::Button::selectable(row.usage == usage, usage.name()));
+                                                    if !available {
+                                                        item.on_disabled_hover_text(tr("Not available yet"));
+                                                    } else if item.clicked() {
+                                                        if selected && window.selected.len() > 1 {
+                                                            selected_usage = Some(usage);
+                                                        } else {
+                                                            row.usage = usage;
+                                                        }
+
+                                                        ui.close();
+                                                    }
+                                                }
+                                            });
+                                    })
+                                    .response
+                                    .on_disabled_hover_text(tr("Materials need no usage"));
+                                });
+                            }
+                        },
+                    );
+
+                    // Include selected rows hidden by the filter
+                    if let Some(usage) = selected_usage {
+                        for row in &mut window.rows {
+                            if window.selected.contains(&row.id) && !is_material(row) {
+                                row.usage = usage;
+                            }
+                        }
                     }
 
-                    ui.add_enabled(false, egui::Button::selectable(false, tr("Asset library"))).on_disabled_hover_text(tr("Not available yet"));
+                    if let Some(id) = clicked_row {
+                        let visible: Vec<u64> =
+                            if modifiers.shift { window.rows.iter().filter(|row| visible(row)).map(|row| row.id).collect() } else { Vec::new() };
+                        click_row(&mut window, &visible, id, modifiers);
+                    }
                 });
-                ui.label(tr("Destination"));
             });
         });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                cancel = ui.button(tr("Cancel")).clicked();
-                import |= ui.add_enabled(!window.rows.is_empty(), primary_button(ui, tr("Import"))).clicked();
-            });
-        });
-    });
 
     if cancel || !open {
         return;
@@ -235,6 +284,7 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     if add {
         let mut extensions: Vec<&str> = IMAGE_EXTS.to_vec();
         extensions.extend_from_slice(MATERIAL_EXTS);
+        extensions.push(MATERIALX_EXT);
         let opening_id = window.opening_id;
         app.ask_file(FileDialog::open_many().filter(tr("Resources"), &extensions), Bound::Project, move |app, paths| {
             let Some(stored) = app.ui.windows.import_resources.as_mut().filter(|stored| stored.opening_id == opening_id) else { return };
@@ -250,7 +300,7 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
         });
     }
 
-    if import && !window.rows.is_empty() {
+    if import && app.session.project_open && !window.rows.is_empty() {
         window.rows.retain(|row| !import_row(app, row));
         if window.rows.is_empty() {
             app.ui.dock.focus(crate::docking::Panel::Assets);
@@ -265,15 +315,21 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     app.ui.windows.import_resources = Some(window);
 }
 
-/// Import one row. A failed file is left in the dialog with its settings.
+/// Returns true once the resource has been imported or a linked material cook has been queued.
 fn import_row(app: &mut TextureCraftApp, row: &ImportRow) -> bool {
     let Some(path) = row.path.to_str() else {
         app.toast(trf("Could not import a path that is not UTF-8: {path}", &[("path", &row.path.display())]), true);
         return false;
     };
 
-    if is_material(row) {
-        return app.run("material.load", json!({ "path": path })).is_some();
+    if let Some(extension) = extension_of(row) {
+        if extension.eq_ignore_ascii_case(MATERIALX_EXT) {
+            return crate::windows::import_materialx(app, path);
+        }
+
+        if is_smart_material_extension(extension) {
+            return app.run("material.load", json!({ "path": path })).is_some();
+        }
     }
 
     let Some(result) = app.run("resource.import", json!({ "path": path, "prefix": row.prefix })) else { return false };

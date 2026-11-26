@@ -50,7 +50,7 @@ fn layer_blended_scalar(mode: u32, a: f32, b: f32, unit: bool) -> f32 {
 }
 
 fn layer_blended_color(mode: u32, a: vec3<f32>, b: vec3<f32>, channel: u32) -> vec3<f32> {
-    let unit = (params.id_bake.z & (1u << channel)) != 0u;
+    let unit = (bitcast<u32>(params.anchor_default.w) & (1u << channel)) != 0u;
     if !group_color_slot(channel) {
         return vec3(layer_blended_scalar(mode, a.x, b.x, unit));
     }

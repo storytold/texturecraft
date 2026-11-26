@@ -130,7 +130,7 @@ impl Rgba {
 
     /// The image as the compositor samples a resource (`srgb`: integer values in the stored encoding).
     pub fn image_res(&self, srgb: bool) -> ImageRes {
-        ImageRes { width: self.width, height: self.height, rgba: self.px.clone(), srgb }
+        ImageRes::new(self.width, self.height, self.px.clone(), srgb)
     }
 
     /// The image as a resource file: 16-bit PNG for integer images (`srgb`: values in their stored encoding, as the

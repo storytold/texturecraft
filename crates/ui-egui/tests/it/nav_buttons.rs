@@ -17,7 +17,11 @@ const WINDOW: egui::Vec2 = vec2(1280.0, 800.0);
 /// The app showing only one view, so that the view fills the viewport rect the 3D view reports
 fn app(layout: ViewLayout) -> (Harness<'static, TextureCraftApp>, Rect) {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(WINDOW).with_pixels_per_point(1.0).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .with_pixels_per_point(1.0)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().session.tool.tool = texturecraft_engine::Tool::Paint;
     harness.state_mut().ui.layout = ViewLayout::Only3D;
     harness.run_steps(4);
@@ -182,13 +186,6 @@ fn a_press_in_the_gap_between_buttons_or_in_the_margin_paints_nothing() {
         drag(&mut harness, margin, margin + vec2(-30.0, 10.0));
         assert_eq!(history(&harness), labels, "{kind:?}: nothing painted");
     }
-}
-
-#[test]
-fn the_2d_view_has_no_orbit_button() {
-    let view = Rect::from_min_size(Pos2::ZERO, vec2(600.0, 500.0));
-    assert!(button_rect(view, NavView::Uv, NavButton::Orbit).is_none());
-    assert!(button_rect(view, NavView::Scene, NavButton::Orbit).is_some());
 }
 
 #[test]

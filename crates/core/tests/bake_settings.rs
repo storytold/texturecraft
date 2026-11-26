@@ -13,10 +13,11 @@ fn reference_defaults_cover_common_and_per_map_settings() {
     let mut thickness_rays = rays.clone();
     thickness_rays["max_distance"] = json!(0.1);
     let mut expected = json!({
-        "common": {"is_enabled": true, "resolution": "R2048", "resolution_height": null, "antialiasing": "None", "dilation": 1, "apply_diffusion": true},
+        "common": {"is_enabled": true, "resolution": "R2048", "resolution_height": null, "antialiasing": "None", "dilation": 32, "apply_diffusion": false},
         "high_poly": {"match_mode": "Always", "use_low_as_high": false, "ignore_backface": true, "low_suffix": "_low", "high_suffix": "_high", "ignore_backface_suffix": "_ignorebf"},
         "cage": {"kind": "DistanceBased", "max_frontal": 0.01, "max_rear": 0.01, "relative_to_bounding_box": true, "average_normals": true},
         "skew": {"method": "MeshNormalsBased", "edge_protection": false, "edge_distance": 0.15, "edge_contrast": 0.5},
+        "sync": {"common": true, "maps": ["Normal", "WorldNormal", "Id", "AmbientOcclusion", "Curvature", "Position", "Thickness", "Height", "BentNormal", "Opacity"]},
         "id": {"source": "MaterialColor", "generator": "HueShift"},
         "ao": {"rays": rays, "ignore_backface": "Never", "self_occlusion": "Always", "attenuation": "Linear", "ground_plane": {"enabled": false, "offset": 0.0}},
         "curvature": {
@@ -81,7 +82,7 @@ fn all_dropdowns_store_enum_choices() {
     assert_choices(&[bake::SkewCorrectionMethod::MeshNormalsBased, bake::SkewCorrectionMethod::FaceNormalsBased]);
     assert_choices(&bake::BakeResolution::ALL);
     assert_choices(&bake::BakeAntialiasing::ALL);
-    assert_choices(&[bake::CageType::DistanceBased, bake::CageType::CustomFile]);
+    assert_choices(&[bake::CageType::DistanceBased, bake::CageType::Automatic, bake::CageType::CustomFile]);
     assert_choices(&[bake::CurvatureMethod::NormalMap, bake::CurvatureMethod::Mesh]);
     assert_choices(&[
         bake::IdColorSource::VertexColor,
@@ -118,7 +119,6 @@ fn components_keep_their_own_defaults() {
     }))
     .unwrap();
     assert_eq!(settings, bake::BakeSettings::default());
-    assert_eq!(settings.maps.thickness.parameters.rays.max_distance, 0.1);
 }
 
 #[test]
@@ -127,7 +127,8 @@ fn nested_settings_round_trip_per_texture_set() {
     settings.common.resolution = bake::BakeResolution::R16;
     settings.common.resolution_height = Some(bake::BakeResolution::R8192);
     settings.common.antialiasing = bake::BakeAntialiasing::Subsampling8x8;
-    settings.common.apply_diffusion = false;
+    settings.common.apply_diffusion = true;
+    settings.sync.set_shares(bake::BakeSyncGroup::Map(bake::BakedMap::Height), false);
     settings.high_poly.ignore_backface_suffix = "_two_sided".into();
     settings.cage.kind = bake::CageType::CustomFile;
     settings.skew.edge_protection = true;

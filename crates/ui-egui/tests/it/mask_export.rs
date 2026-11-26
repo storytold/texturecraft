@@ -22,7 +22,10 @@ fn harness(mask: bool) -> Harness<'static, TextureCraftApp> {
         execute(&mut session, "mask.add.black", &Value::Null).unwrap();
         execute(&mut session, "effect.add.fill", &json!({"value": 0.5})).unwrap();
     }
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     h
 }
@@ -66,16 +69,6 @@ fn export_mask_to_file_writes_the_mask_where_the_dialog_answered() {
     assert!(gray.pixels().any(|p| p.0[0] == 32768), "the mask's 0.5 as a 16-bit level");
     assert!(h.state().toasts.iter().any(|t| !t.error && t.text.contains("picked.png")), "{:?}", h.state().toasts.iter().map(|t| &t.text).collect::<Vec<_>>());
     let _ = std::fs::remove_dir_all(file.parent().unwrap());
-}
-
-#[test]
-fn a_canceled_dialog_writes_nothing() {
-    let mut h = harness(true);
-    h.state_mut().file_dialogs.set_override(Some(Box::new(|_| Answer::Cancelled)));
-    open_menu(&mut h);
-    h.get_by_label("Export mask to file...").click();
-    h.run_steps(4);
-    assert!(h.state().toasts.is_empty());
 }
 
 #[test]

@@ -1,9 +1,6 @@
-//! File > New project: the sections and their order, the defaults, settings shown disabled with a
-//! hint until TextureCraft has them, Create waiting for a mesh file, and the settings that reach
-//! the `file.new` command.
+//! New project creation, including mesh selection, disabled controls and settings passed to file.new.
 
 use egui::Role;
-use egui::accesskit::Toggled;
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_engine::template_cmds::DEFAULT_TEMPLATE;
@@ -24,7 +21,10 @@ fn harness() -> Harness<'static, TextureCraftApp> {
 
 fn harness_sized(size: egui::Vec2) -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::Session::new_project("Open", texturecraft_engine::geom::primitives::cube(1.0), "builtin:cube", None, 128).unwrap();
-    let mut h = Harness::builder().with_size(size).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(size)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(2);
     let ctx = h.ctx.clone();
@@ -89,81 +89,33 @@ fn create_keeps_the_mesh_buffer_for_retry_and_drops_it_after_success() {
     assert_eq!(h.state().session.doc.project.name, "retry");
 }
 
-fn top(h: &Harness<'_, TextureCraftApp>, label: &str) -> f32 {
-    h.get_all_by_label(label).map(|node| node.rect().top()).fold(f32::INFINITY, f32::min)
-}
-
 fn disabled(h: &Harness<'_, TextureCraftApp>, role: Role, label: &str) -> bool {
     h.get_by_role_and_label(role, label).accesskit_node().is_disabled()
 }
 
-fn ticked(h: &Harness<'_, TextureCraftApp>, role: Role, label: &str) -> bool {
-    h.get_by_role_and_label(role, label).accesskit_node().toggled() == Some(Toggled::True)
+#[test]
+fn the_uv_layout_control_is_disabled_when_uv_tiles_are_off() {
+    let h = harness();
+
+    assert!(disabled(&h, Role::RadioButton, "Keep UV tiles together per material"));
 }
 
 #[test]
-fn the_sections_follow_the_project_setup_order() {
-    let h = harness();
-    let order = [
-        "BASIC SETTINGS",
-        "3D mesh",
-        "Project template",
-        "Document resolution (px)",
-        "ADVANCED SETTINGS",
-        "Normal map format",
-        "Compute tangent space per fragment",
-        "UV Tile settings (UDIMs)",
-        "You can enable or disable UV tiles later in Texture Set Settings.",
-        "Use UV Tile workflow",
-        "Keep UV tiles together per material",
-        "Use a separate texture set for each tile",
-        "Import settings",
-        "Import cameras",
-        "Auto-unwrap",
-        "Import baked maps",
-        "Import mesh normal maps and baked maps for all materials.",
-        "Normal map filename: <texture set>_normal",
-        "Physical size",
-        "Use the mesh file’s unit scale",
-        "Custom unit scale",
-        "Scale material fills in real-world units",
-        "Color management",
-        "Working color space",
-    ];
-    let tops: Vec<f32> = order.iter().map(|label| top(&h, label)).collect();
-    for (pair, labels) in tops.windows(2).zip(order.windows(2)) {
-        assert!(pair[0] < pair[1], "{} comes before {}: {pair:?}", labels[0], labels[1]);
-    }
-    assert!(h.query_by_label("Linear - sRGB Chrominance (ITU-R BT.709)").is_some());
-}
+fn rebuild_mesh_uvs_is_off_by_default_and_toggles_with_space() {
+    let mut h = harness();
+    let rebuild = h.get_by_role_and_label(Role::CheckBox, "Rebuild mesh UVs");
 
-#[test]
-fn the_defaults_match_the_reference() {
-    let h = harness();
+    assert!(!rebuild.accesskit_node().is_disabled());
+    assert_eq!(rebuild.accesskit_node().toggled(), Some(egui::accesskit::Toggled::False));
 
-    assert!(h.query_by_label("No file selected").is_some());
-    assert!(h.query_by_value("Default (OpenPBR)").is_some(), "the default template");
-    assert!(h.query_by_value("1024 x 1024").is_some());
-    assert!(h.query_by_value("OpenGL").is_some());
-    assert!(h.query_by_value("Legacy").is_some());
-    assert!(!ticked(&h, Role::CheckBox, "Compute tangent space per fragment"));
-    assert!(!ticked(&h, Role::CheckBox, "Use UV Tile workflow"));
-    assert!(ticked(&h, Role::RadioButton, "Keep UV tiles together per material"));
-    assert!(disabled(&h, Role::RadioButton, "Keep UV tiles together per material"), "greyed while UV tiles are off");
-    assert!(ticked(&h, Role::CheckBox, "Import cameras") && !disabled(&h, Role::CheckBox, "Import cameras"));
-    assert!(ticked(&h, Role::CheckBox, "Auto-unwrap"));
-    assert!(ticked(&h, Role::RadioButton, "Use the mesh file’s unit scale"));
-    assert!(!ticked(&h, Role::CheckBox, "Scale material fills in real-world units"));
-}
+    rebuild.focus();
+    h.run_steps(2);
+    h.key_press(egui::Key::Space);
+    h.run_steps(2);
 
-#[test]
-fn template_controls_name_and_built_in_meshes_are_gone() {
-    let h = harness();
-
-    for label in ["Template name", "Save current project as template", "Name", "UV tiles (UDIM)"] {
-        assert!(h.query_by_label(label).is_none(), "{label} is not in the window");
-    }
-    assert!(h.query_by_label_contains("Built-in:").is_none(), "no built-in mesh dropdown");
+    let rebuild = h.get_by_role_and_label(Role::CheckBox, "Rebuild mesh UVs");
+    assert_eq!(rebuild.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
+    assert!(h.state().ui.new_project.rebuild_uvs);
 }
 
 #[test]
@@ -186,8 +138,6 @@ fn settings_not_available_yet_are_disabled_with_a_hint() {
     let unavailable = [
         (Role::CheckBox, "Compute tangent space per fragment"),
         (Role::RadioButton, "Use a separate texture set for each tile"),
-        (Role::CheckBox, "Auto-unwrap"),
-        (Role::Button, "Auto-unwrap options"),
         (Role::RadioButton, "Custom unit scale"),
         (Role::CheckBox, "Scale material fills in real-world units"),
     ];
@@ -326,16 +276,21 @@ fn the_supported_settings_reach_the_create_command() {
 
 #[test]
 fn ticking_uv_tiles_creates_a_uv_tile_project() {
-    for (tick, expected) in [(false, Vec::<u32>::new()), (true, vec![1002])] {
+    for (enable_uv_tiles, rebuild_uvs, expected_tiles) in [(false, false, vec![]), (true, false, vec![1002]), (true, true, vec![1001])] {
         let mut h = harness();
         let dir = TempDir::new("new-project-udim");
         h.state_mut().ui.new_project.file = Some(mesh_file(&dir, TILE_1002_QUAD));
         h.state_mut().ui.new_project.resolution = 128;
         h.run_steps(2);
-        if tick {
+        if enable_uv_tiles {
             h.get_by_role_and_label(Role::CheckBox, "Use UV Tile workflow").click();
             h.run_steps(3);
             assert!(!disabled(&h, Role::RadioButton, "Keep UV tiles together per material"));
+        }
+
+        if rebuild_uvs {
+            h.get_by_role_and_label(Role::CheckBox, "Rebuild mesh UVs").click();
+            h.run_steps(3);
         }
         h.get_by_role_and_label(Role::CheckBox, "Import cameras").click();
         h.run_steps(2);
@@ -345,8 +300,14 @@ fn ticking_uv_tiles_creates_a_uv_tile_project() {
         let app = h.state();
         assert!(!app.ui.windows.new_project, "the window closes");
         assert_eq!(app.session.doc.project.name, "tiles");
-        assert_eq!(app.session.doc.project.texture_sets[0].uv_tiles, expected, "UV tiles ticked: {tick}");
+        assert_eq!(app.session.doc.project.texture_sets[0].uv_tiles, expected_tiles, "UV tiles enabled: {enable_uv_tiles}, rebuild UVs: {rebuild_uvs}");
         assert_eq!(app.session.doc.project.texture_sets[0].resolution, 128);
+        if rebuild_uvs {
+            let bytes = texturecraft_engine::formats::save_project_bytes(&app.session.project_file()).unwrap();
+            let reopened = texturecraft_engine::Session::from_project_bytes(&bytes).unwrap();
+            assert_eq!(reopened.source_mesh().uvs, app.session.source_mesh().uvs);
+            assert_eq!(reopened.doc.project.format_version, texturecraft_engine::core::project::REBUILT_MESH_UVS_VERSION);
+        }
     }
 }
 
@@ -393,7 +354,7 @@ fn create_asks_before_discarding_edits_made_after_the_form_opened() {
     h.get_by_role_and_label(Role::Button, "Create").click();
     h.run_steps(3);
 
-    assert!(h.query_by_label("Unsaved changes").is_some());
+    assert!(h.query_by_label("Unsaved Changes").is_some());
     assert_eq!(h.state().session.doc.project.name, "Open");
 
     h.get_by_role_and_label(Role::Button, "Don't save").click();

@@ -39,7 +39,7 @@ impl Session {
     pub fn bake_name_pairs(&self, texture_set: usize) -> Result<Option<Vec<NamePair>>> {
         let set = self.doc.project.texture_set(texture_set)?;
         let settings = &set.bake.high_poly;
-        let high = self.bake_meshes.merged_high().filter(|_| settings.match_mode == MeshMatchMode::ByMeshName && !settings.use_low_as_high);
+        let high = self.doc.bake_meshes.merged_high().filter(|_| settings.match_mode == MeshMatchMode::ByMeshName && !settings.use_low_as_high);
 
         Ok(high.map(|high| NamePair::list(&self.mesh, set.material, &high.mesh, settings)))
     }

@@ -13,6 +13,15 @@ pub struct ExportJob {
     pub directory: String,
     /// File names written so far.
     pub written: Vec<String>,
+    /// UDIM file patterns referenced by materials written earlier in this export.
+    pub material_udim_patterns: Vec<String>,
     /// The frame that wrote the last texture set (a frame's second pass writes none).
     pub frame: u64,
+    /// Also write the mesh and materials as a USD asset with the last texture set, as ticked when
+    /// Export was clicked.
+    pub usd_asset: bool,
+    /// The params of the texture sets written so far, for the USD asset.
+    pub sent: Vec<serde_json::Value>,
+    /// Warning messages already shown in this export.
+    pub shown_warnings: Vec<String>,
 }

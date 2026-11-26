@@ -2,25 +2,31 @@
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use bytemuck::{Pod, Zeroable};
 use rayon::prelude::*;
+use texturecraft_compose::environment_sh::EnvironmentSh;
 use texturecraft_compose::graphs::RenderEnv;
 use texturecraft_compose::pattern::pattern_pixels;
 use texturecraft_compose::{BakedMaps, Cooked, DisplayKind, GraphStore, GraphUse, ImageStore, Inputs, PixelStore, Texels};
+use texturecraft_core::project::DisplaySettings;
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelFormat, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Generator, GeneratorKind,
-    GraphRef, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, PlacedMode, ProceduralKind, Project, Projection, Source,
+    BakedMap, BlendMode, Channel, ChannelFormat, ChannelKind, ColorSelection, CompareOp, CompareSource, ContentsOffset, CurvatureDetail, CurvatureMode, Effect,
+    EffectKind, Filter, Generator, GeneratorKind, GraphRef, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, PlacedMode, ProceduralKind, Project,
+    Projection, Sampling, Source, ThresholdMode,
 };
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
 
 use crate::gpu_curvature::{CurvatureGpu, CurvatureInput, CurvatureLevels};
 use crate::gpu_image_source::{
-    DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, MaterialImages, PLACED_TRIPLANAR_PROJECTION, PLACED_UV_PROJECTION, PLACED_WARP_PROJECTION,
+    DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, ImageUse, MaterialImages, PLACED_TRIPLANAR_PROJECTION, PLACED_UV_PROJECTION, PLACED_WARP_PROJECTION,
 };
-use crate::gpu_neighbourhood::{FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
+use crate::gpu_neighbourhood::{self, FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
 use crate::gpu_stencil::GpuStencil;
 use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePatterns};
 use crate::paint_window::CompositePaintWindow;
@@ -30,6 +36,25 @@ use wgpu::util::DeviceExt;
 mod groups;
 #[path = "gpu_composite_pipelines.rs"]
 mod pipelines;
+// The GPU port packages (texturecraft #713): the hub chains every package's hooks, each package
+// owns its module. See gpu_composite_packages.rs for the ownership table and shared layouts.
+#[path = "gpu_composite_brush.rs"]
+mod brush;
+#[path = "gpu_composite_projection.rs"]
+mod fill_projection;
+#[path = "gpu_composite_lighting.rs"]
+mod lighting;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "gpu_composite_oracle.rs"]
+pub(crate) mod oracle;
+#[path = "gpu_composite_packages.rs"]
+mod packages;
+#[path = "gpu_composite_point.rs"]
+mod point;
+#[path = "gpu_composite_stack.rs"]
+mod stack;
+#[path = "gpu_composite_udim.rs"]
+mod udim;
 use groups::{BEGIN_GROUP, END_GROUP, GroupPlan, StackWork};
 use pipelines::CompositePipelines;
 
@@ -87,6 +112,7 @@ const NEIGHBOURHOOD_OPCODE: u32 = 36;
 const COMPARE_OPCODE: u32 = 37;
 const COLOR_SELECTION_OPCODE: u32 = 38;
 const NOOP_EFFECT_OPCODE: u32 = 39;
+const UV_TILE_PROJECTION: u32 = 10;
 const MASK_STAGE: u32 = 1 << 31;
 const PASSTHROUGH_STACK: u32 = 1 << 31;
 const GENERATOR_STAGE: u32 = 1 << 30;
@@ -95,36 +121,168 @@ const MASK_ANCHOR_STAGE: u32 = 1 << 28;
 const ANCHOR_SOURCE: u32 = 15;
 const ANCHOR_PUBLISH_MASK: u32 = 16;
 const ANCHOR_PUBLISH_LAYER: u32 = 17;
+// Opcodes are classified by range, in the shaders too (`is_fill_opcode` in
+// composite_packages.wgsl): fills and patterns below 20 and from 48 below 128, built-in effects
+// 20..40, generators 40..48, the GPU port packages' effects 128..192 (`packages::EXTENDED_EFFECTS`,
+// one block per package), group markers 200 and 201. Never renumber an existing opcode.
 // Extended procedural sources follow the filter and generator opcodes.
 const FIRST_GENERATOR: u32 = 40;
 const FIRST_EXTENDED_PATTERN: u32 = 48;
 pub(crate) const ROWS: u32 = 64;
 const WORKGROUP: u32 = 8;
-// Keep extreme Tile Generator overlap from monopolizing an update, dispatch, or submission.
-const MAX_TILE_WORK_PER_UPDATE: u64 = 8 << 30;
+// Keep costly fills (Tile Generator overlap, symmetry copies) from monopolizing a dispatch or a
+// submission: an update of any cost runs in more bands and submissions instead.
 const MAX_TILE_WORK_PER_BAND: u64 = 64 << 20;
 const MAX_TILE_WORK_PER_SUBMISSION: u64 = 256 << 20;
 const BAKE_MAPS: [BakedMap; 4] = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Thickness];
+/// The maps of the second bake row block, for programs that ask (`ProceduralInputs::read_bake_rows`):
+/// its texel holds the height in x and the stored world normal in yzw (f32 bits). Bit `i` of the
+/// presence word (`bake_has` in WGSL) is set when map `i` is baked.
+const BAKE_ROW_MAPS: [BakedMap; 2] = [BakedMap::Height, BakedMap::WorldNormal];
+/// Side-table words of the environment's diffuse light (`ProceduralInputs::reserve_environment`)
+const ENVIRONMENT_WORDS: usize = 28;
 const MAX_ID_BAKE_BYTES: u64 = 1 << 30;
 const MAX_ID_UPLOAD_BYTES: usize = 64 << 20;
 
 #[derive(Debug)]
 struct BakedInputs {
     width: u32,
+    /// The maps' common height; with maps of different heights ([`Self::separate`]) the
+    /// Curvature's, else the first baked map's
     height: u32,
     maps: [Option<Arc<Texels>>; BAKE_MAPS.len()],
+    /// The second row block's maps ([`BAKE_ROW_MAPS`]), only in programs that read them
+    rows: [Option<Arc<Texels>>; BAKE_ROW_MAPS.len()],
+    /// P8: each map's height in texels, [`BAKE_MAPS`] then [`BAKE_ROW_MAPS`] (0 where not baked)
+    heights: [u32; SEPARATE_MAPS],
 }
 
+/// P8: the maps of the bake texture with maps of different heights, [`BAKE_MAPS`] then
+/// [`BAKE_ROW_MAPS`], as `udim_separate_bake` in WGSL numbers them
+const SEPARATE_MAPS: usize = BAKE_MAPS.len() + BAKE_ROW_MAPS.len();
+/// P8: the order their rows take: the Curvature's first, where the curvature detail sizes read them
+const SEPARATE_ORDER: [usize; SEPARATE_MAPS] = [2, 0, 1, 3, 4, 5];
+
 impl BakedInputs {
-    fn new(baked: &BakedMaps) -> Result<Option<Self>, &'static str> {
-        let maps = BAKE_MAPS.map(|map| baked.maps.get(&map).filter(|data| !data.is_empty()).cloned());
-        let Some(index) = maps.iter().position(Option::is_some) else { return Ok(None) };
-        let height = baked.height(BAKE_MAPS[index]);
-        if height == 0 || baked.resolution == 0 || BAKE_MAPS.iter().zip(&maps).any(|(&map, data)| data.is_some() && baked.height(map) != height) {
-            return Err("The baked maps have different layouts and use CPU compositing.");
+    /// The bakes a program reads: the built-in maps, and with `rows` the second row block's. Maps
+    /// of different heights each keep their own (P8, [`Self::separate`]).
+    fn new(baked: &BakedMaps, rows: bool) -> Result<Option<Self>, &'static str> {
+        let present = |map: &BakedMap| baked.maps.get(map).filter(|data| !data.is_empty()).cloned();
+        let maps = BAKE_MAPS.map(|map| present(&map));
+        let rows = BAKE_ROW_MAPS.map(|map| present(&map).filter(|_| rows));
+        let all = BAKE_MAPS.iter().zip(&maps).chain(BAKE_ROW_MAPS.iter().zip(&rows));
+        let Some(first) = all.clone().find_map(|(&map, data)| data.as_ref().map(|_| map)) else { return Ok(None) };
+        if baked.resolution == 0 || all.clone().any(|(&map, data)| data.is_some() && baked.height(map) == 0) {
+            return Err("A baked map has no whole row of texels and uses CPU compositing.");
         }
-        Ok(Some(Self { width: baked.resolution, height, maps }))
+
+        let mut heights = [0; SEPARATE_MAPS];
+        for (height, (&map, data)) in heights.iter_mut().zip(all) {
+            *height = if data.is_some() { baked.height(map) } else { 0 };
+        }
+        let curvature = baked.height(BakedMap::Curvature);
+        let height = if maps[2].is_some() && curvature != 0 { curvature } else { baked.height(first) };
+        Ok(Some(Self { width: baked.resolution, height, maps, rows, heights }))
     }
+
+    /// Row blocks of the bake texture: the built-in maps', and the second block's when a map of it is baked
+    fn blocks(&self) -> u32 {
+        if self.rows.iter().any(Option::is_some) { 2 } else { 1 }
+    }
+
+    /// The band uniform's bake words (`params.id_bake.zw`): rows per block (0: one block, the
+    /// whole texture; the Curvature's rows with maps of different heights) and the second
+    /// block's presence bits
+    fn uniform_words(&self) -> [u32; 2] {
+        let present = self.rows.iter().enumerate().filter(|(_, data)| data.is_some()).fold(0, |bits, (index, _)| bits | 1 << index);
+        [if self.blocks() > 1 || self.separate() { self.height } else { 0 }, present]
+    }
+
+    /// P8: whether the baked maps have different heights. Each height's maps then take rows of
+    /// their own, with a header row after them ([`Self::separate_layout`]).
+    fn separate(&self) -> bool {
+        let mut heights = self.heights.iter().filter(|&&height| height != 0);
+        let first = heights.next();
+        heights.any(|height| Some(height) != first)
+    }
+
+    /// P8: the rows of baked maps of different heights: each map's first row and height
+    /// ([`BAKE_MAPS`] then [`BAKE_ROW_MAPS`], no rows where not baked), and the header row after
+    /// them. The built-in maps of one height share rows, the row maps of one height too.
+    fn separate_layout(&self) -> ([[u32; 2]; SEPARATE_MAPS], u32) {
+        let mut groups: Vec<((bool, u32), u32)> = Vec::new();
+        let mut next = 0u32;
+        let mut entries = [[0; 2]; SEPARATE_MAPS];
+        for index in SEPARATE_ORDER {
+            let height = self.heights[index];
+            if height == 0 {
+                continue;
+            }
+            let key = (index >= BAKE_MAPS.len(), height);
+            let first = match groups.iter().find(|(group, _)| *group == key) {
+                Some(&(_, first)) => first,
+                None => {
+                    groups.push((key, next));
+                    next = next.saturating_add(height);
+                    next - height
+                }
+            };
+            entries[index] = [first, height];
+        }
+        (entries, next)
+    }
+}
+
+/// P8: upload baked maps of different heights ([`BakedInputs::separate_layout`]): each height's
+/// maps in rows of their own, laid as the one-height texture lays them (a map of another height
+/// keeps its fallback there), then each map's first row and height in the header rows, texel
+/// `map` (`udim_separate_bake` in WGSL).
+fn write_separate_bakes(queue: &wgpu::Queue, texture: &wgpu::Texture, baked: &BakedInputs, (entries, header): ([[u32; 2]; SEPARATE_MAPS], u32)) {
+    let width = baked.width;
+    let mut written: Vec<u32> = Vec::new();
+    for (index, &[first, height]) in entries.iter().enumerate() {
+        if height == 0 || written.contains(&first) {
+            continue;
+        }
+        written.push(first);
+        let row_maps = index >= BAKE_MAPS.len();
+        let own = |map: usize| entries[map] == [first, height];
+        for top in (0..height).step_by(ROWS as usize) {
+            let end = (top + ROWS).min(height);
+            let indices = top as usize * width as usize..end as usize * width as usize;
+            let texels: Vec<[u32; 4]> = if row_maps {
+                // Height in x, the stored world normal in yzw; zeros where a map is not baked here
+                let row = |map: usize, i: usize, component: usize| {
+                    let components = BAKE_ROW_MAPS[map].components();
+                    let data = baked.rows[map].as_ref().filter(|_| own(BAKE_MAPS.len() + map));
+                    data.and_then(|data| data.get(i * components + component)).unwrap_or(0.0).to_bits()
+                };
+                indices.into_par_iter().map(|i| [row(0, i, 0), row(1, i, 0), row(1, i, 1), row(1, i, 2)]).collect()
+            } else {
+                let value =
+                    |map: usize, i: usize, fallback: f32| baked.maps[map].as_ref().filter(|_| own(map)).and_then(|data| data.get(i)).unwrap_or(fallback);
+                indices
+                    .into_par_iter()
+                    .map(|i| {
+                        let normal = if baked.maps[1].is_some() && own(1) {
+                            encode_baked_normal([value(1, i * 3, 0.5), value(1, i * 3 + 1, 0.5), value(1, i * 3 + 2, 1.0)])
+                        } else {
+                            0
+                        };
+                        [value(0, i, 1.0).to_bits(), value(2, i, 0.5).to_bits(), value(3, i, 1.0).to_bits(), normal]
+                    })
+                    .collect()
+            };
+            write_input(queue, texture, (width, end - top), (first + top, 0), &texels);
+        }
+    }
+
+    let header_rows = SEPARATE_MAPS.div_ceil(width.max(1) as usize) as u32;
+    let mut texels = vec![[0u32; 4]; width as usize * header_rows as usize];
+    for (texel, [first, height]) in texels.iter_mut().zip(entries) {
+        *texel = [first, height, 0, 0];
+    }
+    write_input(queue, texture, (width, header_rows), (header, 0), &texels);
 }
 
 #[derive(Debug)]
@@ -163,6 +321,9 @@ struct Operation {
     // Geometry mask row (resolved to a lookup offset at upload), height operation plus one,
     // height-mask contrast and offset encoded as floats.
     constraints: [u32; 4],
+    // The GPU port packages' word, zero everywhere else (layout in gpu_composite_packages.rs):
+    // side-table offset (0: none), P1 projection flags, P2/P3/P6/P7 flag bytes, P8 word.
+    ext: [u32; 4],
 }
 
 #[derive(Debug, Default)]
@@ -285,7 +446,20 @@ impl<'a> CompositeGraphs<'a> {
 
 struct ProceduralInputs<'a> {
     set: usize,
+    /// Texels per side of a UV tile at the base stage's scale (the set's resolution, or a UV
+    /// tile atlas's block)
     resolution: u32,
+    /// The set's own resolution, the texture set size of `OutputResolution::output_size`
+    texture_set: u32,
+    /// The working atlas's longest side, which caps filter radii
+    longest_side: u32,
+    /// P8: a UV tile atlas's block side, where a whole-tile stage finds its tile
+    block: u32,
+    /// P8: the tile resolutions of a UV tile atlas's further scales (`udim::UdimLayout::levels`),
+    /// each a neighbourhood stage of its own after the base stage
+    levels: Vec<u32>,
+    /// P8: each generator stage's (filter, cell) at those further scales, by generator stage
+    generator_levels: Vec<Vec<(Option<NeighbourhoodFilter>, u32)>>,
     ramp_words: Vec<u32>,
     curvature_sizes: [bool; CurvatureDetail::BLURRED_SIZES],
     filters: Vec<(Filter, f32)>,
@@ -295,6 +469,22 @@ struct ProceduralInputs<'a> {
     generator_stages: Vec<(Option<NeighbourhoodFilter>, u32)>,
     generator_sources: Vec<Operation>,
     anchors: AnchorInputs,
+    /// A neighbourhood stage a package lowering asked to run right before the effect's own
+    /// operation ([`Self::precede_with_stage`]); the callers of `point_effect` push it first.
+    preceding_stage: Option<Operation>,
+    /// Source operations effects read as image inputs (`register_input`), appended after the
+    /// effects like the generators' sources.
+    input_sources: Vec<Operation>,
+    /// Side-table words that hold an image's record offset once the atlas is laid out
+    /// (`pack_image`): (word index in the side table, image index).
+    image_words: Vec<(u32, u32)>,
+    /// The side-table word where the environment's diffuse light starts, filled at upload
+    /// (`reserve_environment`).
+    environment_word: Option<u32>,
+    /// A lowering reads the Height and World Normal bake rows (`read_bake_rows`).
+    bake_rows: bool,
+    /// The image inputs (`register_input` references) read as colour (`register_color_input`).
+    color_inputs: BTreeSet<u32>,
 }
 
 #[derive(Default)]
@@ -327,10 +517,22 @@ impl AnchorInputs {
 }
 
 impl<'a> ProceduralInputs<'a> {
-    fn new(set: usize, resolution: u32, graphs: Option<CompositeGraphs<'a>>) -> Self {
+    /// The inputs of a set without imported graphs (the package tests)
+    #[cfg(test)]
+    fn new(resolution: u32) -> Self {
+        Self::with_graphs(0, resolution, None)
+    }
+
+    /// The inputs of texture set `set`, with the cooked outputs of its imported graphs
+    fn with_graphs(set: usize, resolution: u32, graphs: Option<CompositeGraphs<'a>>) -> Self {
         Self {
             set,
             resolution,
+            texture_set: resolution,
+            longest_side: resolution,
+            block: resolution,
+            levels: Vec::new(),
+            generator_levels: Vec::new(),
             ramp_words: Vec::new(),
             curvature_sizes: [false; CurvatureDetail::BLURRED_SIZES],
             filters: Vec::new(),
@@ -340,6 +542,12 @@ impl<'a> ProceduralInputs<'a> {
             generator_stages: Vec::new(),
             generator_sources: Vec::new(),
             anchors: AnchorInputs::default(),
+            preceding_stage: None,
+            input_sources: Vec::new(),
+            image_words: Vec::new(),
+            environment_word: None,
+            bake_rows: false,
+            color_inputs: BTreeSet::new(),
         }
     }
 
@@ -382,6 +590,85 @@ impl<'a> ProceduralInputs<'a> {
         Ok(Some((slot, alpha)))
     }
 
+    /// [`Self::register_input`] for an input read as colour: a neighbourhood stage's field then
+    /// carries its RGB in words 5..8 (`input_color_at` in neighbourhood.wgsl), and a point
+    /// operation reads it with `effect_input_color(effect, texel)`. P5: Color Match's inputs.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn register_color_input(&mut self, source: Operation) -> u32 {
+        let reference = self.register_input(source);
+        self.color_inputs.insert(reference);
+        reference
+    }
+
+    /// Reserve the [`ENVIRONMENT_WORDS`] side-table words that hold the viewport environment's
+    /// diffuse light (`EnvironmentSh`): its nine RGB coefficients as f32 bits in `sh_basis` order
+    /// (coefficient `i`, component `k` at word `3 i + k`), then the environment rotation in
+    /// radians. The program keeps the project's display settings from compile and fills the words
+    /// when it learns the images (`CompositeProgram::set_tile_images`), so a turned or changed
+    /// environment needs no other lowering. Returns their absolute offset (like `pack_words`); a
+    /// second reservation returns the same words. P6: Baked Lighting Environment.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn reserve_environment(&mut self) -> Option<u32> {
+        if let Some(word) = self.environment_word {
+            return LOOKUP_WORDS.checked_add(word);
+        }
+        let word = u32::try_from(self.ramp_words.len()).ok()?;
+        let offset = self.pack_words(&[0; ENVIRONMENT_WORDS])?;
+        self.environment_word = Some(word);
+        Some(offset)
+    }
+
+    /// Ask for the bake rows after the built-in maps: the baked Height and World Normal at
+    /// `baked_block_at(pixel, 1u)` in WGSL (x the height, yzw the stored world normal, f32 bits),
+    /// present when `bake_has(BAKED_HEIGHT)` / `bake_has(BAKED_WORLD_NORMAL)`. The rows exist only
+    /// in programs that ask and only for the maps that are baked. P6: lighting's height slope and
+    /// detail normal.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn read_bake_rows(&mut self) {
+        self.bake_rows = true;
+    }
+
+    /// Register `source` (a `source_operation`) as an effect's image input: the returned
+    /// reference goes in the effect operation's `effects[3]`. The program appends the source
+    /// after the effects and rebinds the reference to its operation index plus one, which a
+    /// neighbourhood stage then evaluates into its field's sixth word (`FilterStage::input`) and
+    /// a point operation reads with `effect_input(effect, texel)` in WGSL. The CPU reads inputs
+    /// with `Sampling::default()` (Bilinear HQ): build the source with P1's sampling.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn register_input(&mut self, source: Operation) -> u32 {
+        self.input_sources.push(source);
+        self.input_sources.len() as u32
+    }
+
+    /// A side-table word that will hold image `name`'s record offset (the atlas layout of
+    /// `MaterialImages`, `u32::MAX` while the image is missing): the returned offset goes where
+    /// the operation's shader reads it with `param_word`, and `image_texel_nearest` reads the
+    /// image there (P3: a Color Selection's ID map).
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn pack_image(&mut self, name: &str, usage: ImageUse) -> Option<u32> {
+        let image = self.materials.register_image(name, usage);
+        let word = u32::try_from(self.ramp_words.len()).ok()?;
+        let offset = self.pack_words(&[u32::MAX])?;
+        self.image_words.push((word, image));
+        Some(offset)
+    }
+
+    /// Lets a package lowering (in `packages::lower_filter`) run the neighbourhood stage of
+    /// `filter` right before the effect's own operation: one effect, two operations. This is the
+    /// seam of the Gradient's `input.blur` (P4 defines the stage, P2 the gradient that follows).
+    /// The point operation then reads the stage's output field in place of the content, so a
+    /// stage that must keep the original colour (for the opacity mix) passes its derived value in
+    /// a component or the sixth field word, as P4 defines it. None, and nothing queued, when the
+    /// GPU has no stage for `filter` or its size reaches nothing.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn precede_with_stage(&mut self, filter: &Filter, opacity: f32) -> Option<()> {
+        NeighbourhoodFilter::new(filter, self.resolution, self.longest_side, opacity, None)?;
+        let ids = [0, NEIGHBOURHOOD_OPCODE, u32::try_from(self.filters.len()).ok()?, 0];
+        self.filters.push((filter.clone(), opacity));
+        self.preceding_stage = Some(Operation { ids, low: [0.0, 0.0, 0.0, opacity.clamp(0.0, 1.0)], ..Operation::zeroed() });
+        Some(())
+    }
+
     fn pack_rgb(&mut self, colors: &[[f32; 3]]) -> Option<[u32; 2]> {
         if colors.iter().flatten().any(|value| !value.is_finite()) {
             return None;
@@ -390,6 +677,26 @@ impl<'a> ProceduralInputs<'a> {
         let count = u32::try_from(colors.len()).ok()?;
         self.ramp_words.extend(colors.iter().flatten().map(|value| value.to_bits()));
         Some([offset, count])
+    }
+
+    /// Append finite `values` to the parameter side table (the words after the sRGB lookup in
+    /// binding 2, shared with [`Self::pack_rgb`]) and return their absolute word offset for
+    /// `Operation::ext[0]`. The shader reads them with `param(op, i)`. None for a non-finite value.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn pack_params(&mut self, values: &[f32]) -> Option<u32> {
+        if values.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let words: Vec<u32> = values.iter().map(|value| value.to_bits()).collect();
+        self.pack_words(&words)
+    }
+
+    /// [`Self::pack_params`] for raw words (counts, packed flags, offsets); read with `param_word(op, i)`.
+    #[allow(dead_code)] // Used by the GPU port packages
+    fn pack_words(&mut self, words: &[u32]) -> Option<u32> {
+        let offset = LOOKUP_WORDS.checked_add(u32::try_from(self.ramp_words.len()).ok()?)?;
+        self.ramp_words.extend_from_slice(words);
+        Some(offset)
     }
 
     fn pack_curvature(&mut self, detail: &CurvatureDetail, derive_levels: bool) -> Option<[f32; 2]> {
@@ -411,46 +718,230 @@ impl<'a> ProceduralInputs<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct FilterStage {
     layer: u32,
     preceding: u32,
     filter: Option<NeighbourhoodFilter>,
     cell: u32,
     anchor: Option<(Channel, u32, u32)>,
+    /// The operation (index plus one, 0: none) the prepare pass evaluates into the field's sixth
+    /// word: an image input's gray (P3) or the layer's own Height (P5, Height To Normal).
+    input: u32,
+    /// How the prepare pass reads `input` ([`INPUT_LAYER`], [`INPUT_COLOR`]; 0: an input source's gray)
+    input_kind: u32,
+    /// A second input source (operation index plus one, 0: none), read as colour into words
+    /// 8..11 (`input2_color_at` in neighbourhood.wgsl): an effect's `effects[2]` on a
+    /// neighbourhood operation (P5: Color Match's Input and Image Input both linked).
+    input2: u32,
+    /// The prepare pass reads the set periodically outside it (P4: Blur and Bevel `wrap`), and
+    /// the fields of the program may start below zero ([`FilterPlan::wraps`]).
+    wrap: bool,
+    /// Evaluated once per update by the whole-set pre-pass ([`FilterPlan::whole_set`]) instead
+    /// of in every band: a stage with a large reach, or one that needs the whole set.
+    whole: bool,
+    /// How the prepare pass views the content (bits of its `field_layout.w`): [`OWN_VIEW`], the
+    /// layer's own material read as the channels' defaults (a mask's This Layer of a lit Base
+    /// Color), and [`NO_FIELDS`], every neighbourhood stage as identity.
+    view: u32,
+    /// The prepare pass's `mask_view` (`FilterPlan::add_lit_mask_views`), zero for most stages
+    mask_view: [u32; 4],
+    /// P8: 0 for a stage of its own; `n` for the stage of the base stage `n` slots before it at a
+    /// UV tile atlas's level `n` (a smaller tile scale), whose output the texels of that level's
+    /// blocks read instead (`udim_level_slot` in WGSL)
+    level: u32,
 }
+
+/// The whole-set pre-pass of a program: the stages it evaluates (the whole-set stages and the
+/// lower stages of their stacks), the whole-set stages whose outputs the bands read, and the
+/// reach of the pre-pass fields.
+#[derive(Debug, PartialEq)]
+struct WholeSet {
+    stages: Vec<usize>,
+    outputs: Vec<usize>,
+    /// The outputs the band uniform names (indices into `outputs`): every output but a level
+    /// stage, whose results follow its base stage's (P8)
+    entries: Vec<usize>,
+    /// The largest pass's reach
+    reach: u32,
+    /// One pass per stack, run one after another in the same working space
+    passes: Vec<WholePass>,
+}
+
+/// The whole-set pre-pass of one stack: its stages (a contiguous run of slots), the outputs of
+/// [`WholeSet::outputs`] among them, the reach of its fields, and how far past the set's edges
+/// its fields reach in a wrapping program (the stages at and below its topmost wrapping stage;
+/// a stage that does not wrap reads only the set, its own copy).
+#[derive(Debug, PartialEq)]
+struct WholePass {
+    stages: Vec<usize>,
+    outputs: Vec<usize>,
+    reach: u32,
+    past_edges: u32,
+    /// The working fields its kernels use besides the original ([`NeighbourhoodFilter::blur_fields`])
+    blur_fields: u32,
+}
+
+impl WholePass {
+    /// The compact slot table (`whole_compact` in composite.wgsl): the pass's stages take slots
+    /// 0.., the working fields the next three. Not active when its stages are not contiguous.
+    fn compact(&self, fields: u32) -> [u32; 4] {
+        let (Some(&first), Some(&last)) = (self.stages.first(), self.stages.last()) else { return [0; 4] };
+        if last + 1 - first != self.stages.len() {
+            return [0, 0, fields, 0];
+        }
+        [first as u32, self.stages.len() as u32, fields, 1]
+    }
+
+    /// The slot `slot` takes in the pass's working space ([`Self::compact`]).
+    fn slot(&self, slot: u32, fields: u32) -> u32 {
+        match self.compact(fields) {
+            [_, count, fields, 1] if slot >= fields => count + slot - fields,
+            [base, _, _, 1] => slot - base,
+            _ => slot,
+        }
+    }
+
+    /// Field slots of the pass's working space: its stages, the original and the working fields
+    /// its kernels use
+    fn slots(&self, fields: u32) -> u64 {
+        match self.compact(fields) {
+            [_, count, _, 1] => u64::from(count) + 1 + u64::from(self.blur_fields),
+            _ => u64::from(fields) + 3,
+        }
+    }
+
+    /// The kernels' working fields: the ones the pass has, else the original (never read then)
+    fn blur(&self, fields: u32, offset: impl Fn(u32) -> u32) -> [u32; 2] {
+        let compact = self.compact(fields)[3] == 1;
+        let field = |index: u32| if !compact || self.blur_fields > index { offset(fields + 1 + index) } else { offset(fields) };
+        [field(0), field(1)]
+    }
+}
+
+/// `FilterStage::input_kind`, also the bits of the prepare pass's `field_layout.w`: the input is a
+/// layer operation whose content times coverage the prepare pass evaluates (Height To Normal's
+/// own Height, `layer_content`), or an input source read as colour into words 5..8.
+const INPUT_LAYER: u32 = 2;
+const INPUT_COLOR: u32 = 4;
+/// The prepare pass's `field_layout.w` bits of a stage's view (`FilterStage::view`): the layer's
+/// own material read as the channels' defaults, and every neighbourhood stage as identity
+const OWN_VIEW: u32 = 8;
+const NO_FIELDS: u32 = 32;
+/// The prepare pass's `field_layout.w` bit of a stage with a second input (`FilterStage::input2`),
+/// whose operation plus one goes in `params.anchor.z`
+const INPUT2: u32 = 16;
+
+/// Whole-set stages the band uniform can address (`whole_slots` in composite.wgsl)
+const MAX_WHOLE_SET_STAGES: usize = 4;
+
+impl FilterStage {
+    fn reach(&self) -> u32 {
+        // A level stage runs beside its base stage, which reaches at least as far
+        if self.level != 0 {
+            return 0;
+        }
+
+        self.filter.map_or(0, NeighbourhoodFilter::reach).saturating_add(if self.cell > 1 { self.cell * 2 } else { 0 })
+    }
+
+    /// The stack the stage belongs to: its layer operation and whether it filters the mask.
+    fn stack(&self) -> (u32, bool) {
+        (self.layer, self.preceding & MASK_STAGE != 0)
+    }
+
+    fn anchors(&self) -> bool {
+        self.anchor.is_some() || self.preceding & (MATERIAL_ANCHOR_STAGE | MASK_ANCHOR_STAGE) != 0
+    }
+}
+
+/// What `FilterPlan::compile` has done so far: the layer operations whose content is planned, the
+/// capture stages of the stack reads by (end operation, channel), and the effects bound to one.
+type ContentProgress<'a> = (&'a mut BTreeSet<usize>, &'a mut BTreeMap<(u32, Channel), u32>, &'a mut BTreeSet<usize>);
 
 #[derive(Debug, Default)]
 struct FilterPlan {
     stages: Vec<FilterStage>,
     reach: u32,
     anchor_slots: Vec<u32>,
+    /// The operation index of the first input source (`bind_input_sources`), while compiling
+    input_base: u32,
 }
 
 impl FilterPlan {
     fn compile(operations: &mut [Operation], layer_count: u32, inputs: &ProceduralInputs) -> Self {
-        if inputs.filters.is_empty() && inputs.generator_stages.is_empty() && inputs.anchors.reads.is_empty() {
+        let reads_stack = operations.iter().skip(layer_count as usize).any(|op| stack_reads(op) != [0; 2]);
+        if inputs.filters.is_empty() && inputs.generator_stages.is_empty() && inputs.anchors.reads.is_empty() && !reads_stack {
             return Self::default();
         }
-        let mut plan = Self::default();
+        let mut plan = Self { input_base: (operations.len() - inputs.input_sources.len()) as u32, ..Self::default() };
         let (layers, effects) = operations.split_at_mut(layer_count as usize);
         let mut masks = BTreeMap::new();
         plan.anchor_slots.resize(inputs.anchors.reads.len(), 0);
-        for (index, layer) in layers.iter_mut().enumerate() {
+        let mut stack_reads = BTreeMap::new();
+        let mut read_effects = BTreeSet::new();
+        let mut prepared = BTreeSet::new();
+        for index in 0..layers.len() {
+            let run = layer_run(&inputs.anchors.draw_ranges, index);
+            if layers[index].ids[1] != ANCHOR_PUBLISH_LAYER {
+                plan.bind_stack_reads(layers, effects, index, run.clone(), false, (&mut stack_reads, &mut read_effects));
+            }
+            let layer = &mut layers[index];
             if layer.ids[1] == ANCHOR_PUBLISH_LAYER {
                 plan.add_anchor(layer.ids[2], index as u32, MATERIAL_ANCHOR_STAGE, &inputs.anchors, Some((layer.effects[0], layer.effects[1])));
                 continue;
             }
-            let [mask, mask_count, content, content_count] = layer.effects;
-            let mask_has_fields = mask_count > 0
-                && *masks.entry(mask).or_insert_with(|| {
+            let [mask, mask_count, _, _] = layer.effects;
+            // A mask reading its own layer's content: that layer's content stacks first, so the
+            // mask's prepare pass resumes from prepared content fields. A Base Color that reads
+            // the layer's material waits for the mask too, which the material's capture reads.
+            if mask_count > 0 && !masks.contains_key(&mask) && effects.iter().skip(mask as usize).take(mask_count as usize).any(packages::mask_reads_own_layer)
+            {
+                let lit = own_material_base(layers, effects, run.clone());
+                for own in run.clone() {
+                    if lit == Some(own) {
+                        plan.bind_stack_reads(layers, effects, own, run.clone(), false, (&mut stack_reads, &mut read_effects));
+                    } else {
+                        plan.add_layer_content(layers, effects, own, run.clone(), inputs, (&mut prepared, &mut stack_reads, &mut read_effects));
+                    }
+                }
+                // A mask comparing its lit Base Color, which has stages: two masks (M1, M2)
+                let base_stages = |base: usize| {
+                    let [_, _, content, count] = layers[base].effects.map(|word| word as usize);
+                    effects.iter().skip(content).take(count).any(|op| op.ids[1] == NEIGHBOURHOOD_OPCODE)
+                };
+                let reads_base = |base: usize| {
+                    effects
+                        .iter()
+                        .skip(mask as usize)
+                        .take(mask_count as usize)
+                        .any(|op| packages::mask_reads_own_layer(op) && op.effects[0] == base as u32 + 1)
+                };
+                match lit.filter(|&base| base_stages(base) && reads_base(base)) {
+                    Some(base) => {
+                        let progress = (&mut prepared, &mut stack_reads, &mut read_effects);
+                        let mask_base = plan.add_lit_mask_views(layers, effects, (index, base, run.clone()), (mask, mask_count), inputs, progress);
+                        masks.insert(mask, mask_base);
+                    }
+                    None => {
+                        plan.add_this_layer_reads(layers, effects, (mask, mask_count), lit, |_| true);
+                    }
+                }
+            }
+            // The mask stack's first slot plus one (0: no fields), read by `layer_mask`
+            let mask_base = if mask_count == 0 {
+                0
+            } else {
+                *masks.entry(mask).or_insert_with(|| {
                     let before = plan.stages.len();
-                    plan.add_stack(effects, mask, mask_count, index as u32, true, false, inputs);
-                    plan.stages.len() != before
-                });
-            let first = plan.stages.len();
-            plan.add_stack(effects, content, content_count, index as u32, false, layer.ids[0] == channel_slot(Channel::Height), inputs);
-            layer.spatial[..3].copy_from_slice(&[first as u32, u32::from(first != plan.stages.len()), u32::from(mask_has_fields)]);
+                    plan.add_stack(effects, (mask, mask_count), (index as u32, None), None, inputs);
+                    if plan.stages.len() != before { before as u32 + 1 } else { 0 }
+                })
+            };
+            // The layer's own material is captured after its mask and its other channels' stacks
+            plan.bind_stack_reads(layers, effects, index, run.clone(), true, (&mut stack_reads, &mut read_effects));
+            plan.add_layer_content(layers, effects, index, run, inputs, (&mut prepared, &mut stack_reads, &mut read_effects));
+            layers[index].spatial[2] = mask_base;
         }
         // An anchor can carry a filter's footprint into the next layer. Independent
         // channels within a layer share a footprint instead of adding to one another.
@@ -458,8 +949,7 @@ impl FilterPlan {
             let mut draw_reach = BTreeMap::<(u32, bool), u32>::new();
             for stage in &plan.stages {
                 let reach = draw_reach.entry((stage.layer, stage.preceding & MASK_STAGE != 0)).or_default();
-                *reach =
-                    reach.saturating_add(stage.filter.map_or(0, NeighbourhoodFilter::reach)).saturating_add(if stage.cell > 1 { stage.cell * 2 } else { 0 });
+                *reach = reach.saturating_add(stage.reach());
             }
             let across_layers = inputs.anchors.draw_ranges.iter().fold(0u32, |reach, range| {
                 let layer = draw_reach.range((range.start, false)..(range.end, false)).map(|(_, reach)| *reach).max().unwrap_or(0);
@@ -467,14 +957,310 @@ impl FilterPlan {
             });
             plan.reach = plan.reach.max(across_layers);
         }
+        // A stack read's field holds every layer below it at the texel, filters included
+        if !stack_reads.is_empty() {
+            let total = plan.stages.iter().fold(0u32, |sum, stage| sum.saturating_add(stage.reach()));
+            plan.reach = plan.reach.max(total);
+        }
+        // The pre-pass resumes no anchor reads, and the band uniform addresses a few outputs
+        let anchors = plan.stages.iter().any(FilterStage::anchors);
+        let mut entries = 0;
+        for stage in plan.stages.iter_mut().filter(|stage| stage.whole) {
+            // P8: a stage's level stages share its entry, their results right after its own
+            entries += usize::from(stage.level == 0);
+            stage.whole = !anchors && entries <= MAX_WHOLE_SET_STAGES;
+        }
         plan
+    }
+
+    /// The whole-set pre-pass, None when no stage is whole-set (every program before the
+    /// packages mark one). Each whole-set stage takes the lower stages of its stack along.
+    fn whole_set(&self) -> Option<WholeSet> {
+        let outputs: Vec<usize> = self.stages.iter().enumerate().filter(|(_, stage)| stage.whole).map(|(index, _)| index).collect();
+        if outputs.is_empty() {
+            return None;
+        }
+        let mut stacks = BTreeMap::<(u32, bool), (BTreeSet<usize>, Vec<usize>)>::new();
+        for &output in &outputs {
+            let stack = self.stages[output].stack();
+            let lower = (0..=output).filter(|&index| {
+                self.stages[index].stack() == stack && !self.stages[index].anchors() && self.stages[index].view == 0 && self.stages[index].mask_view == [0; 4]
+            });
+            let (stages, own) = stacks.entry(stack).or_default();
+            stages.extend(lower);
+            own.push(output);
+        }
+        let passes: Vec<WholePass> = stacks
+            .into_values()
+            .map(|(stages, outputs)| {
+                let stages: Vec<usize> = stages.into_iter().collect();
+                let reach = stages.iter().fold(0u32, |sum, &index| sum.saturating_add(self.stages[index].reach()));
+                let topmost = stages.iter().rposition(|&index| self.stages[index].wrap);
+                let past_edges = topmost.map_or(0, |top| stages[..=top].iter().fold(0u32, |sum, &index| sum.saturating_add(self.stages[index].reach())));
+                let blur_fields = stages
+                    .iter()
+                    .map(|&index| {
+                        let stage = &self.stages[index];
+                        stage.filter.map_or(0, NeighbourhoodFilter::blur_fields).max(u32::from(stage.cell > 1))
+                    })
+                    .max()
+                    .unwrap_or(0);
+                WholePass { stages, outputs, reach, past_edges, blur_fields }
+            })
+            .collect();
+        let mut stages: Vec<usize> = passes.iter().flat_map(|pass| pass.stages.iter().copied()).collect();
+        stages.sort_unstable();
+        let reach = passes.iter().map(|pass| pass.reach).max().unwrap_or(0);
+        let entries = outputs.iter().enumerate().filter(|&(_, &output)| self.stages[output].level == 0).map(|(index, _)| index).collect();
+        Some(WholeSet { stages, outputs, entries, reach, passes })
+    }
+
+    /// The halo of a band: every stack's reach, without the stages the whole-set pre-pass
+    /// evaluates (their reach is the pre-pass's). The plan's reach without a pre-pass.
+    fn band_reach(&self) -> u32 {
+        let Some(whole) = self.whole_set() else { return self.reach };
+        let mut stacks = BTreeMap::<(u32, bool), u32>::new();
+        for (index, stage) in self.stages.iter().enumerate() {
+            let reach = stacks.entry(stage.stack()).or_default();
+            if !whole.stages.contains(&index) {
+                *reach = reach.saturating_add(stage.reach());
+            }
+        }
+        stacks.into_values().max().unwrap_or(0)
+    }
+
+    /// Bind the stack reads of layer operation `index`'s mask and content effects: an effect
+    /// operation that sets `spatial[3]` to a channel slot plus one asks for the material of that
+    /// channel at the texel, accumulated over every layer below its layer (`effects[1]` 0) or
+    /// also over its layer's operations before Base Color (`effects[1]` 1, P6's material reads).
+    /// A stage captures it (a material-anchor capture without a cut), `spatial[3]` becomes that
+    /// stage's slot plus one (`stack_at` in WGSL), and `effects[0]` the layer's own operation of
+    /// that channel plus one (0: none; `this_layer_content` in WGSL). P3: Compare reading This
+    /// Layer and Layers Below; P6: lighting's material.
+    ///
+    /// A package effect (`packages::EXTENDED_EFFECTS`) may ask for a second channel in
+    /// `spatial[2]` the same way, read with `stack_at_second` (P6: Stylized lighting's Metallic
+    /// and Roughness, or Glossiness and Specular). It is bound like the first, up to the same
+    /// operation, and shares a stage with any read of the same channel there; it gets no
+    /// `this_layer_content`.
+    ///
+    /// With `own_material` false it binds the reads of operation `index`'s own effects that stop
+    /// below the layer (`effects[1]` 0). With it true, at the layer's Base Color operation, it
+    /// binds every read of the layer's material (each channel operation's copy), so the capture
+    /// follows the layer's mask and the stacks of its other channels; a layer without a Base
+    /// Color operation has nothing for them to read, and they read nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_stack_reads(
+        &mut self,
+        layers: &[Operation],
+        effects: &mut [Operation],
+        index: usize,
+        run: std::ops::Range<usize>,
+        own_material: bool,
+        (stages, done): (&mut BTreeMap<(u32, Channel), u32>, &mut BTreeSet<usize>),
+    ) {
+        let base_color = (run.start..run.end).find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor));
+        let reads: BTreeSet<usize> = if own_material {
+            if base_color.is_some_and(|base| base != index) {
+                return;
+            }
+            // A set: operations sharing a content range list its effects once each
+            run.clone()
+                .flat_map(|own| effect_ranges(&layers[own]))
+                .filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] == 1))
+                .collect()
+        } else {
+            effect_ranges(&layers[index]).filter(|&effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] != 1)).collect()
+        };
+        for effect in reads {
+            if !done.insert(effect) {
+                continue;
+            }
+            let op = &mut effects[effect];
+            let until = if op.effects[1] == 1 { base_color } else { Some(run.start) };
+            let Some(until) = until else {
+                op.spatial[3] = 0;
+                if packages::EXTENDED_EFFECTS.contains(&op.ids[1]) {
+                    op.spatial[2] = 0;
+                }
+                continue;
+            };
+            let [first_read, second_read] = stack_reads(op);
+            let mut bind = |read: u32| {
+                let slot = read.checked_sub(1)?;
+                let channel = Channel::ALL.into_iter().find(|&channel| channel_slot(channel) == slot)?;
+                let stage = *stages.entry((until as u32, channel)).or_insert_with(|| {
+                    self.stages.push(FilterStage {
+                        layer: until as u32,
+                        preceding: MATERIAL_ANCHOR_STAGE,
+                        filter: None,
+                        cell: 1,
+                        anchor: Some((channel, u32::MAX, 0)),
+                        input: 0,
+                        input_kind: 0,
+                        input2: 0,
+                        wrap: false,
+                        whole: false,
+                        view: 0,
+                        mask_view: [0; 4],
+                        level: 0,
+                    });
+                    self.stages.len() as u32
+                });
+                Some((slot, stage))
+            };
+            // An own-material read keeps its channels for the mask's view of the layer, where it
+            // reads the defaults (`stack_at` while `reading_own_layer`)
+            if op.effects[1] == 1 && packages::EXTENDED_EFFECTS.contains(&op.ids[1]) {
+                op.effects[2] = first_read | (second_read << 16);
+            }
+            let first_stage = bind(first_read);
+            let second_stage = bind(second_read);
+            op.spatial[3] = first_stage.map_or(0, |(_, stage)| stage);
+            if packages::EXTENDED_EFFECTS.contains(&op.ids[1]) {
+                op.spatial[2] = second_stage.map_or(0, |(_, stage)| stage);
+            }
+            if let Some((slot, _)) = first_stage {
+                op.effects[0] = run.clone().find(|&own| layers[own].ids[0] == slot).map_or(0, |own| own as u32 + 1);
+            }
+        }
+    }
+
+    /// The layer's own content as its mask reads it (This Layer, `this_layer_content` in WGSL):
+    /// one stage per read channel operation (`reads` picks which), prepared from its whole
+    /// content stack before the mask stack, its slot plus one in the reading effect's
+    /// `effects[2]`. The mask then reads a field instead of evaluating the content inline, which
+    /// keeps the content's code out of the mask's (the driver inlines every call site).
+    ///
+    /// The lit Base Color `lit`: the CPU evaluates the mask with no lit material (`Texel::lit`
+    /// is None while `node_mask` runs), so its own-material reads give the defaults there
+    /// (`OWN_VIEW`) past its last field.
+    #[allow(clippy::too_many_arguments)]
+    fn add_this_layer_reads(
+        &mut self,
+        layers: &[Operation],
+        effects: &mut [Operation],
+        (mask, mask_count): (u32, u32),
+        lit: Option<usize>,
+        reads: impl Fn(u32) -> bool,
+    ) -> BTreeMap<u32, u32> {
+        let mut views = BTreeMap::<u32, u32>::new();
+        for effect in mask as usize..(mask + mask_count) as usize {
+            let Some(op) = effects.get(effect).filter(|op| packages::mask_reads_own_layer(op)) else { continue };
+            let Some(own) = op.effects[0].checked_sub(1).filter(|&own| reads(own)) else { continue };
+            let slot = *views.entry(own).or_insert_with(|| self.add_this_layer(layers, own, if lit == Some(own as usize) { OWN_VIEW } else { 0 }));
+            effects[effect].effects[2] = slot;
+        }
+        views
+    }
+
+    /// A This Layer stage of layer operation `own` viewed as `view`: its slot plus one.
+    fn add_this_layer(&mut self, layers: &[Operation], own: u32, view: u32) -> u32 {
+        self.stages.push(FilterStage {
+            layer: own,
+            preceding: layers[own as usize].effects[3],
+            filter: None,
+            cell: 1,
+            anchor: None,
+            input: 0,
+            input_kind: 0,
+            input2: 0,
+            wrap: false,
+            whole: false,
+            view,
+            mask_view: [0; 4],
+            level: 0,
+        });
+        self.stages.len() as u32
+    }
+
+    /// A mask that compares its lit Base Color `base` (This Layer) on a layer whose Base Color
+    /// has stages. The CPU (`fields_of`) builds the content fields first, Base Color last; the
+    /// material its lighting reads lies under a first mask M1, whose This Layer reads the Base
+    /// Color with no fields (its stages as identity, `Filter::point`) and no lit material. Then
+    /// it builds the mask field M2, whose This Layer resumes from the finished Base Color
+    /// field; the composite uses M2. So: the other This Layer stages, the Base Color's view V1
+    /// (`OWN_VIEW | NO_FIELDS`), M1 (a copy of the mask stack), the material's capture, the Base
+    /// Color's stack, its view V2 (`OWN_VIEW`), and M2, the layer's mask stack. M1's stages and
+    /// the capture read M1 and V1 in M2's and V2's place (`mask_view`). Returns M2's base plus one.
+    #[allow(clippy::too_many_arguments)]
+    fn add_lit_mask_views(
+        &mut self,
+        layers: &mut [Operation],
+        effects: &mut [Operation],
+        (index, base, run): (usize, usize, std::ops::Range<usize>),
+        (mask, mask_count): (u32, u32),
+        inputs: &ProceduralInputs,
+        (prepared, stages, done): ContentProgress,
+    ) -> u32 {
+        self.add_this_layer_reads(layers, effects, (mask, mask_count), None, |own| own as usize != base);
+        let first_view = self.add_this_layer(layers, base as u32, OWN_VIEW | NO_FIELDS);
+        let first_mask = self.stages.len();
+        self.add_stack(effects, (mask, mask_count), (index as u32, None), None, inputs);
+        let first_end = self.stages.len();
+        self.bind_stack_reads(layers, effects, base, run.clone(), true, (stages, done));
+        let capture_end = self.stages.len();
+        self.add_layer_content(layers, effects, base, run, inputs, (prepared, stages, done));
+        let views = self.add_this_layer_reads(layers, effects, (mask, mask_count), Some(base), |own| own as usize == base);
+        let view = views.get(&(base as u32)).copied();
+        let mask_base = self.stages.len();
+        let copy: Vec<FilterStage> = self.stages[first_mask..first_end].to_vec();
+        self.stages.extend(copy);
+        let mask_view = [mask_base as u32 + 1, first_mask as u32 + 1, first_view, view.unwrap_or(0)];
+        for stage in &mut self.stages[first_mask..capture_end] {
+            stage.mask_view = mask_view;
+            stage.whole = false;
+        }
+        if first_end == first_mask { 0 } else { mask_base as u32 + 1 }
+    }
+
+    /// The stack reads and the content stack of layer operation `index`, once: its first stage
+    /// and whether it has any in the layer's `spatial[0..2]`. A Normal operation whose stack has a
+    /// Height To Normal stage reads its layer's own Height operation (`INPUT_LAYER`), whose stack
+    /// goes first so the Normal stage's prepare pass reads prepared Height fields.
+    #[allow(clippy::too_many_arguments)]
+    fn add_layer_content(
+        &mut self,
+        layers: &mut [Operation],
+        effects: &mut [Operation],
+        index: usize,
+        run: std::ops::Range<usize>,
+        inputs: &ProceduralInputs,
+        (prepared, stages, done): ContentProgress,
+    ) {
+        if !prepared.insert(index) {
+            return;
+        }
+        let height = layer_height(layers, effects, index, run.clone(), inputs);
+        if let Some(height) = height.filter(|&height| height != index) {
+            self.add_layer_content(layers, effects, height, run.clone(), inputs, (prepared, stages, done));
+        }
+        self.bind_stack_reads(layers, effects, index, run, false, (stages, done));
+        let [_, _, content, content_count] = layers[index].effects;
+        let first = self.stages.len();
+        self.add_stack(effects, (content, content_count), (index as u32, height.map(|height| height as u32)), Some(slot_kind(layers[index].ids[0])), inputs);
+        layers[index].spatial[..2].copy_from_slice(&[first as u32, u32::from(first != self.stages.len())]);
     }
 
     fn add_anchor(&mut self, publication: u32, layer: u32, preceding: u32, inputs: &AnchorInputs, material: Option<(u32, u32)>) {
         for (read, &(producer, channel)) in inputs.reads.iter().enumerate().filter(|(_, (producer, _))| *producer == publication) {
             debug_assert_eq!(producer, publication);
             self.anchor_slots[read] = self.stages.len() as u32 + 1;
-            self.stages.push(FilterStage { layer, preceding, filter: None, cell: 1, anchor: material.map(|(first, cut)| (channel, first, cut)) });
+            self.stages.push(FilterStage {
+                layer,
+                preceding,
+                filter: None,
+                cell: 1,
+                anchor: material.map(|(first, cut)| (channel, first, cut)),
+                input: 0,
+                input_kind: 0,
+                input2: 0,
+                wrap: false,
+                whole: false,
+                view: 0,
+                mask_view: [0; 4],
+                level: 0,
+            });
         }
     }
 
@@ -485,7 +1271,18 @@ impl FilterPlan {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn add_stack(&mut self, effects: &mut [Operation], start: u32, count: u32, layer: u32, mask: bool, signed: bool, inputs: &ProceduralInputs) {
+    /// The stages of one effect stack: a mask's when `channel` is None, else the content of a
+    /// channel of that kind (the stage context the packages' stages read).
+    /// `height` is the layer's own Height operation a Height To Normal stage reads (`layer_height`).
+    fn add_stack(
+        &mut self,
+        effects: &mut [Operation],
+        (start, count): (u32, u32),
+        (layer, height): (u32, Option<u32>),
+        channel: Option<ChannelKind>,
+        inputs: &ProceduralInputs,
+    ) {
+        let mask = channel.is_none();
         let first = self.stages.len();
         let mut reach: u32 = 0;
         for (preceding, effect) in effects.iter_mut().skip(start as usize).take(count as usize).enumerate() {
@@ -494,36 +1291,200 @@ impl FilterPlan {
                 continue;
             }
             if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&effect.ids[1]) && effect.spatial[1] != 0 {
-                let (filter, cell) = inputs.generator_stages[effect.spatial[1] as usize - 1];
-                effect.spatial[1] = self.stages.len() as u32 + 1;
+                let generator = effect.spatial[1] as usize - 1;
+                let (filter, cell) = inputs.generator_stages[generator];
+                // Relative to the stack's first stage, as a mask stack's fields are read
+                // (`layer_mask` adds the layer's mask base, `spatial[2]`)
+                effect.spatial[1] = (self.stages.len() - first) as u32 + 1;
                 reach = reach.saturating_add(filter.map_or(0, NeighbourhoodFilter::reach));
                 if cell > 1 {
                     reach = reach.saturating_add(cell * 2);
                 }
-                self.stages.push(FilterStage { layer, preceding: preceding as u32 | MASK_STAGE | GENERATOR_STAGE, filter, cell, anchor: None });
+                // P8: the generator at each further UV tile scale follows its base stage
+                let levels = inputs.generator_levels.get(generator).map_or(&[][..], Vec::as_slice);
+                for (level, &(filter, cell)) in std::iter::once(&(filter, cell)).chain(levels).enumerate() {
+                    self.stages.push(FilterStage {
+                        layer,
+                        preceding: preceding as u32 | MASK_STAGE | GENERATOR_STAGE,
+                        filter,
+                        cell,
+                        anchor: None,
+                        input: 0,
+                        input_kind: 0,
+                        input2: 0,
+                        wrap: false,
+                        whole: false,
+                        view: 0,
+                        mask_view: [0; 4],
+                        level: level as u32,
+                    });
+                }
                 continue;
             }
             if effect.ids[1] != NEIGHBOURHOOD_OPCODE {
                 continue;
             }
-            let (filter, opacity) = &inputs.filters[effect.ids[2] as usize];
-            let Some(filter) = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.resolution, *opacity, signed) else { continue };
+            let (effect_filter, opacity) = &inputs.filters[effect.ids[2] as usize];
+            let Some(filter) = NeighbourhoodFilter::new(effect_filter, inputs.resolution, inputs.longest_side, *opacity, channel) else { continue };
+            // P8: the same filter at each further UV tile scale, each a stage after this one
+            let level_filters = udim::level_filters(effect_filter, filter, (*opacity, channel), inputs);
             let slot = self.stages.len();
-            effect.spatial[0] = if mask { slot } else { slot - first } as u32;
+            let whole = filter.whole_set(inputs.resolution);
+            effect.spatial[0] = (slot - first) as u32;
             let preceding = preceding as u32 | if mask { MASK_STAGE } else { 0 };
-            self.stages.push(FilterStage { layer, preceding, filter: Some(filter), cell: 1, anchor: None });
+            // An image input the effect registered (`ProceduralInputs::register_input`), read as
+            // colour when registered so; Height To Normal on a Normal operation reads the layer's
+            // own Height in its place
+            let (input, input_kind) = match height.filter(|_| matches!(inputs.filters[effect.ids[2] as usize].0, Filter::HeightToNormal(_))) {
+                Some(height) => (height + 1, INPUT_LAYER),
+                None => {
+                    let input = effect.effects[3];
+                    let color = input != 0 && inputs.color_inputs.contains(&input.saturating_sub(self.input_base));
+                    (input, if color { INPUT_COLOR } else { 0 })
+                }
+            };
+            // The pre-pass carries the lower stages of the stage's own stack only, not the Height's
+            let whole = whole && input_kind != INPUT_LAYER;
+            // P4: Blur and Bevel with Wrap read the set periodically past its edges
+            let wrap = gpu_neighbourhood::box_family::wraps(filter);
+            let input2 = effect.effects[2];
+            for (level, filter) in std::iter::once(filter).chain(level_filters).map(Some).enumerate() {
+                self.stages.push(FilterStage {
+                    layer,
+                    preceding,
+                    filter,
+                    cell: 1,
+                    anchor: None,
+                    input,
+                    input_kind,
+                    input2,
+                    wrap,
+                    whole,
+                    view: 0,
+                    mask_view: [0; 4],
+                    level: level as u32,
+                });
+            }
             reach = reach.saturating_add(filter.reach());
         }
         self.reach = self.reach.max(reach);
     }
 
-    fn expand(&self, region: Option<CompositeRegion>) -> Option<CompositeRegion> {
-        region.map(|region| region.expanded(self.reach))
+    /// The update `region` grown by the stages' reach on a set of `size`; None (a full update)
+    /// when a wrapping stage's reach crosses the set's edge, as an edit there changes the
+    /// opposite edge too
+    fn expand(&self, region: Option<CompositeRegion>, (width, height): (u32, u32)) -> Option<CompositeRegion> {
+        let region = region?;
+        let crosses = |min: u32, max: u32, side: u32| min < self.reach || max.saturating_add(self.reach) > side;
+        if self.wraps() && (crosses(region.min[0], region.max[0], width) || crosses(region.min[1], region.max[1], height)) {
+            return None;
+        }
+        Some(region.expanded(self.reach))
     }
 
     fn words(&self, area: u64) -> u64 {
-        if self.stages.is_empty() { 0 } else { (self.stages.len() as u64 + 3) * u64::from(FIELD_WORDS) * area }
+        if self.stages.is_empty() { 0 } else { (self.stages.len() as u64 + 3) * u64::from(self.field_words()) * area }
     }
+
+    /// Whether a stage wraps: the fields then extend by the halo past the set's edges, with an
+    /// origin below zero, and the prepare pass fills the wrapping stages periodically there.
+    fn wraps(&self) -> bool {
+        self.stages.iter().any(|stage| stage.wrap)
+    }
+
+    /// Words per field texel: four premultiplied components and the UV coverage, plus a sixth
+    /// word when a stage carries an input ([`FilterStage::input`]), or three when one reads its
+    /// input as colour. One stride for every field of the program; the shaders read it from the
+    /// uniform, never from a literal.
+    fn field_words(&self) -> u32 {
+        if self.stages.iter().any(|stage| stage.input2 != 0) {
+            FIELD_WORDS + 6
+        } else if self.stages.iter().any(|stage| stage.input_kind == INPUT_COLOR) {
+            FIELD_WORDS + 3
+        } else if self.stages.iter().any(|stage| stage.input != 0) {
+            FIELD_WORDS + 1
+        } else {
+            FIELD_WORDS
+        }
+    }
+
+    /// The kernels' `NeighbourhoodRegion::input` bits for `stage`: the fields carry input words
+    /// (1), the stage has an input of its own (2), the fields carry colour words 5..8 (4), the
+    /// stage has a second input in words 8..11 (8).
+    fn input_bits(&self, stage: &FilterStage) -> u32 {
+        let words = self.field_words();
+        u32::from(words > FIELD_WORDS) | (u32::from(stage.input != 0) << 1) | (u32::from(words >= FIELD_WORDS + 3) << 2) | (u32::from(stage.input2 != 0) << 3)
+    }
+}
+
+/// The layer's own Height operation (in `run`, the draw of layer operation `index`) when
+/// `index` is a Normal operation whose content has a Height To Normal stage: the CPU's stage
+/// reads the layer's Height content times its coverage as its gray (`plan_in(.., Height)`).
+fn layer_height(layers: &[Operation], effects: &[Operation], index: usize, run: std::ops::Range<usize>, inputs: &ProceduralInputs) -> Option<usize> {
+    let layer = &layers[index];
+    if layer.ids[0] != channel_slot(Channel::Normal) {
+        return None;
+    }
+    let [_, _, content, count] = layer.effects.map(|word| word as usize);
+    let reads = effects.iter().skip(content).take(count).any(|op| {
+        op.ids[1] == NEIGHBOURHOOD_OPCODE && inputs.filters.get(op.ids[2] as usize).is_some_and(|(filter, _)| matches!(filter, Filter::HeightToNormal(_)))
+    });
+    if !reads {
+        return None;
+    }
+    run.into_iter().find(|&own| layers[own].ids[0] == channel_slot(Channel::Height))
+}
+
+/// The channel slots plus one an effect operation asks the stack for (`FilterPlan::bind_stack_reads`):
+/// `spatial[3]`, and `spatial[2]` for a package effect; 0 for none. Generators use those words for
+/// their own stages.
+fn stack_reads(op: &Operation) -> [u32; 2] {
+    if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1]) {
+        return [0; 2];
+    }
+    [op.spatial[3], if packages::EXTENDED_EFFECTS.contains(&op.ids[1]) { op.spatial[2] } else { 0 }]
+}
+
+/// The layer operations of the draw holding layer operation `index`, from the draws
+/// `try_compile_with_brush` records (`AnchorInputs::draw_ranges`); the operation alone without
+/// them (the standalone mask preview has one layer operation)
+fn layer_run(draw_ranges: &[std::ops::Range<u32>], index: usize) -> std::ops::Range<usize> {
+    let at = u32::try_from(index).unwrap_or(u32::MAX);
+    draw_ranges.iter().find(|range| range.contains(&at)).map_or(index..index + 1, |range| range.start as usize..range.end as usize)
+}
+
+/// An operation's mask and content effects
+fn effect_ranges(op: &Operation) -> impl Iterator<Item = usize> {
+    let [mask, mask_count, content, content_count] = op.effects.map(|word| word as usize);
+    (mask..mask + mask_count).chain(content..content + content_count)
+}
+
+/// The Base Color operation of the run when one of its effects reads the layer's material (`effects[1]` 1)
+fn own_material_base(layers: &[Operation], effects: &[Operation], run: std::ops::Range<usize>) -> Option<usize> {
+    let reads = run
+        .clone()
+        .flat_map(|own| effect_ranges(&layers[own]))
+        .any(|effect| effects.get(effect).is_some_and(|op| stack_reads(op) != [0; 2] && op.effects[1] == 1));
+    run.into_iter().find(|&own| layers[own].ids[0] == channel_slot(Channel::BaseColor)).filter(|_| reads)
+}
+
+/// Append the effects' image input sources and rebind each effect's `effects[3]` reference to
+/// the source's operation index plus one (generators keep their own source words).
+fn bind_input_sources(operations: &mut Vec<Operation>, layer_count: u32, sources: &[Operation]) {
+    if sources.is_empty() {
+        return;
+    }
+    let offset = operations.len() as u32;
+    for op in operations.iter_mut().skip(layer_count as usize).filter(|op| !(FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1])) {
+        if op.effects[3] != 0 {
+            op.effects[3] += offset;
+        }
+        // A neighbourhood stage's second input (`FilterStage::input2`)
+        if op.ids[1] == NEIGHBOURHOOD_OPCODE && op.effects[2] != 0 {
+            op.effects[2] += offset;
+        }
+    }
+    operations.extend_from_slice(sources);
 }
 
 fn bind_generator_sources(operations: &mut Vec<Operation>, sources: &[Operation]) {
@@ -578,14 +1539,25 @@ impl CompositeRegion {
 pub struct LiveBrush {
     pub target: LiveBrushTarget,
     pub opacity: f32,
+    /// The Eraser: the stroke scales the target's paint and coverage down. A layer target then
+    /// lists the channels the commit erases, with unused values.
+    pub erase: bool,
     pub alpha: wgpu::TextureView,
     /// Supplies opacity modulation and Base Color for a projection stroke.
     pub stencil: Option<GpuStencil>,
 }
 
 pub enum LiveBrushTarget {
-    Layer { layer: LayerId, values: BTreeMap<Channel, [f32; 3]> },
-    Mask { effect: LayerId, value: f32 },
+    Layer {
+        layer: LayerId,
+        values: BTreeMap<Channel, [f32; 3]>,
+    },
+    /// `image`: the image resource whose gray the stroke paints per texel instead of `value`.
+    Mask {
+        effect: LayerId,
+        value: f32,
+        image: Option<String>,
+    },
 }
 
 impl LiveBrush {
@@ -604,12 +1576,14 @@ impl LiveBrush {
         Ok(())
     }
 
-    fn value_for_layer(&self, id: LayerId, channel: Channel) -> Option<([f32; 3], f32)> {
+    /// The live paint of `channel` on paint layer or content paint effect `id`: its value, the
+    /// stroke opacity and whether it erases.
+    fn value_for_layer(&self, id: LayerId, channel: Channel) -> Option<([f32; 3], f32, bool)> {
         let LiveBrushTarget::Layer { layer, values } = &self.target else { return None };
         if *layer != id {
             return None;
         }
-        values.get(&channel).map(|&value| (value, self.opacity.clamp(0.0, 1.0)))
+        values.get(&channel).map(|&value| (value, self.opacity.clamp(0.0, 1.0), self.erase))
     }
 }
 
@@ -639,7 +1613,42 @@ pub struct CompositeProgram {
     unit_channels: u32,
     mask_preview: bool,
     mask_layer: u32,
-    mask_layers: BTreeMap<LayerId, u32>,
+    /// The first operation of each draw of a layer with a mask, with the draw's placement
+    mask_layers: Vec<(LayerId, ContentsOffset, u32)>,
+    /// Side-table words to fill with image record offsets at upload (`ProceduralInputs::pack_image`)
+    image_words: Vec<(u32, u32)>,
+    /// The environment's diffuse light the program reads (`ProceduralInputs::reserve_environment`)
+    environment: Option<LateEnvironment>,
+    /// Upload the second bake row block (`ProceduralInputs::read_bake_rows`)
+    bake_rows: bool,
+    /// P8: the side-table record of a UV tile atlas (`udim::bind`), 0 for a classic set
+    udim: u32,
+    /// P8: the UV tile atlas's blocks, which say where a level stage has texels to filter
+    udim_layout: Option<udim::UdimLayout>,
+}
+
+/// A program's late-bound environment words: where they start in the side table, the display
+/// settings of the compiled project (environment and rotation) and, once the images are known,
+/// the words.
+#[derive(Debug)]
+struct LateEnvironment {
+    word: u32,
+    display: DisplaySettings,
+    words: Option<[u32; ENVIRONMENT_WORDS]>,
+}
+
+impl LateEnvironment {
+    fn new(word: Option<u32>, display: &DisplaySettings) -> Option<Self> {
+        word.map(|word| Self { word, display: display.clone(), words: None })
+    }
+
+    fn set(&mut self, environment: &EnvironmentSh) {
+        let mut words = [0; ENVIRONMENT_WORDS];
+        for (word, value) in words.iter_mut().zip(environment.coefficients().iter().flatten().chain([environment.rotation()].iter())) {
+            *word = value.to_bits();
+        }
+        self.words = Some(words);
+    }
 }
 
 fn display_bit(kind: DisplayKind) -> u32 {
@@ -682,6 +1691,24 @@ fn channel_slot(channel: Channel) -> u32 {
     }
 }
 
+/// `channel_default(slot)` in WGSL: each channel's default value by its destination slot
+/// ([`channel_slot`], `Channel::default_value`), zero for an unknown slot.
+fn channel_defaults_wgsl() -> String {
+    let cases: String = Channel::ALL
+        .into_iter()
+        .map(|channel| {
+            let [r, g, b] = channel.default_value();
+            format!("        case {}u: {{ return vec3({r:?}, {g:?}, {b:?}); }}\n", channel_slot(channel))
+        })
+        .collect();
+    format!("fn channel_default(slot: u32) -> vec3<f32> {{\n    switch slot {{\n{cases}        default: {{ return vec3(0.0); }}\n    }}\n}}")
+}
+
+/// The kind of the channel in destination slot `slot` ([`channel_slot`]).
+fn slot_kind(slot: u32) -> ChannelKind {
+    Channel::ALL.into_iter().find(|&channel| channel_slot(channel) == slot).map_or(ChannelKind::Scalar, Channel::kind)
+}
+
 impl CompositeProgram {
     pub fn is_neutral(&self) -> bool {
         !self.mask_preview
@@ -694,12 +1721,19 @@ impl CompositeProgram {
         self.mask_preview
     }
 
+    /// Work per output texel that sizes bands and submissions: Tile Generator placements per
+    /// plane and sample, and what P1 declares for its fills (`fill_projection::work_per_texel`:
+    /// symmetry copies times sampling cost).
     fn tile_work_per_pixel(&self) -> Result<u64, &'static str> {
-        self.operations.iter().filter(|op| op.ids[1] == TILE_GENERATOR_OPCODE).try_fold(0u64, |work, op| {
-            let tile_work = self.tile_patterns.work_per_sample(op.high[3] as usize).ok_or("A Tile Generator operation has no settings.")?;
-            let planes = if op.procedural[3] == 1 { 3 } else { 1 };
-            let samples = if op.procedural[0] == 0 { 1 } else { 4 };
-            Ok(work.saturating_add(tile_work.saturating_mul(planes * samples)))
+        self.operations.iter().try_fold(0u64, |work, op| {
+            let mut own = 0;
+            if op.ids[1] == TILE_GENERATOR_OPCODE {
+                let tile_work = self.tile_patterns.work_per_sample(op.high[3] as usize).ok_or("A Tile Generator operation has no settings.")?;
+                let planes = if op.procedural[3] == 1 { 3 } else { 1 };
+                let samples = if op.procedural[0] == 0 { 1 } else { 4 };
+                own = tile_work.saturating_mul(planes * samples);
+            }
+            Ok(work.saturating_add(fill_projection::work_per_texel(op, own)))
         })
     }
 
@@ -712,19 +1746,63 @@ impl CompositeProgram {
         self.coverage = Some((coverage, if self.mask_preview { 0 } else { radius.min(15) }));
     }
 
-    /// Resolve named images used by authored fills, decals and Tile Generators.
+    /// Resolve named images used by authored fills, decals and Tile Generators, and the
+    /// environment's diffuse light (an imported environment is an image).
     pub fn set_tile_images(&mut self, images: &ImageStore) {
         self.tile_patterns.set_images(images);
         self.material_images.set_images(images);
+        if let Some(environment) = &mut self.environment {
+            environment.set(&EnvironmentSh::of(&environment.display, images));
+        }
+    }
+
+    /// The environment and rotation (degrees) the program lights with, from the compiled
+    /// project's display settings; None when nothing reads the environment. A viewport compiles
+    /// again when either changes (or the imported environment image does).
+    pub fn environment(&self) -> Option<(&str, f32)> {
+        self.environment.as_ref().map(|environment| (environment.display.environment.as_str(), environment.display.env_rotation))
+    }
+
+    /// Tests: the stage of the layer's Height operation and the stage reading it as its input.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn input_stages(&self) -> (usize, usize) {
+        let stages = &self.filters.stages;
+        let height = stages.iter().position(|stage| self.operations[stage.layer as usize].ids[0] == channel_slot(Channel::Height));
+        let reader = stages.iter().position(|stage| stage.input_kind == INPUT_LAYER);
+        (height.unwrap_or(usize::MAX), reader.unwrap_or(usize::MAX))
+    }
+
+    /// Tests: each whole-set pass's stage count and reach past the set's edges.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn whole_set_passes(&self) -> Vec<(usize, u32)> {
+        self.filters.whole_set().map_or_else(Vec::new, |whole| whole.passes.iter().map(|pass| (pass.stages.len(), pass.past_edges)).collect())
+    }
+
+    /// Tests: the last stage's input and input kind.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn input_of_last_stage(&self) -> (u32, u32) {
+        self.filters.stages.last().map_or((u32::MAX, u32::MAX), |stage| (stage.input, stage.input_kind))
+    }
+
+    /// Replace the environment's diffuse light (tests: a stub reader instead of `EnvironmentSh::of`).
+    #[cfg(test)]
+    fn set_environment(&mut self, environment: &EnvironmentSh) {
+        if let Some(late) = &mut self.environment {
+            late.set(environment);
+        }
     }
 
     /// Mesh-space projections and generators share the viewport's surface and bake inputs.
     pub fn set_surface_inputs(&mut self, mesh: &Arc<Mesh>, gbuf: &Arc<UvGBuffer>, baked: Option<&BakedMaps>) -> Result<(), &'static str> {
+        // P1's projector depth grids, before the atlas reads them
+        self.material_images.set_surface(mesh);
         if self.needs_surface || !self.geometry.parts.is_empty() {
             self.surface = Some((mesh.clone(), gbuf.clone()));
         }
         self.geometry.resolve(mesh);
-        if self.mask_preview || ((!self.filters.stages.is_empty() || !self.geometry.parts.is_empty()) && self.coverage.is_none()) {
+        // Texels no triangle covers keep the channels' defaults, as the CPU leaves them
+        let partly_covered = gbuf.tri.contains(&NO_TRI);
+        if self.mask_preview || ((partly_covered || !self.filters.stages.is_empty() || !self.geometry.parts.is_empty()) && self.coverage.is_none()) {
             self.set_coverage(gbuf.clone(), 0);
         }
         self.set_baked_inputs(baked)
@@ -732,7 +1810,7 @@ impl CompositeProgram {
 
     /// Resolve baked maps independently of the viewport's geometry and image inputs.
     pub fn set_baked_inputs(&mut self, baked: Option<&BakedMaps>) -> Result<(), &'static str> {
-        self.baked = baked.map(BakedInputs::new).transpose()?.flatten();
+        self.baked = baked.map(|baked| BakedInputs::new(baked, self.bake_rows)).transpose()?.flatten();
         self.id_bake = baked.filter(|_| self.operations.iter().any(|op| op.ids[1] == COLOR_SELECTION_OPCODE && op.procedural[2] != 0)).and_then(IdBake::new);
         if !self.mask_preview && self.baked.as_ref().is_some_and(|baked| baked.maps[1].is_some()) {
             self.display_outputs |= display_bit(DisplayKind::Normal);
@@ -793,9 +1871,7 @@ impl CompositeProgram {
         graphs: Option<CompositeGraphs<'_>>,
     ) -> Result<Self, &'static str> {
         let set = project.texture_sets.get(ts).ok_or("The texture set is missing.")?;
-        if !set.uv_tiles.is_empty() {
-            return Err("UDIM texture sets use CPU compositing.");
-        }
+        packages::check_set(set, false)?;
         // User data stays in the document and its CPU composites for export. The viewport
         // material only consumes the native display slots in the shader.
         let display_channels = || set.channels.iter().copied().filter(|(channel, _)| channel.user_index().is_none());
@@ -828,15 +1904,20 @@ impl CompositeProgram {
         let mut paint = PaintInputs::default();
         let mut tile_patterns = TilePatterns::default();
         let mut effects = Vec::new();
-        let mut procedural = ProceduralInputs::new(ts, set.resolution, graphs);
+        let mut procedural = ProceduralInputs::with_graphs(ts, set.resolution, graphs);
+        // P8: a UV tile atlas's block, its tile scales and the set's own resolution
+        let layout = udim::UdimLayout::of(set);
+        udim::prepare(layout.as_ref(), &mut procedural);
         let mut geometry = GeometryMasks::default();
+        let set_tiles = if set.uv_tiles.is_empty() { vec![1001] } else { set.uv_tiles.clone() };
         let mut groups = GroupPlan::default();
         let mut group_depth = 0;
-        let mut mask_layers = BTreeMap::new();
+        let mut mask_layers = Vec::new();
         let mut non_default = [false; Channel::ALL.len()];
         let stencil_pigment = brush.as_ref().is_some_and(|brush| brush.stencil.is_some());
-        let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| StackWork::Layer(id, 0, 0)).collect();
-        while let Some(work) = layers.pop() {
+        // Each draw carries the Scale and Rotation of the folders holding it (an instanced folder's too)
+        let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (StackWork::Layer(id, 0, 0), ContentsOffset::NONE)).collect();
+        while let Some((work, around)) = layers.pop() {
             let (id, depth, inherited_geometry) = match work {
                 StackWork::Layer(id, depth, geometry) => (id, depth, geometry),
                 StackWork::EndGroup(start) => {
@@ -853,15 +1934,18 @@ impl CompositeProgram {
                 continue;
             }
             let Some(layer) = project.content_layer(id) else { continue };
-            if own.geometry_mask.as_ref().is_some_and(|mask| !mask.includes_tile(1001)) {
+            // Every texel of a set without UV tiles is in tile 1001
+            if own.geometry_mask.as_ref().is_some_and(|mask| set_tiles.iter().any(|&tile| !mask.includes_tile(tile))) {
                 return Err("UV tile restrictions use CPU compositing.");
             }
             let geometry_mask = geometry.register(inherited_geometry, own.geometry_mask.as_ref().and_then(|mask| mask.parts()));
             let mask = project.layers.get(&project.mask_owner(id)).and_then(|owner| owner.mask.as_ref()).filter(|m| m.enabled);
-            if let LayerKind::Group { children, .. } = &layer.kind {
+            if let LayerKind::Group { children, contents, .. } = &layer.kind {
                 if depth > texturecraft_core::project::MAX_DEPTH {
                     continue;
                 }
+                // A folder's Scale and Rotation (an instanced folder's too) re-place every fill inside it
+                let children_around = around.then(*contents);
                 // A full-weight group sees the incoming stack and returns it exactly
                 // as its children changed it. Keep the geometry restriction at the
                 // group boundary if children publish anchors beyond it.
@@ -875,7 +1959,7 @@ impl CompositeProgram {
                     })
                     && (geometry_mask == 0 || !groups::children_publish_anchors(project, children, depth + 1))
                 {
-                    layers.extend(children.iter().rev().map(|&child| StackWork::Layer(child, depth + 1, geometry_mask)));
+                    layers.extend(children.iter().rev().map(|&child| (StackWork::Layer(child, depth + 1, geometry_mask), children_around)));
                     continue;
                 }
                 let mut weights = [0.0f32; DISPLAY_CHANNELS];
@@ -902,8 +1986,12 @@ impl CompositeProgram {
                     continue;
                 }
                 let begin = effects.len() as u32;
-                let background = compile_mask(mask, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
+                let background = compile_mask(mask, around, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
                 let count = effects.len() as u32 - begin;
+
+                // A folder's This Layer is the stack below it, as the CPU reads it
+                effects[begin as usize..].iter_mut().for_each(stack::read_folder_layers);
+
                 let height = layer.height_mask;
                 let height_params = if height.enabled && count != 0 {
                     if !height.contrast.is_finite() || !height.offset.is_finite() {
@@ -930,17 +2018,17 @@ impl CompositeProgram {
                 };
                 op.balance[1] = background;
                 operations.push(op);
-                mask_layers.insert(id, open as u32);
+                mask_layers.push((id, around, open as u32));
                 procedural.anchors.draw_ranges.push(open as u32..open as u32 + 1);
                 group_depth += 1;
                 groups.depth = groups.depth.max(group_depth);
-                layers.push(StackWork::EndGroup(open));
+                layers.push((StackWork::EndGroup(open), ContentsOffset::NONE));
                 // The group tests its geometry before entering. Children still apply their own masks.
-                layers.extend(children.iter().rev().map(|&child| StackWork::Layer(child, depth + 1, 0)));
+                layers.extend(children.iter().rev().map(|&child| (StackWork::Layer(child, depth + 1, 0), children_around)));
                 continue;
             }
             let mask_start = effects.len() as u32;
-            let mask_background = compile_mask(mask, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
+            let mask_background = compile_mask(mask, around, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut effects)?;
             let shared_content = effects.len() as u32;
             let mask_count = shared_content - mask_start;
             let has_content_anchors = layer.content_effects.iter().any(|effect| effect.visible && matches!(effect.kind, EffectKind::Anchor));
@@ -949,7 +2037,7 @@ impl CompositeProgram {
             }
             let mut content_anchors = Vec::new();
             let mut visible_cut = 0u32;
-            let per_channel = layer.content_effects.iter().any(|effect| effect.visible && content_depends_on_channel(effect));
+            let per_channel = layer.content_effects.iter().any(|effect| effect.visible && (content_depends_on_channel(effect) || blends_per_channel(effect)));
             let mut templates = Vec::new();
             for effect in layer.content_effects.iter().filter(|e| e.visible) {
                 if matches!(effect.kind, EffectKind::Anchor) {
@@ -957,14 +2045,36 @@ impl CompositeProgram {
                     continue;
                 }
                 visible_cut += 1;
-                let op = if matches!(effect.kind, EffectKind::Material(_) | EffectKind::Paint | EffectKind::Path(_) | EffectKind::Graph { .. }) {
+                let first_input = procedural.input_sources.len();
+
+                // A filter laid on each channel apart is lowered once per channel of the set
+                let channel_ops = if blends_per_channel(effect) && !content_depends_on_channel(effect) {
+                    let mut ops = BTreeMap::new();
+                    for (channel, _) in display_channels() {
+                        let op = channel_filter(effect, channel, &mut procedural).ok_or("A layer effect uses CPU compositing.")?;
+                        ops.insert(channel, (procedural.preceding_stage.take(), op));
+                    }
+                    Some(ops)
+                } else {
+                    None
+                };
+                let op = if content_depends_on_channel(effect) || channel_ops.is_some() {
                     None
                 } else {
                     Some(content_filter(effect, &mut procedural).ok_or("A layer effect uses CPU compositing.")?)
                 };
+                stack::bind_input_tiles(effect, &mut procedural.input_sources[first_input..], &mut tile_patterns);
+
+                // A lowering with a stage before its operation takes two operations, on every channel alike
+                let mut stage = procedural.preceding_stage.take();
+                if channel_ops.as_ref().is_some_and(|ops| ops.values().any(|(channel_stage, _)| channel_stage.is_some())) {
+                    stage = Some(Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() });
+                }
+                visible_cut += u32::from(stage.is_some());
                 if per_channel {
-                    templates.push((effect, op));
+                    templates.push((effect, stage, op, channel_ops));
                 } else if let Some(op) = op {
+                    effects.extend(stage);
                     effects.push(op);
                 }
             }
@@ -973,10 +2083,7 @@ impl CompositeProgram {
                 LayerKind::Paint => None,
                 _ => return Err("A group or another layer type uses CPU compositing."),
             };
-            let decal = fill.and_then(|fill| match fill.projection {
-                Projection::Decal(frame) => Some(procedural.materials.register_decal(frame, fill.sources.values())),
-                _ => None,
-            });
+            let decal = fill.map(|fill| register_decal(fill, &mut procedural.materials)).transpose()?.flatten();
 
             let height = layer.height_mask;
             let height_params = if height.enabled && mask_count != 0 {
@@ -1015,12 +2122,18 @@ impl CompositeProgram {
                 }
                 let content_start = if per_channel { effects.len() as u32 } else { shared_content };
                 let mut adds_coverage = false;
-                for &(effect, template) in &templates {
-                    let op = if !effect.acts_on(channel) {
-                        Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() }
-                    } else if let Some(op) = template {
+                for (effect, shared_stage, shared_template, channel_ops) in &templates {
+                    // A channel without a stage of its own keeps the placeholder, so an anchor's content cut holds on every channel
+                    let (stage, template) = match channel_ops.as_ref().and_then(|ops| ops.get(&channel)) {
+                        Some((channel_stage, op)) => (shared_stage.map(|placeholder| channel_stage.unwrap_or(placeholder)), Some(*op)),
+                        None => (*shared_stage, *shared_template),
+                    };
+                    effects.extend(stage);
+                    let op = if let Some(op) = template {
                         op
-                    } else if let Some(op) = content_deposit(effect, channel, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns))? {
+                    } else if let Some(op) =
+                        content_deposit(effect, (channel, around), pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns))?
+                    {
                         adds_coverage = true;
                         op
                     } else {
@@ -1055,9 +2168,17 @@ impl CompositeProgram {
                 let mut op = if fill.is_none() {
                     content_paint(layer.id, channel, painted, brush_value, stencil_pigment, &mut paint)
                 } else {
-                    let projection = &fill.ok_or("A fill has no projection.")?.projection;
-                    source_operation_checked(source, projection, default, channel.kind(), (layer.id, Some(channel)), &mut procedural)
-                        .map_err(|reason| reason.unwrap_or("A fill source or projection uses CPU compositing."))?
+                    let fill = fill.ok_or("A fill has no projection.")?;
+                    source_operation_checked(
+                        source,
+                        &placed(around, &fill.projection),
+                        fill.sampling,
+                        default,
+                        channel.kind(),
+                        (layer.id, Some(channel)),
+                        &mut procedural,
+                    )
+                    .map_err(|reason| reason.unwrap_or("A fill source or projection uses CPU compositing."))?
                 };
                 if let Some(decal) = decal {
                     op.uv[0] = decal as f32;
@@ -1075,16 +2196,23 @@ impl CompositeProgram {
                 }
                 operations.push(op);
             }
+
+            packages::order_layer_operations(&mut operations[first_op..]);
+            if height_op != 0 {
+                // The reorder can move the Height operation that the height mask reads
+                let height = operations[first_op..].iter().position(|op| op.ids[0] == channel_slot(Channel::Height));
+                height_op = height.map_or(0, |index| (first_op + index) as u32 + 1);
+            }
             for op in &mut operations[first_op..] {
                 op.constraints = [geometry_mask, height_op | op.constraints[1], height_params[0], height_params[1]];
             }
             if first_op != operations.len() {
-                mask_layers.insert(id, first_op as u32);
+                mask_layers.push((id, around, first_op as u32));
             } else if mask.as_ref().is_some_and(|mask| {
                 mask.effects.iter().any(|effect| effect.visible && (!effect.kind.anchors_read().is_empty() || matches!(effect.kind, EffectKind::Anchor)))
             }) {
                 // A layer with no display channels can still publish anchors in its mask.
-                mask_layers.insert(id, first_op as u32);
+                mask_layers.push((id, around, first_op as u32));
                 operations.push(Operation {
                     ids: [u32::MAX, ANCHOR_PUBLISH_MASK, 0, 0],
                     effects: [mask_start, mask_count, 0, 0],
@@ -1127,10 +2255,16 @@ impl CompositeProgram {
             geometry.parts.clear();
         }
         operations.extend(effects);
-        let filters = FilterPlan::compile(&mut operations, layer_count, &procedural);
+        bind_input_sources(&mut operations, layer_count, &procedural.input_sources);
+        let mut filters = FilterPlan::compile(&mut operations, layer_count, &procedural);
         bind_generator_sources(&mut operations, &procedural.generator_sources);
         filters.bind_anchors(&mut operations);
-        let region = filters.expand(region);
+        let udim = udim::bind(layout.as_ref(), &mut filters, &mut procedural).ok_or("The UV tile layout exceeds the GPU parameter table.")?;
+        // A UV tile smaller than its block shades its height slopes at its own scale (Extra's alpha)
+        if layout.as_ref().is_some_and(|layout| layout.scaled) {
+            display_outputs |= display_bit(DisplayKind::Extra);
+        }
+        let region = filters.expand(region, project.texture_sets.get(ts).map_or((0, 0), texturecraft_core::TextureSet::size));
         let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
         let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
         Ok(Self {
@@ -1159,6 +2293,11 @@ impl CompositeProgram {
             mask_preview: false,
             mask_layer: 0,
             mask_layers,
+            image_words: procedural.image_words,
+            environment: LateEnvironment::new(procedural.environment_word, &project.display),
+            bake_rows: procedural.bake_rows,
+            udim,
+            udim_layout: layout,
         })
     }
 
@@ -1184,16 +2323,24 @@ impl CompositeProgram {
         graphs: Option<CompositeGraphs<'_>>,
     ) -> Result<Self, &'static str> {
         let set = project.texture_sets.get(ts).ok_or("The texture set is missing.")?;
-        if !set.uv_tiles.is_empty() {
-            return Err("UDIM texture sets use CPU mask preview.");
-        }
+        packages::check_set(set, true)?;
+        // The folders around the requested layer (an instance's own, as the CPU places it) re-place its mask fills
+        let requested = owner;
         let measured_blend = project.rules.blend.is_measured();
         let owner = project.mask_owner(owner);
+        let around = project.contents_around(requested);
         let mask = project.layers.get(&owner).and_then(|layer| layer.mask.as_ref()).filter(|mask| mask.enabled);
         let mask = mask.ok_or("The layer has no enabled mask.")?;
-        if mask.effects.iter().any(|effect| effect.visible && !effect.kind.anchors_read().is_empty()) {
+
+        // A mask reading anchors or the layers needs the stack below it: the material program
+        let reads_below = |effect: &Effect| {
+            !effect.kind.anchors_read().is_empty() || effect.inputs.values().any(|source| source.reads_anchor(None)) || effect.kind.reads_stack()
+        };
+        if mask.effects.iter().any(|effect| effect.visible && reads_below(effect)) {
+            // The material program draws the owner once per placement: show the draw where the requested layer sits
             let mut program = Self::try_compile_with_graphs(project, pixels, ts, region, brush, graphs)?;
-            program.mask_layer = *program.mask_layers.get(&owner).ok_or("The mask's GPU anchor stack is missing.")?;
+            let draw = program.mask_layers.iter().rev().find(|&&(id, offset, _)| (id == requested || id == owner) && offset == around);
+            program.mask_layer = draw.ok_or("The mask's GPU anchor stack is missing.")?.2;
             program.mask_preview = true;
             program.display_outputs = display_bit(DisplayKind::BaseColor);
             return Ok(program);
@@ -1203,15 +2350,20 @@ impl CompositeProgram {
         }
         let mut operations = vec![Operation::zeroed()];
         let mut paint = PaintInputs::default();
-        let mut procedural = ProceduralInputs::new(ts, set.resolution, graphs);
+        let mut procedural = ProceduralInputs::with_graphs(ts, set.resolution, graphs);
+        // P8: a UV tile atlas's block, its tile scales and the set's own resolution
+        let layout = udim::UdimLayout::of(set);
+        udim::prepare(layout.as_ref(), &mut procedural);
         let mut tile_patterns = TilePatterns::default();
-        let background = compile_mask(Some(mask), pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut operations)?;
+        let background = compile_mask(Some(mask), around, pixels, brush.as_ref(), (&mut paint, &mut procedural, &mut tile_patterns), &mut operations)?;
         operations[0].effects[1] = operations.len() as u32 - 1;
         operations[0].balance[1] = background;
-        let filters = FilterPlan::compile(&mut operations, 1, &procedural);
+        bind_input_sources(&mut operations, 1, &procedural.input_sources);
+        let mut filters = FilterPlan::compile(&mut operations, 1, &procedural);
         bind_generator_sources(&mut operations, &procedural.generator_sources);
         filters.bind_anchors(&mut operations);
-        let region = filters.expand(region);
+        let udim = udim::bind(layout.as_ref(), &mut filters, &mut procedural).ok_or("The UV tile layout exceeds the GPU parameter table.")?;
+        let region = filters.expand(region, project.texture_sets.get(ts).map_or((0, 0), texturecraft_core::TextureSet::size));
         let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
         let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
         Ok(Self {
@@ -1240,9 +2392,22 @@ impl CompositeProgram {
             unit_channels: 0,
             mask_preview: true,
             mask_layer: 0,
-            mask_layers: BTreeMap::new(),
+            mask_layers: Vec::new(),
+            image_words: procedural.image_words,
+            environment: LateEnvironment::new(procedural.environment_word, &project.display),
+            bake_rows: procedural.bake_rows,
+            udim,
+            udim_layout: layout,
         })
     }
+}
+
+/// Filter library ids that still composite on the CPU with their library defaults, as
+/// (package, id). The GPU port's library gate (crates/ui-egui/src/gpu_port_gate.rs) checks this
+/// against the compiler; at the end of the port it is empty.
+#[doc(hidden)]
+pub fn library_filters_still_on_cpu() -> Vec<(&'static str, &'static str)> {
+    packages::library_still_on_cpu()
 }
 
 fn needs_surface(operations: &[Operation]) -> bool {
@@ -1250,6 +2415,7 @@ fn needs_surface(operations: &[Operation]) -> bool {
         (op.procedural[3] != 0 && op.procedural[3] != PLACED_UV_PROJECTION)
             || op.ids[1] == BAKED_LIGHTING_OPCODE
             || (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&op.ids[1])
+            || packages::needs_surface(op)
     })
 }
 
@@ -1261,58 +2427,116 @@ fn sparse_channel(pixels: &PixelStore, id: LayerId, channel: Channel) -> Result<
     Ok(image)
 }
 
+/// `projection` under the Scale and Rotation `around` of the folders holding its fill, borrowed
+/// when they change nothing.
+fn placed(around: ContentsOffset, projection: &Projection) -> Cow<'_, Projection> {
+    if around.is_none() { Cow::Borrowed(projection) } else { Cow::Owned(around.apply(projection)) }
+}
+
 fn content_paint(
     id: LayerId,
     channel: Channel,
     image: Option<&TileImage>,
-    brush_value: Option<([f32; 3], f32)>,
+    brush_value: Option<([f32; 3], f32, bool)>,
     stencil_pigment: bool,
     paint: &mut PaintInputs,
 ) -> Operation {
     let image_index = image.map_or(NO_PAINT_IMAGE, |image| paint.register(id, Some(channel), image));
     let mut op = Operation { ids: [channel_slot(channel), 10, image_index, (channel.components() + 1) as u32], ..Operation::zeroed() };
-    if let Some(([r, g, b], opacity)) = brush_value {
+    if let Some(([r, g, b], opacity, erase)) = brush_value {
         op.projection[3] = if stencil_pigment && channel == Channel::BaseColor { 2.0 } else { 1.0 };
         op.uv = [r, g, b, opacity];
+        op.ext[2] = brush::live_paint_bits(erase, false);
     }
     op
 }
 
 fn content_depends_on_channel(effect: &Effect) -> bool {
-    !effect.channels.is_empty() || matches!(effect.kind, EffectKind::Material(_) | EffectKind::Paint | EffectKind::Path(_) | EffectKind::Graph { .. })
+    matches!(effect.kind, EffectKind::Material(_) | EffectKind::Paint | EffectKind::Path(_) | EffectKind::Graph { .. })
 }
 
 fn content_filter(effect: &Effect, procedural: &mut ProceduralInputs) -> Option<Operation> {
-    match effect.kind {
+    let noop = Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() };
+    match &effect.kind {
         // A mask-only effect authored in this stack leaves its content alone.
-        EffectKind::Fill { .. }
-        | EffectKind::Generator(_)
-        | EffectKind::ColorSelection { .. }
-        | EffectKind::Compare { .. }
-        | EffectKind::Placeholder { .. } => Some(Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() }),
-        _ => point_effect(effect, procedural),
+        EffectKind::Fill { .. } | EffectKind::Generator(_) | EffectKind::ColorSelection(_) | EffectKind::Compare { .. } | EffectKind::Placeholder { .. } => {
+            Some(noop)
+        }
+        // A blending effect set to Disable leaves the content as it is
+        kind if kind.blends() && effect.blend == BlendMode::Disable && uniform_blend(effect) => Some(noop),
+        _ => {
+            let mut op = point_effect(effect, procedural)?;
+            stack::attach_distance_map(effect, &mut op, procedural)?;
+            stack::attach_gather_input(effect, &mut op, procedural)?;
+            Some(op)
+        }
     }
+}
+
+/// Whether the effect blends every channel alike: one operation then serves every channel
+fn uniform_blend(effect: &Effect) -> bool {
+    effect.channel_blends.is_empty() && effect.off_channels.is_empty()
+}
+
+/// Whether a content effect lays onto each channel apart: per-channel blends, switched-off
+/// channels, or Levels remapping one channel only (`Levels::affects`).
+fn blends_per_channel(effect: &Effect) -> bool {
+    !uniform_blend(effect) || matches!(&effect.kind, EffectKind::Levels(levels) if levels.affects.is_some())
+}
+
+/// A content filter's operation on `channel`: lowered with the channel's own blend and opacity
+/// ([`Effect::applied_blend`], none on a switched-off channel), and Levels only on the channel it
+/// remaps, as the CPU's `content_effect` lays it on.
+fn channel_filter(effect: &Effect, channel: Channel, procedural: &mut ProceduralInputs) -> Option<Operation> {
+    if let EffectKind::Levels(levels) = &effect.kind
+        && !levels.remaps(channel)
+    {
+        return Some(Operation { ids: [0, NOOP_EFFECT_OPCODE, 0, 0], ..Operation::zeroed() });
+    }
+
+    let blend = effect.applied_blend(Some(channel));
+    let mut on_channel = effect.clone();
+    on_channel.blend = blend.mode;
+    on_channel.opacity = blend.opacity;
+    on_channel.channel_blends.clear();
+    on_channel.off_channels.clear();
+    if let EffectKind::Levels(levels) = &mut on_channel.kind {
+        levels.affects = None;
+    }
+    content_filter(&on_channel, procedural)
 }
 
 fn content_deposit(
     effect: &Effect,
-    channel: Channel,
+    (channel, around): (Channel, ContentsOffset),
     pixels: &PixelStore,
     brush: Option<&LiveBrush>,
     (paint, procedural, tile_patterns): (&mut PaintInputs, &mut ProceduralInputs, &mut TilePatterns),
 ) -> Result<Option<Operation>, &'static str> {
-    if !effect.opacity.is_finite() {
+    // The channel's own blend, at no opacity where the effect is switched off
+    let blend = effect.applied_blend(Some(channel));
+    if !blend.opacity.is_finite() {
         return Err("A content effect has an invalid opacity.");
     }
-    if effect.opacity <= 0.0 {
+
+    // A deposit set to Disable leaves the content and its coverage as they are
+    if blend.opacity <= 0.0 || blend.mode == BlendMode::Disable {
         return Ok(None);
     }
     let mut op = if let EffectKind::Material(fill) = &effect.kind {
         let Some(source) = fill.sources.get(&channel) else { return Ok(None) };
-        let mut op = source_operation_checked(Some(source), &fill.projection, channel.default_value(), channel.kind(), (effect.id, Some(channel)), procedural)
-            .map_err(|reason| reason.unwrap_or("A content material source or projection uses CPU compositing."))?;
-        if let Projection::Decal(frame) = fill.projection {
-            op.uv[0] = procedural.materials.register_decal(frame, fill.sources.values()) as f32;
+        let mut op = source_operation_checked(
+            Some(source),
+            &placed(around, &fill.projection),
+            fill.sampling,
+            channel.default_value(),
+            channel.kind(),
+            (effect.id, Some(channel)),
+            procedural,
+        )
+        .map_err(|reason| reason.unwrap_or("A content material source or projection uses CPU compositing."))?;
+        if let Some(decal) = register_decal(fill, &mut procedural.materials)? {
+            op.uv[0] = decal as f32;
         }
         bind_tile_source(&mut op, Some(source), tile_patterns);
         op.ids[0] = channel_slot(channel);
@@ -1320,13 +2544,14 @@ fn content_deposit(
     } else if let EffectKind::Graph { graph, projection } = &effect.kind {
         let Some(output) = graph.output_for(channel) else { return Ok(None) };
         let alpha = graph.output_alphas.get(&channel).map(String::as_str).or_else(|| (!graph.reads_stack()).then_some(graph.alpha_output.as_deref()).flatten());
-        let Some(mut op) = graph_operation(graph, (output, alpha), projection, (effect.id, Some(channel)), channel.kind(), true, procedural)? else {
+        let projection = placed(around, projection);
+        let Some(mut op) = graph_operation(graph, (output, alpha), &projection, (effect.id, Some(channel)), channel.kind(), true, procedural)? else {
             return Ok(None);
         };
         if !graph.reads_stack()
-            && let Projection::Decal(frame) = projection
+            && let Some(frame) = projection.frame()
         {
-            op.uv[0] = procedural.materials.register_decal(*frame, std::iter::empty()) as f32;
+            op.uv[0] = procedural.materials.register_decal(*frame, std::iter::empty(), Sampling::SAVED_BEFORE) as f32;
         }
         op.ids[0] = channel_slot(channel);
         op
@@ -1338,13 +2563,16 @@ fn content_deposit(
         }
         content_paint(effect.id, channel, image, value, brush.is_some_and(|brush| brush.stencil.is_some()), paint)
     };
-    op.low[3] = effect.opacity.min(1.0);
-    op.balance[2] = blend_code(effect.blend).ok_or("The effect blend mode uses CPU compositing.")? as f32;
+    op.low[3] = blend.opacity.min(1.0);
+    op.balance[2] = blend_code(blend.mode).ok_or("The effect blend mode uses CPU compositing.")? as f32;
     Ok(Some(op))
 }
 
+/// `mask`'s effects as operations, its fills under the Scale and Rotation `around` of the folders
+/// holding the layer, and the mask's background value.
 fn compile_mask(
     mask: Option<&Mask>,
+    around: ContentsOffset,
     pixels: &PixelStore,
     brush: Option<&LiveBrush>,
     (paint, procedural, tile_patterns): (&mut PaintInputs, &mut ProceduralInputs, &mut TilePatterns),
@@ -1353,31 +2581,40 @@ fn compile_mask(
     let Some(mask) = mask else { return Ok(1.0) };
     for effect in mask.effects.iter().filter(|e| e.visible) {
         let mut op = match &effect.kind {
-            EffectKind::Fill { source, projection } => {
-                let mut operation = source_operation_checked(Some(source), projection, [0.0; 3], ChannelKind::Scalar, (effect.id, None), procedural)
-                    .map_err(|reason| reason.unwrap_or("A mask fill source or projection uses CPU compositing."))?;
-                if let Projection::Decal(frame) = projection {
-                    operation.uv[0] = procedural.materials.register_decal(*frame, std::iter::once(source)) as f32;
+            EffectKind::Fill { source, projection, sampling } => {
+                let mut operation = source_operation_checked(
+                    Some(source),
+                    &placed(around, projection),
+                    *sampling,
+                    [0.0; 3],
+                    ChannelKind::Scalar,
+                    (effect.id, None),
+                    procedural,
+                )
+                .map_err(|reason| reason.unwrap_or("A mask fill source or projection uses CPU compositing."))?;
+                if let Some(frame) = projection.frame() {
+                    operation.uv[0] = procedural.materials.register_decal(*frame, std::iter::once(source), *sampling) as f32;
                 }
                 operation
             }
             EffectKind::Graph { graph, projection } => {
+                let projection = placed(around, projection);
                 let Some(mut op) =
-                    graph_operation(graph, (graph.output.as_deref(), None), projection, (effect.id, None), ChannelKind::Scalar, true, procedural)?
+                    graph_operation(graph, (graph.output.as_deref(), None), &projection, (effect.id, None), ChannelKind::Scalar, true, procedural)?
                 else {
                     continue;
                 };
                 if !graph.reads_stack()
-                    && let Projection::Decal(frame) = projection
+                    && let Some(frame) = projection.frame()
                 {
-                    op.uv[0] = procedural.materials.register_decal(*frame, std::iter::empty()) as f32;
+                    op.uv[0] = procedural.materials.register_decal(*frame, std::iter::empty(), Sampling::SAVED_BEFORE) as f32;
                 }
                 op
             }
             EffectKind::Paint | EffectKind::Path(_) => {
                 let live = brush.and_then(|brush| match &brush.target {
-                    LiveBrushTarget::Mask { effect: id, value } if *id == effect.id && matches!(effect.kind, EffectKind::Paint) => {
-                        Some((value.clamp(0.0, 1.0), brush.opacity.clamp(0.0, 1.0)))
+                    LiveBrushTarget::Mask { effect: id, value, image } if *id == effect.id && matches!(effect.kind, EffectKind::Paint) => {
+                        Some((value.clamp(0.0, 1.0), brush.opacity.clamp(0.0, 1.0), brush.erase, image.as_deref()))
                     }
                     _ => None,
                 });
@@ -1390,26 +2627,40 @@ fn compile_mask(
                 }
                 let image_index = image.map_or(NO_PAINT_IMAGE, |image| paint.register(effect.id, None, image));
                 let mut op = Operation { ids: [0, 10, image_index, 2], ..Operation::zeroed() };
-                if let Some((value, opacity)) = live {
+                if let Some((value, opacity, erase, mask_image)) = live {
                     op.projection[3] = 1.0;
                     op.uv = [value, value, value, opacity];
+                    let mask_image = mask_image.filter(|_| !erase);
+                    op.ext[2] = brush::live_paint_bits(erase, mask_image.is_some());
+                    if let Some(name) = mask_image {
+                        op.ext[0] = procedural.pack_image(name, ImageUse::Material).ok_or("The live brush's mask image does not fit the GPU program.")?;
+                    }
                 }
                 op
             }
             EffectKind::Generator(generator) => generator_operation(generator, procedural, tile_patterns).ok_or("A mask generator uses CPU compositing.")?,
-            EffectKind::ColorSelection { colors, tolerance, map: BakedMap::Id } => {
+            // The baked ID map, or an image as ID map through the side table; other baked maps use the CPU
+            EffectKind::ColorSelection(selection) if selection.map == BakedMap::Id => {
+                let ColorSelection { colors, tolerance, .. } = selection;
                 let [offset, count] = procedural.pack_rgb(colors).ok_or("A color selection has invalid colors.")?;
                 if !tolerance.is_finite() {
                     return Err("A color selection has invalid tolerance.");
                 }
-                Operation { ids: [0, COLOR_SELECTION_OPCODE, 0, 0], low: [*tolerance, 0.0, 0.0, 0.0], procedural: [0, offset, count, 0], ..Operation::zeroed() }
+                let mut operation = Operation {
+                    ids: [0, COLOR_SELECTION_OPCODE, 0, 0],
+                    low: [*tolerance, 0.0, 0.0, 0.0],
+                    procedural: [0, offset, count, 0],
+                    ..Operation::zeroed()
+                };
+                stack::soften_selection(&mut operation, selection, procedural).ok_or("A color selection has invalid parameters.")?;
+                operation
             }
             EffectKind::Placeholder { .. } => continue,
             EffectKind::Anchor => {
                 let publication = procedural.anchors.publish(effect.id, true);
                 Operation { ids: [0, ANCHOR_PUBLISH_MASK, publication, 0], ..Operation::zeroed() }
             }
-            EffectKind::Compare { op, value, tolerance } => {
+            EffectKind::Compare { op, value, tolerance, left, right, channel, hardness } => {
                 if !value.is_finite() || !tolerance.is_finite() {
                     return Err("A mask comparison has invalid parameters.");
                 }
@@ -1418,10 +2669,27 @@ fn compile_mask(
                     CompareOp::WithinTolerance => 1,
                     CompareOp::GreaterThan => 2,
                 };
-                Operation { ids: [0, COMPARE_OPCODE, compare, 0], low: [*value, *tolerance, 0.0, 0.0], ..Operation::zeroed() }
+                let mut operation = Operation { ids: [0, COMPARE_OPCODE, compare, 0], low: [*value, *tolerance, 0.0, 0.0], ..Operation::zeroed() };
+                stack::soften_compare(&mut operation, *hardness);
+
+                // A side reading the layers below or this layer reads the material of the channel at
+                // the texel; any pair but the mask against the constant names its sides too
+                if left.reads_stack() || right.reads_stack() || (*left, *right) != (CompareSource::ThisMask, CompareSource::Constant) {
+                    stack::read_layers(&mut operation, *left, *right, *channel);
+                }
+                operation
             }
-            EffectKind::Filter(Filter::BakedLighting { .. }) => continue,
-            _ => point_effect(effect, procedural).ok_or("A mask effect uses CPU compositing.")?,
+            // Lighting and PBR Validate read the base color, which a mask does not have: the CPU
+            // leaves the mask as it is (`Filter::point` is None), so they lower to nothing here
+            EffectKind::Filter(Filter::BakedLighting { .. } | Filter::EnvironmentLighting { .. } | Filter::PbrValidate(_)) => continue,
+            _ => {
+                let first_input = procedural.input_sources.len();
+                let mut operation = point_effect(effect, procedural).ok_or("A mask effect uses CPU compositing.")?;
+                stack::attach_distance_map(effect, &mut operation, procedural).ok_or("A mask effect's Distance Map uses CPU compositing.")?;
+                stack::attach_gather_input(effect, &mut operation, procedural).ok_or("A mask effect's image input uses CPU compositing.")?;
+                stack::bind_input_tiles(effect, &mut procedural.input_sources[first_input..], tile_patterns);
+                operation
+            }
         };
         if !effect.opacity.is_finite() {
             return Err("A mask effect has an invalid opacity.");
@@ -1431,6 +2699,8 @@ fn compile_mask(
         }
         op.low[3] = effect.opacity.clamp(0.0, 1.0);
         op.balance[2] = blend_code(effect.blend).ok_or("The effect blend mode uses CPU compositing.")? as f32;
+        // A lowering with a stage before its operation (`ProceduralInputs::precede_with_stage`)
+        effects.extend(procedural.preceding_stage.take());
         effects.push(op);
     }
     Ok(if mask.background == MaskBackground::White { 1.0 } else { 0.0 })
@@ -1487,6 +2757,7 @@ fn bind_tile_source(op: &mut Operation, source: Option<&Source>, patterns: &mut 
 fn source_operation_checked(
     source: Option<&Source>,
     projection: &Projection,
+    sampling: Sampling,
     default: [f32; 3],
     channel: ChannelKind,
     owner: (LayerId, Option<Channel>),
@@ -1498,7 +2769,7 @@ fn source_operation_checked(
             .map(|op| op.unwrap_or_else(|| Operation { low: [0.5, 0.5, 0.5, 0.0], ..Operation::zeroed() }))
             .map_err(Some);
     }
-    source_operation(source, projection, default, channel, inputs).ok_or(None)
+    source_operation(source, projection, sampling, default, channel, inputs).ok_or(None)
 }
 
 fn graph_operation(
@@ -1524,8 +2795,10 @@ fn graph_operation(
     let Some((binding, alpha_slot)) = inputs.graph_image(graph, output, alpha, owner, dynamic)? else { return Ok(None) };
     let mut op = Operation { ids: [0, IMAGE_SOURCE_OPCODE, binding, kind], ..Operation::zeroed() };
     op.procedural[1] = alpha_slot;
+    let unsupported = "An imported graph uses a projection that uses CPU compositing.";
     if dynamic {
-        image_projection(&mut op, &Projection::default());
+        // A graph that reads the stack lies on the texture as the stack does
+        fill_projection::place_image(&Projection::default(), Sampling::SAVED_BEFORE, &mut op, inputs).ok_or(unsupported)?;
         if owner.1.is_some() && alpha.is_none() {
             let normal_or_height = matches!(channel, ChannelKind::NormalMap | ChannelKind::Signed);
             op.procedural[0] = if normal_or_height && output.is_some_and(|name| graph.colour_outputs.contains(name)) {
@@ -1539,42 +2812,15 @@ fn graph_operation(
     } else if let Projection::Placed(placed) = projection {
         placed_image_projection(&mut op, placed, inputs).ok_or("An imported graph uses an unsupported placed projection.")?;
     } else {
-        image_projection(&mut op, projection);
+        fill_projection::place_image(projection, Sampling::SAVED_BEFORE, &mut op, inputs).ok_or(unsupported)?;
+        fill_projection::place_cover(projection, Sampling::SAVED_BEFORE, &mut op, inputs).ok_or(unsupported)?;
+
+        // P1's path reads the atlas encodings of authored images only
+        if op.ext[1] != 0 {
+            return Err(unsupported);
+        }
     }
     Ok(Some(op))
-}
-
-fn image_projection(op: &mut Operation, projection: &Projection) {
-    match projection {
-        Projection::Uv { scale, rotation, offset } => {
-            let (sin, cos) = rotation.to_radians().sin_cos();
-            op.projection = [cos, sin, scale[0], scale[1]];
-            op.uv[..2].copy_from_slice(offset);
-        }
-        Projection::Triplanar { scale, sharpness, offset } => {
-            op.projection = [offset[0], offset[1], offset[2], *scale];
-            op.procedural[3] = 1;
-            op.balance[3] = sharpness.max(1.0);
-        }
-        Projection::Planar { scale, axis, offset } => {
-            op.projection = [offset[0], offset[1], offset[2], *scale];
-            op.procedural[3] = 2 + u32::from((*axis).min(2));
-        }
-        Projection::Spherical { scale } => {
-            op.projection[3] = *scale;
-            op.procedural[3] = 5;
-        }
-        Projection::Cylindrical { scale, axis } => {
-            op.projection[3] = *scale;
-            op.procedural[3] = match axis {
-                0 => 6,
-                2 => 8,
-                _ => 7,
-            };
-        }
-        Projection::Decal(_) => op.procedural[3] = DECAL_PROJECTION,
-        Projection::Placed(_) => {}
-    }
 }
 
 fn placed_uv_projection(op: &mut Operation, scale: &[f32; 2], rotation: f32, offset: &[f32; 2], repeat: [bool; 2]) {
@@ -1604,9 +2850,17 @@ fn placed_image_projection(op: &mut Operation, placed: &texturecraft_core::Place
     Some(())
 }
 
+/// The frame record of a placed planar or warp fill (its first image's alpha also controls the
+/// non-image channels), as `op.uv[0]` of its operations.
+fn register_decal(fill: &texturecraft_core::Fill, materials: &mut MaterialImages) -> Result<Option<u32>, &'static str> {
+    let Some(frame) = fill.projection.frame() else { return Ok(None) };
+    Ok(Some(materials.register_decal(*frame, fill.sources.values(), fill.sampling)))
+}
+
 fn source_operation(
     source: Option<&Source>,
     projection: &Projection,
+    sampling: Sampling,
     default: [f32; 3],
     channel: ChannelKind,
     inputs: &mut ProceduralInputs,
@@ -1629,8 +2883,11 @@ fn source_operation(
                     }
                 }
             };
-            op.ids = [0, IMAGE_SOURCE_OPCODE, inputs.materials.register_image(name), kind];
-            image_projection(&mut op, projection);
+            op.ids = [0, IMAGE_SOURCE_OPCODE, inputs.materials.register_image(name, fill_projection::image_use(sampling, channel)), kind];
+            // A placed projection lays the image with its own words below
+            if !matches!(projection, Projection::Placed(_)) {
+                fill_projection::place_image(projection, sampling, &mut op, inputs)?;
+            }
         }
         Some(Source::Anchor { anchor, channel: read_channel, ramp }) => {
             if read_channel.user_index().is_some() {
@@ -1697,63 +2954,43 @@ fn source_operation(
             op.uv[2] = pattern.scale.max(1e-4);
             op.uv[3] = pattern.contrast.max(0.0);
             op.balance[0] = pattern.balance;
-            op.procedural[0] = pattern_pixels(pattern, inputs.resolution, inputs.resolution).unwrap_or(0);
+            op.procedural[0] = pattern_pixels(pattern, inputs.resolution, inputs.texture_set).unwrap_or(0);
+            // P8: a UV tile atlas's smaller tiles reduce the pattern at their own resolution
+            op.ext[3] = udim::pattern_levels(pattern, inputs)?;
             if channel == ChannelKind::Color && !ramp.is_empty() {
                 op.procedural[1..3].copy_from_slice(&inputs.pack_rgb(ramp)?);
             }
-            match projection {
-                Projection::Uv { scale, rotation, offset } => {
-                    let (sin, cos) = rotation.to_radians().sin_cos();
-                    op.projection = [cos, sin, scale[0], scale[1]];
-                    op.uv[..2].copy_from_slice(offset);
-                    if scale.iter().zip(offset).any(|(s, o)| (s.abs() * 2.0 + o.abs()) * op.uv[2] > 32_768.0) {
-                        return None;
-                    }
-                }
-                Projection::Triplanar { scale, offset, .. } | Projection::Planar { scale, offset, .. } => {
-                    let frequency = *scale * op.uv[2];
-                    if offset.iter().any(|o| frequency.abs() + o.abs() > 32_768.0) {
-                        return None;
-                    }
-                    op.projection = [offset[0], offset[1], offset[2], frequency];
-                    if let Projection::Planar { axis, .. } = projection {
-                        op.procedural[3] = 2 + u32::from((*axis).min(2));
-                    } else if let Projection::Triplanar { sharpness, .. } = projection {
-                        op.procedural[3] = 1;
-                        op.balance[3] = sharpness.max(1.0);
-                    }
-                }
-                Projection::Spherical { scale } | Projection::Cylindrical { scale, .. } => {
-                    let frequency = *scale * op.uv[2];
-                    if frequency.abs() * 4.0 > 32_768.0 {
-                        return None;
-                    }
-                    op.projection[3] = frequency;
-                    op.procedural[3] = match projection {
-                        Projection::Cylindrical { axis: 0, .. } => 6,
-                        Projection::Cylindrical { axis: 2, .. } => 8,
-                        Projection::Cylindrical { .. } => 7,
-                        _ => 5,
-                    };
-                }
-                Projection::Decal(_) => {}
-                Projection::Placed(_) => return None,
+            if matches!(projection, Projection::Placed(_)) {
+                return None;
             }
+            fill_projection::place_procedural(projection, sampling, &mut op, inputs)?;
         }
         Some(Source::Graph(_)) => return None,
     }
-    match projection {
-        Projection::Placed(placed) if matches!(source, None | Some(Source::Uniform(_) | Source::Image { .. })) => {
-            placed_image_projection(&mut op, placed, inputs)?;
+    if let Projection::Placed(placed) = projection {
+        // Placed projections of imported fills: uniform and image sources on their own paths
+        if !matches!(source, None | Some(Source::Uniform(_) | Source::Image { .. })) {
+            return None;
         }
-        Projection::Placed(_) => return None,
-        Projection::Decal(_) => op.procedural[3] = DECAL_PROJECTION,
-        _ => {}
+        placed_image_projection(&mut op, placed, inputs)?;
+    } else {
+        // Coverage of every source kind (wrap, crop, backface, depth culling, decals)
+        fill_projection::place_cover(projection, sampling, &mut op, inputs)?;
     }
     op.low.iter().chain(&op.high).chain(&op.projection).chain(&op.uv).chain(&op.balance).all(|v| v.is_finite()).then_some(op)
 }
 
 fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
+    // The GPU has the earlier model alone: the wear, section, light and kind controls, a texture,
+    // a grunge, Micro Details and the kinds without an earlier model compose on the CPU
+    if !generator.on_earlier_model()
+        || generator.controls.is_some()
+        || generator.texture.is_some()
+        || generator.grunge.is_some()
+        || generator.micro_in_use().is_some()
+    {
+        return None;
+    }
     let kind = match generator.kind {
         GeneratorKind::EdgeWear => 40,
         GeneratorKind::Dirt => 41,
@@ -1762,6 +2999,7 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
         GeneratorKind::AmbientOcclusion => 44,
         GeneratorKind::Position => 45,
         GeneratorKind::Direction => 46,
+        _ => return None,
     };
     let direction = Vec3::from(generator.direction).try_normalize().unwrap_or(Vec3::Y);
     let mut op = Operation {
@@ -1771,28 +3009,35 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
         projection: [generator.noise_scale.max(1e-3), generator.offset, generator.global.balance, generator.global.contrast],
         ..Operation::zeroed()
     };
-    if let Some(source) = generator.kind.inputs().first().and_then(|map| generator.inputs.get(map)) {
-        let mut source_op = source_operation(Some(source), &Projection::default(), [0.0; 3], ChannelKind::Scalar, inputs)?;
+    // The map the earlier model reads (GeneratorKind::inputs lists the newer controls' maps too)
+    let earlier_input = match generator.kind {
+        GeneratorKind::EdgeWear | GeneratorKind::Curvature => Some(BakedMap::Curvature),
+        GeneratorKind::Dirt | GeneratorKind::AmbientOcclusion => Some(BakedMap::AmbientOcclusion),
+        GeneratorKind::ThinAreas => Some(BakedMap::Thickness),
+        _ => None,
+    };
+    if let Some(source) = earlier_input.and_then(|map| generator.inputs.get(&map)) {
+        let mut source_op = source_operation(Some(source), &Projection::default(), Sampling::SAVED_BEFORE, [0.0; 3], ChannelKind::Scalar, inputs)?;
         bind_tile_source(&mut source_op, Some(source), patterns);
         inputs.generator_sources.push(source_op);
         op.effects[3] = inputs.generator_sources.len() as u32;
     }
-    if let Some(micro) = generator.micro {
-        let source = Source::Anchor { anchor: micro.anchor, channel: Channel::Height, ramp: Vec::new() };
-        let source = source_operation(Some(&source), &Projection::default(), [0.0; 3], ChannelKind::Signed, inputs)?;
+    // A micro detail saved before Micro Details: its anchor's height times the amount
+    if let Some((anchor, amount)) = generator.earlier_micro() {
+        let source = Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() };
+        let source = source_operation(Some(&source), &Projection::default(), Sampling::SAVED_BEFORE, [0.0; 3], ChannelKind::Signed, inputs)?;
         inputs.generator_sources.push(source);
         op.effects[2] = inputs.generator_sources.len() as u32;
-        op.uv[2] = if micro.amount.is_finite() { micro.amount.clamp(0.0, 1.0) } else { 0.0 };
+        op.uv[2] = amount;
     }
-    let resolution = inputs.resolution;
-    let cell = generator.resolution.cell(resolution, resolution);
     op.spatial[2] = u32::from(generator.global.blur > 0.0 || generator.resolution.can_reduce());
-    let blur = (generator.global.blur_radius_at(resolution).round() > 0.0)
-        .then(|| Filter::Blur { radius: generator.global.blur_radius() })
-        .and_then(|blur| NeighbourhoodFilter::new(&blur, resolution, resolution, 1.0, false));
+    let (blur, cell) = generator_stage(generator, inputs.resolution, inputs);
     if let (Some(_), _) | (None, 2..) = (blur, cell) {
         inputs.generator_stages.push((blur, cell));
         op.spatial[1] = inputs.generator_stages.len() as u32;
+        // P8: the generator's cells and blur at each further UV tile scale
+        let levels: Vec<_> = inputs.levels.iter().map(|&resolution| generator_stage(generator, resolution, inputs)).collect();
+        inputs.generator_levels.push(levels);
     }
     if matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear)
         && let Some(detail) = &generator.detail
@@ -1802,35 +3047,59 @@ fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, pat
     op.low.iter().chain(&op.projection).all(|x| x.is_finite()).then_some(op)
 }
 
+/// A generator's blur and cell side for a UV tile of `resolution` texels (`generator_region` in
+/// eval.rs): its blur stage, if it blurs, and its cells' side in texels.
+fn generator_stage(generator: &Generator, resolution: u32, inputs: &ProceduralInputs) -> (Option<NeighbourhoodFilter>, u32) {
+    let cell = generator.resolution.cell(resolution, inputs.texture_set);
+    let blur = (generator.global.blur_radius_at(resolution).round() > 0.0)
+        .then(|| Filter::Blur { radius: generator.global.blur_radius(), wrap: false })
+        .and_then(|blur| NeighbourhoodFilter::new(&blur, resolution, inputs.longest_side, 1.0, None));
+    (blur, cell)
+}
+
+/// One effect as a GPU point operation, or a neighbourhood stage. None for any kind or setting
+/// the GPU program does not evaluate as the CPU does, so the stack composites on the CPU.
 fn point_effect(effect: &Effect, inputs: &mut ProceduralInputs) -> Option<Operation> {
     use Filter::*;
+    // Per-channel blends are checked by the content caller; a mask ignores them
     if !effect.opacity.is_finite() {
         return None;
     }
     let mut op = Operation::zeroed();
     let (kind, params) = match &effect.kind {
         EffectKind::Levels(levels) => {
-            op.high[..2].copy_from_slice(&[levels.out_low, levels.out_high]);
+            // Unclamped Levels keep values outside the input range on the line through it
+            op.high[..3].copy_from_slice(&[levels.out_low, levels.out_high, f32::from(u8::from(levels.clamp))]);
             (20, [levels.in_low, levels.in_high, levels.gamma])
         }
         EffectKind::Filter(filter) => match filter {
             Invert => (21, [0.0; 3]),
-            Threshold { level } => (22, [*level, 0.0, 0.0]),
+            Threshold { level, mode } => {
+                // The comparison in ids.z: 0 at or above (projects saved before the modes), 1 above, 2 below, 3 at or below
+                op.ids[2] = match mode {
+                    ThresholdMode::GreaterOrEqual => 0,
+                    ThresholdMode::Greater => 1,
+                    ThresholdMode::Lower => 2,
+                    ThresholdMode::LowerOrEqual => 3,
+                };
+                (22, [*level, 0.0, 0.0])
+            }
             ContrastLuminosity { contrast, luminosity } => (23, [*contrast, *luminosity, 0.0]),
-            Posterize { levels } => (24, [*levels, 0.0, 0.0]),
+            Posterize { levels, alpha: false } => (24, [*levels, 0.0, 0.0]),
             Clamp { min, max } => (25, [min.min(*max), min.max(*max), 0.0]),
-            HistogramScan { position, contrast } => (26, [*position, *contrast, 0.0]),
+            HistogramScan { position, contrast, invert_position: false } => (26, [*position, *contrast, 0.0]),
             HistogramRange { range, position } => (27, [*range, *position, 0.0]),
             HistogramShift { offset } => (28, [*offset, 0.0, 0.0]),
             Grayscale => (29, [0.0; 3]),
             NormalInvert => (30, [0.0; 3]),
-            Hsl { hue, saturation, lightness } => (31, [*hue, *saturation, *lightness]),
+            Hsl { hue, saturation, lightness, perceptive: false } => (31, [*hue, *saturation, *lightness]),
             ColorBalance { shadows, midtones, highlights } => {
                 op.high[..3].copy_from_slice(midtones);
                 op.projection[..3].copy_from_slice(highlights);
                 (32, *shadows)
             }
-            GradientMap { colors } => {
+            // An evenly spaced linear ramp read from the plain gray
+            GradientMap { colors, positions, quantity: None, input, linear: true, debug: false } if positions.is_empty() && input.is_unchanged() => {
                 op.procedural[1..3].copy_from_slice(&inputs.pack_rgb(colors)?);
                 (33, [0.0; 3])
             }
@@ -1839,21 +3108,25 @@ fn point_effect(effect: &Effect, inputs: &mut ProceduralInputs) -> Option<Operat
                 op.projection[..2].copy_from_slice(&[tolerance.clamp(0.0, 1.0), softness.clamp(0.0, 1.0)]);
                 (34, *from)
             }
-            BakedLighting { azimuth, elevation, light, ambient, occlusion } => {
+            BakedLighting { azimuth, elevation, light, ambient, occlusion, stylized: None } => {
                 let (sa, ca) = azimuth.to_radians().sin_cos();
                 let (se, ce) = elevation.to_radians().sin_cos();
                 op.high[..3].copy_from_slice(&[ce * sa, se, ce * ca]);
                 (BAKED_LIGHTING_OPCODE, [*light, *ambient, occlusion.clamp(0.0, 1.0)])
             }
-            filter if filter.is_neighbourhood() => {
-                let spatial = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.resolution, effect.opacity, false);
+            // Invert switched off and a filter not chosen yet change nothing
+            InvertOff | Empty => (NOOP_EFFECT_OPCODE, [0.0; 3]),
+            filter if gpu_neighbourhood::supports(filter) => {
+                // A known stage whose size reaches nothing leaves the field as the CPU does
+                let spatial = NeighbourhoodFilter::new(filter, inputs.resolution, inputs.longest_side, effect.opacity, None);
                 if spatial.is_some() {
                     op.ids[2] = inputs.filters.len() as u32;
                     inputs.filters.push((filter.clone(), effect.opacity));
                 }
                 (if spatial.is_some() { NEIGHBOURHOOD_OPCODE } else { NOOP_EFFECT_OPCODE }, [0.0; 3])
             }
-            _ => return None,
+            // Every other filter, and new settings of the ones above: a GPU port package lowers it, or the stack composites on the CPU
+            filter => packages::lower_filter(filter, effect, &mut op, inputs)?,
         },
         _ => return None,
     };
@@ -1908,7 +3181,8 @@ struct SurfaceCache {
 
 struct BakeCache {
     size: (u32, u32),
-    maps: [Option<Weak<Texels>>; BAKE_MAPS.len()],
+    /// The built-in maps, then the second row block's
+    maps: Vec<Option<Weak<Texels>>>,
     view: wgpu::TextureView,
 }
 
@@ -1933,10 +3207,14 @@ struct CurvatureResources {
 }
 
 pub(crate) struct GpuCompositor {
-    pipelines: CompositePipelines,
+    pipelines: Arc<std::sync::Mutex<CompositePipelines>>,
+    /// Compile new pipelines on worker threads (`set_asynchronous_compile`)
+    asynchronous: bool,
     bindings: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     filter_gpu: Option<NeighbourhoodGpu>,
+    /// Take the neighbourhood kernels the tests on the shared device share
+    shared_test_kernels: bool,
     lookup: wgpu::Buffer,
     uniform_coverage: wgpu::Buffer,
     coverage: Vec<(Weak<UvGBuffer>, wgpu::Buffer)>,
@@ -1953,6 +3231,10 @@ pub(crate) struct GpuCompositor {
     default_tile_images: wgpu::TextureView,
     tile_images: BTreeMap<usize, TileImageAtlas>,
     paint_upload: Option<wgpu::Buffer>,
+    /// The working buffer of the last update, reused while the next one fits it
+    scratch: Option<wgpu::Buffer>,
+    /// Bytes of the last update's working space and paint upload (tests report them)
+    update_bytes: [u64; 2],
 }
 
 /// Lets an import worker prepare material pipelines without borrowing the viewport renderer.
@@ -1960,16 +3242,23 @@ pub(crate) struct GpuCompositor {
 pub struct CompositePipelineWarmup {
     device: wgpu::Device,
     layout: wgpu::PipelineLayout,
-    pipelines: CompositePipelines,
+    pipelines: Arc<std::sync::Mutex<CompositePipelines>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl CompositePipelineWarmup {
+    /// Compile the program's pipelines on worker threads and wait for them, locking the cache only to look
     pub fn prepare(&self, program: &CompositeProgram) -> Result<(), String> {
-        if !program.is_neutral() {
-            self.pipelines.get(&self.device, &self.layout, program)?;
+        if program.is_neutral() {
+            return Ok(());
         }
-        Ok(())
+        loop {
+            let ready = self.pipelines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&self.device, &self.layout, program, true)?;
+            if ready.is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -1990,7 +3279,14 @@ impl GpuCompositor {
             && limits.max_compute_workgroup_size_y >= WORKGROUP
     }
 
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn new(device: &wgpu::Device) -> Self {
+        Self::new_with(device, false)
+    }
+
+    /// [`GpuCompositor::new`], taking the pipelines and kernels the tests on the shared device
+    /// share when `shared` ([`crate::headless::Headless::for_tests`])
+    pub(crate) fn new_with(device: &wgpu::Device, shared: bool) -> Self {
         let binding = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
         let buffer = |ty| wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None };
         let uniform = buffer(wgpu::BufferBindingType::Uniform);
@@ -2055,7 +3351,9 @@ impl GpuCompositor {
         let default_brush_alpha =
             input_texture(device, "tc_composite_empty_brush_alpha", (1, 1), 1, wgpu::TextureFormat::R16Uint).create_view(&Default::default());
         Self {
-            pipelines: CompositePipelines::new(supports_curvature, supports_id),
+            pipelines: pipelines::shared(shared, supports_curvature, supports_id),
+            shared_test_kernels: shared,
+            asynchronous: false,
             bindings,
             pipeline_layout,
             filter_gpu: None,
@@ -2076,6 +3374,8 @@ impl GpuCompositor {
             default_tile_images: TileImageAtlas::empty_view(device),
             tile_images: BTreeMap::new(),
             paint_upload: None,
+            scratch: None,
+            update_bytes: [0; 2],
         }
     }
 
@@ -2124,7 +3424,8 @@ impl GpuCompositor {
             return Ok((view.clone(), vertices.clone()));
         }
         let limits = device.limits();
-        let vertex_bytes = mesh.indices.len() as u64 * 32;
+        // Two vec4 per vertex, then the tangents two per 32-byte element (`surface_tangent` in WGSL)
+        let vertex_bytes = (mesh.indices.len() as u64 + (mesh.indices.len() as u64).div_ceil(2)) * 32;
         if gbuf.width.max(gbuf.height) > limits.max_texture_dimension_2d || vertex_bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
             return Err("UV surface data exceeds the GPU limits".into());
         }
@@ -2132,7 +3433,7 @@ impl GpuCompositor {
         let (lo, hi) = mesh.bounds();
         let center = (lo + hi) * 0.5;
         let radius = ((hi - lo).length() * 0.5).max(1e-4);
-        let vertex_data: Vec<[[f32; 4]; 2]> = mesh
+        let mut vertex_data: Vec<[[f32; 4]; 2]> = mesh
             .indices
             .iter()
             .map(|&index| {
@@ -2143,6 +3444,10 @@ impl GpuCompositor {
                 [pos.extend(uv.x).to_array(), normal.extend(uv.y).to_array()]
             })
             .collect();
+        // The MikkTSpace tangents after the vertices, two per element: the brush and the stencil
+        // read the vertices at the same stride
+        let tangent = |index: Option<&u32>| index.and_then(|&index| mesh.tangents.get(index as usize)).copied().unwrap_or_default().to_array();
+        vertex_data.extend(mesh.indices.chunks(2).map(|pair| [tangent(pair.first()), tangent(pair.get(1))]));
         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tc_composite_surface_vertices"),
             contents: bytemuck::cast_slice(&vertex_data),
@@ -2268,9 +3573,10 @@ impl GpuCompositor {
             return Ok(self.default_baked.clone());
         };
         let size = (baked.width, baked.height);
-        let refs = baked.maps.each_ref().map(|map| map.as_ref().map(Arc::downgrade));
+        let refs: Vec<_> = baked.maps.iter().chain(&baked.rows).map(|map| map.as_ref().map(Arc::downgrade)).collect();
         if let Some(cache) = self.baked.get(&ts).filter(|cache| {
             size == cache.size
+                && refs.len() == cache.maps.len()
                 && refs.iter().zip(&cache.maps).all(|(a, b)| match (a, b) {
                     (Some(a), Some(b)) => a.ptr_eq(b),
                     (None, None) => true,
@@ -2279,13 +3585,27 @@ impl GpuCompositor {
         }) {
             return Ok(cache.view.clone());
         }
-        if size.0.max(size.1) > device.limits().max_texture_dimension_2d {
+        // The second row block (Height and World Normal) sits below the built-in maps; P8: maps of
+        // different heights take rows of their own, the header rows after them
+        let separate = baked.separate().then(|| baked.separate_layout());
+        let rows = match separate {
+            Some((_, header)) => header.checked_add(SEPARATE_MAPS.div_ceil(size.0.max(1) as usize) as u32),
+            None => size.1.checked_mul(baked.blocks()),
+        }
+        .ok_or("Baked maps exceed the GPU texture dimensions")?;
+        if size.0.max(rows) > device.limits().max_texture_dimension_2d {
             return Err("Baked maps exceed the GPU texture dimensions".into());
         }
         self.baked.remove(&ts);
         // Keep all three scalar inputs at f32 precision for narrow generator ramps. The
         // normal uses the remaining word, keeping the atlas at 16 bytes per texel.
-        let texture = input_texture(device, "tc_composite_bakes", size, 1, wgpu::TextureFormat::Rgba32Uint);
+        let texture = input_texture(device, "tc_composite_bakes", (size.0, rows), 1, wgpu::TextureFormat::Rgba32Uint);
+        if let Some(layout) = separate {
+            write_separate_bakes(queue, &texture, baked, layout);
+            let view = texture.create_view(&Default::default());
+            self.baked.insert(ts, BakeCache { size, maps: refs, view: view.clone() });
+            return Ok(view);
+        }
         let value = |map: usize, i: usize, fallback: f32| baked.maps[map].as_ref().and_then(|data| data.get(i)).unwrap_or(fallback);
         for top in (0..size.1).step_by(ROWS as usize) {
             let end = (top + ROWS).min(size.1);
@@ -2302,6 +3622,19 @@ impl GpuCompositor {
                 })
                 .collect();
             write_input(queue, &texture, (size.0, end - top), (top, 0), &texels);
+        }
+        if baked.blocks() > 1 {
+            // Height in x, the stored world normal in yzw; zeros where a map is not baked
+            let row = |map: usize, i: usize, component: usize| {
+                let components = BAKE_ROW_MAPS[map].components();
+                baked.rows[map].as_ref().and_then(|data| data.get(i * components + component)).unwrap_or(0.0).to_bits()
+            };
+            for top in (0..size.1).step_by(ROWS as usize) {
+                let end = (top + ROWS).min(size.1);
+                let indices = top as usize * size.0 as usize..end as usize * size.0 as usize;
+                let texels: Vec<[u32; 4]> = indices.into_par_iter().map(|i| [row(0, i, 0), row(1, i, 0), row(1, i, 1), row(1, i, 2)]).collect();
+                write_input(queue, &texture, (size.0, end - top), (size.1 + top, 0), &texels);
+            }
         }
         let view = texture.create_view(&Default::default());
         self.baked.insert(ts, BakeCache { size, maps: refs, view: view.clone() });
@@ -2375,15 +3708,19 @@ impl GpuCompositor {
         {
             return Ok(Some(cache.levels.clone()));
         }
-        let coverage = (gbuf.covered_count() != gbuf.tri.len()).then(|| self.coverage_buffer(device, Some(gbuf))).transpose()?;
+        // P8: a UV tile atlas pads, blurs and coarsens each block of the bake alone, and a tile smaller
+        // than its block covers only its share of the bake
+        let layout = program.udim_layout.as_ref();
+        let block = layout.map_or(size, |layout| [size[0] / layout.grid.cols.max(1), size[1] / layout.grid.rows.max(1)]);
+        let scales = layout.filter(|layout| layout.scaled).map_or((0, &[][..]), |layout| (layout.block, layout.scales.as_slice()));
+        let partly_covered = gbuf.covered_count() != gbuf.tri.len() || !scales.1.is_empty();
+        let coverage = partly_covered.then(|| self.coverage_buffer(device, Some(gbuf))).transpose()?;
         let curvature = self.curvature.as_mut().ok_or("The GPU curvature adapter is unavailable.")?;
         curvature.cache.remove(&ts);
         let gpu = curvature.gpu.get_or_insert_with(|| CurvatureGpu::new(device));
-        let levels = gpu.build(
-            device,
-            queue,
-            CurvatureInput { baked: baked_view, bake_size: size, coverage: coverage.as_ref(), working_size: [gbuf.width, gbuf.height], needed },
-        )?;
+        let working_size = [gbuf.width, gbuf.height];
+        let levels =
+            gpu.build(device, queue, CurvatureInput { baked: baked_view, bake_size: size, coverage: coverage.as_ref(), working_size, needed, block, scales })?;
         curvature.cache.insert(ts, CurvatureCache { gbuf: key, map, size, needed, levels: levels.clone() });
         Ok(Some(levels))
     }
@@ -2397,14 +3734,15 @@ impl GpuCompositor {
         timing: Option<&mut CompositeTiming>,
     ) -> Result<Option<&TileImageAtlas>, String> {
         let gray: Vec<_> = program.tile_patterns.image_sources().collect();
-        let color: Vec<_> = program.material_images.sources().collect();
-        if gray.is_empty() && color.is_empty() {
+        let color: Vec<_> = program.material_images.atlas_images().collect();
+        let raw = program.material_images.raw_planes();
+        if gray.is_empty() && color.is_empty() && raw.is_empty() {
             self.tile_images.remove(&ts);
             return Ok(None);
         }
-        if self.tile_images.get(&ts).is_none_or(|atlas| !atlas.matches(&gray, &color)) {
+        if self.tile_images.get(&ts).is_none_or(|atlas| !atlas.matches(&gray, &color, raw)) {
             self.tile_images.remove(&ts);
-            let atlas = TileImageAtlas::new(device, queue, &gray, &color, timing)?;
+            let atlas = TileImageAtlas::new(device, queue, &gray, &color, raw, timing)?;
             self.tile_images.insert(ts, atlas);
         }
         Ok(self.tile_images.get(&ts))
@@ -2437,13 +3775,19 @@ impl GpuCompositor {
             0
         };
         let pattern_work = program.tile_work_per_pixel()?;
-        check_tile_update_budget(width, height, pattern_work)?;
+        check_texel_work(pattern_work)?;
         let tile_work = pattern_work.saturating_add(program.groups.work_per_pixel()).saturating_add(selection_work);
         let grouped = program.groups.depth != 0;
         let radius = program.coverage.as_ref().map_or(0, |(_, radius)| *radius);
-        let halo = radius.saturating_add(program.filters.reach);
+        // A band's halo leaves out the stages the whole-set pre-pass evaluates
+        let halo = radius.saturating_add(program.filters.band_reach());
+        let whole = program.filters.whole_set();
         let limits = device.limits();
-        let scratch_limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
+        // The other buffers an update keeps alive: paint, operations and the parameter lookup
+        let live = self.paint_upload.as_ref().map_or(0, wgpu::Buffer::size)
+            + (program.operations.len() * size_of::<Operation>()) as u64
+            + (u64::from(LOOKUP_WORDS) + program.ramp_words.len() as u64 + program.geometry.words.len() as u64) * 4;
+        let scratch_limit = scratch_limit(&limits, live);
         let (mut band_width, mut band_rows) = composite_band_size(width, tile_work);
         let filtered = !program.filters.stages.is_empty();
         if filtered {
@@ -2456,10 +3800,12 @@ impl GpuCompositor {
         }
         let (pipeline, prepare) = time_composite(timing.as_deref_mut().map(|t| &mut t.pipelines), || {
             if filtered {
-                self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::new(device));
+                let shared = self.shared_test_kernels;
+                self.filter_gpu.get_or_insert_with(|| NeighbourhoodGpu::for_device(device, shared));
             }
-            self.pipelines.get(device, &self.pipeline_layout, program)
-        })?;
+            self.pipelines().get(device, &self.pipeline_layout, program, self.asynchronous)
+        })?
+        .ok_or(GPU_PIPELINES_PENDING)?;
         let (coverage, surface, vertices, baked, curvature, id_bake) =
             time_composite(timing.as_deref_mut().map(|t| &mut t.scene_inputs), || -> Result<_, String> {
                 let coverage = self.coverage_buffer(device, program.coverage.as_ref().map(|(map, _)| map))?;
@@ -2470,6 +3816,7 @@ impl GpuCompositor {
                 Ok((coverage, surface, vertices, baked, curvature, id_bake))
             })?;
         let [id_width, id_height] = program.id_bake.as_ref().map_or([0; 2], |id| id.size);
+        let bake_words = program.baked.as_ref().map_or([0; 2], BakedInputs::uniform_words);
         let mut words_per_pixel = 0;
         let copies = DisplayKind::ALL.map(|kind| {
             if !program.writes_display(kind) {
@@ -2480,8 +3827,13 @@ impl GpuCompositor {
             words_per_pixel += u64::from(bytes_per_texel / 4);
             Some((offset, bytes_per_texel))
         });
+        // A wrapping stage's fields extend past the set's edges (FilterPlan::wraps)
+        let wraps = program.filters.wraps();
         let field_area = |width: u32, rows: u32| {
-            let side = |pixels: u32, limit: u32| (pixels << shift).saturating_add(halo.saturating_mul(2)).min(limit);
+            let side = |pixels: u32, limit: u32| {
+                let side = (pixels << shift).saturating_add(halo.saturating_mul(2));
+                if wraps { side } else { side.min(limit) }
+            };
             u64::from(side(width, source_size.0)) * u64::from(side(rows, source_size.1))
         };
         let band_area = |width: u32, rows: u32| u64::from(width.next_multiple_of(64) * rows);
@@ -2490,6 +3842,29 @@ impl GpuCompositor {
         let required = |width, rows| (group_start(width, rows) + program.groups.words(band_area(width, rows))) * 4;
         let filter_work: u64 =
             program.filters.stages.iter().map(|stage| stage.filter.map_or(1, NeighbourhoodFilter::work_per_texel) + if stage.cell > 1 { 6 } else { 0 }).sum();
+        let texel_words = program.filters.field_words();
+        // The whole-set pre-pass: its result region (what the bands read around the update), its
+        // stripes and the scratch it needs besides the bands'
+        let whole = whole.map(|whole| WholeSetPass::plan(whole, (region, shift), source_size, halo, wraps, texel_words, program.filters.stages.len()));
+        let whole_bytes = whole.as_ref().map_or(0, WholeSetPass::result_bytes);
+        if whole_bytes >= scratch_limit {
+            return Err("The whole-set filter results exceed the adapter's working memory limit.".into());
+        }
+        let scratch_limit = scratch_limit - whole_bytes;
+        let whole = whole.map(|whole| whole.with_stripes(scratch_limit)).transpose()?;
+        // Color Match's Average reduces its whole field to one mean: in stripes each stripe would
+        // apply its own, so a set that needs stripes composites it on the CPU
+        if let Some(whole) = &whole
+            && whole.stripe_rows < whole.region[3] - whole.region[1]
+            && whole
+                .stages
+                .stages
+                .iter()
+                .filter_map(|&stage| program.filters.stages.get(stage)?.filter)
+                .any(crate::gpu_neighbourhood::gather::reads_whole_set_mean)
+        {
+            return Err("Color Match's Average over a set that needs stripes uses CPU compositing.".into());
+        }
         // A filtered band includes its source halo. Folder snapshots use only its output area.
         while required(band_width, band_rows) > scratch_limit {
             if band_width == 1 && band_rows == 1 {
@@ -2502,17 +3877,43 @@ impl GpuCompositor {
             }
         }
         let pitch = band_width.next_multiple_of(64);
-        let submit_budget = if grouped || filtered || band_width < width || band_rows < ROWS { MAX_TILE_WORK_PER_SUBMISSION } else { u64::MAX };
+        // A costly update submits its bands in parts of the submission budget
+        let update_work = (u64::from(width) * u64::from(height)).saturating_mul(tile_work);
+        let submit_budget = if grouped || filtered || band_width < width || band_rows < ROWS || update_work > MAX_TILE_WORK_PER_SUBMISSION {
+            MAX_TILE_WORK_PER_SUBMISSION
+        } else {
+            u64::MAX
+        };
         let area = pitch * band_rows;
         let stride = u64::from(area) * 4;
         let field_base = (display_words(band_width, band_rows)) as u32;
         let group_base = group_start(band_width, band_rows) as u32;
-        let scratch = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tc_composite_scratch"),
-            size: required(band_width, band_rows),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        // The whole-set results follow the larger of the bands' and the pre-pass's working space
+        let working = whole.as_ref().map_or(0, WholeSetPass::stripe_bytes).max(required(band_width, band_rows));
+        let whole_base = u32::try_from(working / 4).map_err(|_| "The GPU working memory exceeds 32-bit word addressing.")?;
+        // The working buffer of the last update when it is large enough and at most four times
+        // this one's size (a larger one is released), cleared as a new buffer would be
+        let size = working + whole_bytes;
+        let scratch = match &self.scratch {
+            Some(buffer) if buffer.size() >= size && buffer.size() / 4 <= size => {
+                let mut clear = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_composite_clear") });
+                clear.clear_buffer(buffer, 0, Some(size));
+                queue.submit([clear.finish()]);
+                buffer.clone()
+            }
+            _ => {
+                self.scratch = None;
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("tc_composite_scratch"),
+                    size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.scratch = Some(buffer.clone());
+                buffer
+            }
+        };
+        self.update_bytes = [size, 0];
         let atlas = self.tile_atlas(device, queue, ts, program, timing.as_deref_mut())?;
         let tile_images = atlas.map(|atlas| atlas.view.clone());
         let (operations, lookup) =
@@ -2526,6 +3927,16 @@ impl GpuCompositor {
                 let offsets = program.tile_patterns.append_words(&mut words, atlas);
                 let mesh = program.surface.as_ref().map(|(mesh, _)| mesh.as_ref());
                 let (images, decals, volumes) = program.material_images.append_words(&mut words, atlas, mesh);
+                // Side-table words that name an image hold its record offset (`pack_image`)
+                for &(word, image) in &program.image_words {
+                    let at = LOOKUP_WORDS as usize + word as usize;
+                    words[at] = images.get(image as usize).copied().unwrap_or(u32::MAX);
+                }
+                // The environment's diffuse light, late-bound (`reserve_environment`)
+                if let Some(LateEnvironment { word, words: Some(light), .. }) = &program.environment {
+                    let at = LOOKUP_WORDS as usize + *word as usize;
+                    words[at..at + ENVIRONMENT_WORDS].copy_from_slice(light);
+                }
                 let limits = device.limits();
                 // The operation stores the offset as an exactly represented float.
                 if ((!offsets.is_empty() || !decals.is_empty() || !volumes.is_empty()) && words.len() >= 1 << 24)
@@ -2550,7 +3961,8 @@ impl GpuCompositor {
                             op.procedural[1] = images.get(alpha as usize).and_then(|offset| offset.checked_add(1)).unwrap_or(0);
                         }
                     }
-                    if op.procedural[3] == DECAL_PROJECTION {
+                    // Placed planars and warps (the first of P1's selectors) read their frame record
+                    if op.procedural[3] == DECAL_PROJECTION || op.procedural[3] == packages::PROJECTION_SELECTORS.start {
                         op.uv[0] = *decals.get(op.uv[0] as usize).ok_or("A decal has no frame.")? as f32;
                     }
                     if matches!(op.procedural[3], PLACED_TRIPLANAR_PROJECTION | PLACED_WARP_PROJECTION) {
@@ -2579,6 +3991,100 @@ impl GpuCompositor {
         });
         let max_words = MAX_PAINT_WORDS.min((limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / 4) as usize);
         let windows = paint_windows(program, region, source_size, shift, halo, max_words)?;
+        // The band uniform: the positional words, the field layout and the package vec4s
+        let band_values =
+            |(width, rows, top, left): (u32, u32, u32, u32), [paint_x, paint_y, paint_columns, paint_rows]: [u32; 4], field_rect: [u32; 4], field_base: u32| {
+                let mut values = [0; packages::UNIFORM_WORDS];
+                values[..packages::FIELD_LAYOUT].copy_from_slice(&[
+                    width,
+                    rows,
+                    top,
+                    area,
+                    source_size.0,
+                    source_size.1,
+                    1 << shift,
+                    u32::from(program.glossiness),
+                    program.layer_count,
+                    pitch,
+                    program.display_outputs,
+                    left,
+                    u32::from(program.coverage.is_some()),
+                    source_size.0.div_ceil(32),
+                    radius,
+                    u32::from(program.needs_surface)
+                        | (u32::from(program.baked.is_some()) << 1)
+                        | (u32::from(program.brush_stencil.is_some()) << 2)
+                        | (u32::from(!program.geometry.words.is_empty()) << 3),
+                    paint_x,
+                    paint_y,
+                    paint_columns,
+                    paint_rows,
+                    field_rect[0],
+                    field_rect[1],
+                    field_rect[2],
+                    field_rect[3],
+                    field_base,
+                    group_base,
+                    program.groups.words_per_level,
+                    program.groups.channels,
+                    0,
+                    0,
+                    field_rect[2],
+                    field_rect[3],
+                    id_width,
+                    id_height,
+                    bake_words[0],
+                    bake_words[1],
+                    0,
+                    0,
+                    0,
+                    program.mask_layer,
+                    0,
+                    0,
+                    0,
+                    // The unit channels' bit mask in `anchor_default.w` (composite_measured.wgsl)
+                    program.unit_channels,
+                ]);
+                // Words per field texel and whether the sixth (input) word is present; the
+                // prepare pass adds its stage's input operation in the third word.
+                values[packages::FIELD_LAYOUT..packages::FIELD_LAYOUT + 2].copy_from_slice(&[texel_words, u32::from(texel_words > FIELD_WORDS)]);
+                packages::write_band_uniform(program, &mut values);
+                values
+            };
+        let make_bindings = |values: &[u32], paint: &wgpu::Buffer| {
+            let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tc_composite_band"),
+                contents: bytemuck::cast_slice(values),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let mut entries = [
+                wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: ops.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: lookup.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: scratch.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: paint.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: coverage.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&surface) },
+                wgpu::BindGroupEntry { binding: 7, resource: vertices.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&baked) },
+                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(brush_alpha) },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(tile_images) },
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&brush_stencil.image) },
+                wgpu::BindGroupEntry { binding: 12, resource: brush_stencil.uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(curvature.as_ref().map_or(&baked, |levels| &levels.image)) },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: curvature.as_ref().map_or_else(|| lookup.as_entire_binding(), |levels| levels.layout.as_entire_binding()),
+                },
+                wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(id_bake.as_ref().unwrap_or(&baked)) },
+            ];
+            let mut count = if curvature.is_some() { 15 } else { 13 };
+            if id_bake.is_some() {
+                entries.swap(count, 15);
+                count += 1;
+            }
+            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("tc_composite_band"), layout: &self.bindings, entries: &entries[..count] })
+        };
         let mut packed = Vec::new();
         let mut pending_bytes = 0;
         let mut last_submission = None;
@@ -2588,6 +4094,178 @@ impl GpuCompositor {
             *submitted = Some(submitted.map_or(bounds, |region| region.union(bounds)));
             submission
         };
+        // The whole-set pre-pass: its stages once over the region the bands read, in stripes,
+        // one stack after another in the same working space, their outputs copied into the
+        // results the bands read through `filter_value`
+        if let (Some(whole), Some(prepare), Some(kernels)) = (&whole, &prepare, &self.filter_gpu) {
+            let [x0, y0, x1, y1] = whole.region;
+            let fields = program.filters.stages.len() as u32;
+            let paint_limit = (max_words * 4) as u64;
+            // Pack and upload a paint window, after submitting what reads the previous one
+            let upload = |window: &CompositePaintWindow,
+                          words: usize,
+                          encoder: &mut wgpu::CommandEncoder,
+                          (buffer, packed): (&mut Option<wgpu::Buffer>, &mut Vec<u32>)| {
+                queue.submit([std::mem::replace(encoder, make_encoder()).finish()]);
+                window.pack(&program.paint, words, packed);
+                let bytes = (words * 4) as u64;
+                let paint = match buffer {
+                    Some(paint) if paint.size() >= bytes => paint,
+                    _ => buffer.insert(device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("tc_composite_paint"),
+                        size: bytes.next_power_of_two().min(paint_limit),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })),
+                };
+                queue.write_buffer(paint, 0, bytemuck::cast_slice(packed));
+            };
+            for top in (y0..y1).step_by(whole.stripe_rows as usize) {
+                let rows = whole.stripe_rows.min(y1 - top);
+                let mut encoder = make_encoder();
+                // One paint window for the stripe when it fits the upload budget, else one per
+                // source chunk of each stage (a whole-tile stripe reads the whole set)
+                let (low, high) = whole.paint_window(source_size, top, rows);
+                let stripe_window = CompositePaintWindow::covering(low, high, [source_size.0, source_size.1], &program.paint);
+                let paint_words = pre_pass_paint_words(max_words);
+                let stripe_words = stripe_window.words(&program.paint, paint_words);
+                if let Some(words) = stripe_words {
+                    upload(&stripe_window, words, &mut encoder, (&mut self.paint_upload, &mut packed));
+                }
+                for pass in &whole.stages.passes {
+                    let field_rect = whole.field_rect(pass, top, rows);
+                    let set_bounds = field_bounds(field_rect, source_size);
+                    let field_words = field_rect[2] * field_rect[3] * texel_words;
+                    let offset = |slot: u32| pass.slot(slot, fields) * field_words;
+                    let values = |paint_params: [u32; 4]| {
+                        let mut values = band_values((0, 0, 0, 0), paint_params, field_rect, 0);
+                        values[packages::WHOLE_COMPACT..packages::WHOLE_COMPACT + 4].copy_from_slice(&pass.compact(fields));
+                        values
+                    };
+                    let (source_width, source_rows) =
+                        if tile_work == 0 { (field_rect[2], field_rect[3]) } else { composite_band_size(field_rect[2], tile_work) };
+                    let mut work = 0u64;
+                    for &output in &pass.stages {
+                        let stage = &program.filters.stages[output];
+                        // P8: a level stage runs only where a block of its tile scale lies, on its base stage's field
+                        if !udim::runs_over(program.udim_layout.as_ref(), stage.level, field_rect, (source_size, wraps)) {
+                            continue;
+                        }
+                        let reuses_field = udim::reuses_base_field(&program.filters.stages, output);
+                        let direct = stage.filter.is_none() && stage.cell == 1;
+                        let slot = if direct { output as u32 } else { fields };
+                        let stage_values = |paint_params: [u32; 4]| {
+                            let mut source = values(paint_params);
+                            source[25..28].copy_from_slice(&[slot, stage.layer, stage.preceding]);
+                            source[packages::FIELD_LAYOUT + 2] = stage.input;
+                            source[packages::FIELD_LAYOUT + 3] = u32::from(wraps) | stage.input_kind | stage.view | if stage.input2 != 0 { INPUT2 } else { 0 };
+                            // A second input source (operation plus one), the mask views
+                            source[38] = stage.input2;
+                            source[packages::MASK_VIEW..packages::MASK_VIEW + 4].copy_from_slice(&stage.mask_view);
+                            source
+                        };
+                        let source_rows_total = if reuses_field { 0 } else { field_rect[3] };
+                        let mut chunks: Vec<[u32; 4]> = (0..source_rows_total)
+                            .step_by(source_rows as usize)
+                            .flat_map(|y| {
+                                (0..field_rect[2])
+                                    .step_by(source_width as usize)
+                                    .map(move |x| [x, y, source_width.min(field_rect[2] - x), source_rows.min(field_rect[3] - y)])
+                            })
+                            .rev()
+                            .collect();
+                        while let Some(chunk @ [x, y, columns, chunk_rows]) = chunks.pop() {
+                            let paint_params = if stripe_words.is_some() {
+                                stripe_window.params()
+                            } else {
+                                // The chunk's own paint, split in two while it does not fit
+                                let (low, high) = chunk_paint(field_rect, chunk, source_size, wraps);
+                                let window = CompositePaintWindow::covering(low, high, [source_size.0, source_size.1], &program.paint);
+                                let Some(words) = window.words(&program.paint, paint_words) else {
+                                    if chunk_rows < 2 {
+                                        return Err("Paint inputs of the whole-set filter exceed the adapter's upload budget.".into());
+                                    }
+                                    let half = chunk_rows / 2;
+                                    chunks.extend([[x, y + half, columns, chunk_rows - half], [x, y, columns, half]]);
+                                    continue;
+                                };
+                                upload(&window, words, &mut encoder, (&mut self.paint_upload, &mut packed));
+                                #[cfg(all(test, not(target_arch = "wasm32")))]
+                                PRE_PASS_CHUNK_WINDOWS.set(PRE_PASS_CHUNK_WINDOWS.get() + 1);
+                                work = 0;
+                                window.params()
+                            };
+                            let work_here = u64::from(columns).saturating_mul(u64::from(chunk_rows)).saturating_mul(tile_work);
+                            if work > 0 && work.saturating_add(work_here) > MAX_TILE_WORK_PER_SUBMISSION {
+                                queue.submit([std::mem::replace(&mut encoder, make_encoder()).finish()]);
+                                work = 0;
+                            }
+                            let mut source = stage_values(paint_params);
+                            source[28..32].copy_from_slice(&chunk);
+                            let paint = self.paint_upload.as_ref().ok_or("paint upload buffer is missing")?;
+                            let source_bindings = make_bindings(&source, paint);
+                            let mut compute =
+                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tc_whole_set_source"), timestamp_writes: None });
+                            compute.set_pipeline(prepare);
+                            compute.set_bind_group(0, &source_bindings, &[]);
+                            compute.dispatch_workgroups(columns.div_ceil(WORKGROUP), chunk_rows.div_ceil(WORKGROUP), 1);
+                            drop(compute);
+                            work = work.saturating_add(work_here);
+                        }
+                        let region = NeighbourhoodRegion {
+                            rect: field_rect,
+                            original: offset(fields),
+                            blur: pass.blur(fields, offset),
+                            output: offset(output as u32),
+                            field_words: texel_words,
+                            input: program.filters.input_bits(stage),
+                            wrap: stage.wrap,
+                            bounds: set_bounds,
+                        };
+                        // The stage's kernels over the whole field, the gathers in row chunks
+                        // within the submission budget
+                        queue.submit([std::mem::replace(&mut encoder, make_encoder()).finish()]);
+                        work = 0;
+                        if reuses_field && direct {
+                            let field = (field_rect[2], field_rect[3]);
+                            kernels.encode_copy(
+                                device,
+                                &mut encoder,
+                                &scratch,
+                                (region.original, field.0, [0; 2]),
+                                (region.output, field.0, 0),
+                                [field.0, field.1],
+                                texel_words,
+                            );
+                        }
+                        let _budget = kernels.budget(queue, stage.filter.map_or(1, NeighbourhoodFilter::work_per_texel), pre_pass_budget());
+                        if stage.cell > 1 {
+                            let target = if stage.filter.is_some() { region.original } else { region.output };
+                            kernels.encode_cells(device, &mut encoder, &scratch, NeighbourhoodRegion { output: target, ..region }, stage.cell);
+                        }
+                        if let Some(filter) = stage.filter {
+                            kernels.encode(device, &mut encoder, &scratch, region, filter);
+                        }
+                    }
+                    // The stripe's rows of the pass's outputs, from their fields into the results
+                    let from = [(x0 as i32 - field_rect[0] as i32) as u32, (top as i32 - field_rect[1] as i32) as u32];
+                    for &output in &pass.outputs {
+                        let index = whole.stages.outputs.iter().position(|&own| own == output).ok_or("A whole-set output has no result.")?;
+                        let result = whole.result_base(whole_base, index);
+                        kernels.encode_copy(
+                            device,
+                            &mut encoder,
+                            &scratch,
+                            (offset(output as u32), field_rect[2], from),
+                            (result, x1 - x0, top - y0),
+                            [x1 - x0, rows],
+                            texel_words,
+                        );
+                    }
+                    queue.submit([std::mem::replace(&mut encoder, make_encoder()).finish()]);
+                }
+            }
+        }
         for (chunk, window, words) in windows {
             let bytes = (words * 4) as u64;
             time_composite(timing.as_deref_mut().map(|t| &mut t.packing), || window.pack(&program.paint, words, &mut packed));
@@ -2626,113 +4304,54 @@ impl GpuCompositor {
                     work = 0;
                 }
                 let field = CompositeRegion { min: [left << shift, top << shift], max: [(left + width) << shift, (top + rows) << shift] }.expanded(halo);
-                let field_rect = [field.min[0], field.min[1], field.max[0].min(source_size.0) - field.min[0], field.max[1].min(source_size.1) - field.min[1]];
-                let values = [
-                    width,
-                    rows,
-                    top,
-                    area,
-                    source_size.0,
-                    source_size.1,
-                    1 << shift,
-                    u32::from(program.glossiness),
-                    program.layer_count,
-                    pitch,
-                    program.display_outputs,
-                    left,
-                    u32::from(program.coverage.is_some()),
-                    source_size.0.div_ceil(32),
-                    radius,
-                    u32::from(program.needs_surface)
-                        | (u32::from(program.baked.is_some()) << 1)
-                        | (u32::from(program.brush_stencil.is_some()) << 2)
-                        | (u32::from(!program.geometry.words.is_empty()) << 3),
-                    paint_x,
-                    paint_y,
-                    paint_columns,
-                    paint_rows,
-                    field_rect[0],
-                    field_rect[1],
-                    field_rect[2],
-                    field_rect[3],
-                    field_base,
-                    group_base,
-                    program.groups.words_per_level,
-                    program.groups.channels,
-                    0,
-                    0,
-                    field_rect[2],
-                    field_rect[3],
-                    id_width,
-                    id_height,
-                    program.unit_channels,
-                    0,
-                    0,
-                    0,
-                    0,
-                    program.mask_layer,
-                    0,
-                    0,
-                    0,
-                    0,
-                ];
-                let bindings = |values: &[u32]| {
-                    let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("tc_composite_band"),
-                        contents: bytemuck::cast_slice(values),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
-                    let mut entries = [
-                        wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: ops.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: lookup.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: scratch.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 4, resource: paint.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 5, resource: coverage.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&surface) },
-                        wgpu::BindGroupEntry { binding: 7, resource: vertices.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&baked) },
-                        wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(brush_alpha) },
-                        wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(tile_images) },
-                        wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&brush_stencil.image) },
-                        wgpu::BindGroupEntry { binding: 12, resource: brush_stencil.uniforms.as_entire_binding() },
-                        wgpu::BindGroupEntry {
-                            binding: 13,
-                            resource: wgpu::BindingResource::TextureView(curvature.as_ref().map_or(&baked, |levels| &levels.image)),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 14,
-                            resource: curvature.as_ref().map_or_else(|| lookup.as_entire_binding(), |levels| levels.layout.as_entire_binding()),
-                        },
-                        wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(id_bake.as_ref().unwrap_or(&baked)) },
-                    ];
-                    let mut count = if curvature.is_some() { 15 } else { 13 };
-                    if id_bake.is_some() {
-                        entries.swap(count, 15);
-                        count += 1;
-                    }
-                    device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("tc_composite_band"),
-                        layout: &self.bindings,
-                        entries: &entries[..count],
-                    })
-                };
+                let mut field_rect =
+                    [field.min[0], field.min[1], field.max[0].min(source_size.0) - field.min[0], field.max[1].min(source_size.1) - field.min[1]];
+                if wraps {
+                    // The whole halo on every side; the origin can lie below zero (i32 bits)
+                    let start = |pixel: u32| (i64::from(pixel << shift) - i64::from(halo)) as i32 as u32;
+                    field_rect = [start(left), start(top), (width << shift).saturating_add(halo * 2), (rows << shift).saturating_add(halo * 2)];
+                }
+                // The set in field-local texels: a stage that does not wrap never reads across its
+                // edges (the CPU's region stops there), a wrapping one reads the periodic copy
+                let set_bounds = field_bounds(field_rect, source_size);
+                let mut values = band_values((width, rows, top, left), [paint_x, paint_y, paint_columns, paint_rows], field_rect, field_base);
+                if let Some(whole) = &whole {
+                    whole.write_uniform(&mut values, whole_base);
+                }
+                let bindings = |values: &[u32]| make_bindings(values, paint);
                 if let (Some(prepare), Some(kernels)) = (&prepare, &self.filter_gpu) {
                     let fields = program.filters.stages.len() as u32;
-                    let field_words = field_rect[2] * field_rect[3] * FIELD_WORDS;
+                    let field_words = field_rect[2] * field_rect[3] * texel_words;
                     let offset = |slot| field_base + slot * field_words;
                     let (source_width, source_rows) =
                         if tile_work == 0 { (field_rect[2], field_rect[3]) } else { composite_band_size(field_rect[2], tile_work) };
                     for (output, stage) in program.filters.stages.iter().enumerate() {
+                        // The whole-set pre-pass evaluated this stage for the bands
+                        if whole.as_ref().is_some_and(|whole| whole.stages.stages.contains(&output)) {
+                            continue;
+                        }
+                        // P8: a level stage runs only where a block of its tile scale lies, on its base stage's field
+                        if !udim::runs_over(program.udim_layout.as_ref(), stage.level, field_rect, (source_size, wraps)) {
+                            continue;
+                        }
+                        let reuses_field = udim::reuses_base_field(&program.filters.stages, output);
                         let mut source = values;
                         let direct = stage.filter.is_none() && stage.cell == 1;
                         let slot = if direct { output as u32 } else { fields };
                         source[25..28].copy_from_slice(&[slot, stage.layer, stage.preceding]);
+                        source[packages::FIELD_LAYOUT + 2] = stage.input;
+                        // In a wrapping program every stage's field is a periodic copy of the set
+                        // past its edges; the stages keep apart what lies across a seam (`bounds`)
+                        source[packages::FIELD_LAYOUT + 3] = u32::from(wraps) | stage.input_kind | stage.view | if stage.input2 != 0 { INPUT2 } else { 0 };
+                        // A second input source (operation plus one), the mask views
+                        source[38] = stage.input2;
+                        source[packages::MASK_VIEW..packages::MASK_VIEW + 4].copy_from_slice(&stage.mask_view);
                         if let Some((channel, first, cut)) = stage.anchor {
                             source[36..39].copy_from_slice(&[channel_slot(channel), first, cut]);
                             source[40..43].copy_from_slice(&channel.default_value().map(f32::to_bits));
                         }
-                        for y in (0..field_rect[3]).step_by(source_rows as usize) {
+                        let source_chunks = if reuses_field { 0 } else { field_rect[3] };
+                        for y in (0..source_chunks).step_by(source_rows as usize) {
                             for x in (0..field_rect[2]).step_by(source_width as usize) {
                                 let columns = source_width.min(field_rect[2] - x);
                                 let rows = source_rows.min(field_rect[3] - y);
@@ -2760,7 +4379,23 @@ impl GpuCompositor {
                             original: offset(fields),
                             blur: [offset(fields + 1), offset(fields + 2)],
                             output: offset(output as u32),
+                            field_words: texel_words,
+                            input: program.filters.input_bits(stage),
+                            wrap: stage.wrap,
+                            bounds: set_bounds,
                         };
+                        if reuses_field && direct {
+                            let field = (field_rect[2], field_rect[3]);
+                            kernels.encode_copy(
+                                device,
+                                &mut encoder,
+                                &scratch,
+                                (region.original, field.0, [0; 2]),
+                                (region.output, field.0, 0),
+                                [field.0, field.1],
+                                texel_words,
+                            );
+                        }
                         if stage.cell > 1 {
                             let target = if stage.filter.is_some() { region.original } else { region.output };
                             kernels.encode_cells(device, &mut encoder, &scratch, NeighbourhoodRegion { output: target, ..region }, stage.cell);
@@ -2797,14 +4432,233 @@ impl GpuCompositor {
             }
             pending_bytes += bytes;
         }
+        self.update_bytes[1] = self.paint_upload.as_ref().map_or(0, wgpu::Buffer::size);
         Ok(())
+    }
+
+    /// Whether `program`'s pipelines are compiled; starts compiling them otherwise (on worker
+    /// threads when [`Self::set_asynchronous_compile`] is on). An error when their compile failed.
+    pub(crate) fn pipelines_ready(&mut self, device: &wgpu::Device, program: &CompositeProgram) -> Result<bool, String> {
+        Ok(self.pipelines().get(device, &self.pipeline_layout, program, self.asynchronous)?.is_some())
+    }
+
+    /// Start compiling `program`'s pipelines on worker threads without compositing.
+    pub(crate) fn prewarm(&mut self, device: &wgpu::Device, program: &CompositeProgram) {
+        self.pipelines().prewarm(device, &self.pipeline_layout, program);
+    }
+
+    /// Compile new pipelines on worker threads (the app's viewport) or in place (tests, wasm).
+    pub(crate) fn set_asynchronous_compile(&mut self, asynchronous: bool) {
+        self.asynchronous = asynchronous && !cfg!(target_arch = "wasm32");
+    }
+
+    fn pipelines(&self) -> std::sync::MutexGuard<'_, CompositePipelines> {
+        self.pipelines.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Bytes of the last update's working buffer and paint upload buffer.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn update_bytes(&self) -> [u64; 2] {
+        self.update_bytes
     }
 }
 
-fn check_tile_update_budget(width: u32, height: u32, work_per_pixel: u64) -> Result<(), &'static str> {
-    let estimated_work = (u64::from(width) * u64::from(height)).saturating_mul(work_per_pixel);
-    if estimated_work > MAX_TILE_WORK_PER_UPDATE {
-        return Err("Tile Generator overlap exceeds the GPU compositor's interactive work budget.");
+/// What `Renderer::composite_on_gpu` answers while a new program's pipelines compile on worker
+/// threads: neither a failure nor a reason for the CPU; the viewport keeps its last result and
+/// asks again.
+pub const GPU_PIPELINES_PENDING: &str = "GPU pipelines are compiling.";
+
+/// The work one submission of the whole-set pre-pass's kernels may hold
+fn pre_pass_budget() -> u64 {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    if let Some(budget) = PRE_PASS_TEST_BUDGET.get() {
+        return budget;
+    }
+    MAX_TILE_WORK_PER_SUBMISSION
+}
+
+/// The paint words one upload of the whole-set pre-pass may hold
+fn pre_pass_paint_words(max_words: usize) -> usize {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    if let Some(words) = PRE_PASS_TEST_PAINT_WORDS.get() {
+        return words;
+    }
+    max_words
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    /// Test seam: a smaller work budget for the pre-pass's kernels (their row chunks)
+    pub(crate) static PRE_PASS_TEST_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// Test seam: a smaller paint upload for the pre-pass (its per-chunk windows)
+    pub(crate) static PRE_PASS_TEST_PAINT_WORDS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Tests: the per-chunk paint windows the pre-pass uploaded
+    pub(crate) static PRE_PASS_CHUNK_WINDOWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A later user-set limit on the GPU memory one update of the compositor may hold (bytes).
+/// None: the adapter's reported limits alone (the default).
+fn user_memory_limit() -> Option<u64> {
+    None
+}
+
+/// The bytes the working buffer of an update may take: the adapter's binding and buffer limits,
+/// the shaders' 32-bit word addressing (16 GiB), and a user-set memory limit less the `live`
+/// bytes of the update's other buffers.
+fn scratch_limit(limits: &wgpu::Limits, live: u64) -> u64 {
+    let addressable = (u64::from(u32::MAX) + 1) * 4;
+    let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size).min(addressable);
+    user_memory_limit().map_or(limit, |memory| limit.min(memory.saturating_sub(live)))
+}
+
+/// The whole-set pre-pass of one update ([`FilterPlan::whole_set`]): the region of results the
+/// bands read (source texels [x0, y0, x1, y1]: the update plus the bands' halo, a whole axis
+/// where a wrapping program crosses the set's edge) and the stripes it is evaluated in.
+struct WholeSetPass {
+    stages: WholeSet,
+    region: [u32; 4],
+    size: (u32, u32),
+    wraps: bool,
+    texel_words: u32,
+    /// The program's stage count: its first working field's slot
+    fields: u32,
+    stripe_rows: u32,
+}
+
+impl WholeSetPass {
+    fn plan(stages: WholeSet, (region, shift): (CompositeRegion, u32), size: (u32, u32), halo: u32, wraps: bool, texel_words: u32, stage_count: usize) -> Self {
+        let axis = |min: u32, max: u32, side: u32| {
+            let (low, high) = ((min << shift).saturating_sub(halo), (max << shift).saturating_add(halo));
+            if wraps && ((min << shift) < halo || high > side) { [0, side] } else { [low, high.min(side)] }
+        };
+        let [x0, x1] = axis(region.min[0], region.max[0], size.0);
+        let [y0, y1] = axis(region.min[1], region.max[1], size.1);
+        Self { region: [x0, y0, x1, y1], size, wraps, texel_words, fields: stage_count as u32, stripe_rows: (y1 - y0).max(1), stages }
+    }
+
+    fn result_words(&self) -> u64 {
+        let [x0, y0, x1, y1] = self.region;
+        u64::from(x1 - x0) * u64::from(y1 - y0) * u64::from(self.texel_words)
+    }
+
+    fn result_bytes(&self) -> u64 {
+        self.result_words() * self.stages.outputs.len() as u64 * 4
+    }
+
+    /// First word of output `index`'s results, after the working space ending at word `base`.
+    fn result_base(&self, base: u32, index: usize) -> u32 {
+        (u64::from(base) + self.result_words() * index as u64) as u32
+    }
+
+    /// The field of `pass` for the stripe of `rows` from row `top`: the pass's reach on every
+    /// side, clamped to the set, or in a wrapping program to the set plus how far the pass's
+    /// fields reach past its edges (origin as i32 bits).
+    fn field_rect(&self, pass: &WholePass, top: u32, rows: u32) -> [u32; 4] {
+        let [x0, _, x1, _] = self.region;
+        let (left, right) = self.span(pass, x0, x1, self.size.0);
+        let (upper, lower) = self.span(pass, top, top + rows, self.size.1);
+        [left as i32 as u32, upper as i32 as u32, (right - left) as u32, (lower - upper) as u32]
+    }
+
+    /// `low..high` plus the pass's reach on both sides, clamped to the set (`side`) widened by
+    /// the pass's reach past the edges in a wrapping program (periodic copies there).
+    fn span(&self, pass: &WholePass, low: u32, high: u32, side: u32) -> (i64, i64) {
+        let reach = i64::from(pass.reach);
+        let past = if self.wraps { i64::from(pass.past_edges) } else { 0 };
+        ((i64::from(low) - reach).max(-past), (i64::from(high) + reach).min(i64::from(side) + past))
+    }
+
+    /// Bytes of the largest stripe's fields: the largest pass's slots over the stripe plus its
+    /// reach, as `field_rect` clamps it.
+    fn stripe_bytes(&self) -> u64 {
+        let [x0, _, x1, _] = self.region;
+        self.stages
+            .passes
+            .iter()
+            .map(|pass| {
+                let (left, right) = self.span(pass, x0, x1, self.size.0);
+                let past = if self.wraps { u64::from(pass.past_edges) } else { 0 };
+                let rows = (u64::from(self.stripe_rows) + 2 * u64::from(pass.reach)).min(u64::from(self.size.1) + 2 * past);
+                (right - left) as u64 * rows * pass.slots(self.fields) * u64::from(self.texel_words) * 4
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The tallest stripes whose fields fit in `limit` bytes beside the results.
+    fn with_stripes(mut self, limit: u64) -> Result<Self, String> {
+        while self.stripe_bytes() > limit {
+            if self.stripe_rows <= 1 {
+                return Err("A whole-set filter's stripe exceeds the adapter's working memory limit.".into());
+            }
+            self.stripe_rows = self.stripe_rows.div_ceil(2);
+        }
+        Ok(self)
+    }
+
+    /// The paint the stripe of `rows` from `top` reads: the stripe plus the pre-pass reach, the
+    /// whole axis where a wrapping program crosses the set's edge.
+    fn paint_window(&self, size: (u32, u32), top: u32, rows: u32) -> ([u32; 2], [u32; 2]) {
+        let reach = self.stages.reach;
+        let [x0, _, x1, _] = self.region;
+        let (y0, y1) = (top, top + rows);
+        let axis = |low: u32, high: u32, side: u32| {
+            if self.wraps && (low < reach || high.saturating_add(reach) > side) {
+                (0, side)
+            } else {
+                (low.saturating_sub(reach), high.saturating_add(reach).min(side))
+            }
+        };
+        let ((left, right), (upper, lower)) = (axis(x0, x1, size.0), axis(y0, y1, size.1));
+        ([left, upper], [right, lower])
+    }
+
+    /// The band uniform's whole-set table: each output's slot plus one, its first word, the region.
+    fn write_uniform(&self, values: &mut [u32; packages::UNIFORM_WORDS], base: u32) {
+        let table = &mut values[packages::WHOLE_SET..packages::WHOLE_SET + 12];
+        for (entry, &index) in self.stages.entries.iter().enumerate() {
+            table[entry] = self.stages.outputs[index] as u32 + 1;
+            table[4 + entry] = self.result_base(base, index);
+        }
+        let [x0, y0, x1, y1] = self.region;
+        table[8..].copy_from_slice(&[x0, y0, x1 - x0, y1 - y0]);
+    }
+}
+
+/// The source texels [low, high) a prepare chunk `[x, y, columns, rows]` of a pre-pass field at
+/// `field_rect` (origin as i32 bits) reads paint at: the chunk itself, moved into the set when it
+/// lies in one periodic copy of a wrapping program, else the whole axis there.
+fn chunk_paint(field_rect: [u32; 4], [x, y, columns, rows]: [u32; 4], size: (u32, u32), wraps: bool) -> ([u32; 2], [u32; 2]) {
+    let axis = |origin: u32, start: u32, count: u32, side: u32| -> (u32, u32) {
+        let low = i64::from(origin as i32) + i64::from(start);
+        let high = low + i64::from(count);
+        let side = i64::from(side.max(1));
+        if !wraps {
+            return (low.clamp(0, side) as u32, high.clamp(0, side) as u32);
+        }
+        let copy = low.div_euclid(side);
+        if (high - 1).div_euclid(side) != copy {
+            return (0, side as u32);
+        }
+        ((low - copy * side) as u32, (high - copy * side) as u32)
+    };
+    let (left, right) = axis(field_rect[0], x, columns, size.0);
+    let (upper, lower) = axis(field_rect[1], y, rows, size.1);
+    ([left, upper], [right, lower])
+}
+
+/// The set in the field-local texels of `field_rect` (origin as i32 bits) [x0, y0, x1, y1]:
+/// what a stage that does not wrap stays within (`NeighbourhoodRegion::bounds`).
+fn field_bounds(field_rect: [u32; 4], source_size: (u32, u32)) -> [i32; 4] {
+    let origin = [field_rect[0] as i32, field_rect[1] as i32];
+    [-origin[0], -origin[1], source_size.0 as i32 - origin[0], source_size.1 as i32 - origin[1]]
+}
+
+/// Whether one texel's fill work fits a band: the bands and submissions split an update of any
+/// size, but not a texel. Only a single texel beyond a whole band's budget is refused.
+fn check_texel_work(work_per_pixel: u64) -> Result<(), &'static str> {
+    if work_per_pixel > MAX_TILE_WORK_PER_BAND {
+        return Err("The fill work of one texel exceeds what a GPU dispatch may hold.");
     }
     Ok(())
 }
@@ -2830,7 +4684,15 @@ fn paint_windows(
     let mut work = vec![region];
     let mut windows = Vec::new();
     while let Some(chunk) = work.pop() {
-        let source = CompositeRegion { min: chunk.min.map(|p| p << shift), max: chunk.max.map(|p| p << shift) }.expanded(radius);
+        let mut source = CompositeRegion { min: chunk.min.map(|p| p << shift), max: chunk.max.map(|p| p << shift) }.expanded(radius);
+        if program.filters.wraps() {
+            // A wrapping program's fields read the far side of the set across a crossed edge
+            for (axis, side) in [size.0, size.1].into_iter().enumerate() {
+                if (chunk.min[axis] << shift) < radius || source.max[axis] > side {
+                    (source.min[axis], source.max[axis]) = (0, side);
+                }
+            }
+        }
         let window = CompositePaintWindow::covering(source.min, source.max, [size.0, size.1], &program.paint);
         if let Some(words) = window.words(&program.paint, limit) {
             windows.push((chunk, window, words));
@@ -2860,7 +4722,7 @@ mod procedural_tests {
     use crate::{headless::Headless, readback::Readback};
     use texturecraft_compose::PatternContext;
     use texturecraft_compose::pattern::{Coords, procedural_in};
-    use texturecraft_core::{Fill, Layer, Mask, OutputResolution, Procedural, TextureSet};
+    use texturecraft_core::{CompareSource, Fill, HighpassSpace, Layer, Levels, Mask, OutputResolution, Procedural, TextureSet};
     use texturecraft_geom::primitives;
     use texturecraft_texel::{srgb_lut, to_u16};
 
@@ -2874,7 +4736,7 @@ mod procedural_tests {
         project.texture_sets.push(set);
 
         let folder = project.alloc_id();
-        let mut group = Layer::new(folder, "Translucent group", LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
+        let mut group = Layer::new(folder, "Translucent group", LayerKind::folder(), &channels);
         group.channels.get_mut(&Channel::BaseColor).unwrap().opacity = 0.4;
         project.insert_layer(0, group, None, false).unwrap();
 
@@ -2903,7 +4765,7 @@ mod procedural_tests {
     fn mask_and_content_anchors_match_cpu_in_material_and_mask_views() {
         use texturecraft_compose::eval::{Composite, Inputs, composite_tiles, mask_image};
         use texturecraft_compose::tile_bytes;
-        use texturecraft_core::MicroDetail;
+        use texturecraft_core::MicroDetails;
 
         let Ok(mut gpu) = Headless::new() else { return };
         const SIZE: u32 = 64;
@@ -2913,7 +4775,7 @@ mod procedural_tests {
         project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
         let channels = [Channel::BaseColor, Channel::Height];
         let folder = project.alloc_id();
-        let mut group = Layer::new(folder, "Translucent folder", LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
+        let mut group = Layer::new(folder, "Translucent folder", LayerKind::folder(), &channels);
         group.channels.get_mut(&Channel::Height).unwrap().opacity = 0.45;
         project.insert_layer(0, group, None, false).unwrap();
         let lower = project.alloc_id();
@@ -2922,7 +4784,10 @@ mod procedural_tests {
         let source = BTreeMap::from([(Channel::Height, Source::Uniform([0.8; 3]))]);
         let mut layer = Layer::new(lower, "Donor", LayerKind::Fill(Fill { sources: source, ..Fill::default() }), &channels);
         let mut mask = Mask::new(MaskBackground::Black);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.6; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill { source: Source::Uniform([0.6; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+        ));
         mask.effects.push(Effect::new(mask_anchor, EffectKind::Anchor));
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert)));
         layer.mask = Some(mask);
@@ -2944,8 +4809,8 @@ mod procedural_tests {
         )]);
         let mut layer = Layer::new(owner, "Reader", LayerKind::Fill(Fill { sources: source, ..Fill::default() }), &channels);
         let mut mask = Mask::new(MaskBackground::Black);
-        let mut generator = Generator::new(GeneratorKind::AmbientOcclusion);
-        generator.micro = Some(MicroDetail { anchor: height_anchor, amount: 0.8 });
+        let mut generator = crate::gpu_composite::oracle::earlier_generator(GeneratorKind::AmbientOcclusion);
+        generator.micro = MicroDetails::of_anchor(GeneratorKind::AmbientOcclusion, height_anchor, 0.8).map(Box::new);
         generator.inputs.insert(BakedMap::AmbientOcclusion, Source::Anchor { anchor: mask_anchor, channel: Channel::BaseColor, ramp: Vec::new() });
         generator.global.blur = 0.7;
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
@@ -2954,6 +4819,7 @@ mod procedural_tests {
             EffectKind::Fill {
                 source: Source::Anchor { anchor: after_group_anchor, channel: Channel::Height, ramp: Vec::new() },
                 projection: Projection::default(),
+                sampling: Sampling::SAVED_BEFORE,
             },
         );
         mix_height.opacity = 0.3;
@@ -3017,7 +4883,7 @@ mod procedural_tests {
         let channels = set.channel_list();
         project.texture_sets.push(set);
         let folder = project.alloc_id();
-        let mut group = Layer::new(folder, "One part", LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
+        let mut group = Layer::new(folder, "One part", LayerKind::folder(), &channels);
         for blend in group.channels.values_mut() {
             blend.mode = BlendMode::Passthrough;
         }
@@ -3035,7 +4901,10 @@ mod procedural_tests {
             &channels,
         );
         let mut mask = Mask::new(MaskBackground::Black);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.8; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill { source: Source::Uniform([0.8; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+        ));
         mask.effects.push(Effect::new(mask_anchor, EffectKind::Anchor));
         donor.mask = Some(mask);
         donor.content_effects.push(Effect::new(content_anchor, EffectKind::Anchor));
@@ -3105,7 +4974,7 @@ mod procedural_tests {
         project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
         let owner = project.alloc_id();
         let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(Fill::default()), &[Channel::BaseColor]);
-        let mut generator = Generator::new(GeneratorKind::Dirt);
+        let mut generator = crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Dirt);
         generator.noise_amount = 0.0;
         generator.invert = true;
         generator.offset = 0.07;
@@ -3116,20 +4985,23 @@ mod procedural_tests {
         generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("AO override"));
         let pixels = PixelStore::default();
         let baked = BakedMaps::default();
-        let images = ImageStore::from([(
-            "AO override".into(),
-            Arc::new(ImageRes { width: 2, height: 2, rgba: vec![[0.15; 4], [0.7; 4], [0.85; 4], [0.3; 4]], srgb: false }),
-        )]);
+        let images = ImageStore::from([("AO override".into(), Arc::new(ImageRes::new(2, 2, vec![[0.15; 4], [0.7; 4], [0.85; 4], [0.3; 4]], false)))]);
         let mut mask = Mask::new(MaskBackground::Black);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.58; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill { source: Source::Uniform([0.58; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+        ));
         let mut effect = Effect::new(project.alloc_id(), EffectKind::Generator(generator));
         effect.blend = BlendMode::LinearDodge;
         effect.opacity = 0.83;
         mask.effects.push(effect);
-        let mut subtract = Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.22; 3]), projection: Projection::default() });
+        let mut subtract = Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill { source: Source::Uniform([0.22; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+        );
         subtract.blend = BlendMode::Subtract;
         mask.effects.push(subtract);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0 })));
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0, wrap: false })));
         layer.mask = Some(mask);
         project.insert_layer(0, layer, None, false).unwrap();
         let inputs = Inputs {
@@ -3178,7 +5050,7 @@ mod procedural_tests {
         layer.channels.get_mut(&Channel::BaseColor).unwrap().mode = BlendMode::Replace;
         let material = Fill {
             sources: BTreeMap::from([(Channel::BaseColor, Source::image("Decal")), (Channel::Height, Source::Uniform([-0.29; 3]))]),
-            projection: Projection::Decal(Decal {
+            projection: Projection::decal(Decal {
                 center: [-0.14, 0.0, 0.13],
                 normal: [0.0, 1.0, 0.0],
                 up: [0.0, 0.0, 1.0],
@@ -3189,6 +5061,7 @@ mod procedural_tests {
                 symmetry: None,
                 flip: [false, true],
             }),
+            sampling: Sampling::SAVED_BEFORE,
             ..Fill::default()
         };
         let mut material = Effect::new(project.alloc_id(), EffectKind::Material(material));
@@ -3197,7 +5070,7 @@ mod procedural_tests {
         paint.opacity = 0.78;
         paint.blend = BlendMode::Screen;
         let paint_id = paint.id;
-        let blur = Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 96.0 }));
+        let blur = Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 96.0, wrap: false }));
         let mut path = Effect::new(project.alloc_id(), EffectKind::Path(Vec::new()));
         path.opacity = 0.48;
         path.blend = BlendMode::Subtract;
@@ -3220,7 +5093,7 @@ mod procedural_tests {
         }
         let images = ImageStore::from([(
             "Decal".into(),
-            Arc::new(ImageRes { width: 2, height: 2, rgba: vec![[0.18, 0.26, 0.63, 0.14], [0.36, 0.8, 0.16, 0.82], [0.72; 4], [0.39; 4]], srgb: true }),
+            Arc::new(ImageRes::new(2, 2, vec![[0.18, 0.26, 0.63, 0.14], [0.36, 0.8, 0.16, 0.82], [0.72; 4], [0.39; 4]], true)),
         )]);
         let alpha = input_texture(&gpu.device, "test content stroke", size, 1, wgpu::TextureFormat::R16Uint);
         let mut preview = StrokePreview {
@@ -3229,7 +5102,7 @@ mod procedural_tests {
             opacity: 0.8,
             erase: false,
             values: BTreeMap::from([(Channel::BaseColor, [0.11, 0.46, 0.22]), (Channel::Height, [0.42; 3])]),
-            mask_value: 1.0,
+            mask_gray: texturecraft_compose::MaskGray::Value(1.0),
             stencil: None,
             carried: BTreeMap::new(),
             carried_mask: None,
@@ -3264,6 +5137,7 @@ mod procedural_tests {
             let live_brush = live.then(|| LiveBrush {
                 target: LiveBrushTarget::Layer { layer: paint_id, values: preview.values.clone() },
                 opacity: preview.opacity,
+                erase: false,
                 alpha: alpha.create_view(&Default::default()),
                 stencil: None,
             });
@@ -3307,20 +5181,25 @@ mod procedural_tests {
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[(size, 0)], 1);
 
         let filters = [
-            Filter::Blur { radius: 64.0 },
+            Filter::Blur { radius: 64.0, wrap: false },
             Filter::Sharpen { amount: 0.85 },
-            Filter::HighPass { radius: 64.0 },
-            Filter::Bevel { width: 128.0 },
+            Filter::HighPass { radius: 64.0, space: HighpassSpace::Working, alpha: false },
+            Filter::Bevel { width: 128.0, wrap: false },
             Filter::Glow { radius: 64.0, amount: 0.65 },
             Filter::DirectionalBlur { radius: 64.0, angle: 34.0 },
-            Filter::Warp { intensity: 64.0, scale: 6.0, seed: 11 },
-            Filter::DirectionalWarp { intensity: 64.0, angle: 40.0, scale: 6.0, seed: 11 },
+            Filter::Warp { intensity: 64.0, scale: 6.0, seed: 11, divider: 1 },
+            Filter::Warp { intensity: 640.0, scale: 6.0, seed: 11, divider: 10 },
+            Filter::DirectionalWarp { intensity: 64.0, angle: 40.0, scale: 6.0, seed: 11, divider: 1 },
             Filter::EdgeDetect { width: 52.0 },
-            Filter::SlopeBlur { radius: 64.0, scale: 6.0, seed: 11 },
-            Filter::Mosaic { size: 64.0 },
+            Filter::SlopeBlur { radius: 64.0, scale: 6.0, seed: 11, divider: 1 },
+            Filter::Mosaic { size: 64.0, alpha: true },
         ];
-        let cases = filters.into_iter().map(|filter| (filter, BlendMode::Normal)).chain([(Filter::Blur { radius: 64.0 }, BlendMode::Replace)]);
-        for (filter, blend) in cases {
+        // A filter set to Disable leaves content alone; a mask filter applies whatever its blend
+        let cases = filters.into_iter().map(|filter| (filter, BlendMode::Normal, BlendMode::Normal)).chain([
+            (Filter::Blur { radius: 64.0, wrap: false }, BlendMode::Replace, BlendMode::Normal),
+            (Filter::Blur { radius: 64.0, wrap: false }, BlendMode::Normal, BlendMode::Disable),
+        ]);
+        for (filter, blend, effect_blend) in cases {
             let mut project = Project::new("Neighbourhood filters", "builtin:plane");
             project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
             let owner = project.alloc_id();
@@ -3332,9 +5211,10 @@ mod procedural_tests {
             for stack in [&mut layer.content_effects, &mut mask.effects] {
                 let mut effect = Effect::new(project.alloc_id(), EffectKind::Filter(filter.clone()));
                 effect.opacity = 0.8;
+                effect.blend = effect_blend;
                 stack.push(effect);
                 stack.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Clamp { min: 0.18, max: 0.86 })));
-                stack.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 24.0 })));
+                stack.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 24.0, wrap: false })));
             }
             layer.mask = Some(mask);
             project.insert_layer(0, layer, None, false).unwrap();
@@ -3367,7 +5247,8 @@ mod procedural_tests {
             composite_tiles(&inputs, &mut oracle, &tiles);
             let mut program = CompositeProgram::try_compile_region(&project, &pixels, 0, None).unwrap();
             program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
-            assert_eq!(program.filters.stages.len(), 4);
+            // A disabled content filter is no stage
+            assert_eq!(program.filters.stages.len(), if effect_blend == BlendMode::Disable { 3 } else { 4 });
             gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
             let texture = gpu.renderer.display_textures()[0][DisplayKind::BaseColor as usize];
             let (_, _, full) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
@@ -3400,8 +5281,27 @@ mod procedural_tests {
         }
     }
 
+    /// A generator on the earlier model composes on the GPU; one with the reference app's controls
+    /// (a new generator's), a kind without an earlier model or Micro Details composes on the CPU
     #[test]
-    fn tile_generator_budget_rejects_full_overlap_and_allows_smaller_gpu_updates() {
+    fn generators_beyond_the_earlier_model_compose_on_the_cpu() {
+        use texturecraft_core::MicroDetails;
+
+        let (mut inputs, mut patterns) = (ProceduralInputs::new(64), TilePatterns::default());
+        let mut gpu = |generator: &Generator| generator_operation(generator, &mut inputs, &mut patterns).is_some();
+        let earlier = oracle::earlier_generator(GeneratorKind::Dirt);
+        assert!(gpu(&earlier));
+        assert!(!gpu(&Generator::new(GeneratorKind::Dirt)), "the reference app's controls");
+        assert!(!gpu(&oracle::earlier_generator(GeneratorKind::UvChecker)), "no earlier model");
+        let micro = MicroDetails { enabled: true, ..MicroDetails::defaults(GeneratorKind::Curvature).unwrap() };
+        let curvature = Generator { micro: Some(Box::new(micro)), ..oracle::earlier_generator(GeneratorKind::Curvature) };
+        assert!(!gpu(&curvature), "Micro Details");
+    }
+
+    /// A costly fill splits into narrower bands and more submissions at any update size; only a
+    /// single texel beyond a band's budget is refused.
+    #[test]
+    fn costly_fills_split_into_bands_instead_of_leaving_the_gpu() {
         use texturecraft_core::{TileGenerator, TileSizeMode};
 
         let mut patterns = TilePatterns::default();
@@ -3412,10 +5312,10 @@ mod procedural_tests {
         let regular_work = patterns.work_per_sample(normal).unwrap();
         let overlapping_work = patterns.work_per_sample(overlapping_index).unwrap();
 
-        assert_eq!(check_tile_update_budget(8192, 8192, regular_work), Ok(()));
+        assert_eq!(check_texel_work(regular_work), Ok(()));
         assert_eq!(composite_band_size(8192, regular_work), (8192, ROWS));
-        assert!(check_tile_update_budget(8192, 8192, overlapping_work).is_err());
-        assert_eq!(check_tile_update_budget(256, 256, overlapping_work), Ok(()));
+        assert_eq!(check_texel_work(overlapping_work * 12), Ok(()), "an update of any size splits");
+        assert!(check_texel_work(MAX_TILE_WORK_PER_BAND + 1).is_err());
         let (width, rows) = composite_band_size(256, overlapping_work);
         assert!(rows < ROWS);
         assert!(u64::from(width) * u64::from(rows) * overlapping_work <= MAX_TILE_WORK_PER_BAND);
@@ -3431,7 +5331,7 @@ mod procedural_tests {
         let source = Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() };
         let fill = Fill {
             sources: BTreeMap::from([(Channel::BaseColor, source)]),
-            projection: Projection::Triplanar { scale: 1.0, sharpness: 6.0, offset: [0.0; 3] },
+            projection: Projection::Triplanar { scale: 1.0, sharpness: 6.0, offset: [0.0; 3], uv: Default::default(), projector: Default::default() },
             ..Default::default()
         };
         let layer = Layer::new(project.alloc_id(), "Overlapping tiles", LayerKind::Fill(fill), &[Channel::BaseColor]);
@@ -3439,6 +5339,50 @@ mod procedural_tests {
         let program = CompositeProgram::compile(&project, &PixelStore::default(), 0).unwrap();
         assert_eq!(program.tile_work_per_pixel().unwrap(), overlapping_work * 12, "the three planes each need four samples");
     }
+
+    /// A 4K fill whose every texel evaluates 2304 overlapping tile placements on two channels
+    /// (about 39 G in all, beyond the old 8 G update cap) composites on the GPU in bands and
+    /// submissions.
+    #[test]
+    fn a_costly_4k_fill_composites_on_the_gpu() {
+        use texturecraft_core::{TileGenerator, TileSizeMode};
+
+        let Ok(mut gpu) = Headless::new() else { return };
+        // About 39 G placements: seconds on a GPU, far longer on a software rasterizer
+        if gpu.device.adapter_info().device_type == wgpu::DeviceType::Cpu {
+            return;
+        }
+        const SIZE: u32 = 4096;
+        let overlapping = TileGenerator { amount: [12, 8], size_mode: TileSizeMode::Absolute, size_absolute: [1.0; 2], ..TileGenerator::default() };
+        let mut project = Project::new("Costly fill", "builtin:plane");
+        project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
+        let pattern = Procedural { tile: Some(Box::new(overlapping)), seed: 0, ..Procedural::new(ProceduralKind::TileGenerator) };
+        let source = Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() };
+        let fill = Fill {
+            sources: BTreeMap::from([(Channel::BaseColor, source.clone()), (Channel::Roughness, source)]),
+            projection: Projection::Triplanar { scale: 1.0, sharpness: 6.0, offset: [0.0; 3], uv: Default::default(), projector: Default::default() },
+            ..Default::default()
+        };
+        let layer = Layer::new(project.alloc_id(), "Overlapping tiles", LayerKind::Fill(fill), &[Channel::BaseColor, Channel::Roughness]);
+        project.insert_layer(0, layer, None, false).unwrap();
+        let mut program = CompositeProgram::compile(&project, &PixelStore::default(), 0).unwrap();
+        let work = program.tile_work_per_pixel().unwrap();
+        assert!(u64::from(SIZE) * u64::from(SIZE) * work > 8 << 30, "{work} per texel");
+        let mesh = Arc::new(primitives::plane(1.0, 1));
+        let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
+        program.set_surface_inputs(&mesh, &gbuf, None).unwrap();
+        program.set_tile_images(&ImageStore::default());
+        gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
+        let started = std::time::Instant::now();
+        gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+        gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        eprintln!("4K fill of {work} per texel: {:?}", started.elapsed());
+    }
+
+    // The CPU fallback tables of the GPU port live with each package (`still_on_cpu` in
+    // gpu_composite_point.rs, gpu_composite_stack.rs, gpu_composite_lighting.rs,
+    // gpu_neighbourhood_box.rs, gpu_neighbourhood_gather.rs, …); the stacks that must stay on the
+    // GPU are checked in gpu_composite_packages.rs.
 
     #[test]
     fn point_filters_match_cpu_for_material_channels_and_mask_preview() {
@@ -3467,26 +5411,51 @@ mod procedural_tests {
         ]);
         let filters = [
             Filter::ColorBalance { shadows: [0.27, 0.06, -0.13], midtones: [-0.11, 0.23, 0.09], highlights: [0.08, 0.21, -0.08] },
-            Filter::GradientMap { colors: vec![[0.04, 0.13, 0.7], [0.85, 0.56, 0.22], [0.76, 0.11, 0.34]] },
-            Filter::GradientMap { colors: Vec::new() },
+            Filter::even_gradient(vec![[0.04, 0.13, 0.7], [0.85, 0.56, 0.22], [0.76, 0.11, 0.34]]),
+            Filter::even_gradient(Vec::new()),
             Filter::ReplaceColor { from: [0.2, 0.43, 0.72], to: [0.62, 0.35, 0.33], tolerance: 0.09, softness: 0.28 },
-            Filter::BakedLighting { azimuth: 30.0, elevation: 60.0, light: 0.6, ambient: 0.35, occlusion: 0.72 },
+            Filter::BakedLighting { azimuth: 30.0, elevation: 60.0, light: 0.6, ambient: 0.35, occlusion: 0.72, stylized: None },
+            Filter::Threshold { level: 0.4, mode: ThresholdMode::GreaterOrEqual },
+            // Each mode at the roughness and the mask's exact values, where the modes part
+            Filter::Threshold { level: 0.41, mode: ThresholdMode::GreaterOrEqual },
+            Filter::Threshold { level: 0.41, mode: ThresholdMode::Greater },
+            Filter::Threshold { level: 0.41, mode: ThresholdMode::Lower },
+            Filter::Threshold { level: 0.41, mode: ThresholdMode::LowerOrEqual },
+            Filter::Threshold { level: 0.36, mode: ThresholdMode::GreaterOrEqual },
+            Filter::Threshold { level: 0.36, mode: ThresholdMode::Greater },
+            Filter::Threshold { level: 0.36, mode: ThresholdMode::Lower },
+            Filter::Threshold { level: 0.36, mode: ThresholdMode::LowerOrEqual },
+            Filter::Posterize { levels: 4.0, alpha: false },
+            Filter::Hsl { hue: 0.2, saturation: 0.3, lightness: -0.1, perceptive: false },
+            Filter::HistogramScan { position: 0.45, contrast: 0.6, invert_position: false },
+            Filter::InvertOff,
+            Filter::Empty,
         ];
+        // Levels from older saves clamp; new ones keep values outside the input range on the line through it
+        let levels = |clamp| Levels { in_low: 0.38, in_high: 0.52, gamma: 1.6, out_low: 0.1, out_high: 0.85, affects: None, clamp };
+        let kinds = filters.into_iter().map(EffectKind::Filter).chain([EffectKind::Levels(levels(true)), EffectKind::Levels(levels(false))]);
         gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
-        for filter in filters {
+        // Each once more set to Disable: content filters then change nothing, mask filters apply anyway
+        for (filter, disabled) in kinds.flat_map(|kind| [(kind.clone(), false), (kind, true)]) {
             let mut project = Project::new("Point filters", "builtin:plane");
             project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
             let owner = project.alloc_id();
             let fill = Fill { sources: sources.clone(), ..Default::default() };
             let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &channels);
-            let mut effect = Effect::new(project.alloc_id(), EffectKind::Filter(filter.clone()));
+            let mut effect = Effect::new(project.alloc_id(), filter.clone());
             effect.opacity = 0.77;
+            if disabled {
+                effect.blend = BlendMode::Disable;
+            }
             layer.content_effects.push(effect);
             let mut mask = Mask::new(MaskBackground::Black);
-            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.36; 3]), projection: Projection::default() }));
-            let mut effect = Effect::new(project.alloc_id(), EffectKind::Filter(filter.clone()));
+            mask.effects.push(Effect::new(
+                project.alloc_id(),
+                EffectKind::Fill { source: Source::Uniform([0.36; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+            ));
+            let mut effect = Effect::new(project.alloc_id(), filter.clone());
             effect.opacity = 0.63;
-            effect.blend = BlendMode::Multiply;
+            effect.blend = if disabled { BlendMode::Disable } else { BlendMode::Multiply };
             mask.effects.push(effect);
             layer.mask = Some(mask);
             project.insert_layer(0, layer, None, false).unwrap();
@@ -3518,10 +5487,10 @@ mod procedural_tests {
                     for (actual, expected) in actual.as_chunks::<2>().0.iter().zip(expected.as_chunks::<2>().0) {
                         let actual = half::f16::from_le_bytes(*actual).to_f32();
                         let expected = half::f16::from_le_bytes(*expected).to_f32();
-                        assert!((actual - expected).abs() <= 0.001, "{filter:?} {kind:?}: GPU {actual} vs CPU {expected}");
+                        assert!((actual - expected).abs() <= 0.001, "{filter:?} disabled {disabled} {kind:?}: GPU {actual} vs CPU {expected}");
                     }
                 } else {
-                    assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1), "{filter:?} {kind:?}");
+                    assert!(actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1), "{filter:?} disabled {disabled} {kind:?}");
                 }
             }
 
@@ -3533,7 +5502,7 @@ mod procedural_tests {
             let (_, _, rgba) = Readback::blocking(&gpu.device, &gpu.queue, texture).unwrap();
             assert_eq!(rgba.len(), expected.len() * 4);
             for (&expected, &[r, g, b, a]) in expected.iter().zip(rgba.as_chunks::<4>().0) {
-                assert!(r.abs_diff(expected) <= 1 && r == g && r == b && a == 255, "{filter:?} mask: GPU {r} vs CPU {expected}");
+                assert!(r.abs_diff(expected) <= 1 && r == g && r == b && a == 255, "{filter:?} disabled {disabled} mask: GPU {r} vs CPU {expected}");
             }
         }
     }
@@ -3554,11 +5523,14 @@ mod procedural_tests {
         let fill = Fill { sources: BTreeMap::from([(color, Source::Uniform([0.89, 0.19, 0.04]))]), ..Default::default() };
         let mut layer = Layer::new(owner, "Surface", LayerKind::Fill(fill), &[color]);
         let mut mask = Mask::new(MaskBackground::Black);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.75; 3]), projection: Projection::default() }));
+        mask.effects.push(Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill { source: Source::Uniform([0.75; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+        ));
         let raw = [0.40101, 0.69217, 0.05289];
         let within = [0.375; 3];
         let exact = [0.21875, 0.78125, 0.09375];
-        let effect_kind = |tolerance| EffectKind::ColorSelection { colors: vec![raw, within, exact], tolerance, map: BakedMap::Id };
+        let effect_kind = |tolerance| EffectKind::ColorSelection(ColorSelection::new(vec![raw, within, exact], tolerance));
         let mut select = Effect::new(project.alloc_id(), effect_kind(1.0 / 64.0));
         select.blend = BlendMode::Multiply;
         select.opacity = 0.75;
@@ -3758,7 +5730,7 @@ mod procedural_tests {
         let mut project = Project::new("Layer mask constraints", "builtin:plane");
         project.texture_sets.push(TextureSet::new("Plane", 0, SIZE));
         let folder_id = project.alloc_id();
-        let mut folder = Layer::new(folder_id, "Folder", LayerKind::Group { children: Vec::new(), collapsed: false }, &project.texture_sets[0].channel_list());
+        let mut folder = Layer::new(folder_id, "Folder", LayerKind::folder(), &project.texture_sets[0].channel_list());
         for blend in folder.channels.values_mut() {
             blend.mode = BlendMode::Passthrough;
         }
@@ -3776,8 +5748,22 @@ mod procedural_tests {
         layer.geometry_mask = Some(texturecraft_core::GeometryMask::Parts(vec!["Shared part".into(), "Layer only".into()]));
         layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Invert)));
         let mut mask = Mask::new(MaskBackground::Black);
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: Source::Uniform([0.375; 3]), projection: Projection::default() }));
-        let mut compare = Effect::new(comparison, EffectKind::Compare { op: CompareOp::LesserThan, value: 0.5, tolerance: 0.0 });
+        mask.effects.push(Effect::new(
+            project.alloc_id(),
+            EffectKind::Fill { source: Source::Uniform([0.375; 3]), projection: Projection::default(), sampling: Sampling::SAVED_BEFORE },
+        ));
+        let mut compare = Effect::new(
+            comparison,
+            EffectKind::Compare {
+                op: CompareOp::LesserThan,
+                value: 0.5,
+                tolerance: 0.0,
+                left: CompareSource::ThisMask,
+                right: CompareSource::Constant,
+                channel: Channel::Height,
+                hardness: 1.0,
+            },
+        );
         compare.opacity = 0.5;
         compare.blend = BlendMode::Multiply;
         mask.effects.push(compare);
@@ -3801,7 +5787,15 @@ mod procedural_tests {
         for (op, value, tolerance, passes, height_enabled) in cases {
             let layer = project.layer_mut(owner).unwrap();
             layer.channels.get_mut(&Channel::Height).unwrap().mode = if height_enabled { BlendMode::Normal } else { BlendMode::Disable };
-            layer.mask.as_mut().unwrap().effects[1].kind = EffectKind::Compare { op, value, tolerance };
+            layer.mask.as_mut().unwrap().effects[1].kind = EffectKind::Compare {
+                op,
+                value,
+                tolerance,
+                left: CompareSource::ThisMask,
+                right: CompareSource::Constant,
+                channel: Channel::Height,
+                hardness: 1.0,
+            };
             let inputs = Inputs {
                 project: &project,
                 ts: 0,
@@ -3845,7 +5839,8 @@ mod procedural_tests {
             for (&expected, &[r, g, b, a]) in expected.iter().zip(actual.as_chunks::<4>().0) {
                 assert!(r.abs_diff(expected) <= 1 && r == g && r == b && a == 255, "mask: {op:?} {value} ± {tolerance}");
             }
-            assert_eq!(expected[shared], if passes { 175 } else { 48 });
+            // The comparison multiplies: a pass keeps the fill's 0.375, a fail halves it at opacity 0.5
+            assert_eq!(expected[shared], if passes { 96 } else { 48 });
             assert_eq!(expected[shared], expected[layer_only]);
             assert_eq!(expected[uncovered], 0);
         }
@@ -3875,7 +5870,7 @@ mod procedural_tests {
 
         let outer = project.alloc_id();
         let inner = project.alloc_id();
-        let group = |id, name| Layer::new(id, name, LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
+        let group = |id, name| Layer::new(id, name, LayerKind::folder(), &channels);
         let mut folder = group(outer, "Masked folder");
         for blend in folder.channels.values_mut() {
             // The CPU uses the group's channel opacity with the completed inner
@@ -3887,9 +5882,9 @@ mod procedural_tests {
         folder.height_mask = HeightMask { enabled: true, contrast: 0.4, offset: 0.1 };
         folder.geometry_mask = Some(texturecraft_core::GeometryMask::Parts(vec![mesh.submeshes[0].name.clone()]));
         let mut mask = Mask::new(MaskBackground::Black);
-        let position = Generator { direction: [1.0, 0.0, 0.0], softness: 0.18, ..Generator::new(GeneratorKind::Position) };
+        let position = Generator { direction: [1.0, 0.0, 0.0], softness: 0.18, ..crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Position) };
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(position)));
-        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0 })));
+        mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 32.0, wrap: false })));
         folder.mask = Some(mask);
         project.insert_layer(0, folder, None, false).unwrap();
 
@@ -3982,7 +5977,7 @@ mod procedural_tests {
         let owner = project.alloc_id();
         let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.8, 0.45, 0.1]))]), ..Default::default() };
         let mut layer = Layer::new(owner, "Lit surface", LayerKind::Fill(fill), &channels);
-        let filter = Filter::BakedLighting { azimuth: 0.0, elevation: 20.0, light: 0.45, ambient: 0.45, occlusion: 1.0 };
+        let filter = Filter::BakedLighting { azimuth: 0.0, elevation: 20.0, light: 0.45, ambient: 0.45, occlusion: 1.0, stylized: None };
         layer.content_effects.push(Effect::new(project.alloc_id(), EffectKind::Filter(filter)));
         project.insert_layer(0, layer, None, false).unwrap();
 
@@ -4038,7 +6033,7 @@ mod procedural_tests {
         let owner = project.alloc_id();
         let mut layer = Layer::new(owner, "AO mask", LayerKind::Fill(Fill::default()), &[Channel::BaseColor]);
         let mut mask = Mask::new(MaskBackground::Black);
-        let generator = Generator { softness: Generator::MIN_SOFTNESS, ..Generator::new(GeneratorKind::AmbientOcclusion) };
+        let generator = Generator { softness: Generator::MIN_SOFTNESS, ..crate::gpu_composite::oracle::earlier_generator(GeneratorKind::AmbientOcclusion) };
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
         layer.mask = Some(mask);
         project.insert_layer(0, layer, None, false).unwrap();
@@ -4119,7 +6114,7 @@ mod procedural_tests {
                         noise_amount: 0.43,
                         noise_scale: 0.85,
                         seed: 27,
-                        ..Generator::new(kind)
+                        ..crate::gpu_composite::oracle::earlier_generator(kind)
                     };
                     mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
                     layer.mask = Some(mask);
@@ -4199,7 +6194,8 @@ mod procedural_tests {
             gpu.renderer.set_texture_sets(&gpu.device, &gpu.queue, &[((SIZE, SIZE), 0)], 1);
         }
         let uv = Projection::Uv { scale: [1.15, 0.76], rotation: 13.0, offset: [-0.51, 0.12] };
-        let triplanar = Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43] };
+        let triplanar =
+            Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43], uv: Default::default(), projector: Default::default() };
         let cases = ProceduralKind::ALL
             .iter()
             .copied()
@@ -4211,9 +6207,9 @@ mod procedural_tests {
         let reduced = [
             uv.clone(),
             triplanar.clone(),
-            Projection::Planar { scale: 0.8, axis: 1, offset: [0.03, 0.0, 0.34] },
-            Projection::Spherical { scale: 0.9 },
-            Projection::Cylindrical { scale: 0.7, axis: 2 },
+            Projection::Planar { scale: 0.8, axis: 1, offset: [0.03, 0.0, 0.34], uv: Default::default(), projector: Default::default(), placed: None },
+            Projection::Spherical { scale: 0.9, uv: Default::default(), projector: Default::default(), offset: [0.0; 3] },
+            Projection::Cylindrical { scale: 0.7, axis: 2, uv: Default::default(), projector: Default::default(), offset: [0.0; 3], angle: 360.0 },
         ]
         .into_iter()
         .flat_map(|projection| [(reduced_pattern.clone(), projection.clone(), false, ramp.clone()), (reduced_pattern.clone(), projection, true, ramp.clone())]);
@@ -4231,7 +6227,8 @@ mod procedural_tests {
             let mut layer = Layer::new(project.alloc_id(), "Procedural fill", LayerKind::Fill(fill), &[Channel::BaseColor]);
             if in_mask {
                 let mut mask = Mask::new(MaskBackground::Black);
-                mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source, projection: projection.clone() }));
+                mask.effects
+                    .push(Effect::new(project.alloc_id(), EffectKind::Fill { source, projection: projection.clone(), sampling: Sampling::SAVED_BEFORE }));
                 layer.mask = Some(mask);
             }
             project.insert_layer(0, layer, None, false).unwrap();
@@ -4266,7 +6263,7 @@ mod procedural_tests {
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
         let (lo, hi) = mesh.bounds();
-        let image = |rgba| Arc::new(ImageRes { width: 2, height: 2, rgba, srgb: false });
+        let image = |rgba| Arc::new(ImageRes::new(2, 2, rgba, false));
         let images = ImageStore::from([
             ("tile".into(), image(vec![[1.0, 0.0, 0.0, 1.0], [1.0; 4], [0.0; 4], [0.4; 4]])),
             ("another".into(), image(vec![[0.3; 4], [0.6; 4], [0.2; 4], [0.9; 4]])),
@@ -4280,7 +6277,7 @@ mod procedural_tests {
         for (index, shape) in TileShape::ALL.into_iter().enumerate() {
             let in_mask = index % 2 != 0;
             let projection = if in_mask {
-                Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43] }
+                Projection::Triplanar { scale: 0.65, sharpness: 6.0, offset: [-0.23, 0.12, 0.43], uv: Default::default(), projector: Default::default() }
             } else {
                 Projection::Uv { scale: [1.15, 0.76], rotation: 13.0, offset: [-0.51, 0.12] }
             };
@@ -4337,7 +6334,8 @@ mod procedural_tests {
             let mut layer = Layer::new(project.alloc_id(), "Tile Generator", LayerKind::Fill(fill), &[Channel::BaseColor]);
             if in_mask {
                 let mut mask = Mask::new(MaskBackground::Black);
-                mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source, projection: projection.clone() }));
+                mask.effects
+                    .push(Effect::new(project.alloc_id(), EffectKind::Fill { source, projection: projection.clone(), sampling: Sampling::SAVED_BEFORE }));
                 layer.mask = Some(mask);
             }
             project.insert_layer(0, layer, None, false).unwrap();
@@ -4399,7 +6397,7 @@ mod procedural_tests {
         let mut graph = GraphRef::new(graphs.add_text("format 3\nsize 16\nnode 1 input idx=0\nnode 2 invert in=@1\noutput out 2\n"), "invert");
         graph.inputs.insert(0, GraphInput::Stack { channel: None });
         let mut effect = Effect::new(project.alloc_id(), EffectKind::Graph { graph: graph.clone(), projection: Projection::default() });
-        effect.channels = vec![Channel::BaseColor];
+        effect.off_channels = [Channel::Roughness].into();
         layer.content_effects.push(effect);
         let mut mask = Mask::new(MaskBackground::White);
         let mut mask_filter = Effect::new(project.alloc_id(), EffectKind::Graph { graph, projection: Projection::default() });
@@ -4456,7 +6454,7 @@ mod procedural_tests {
         mesh.normals.fill(Vec3::new(0.3, 0.9, -0.2).normalize());
         let mesh = Arc::new(mesh);
         let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, SIZE, SIZE));
-        let image = |rgba, srgb| Arc::new(ImageRes { width: 2, height: 2, rgba, srgb });
+        let image = |rgba, srgb| Arc::new(ImageRes::new(2, 2, rgba, srgb));
         let bytes = [[18, 206, 44, 17], [191, 51, 20, 237], [44, 12, 99, 0], [213, 221, 40, 110]].map(|pixel| pixel.map(|v| v as f32 / 255.0));
         let shorts = [[15324, 60403, 21177, 65535], [33499, 2177, 5828, 0], [21643, 8005, 11999, 9001], [57132, 39801, 6021, 32777]]
             .map(|pixel| pixel.map(|v| v as f32 / 65535.0));
@@ -4491,15 +6489,15 @@ mod procedural_tests {
         curved[7].pos = [0.1, -0.85, 0.05];
         let projections = [
             Projection::Uv { scale: [1.21, -0.78], rotation: 39.0, offset: [-0.54, 0.16] },
-            Projection::Triplanar { scale: 0.63, sharpness: 2.1, offset: [0.14, -0.27, 0.31] },
-            Projection::Planar { scale: 1.4, axis: 0, offset: [0.04, 0.23, 0.18] },
-            Projection::Planar { scale: 0.9, axis: 1, offset: [-0.18, -0.34, 1.03] },
-            Projection::Planar { scale: 1.1, axis: 2, offset: [0.65, -0.26, -0.31] },
-            Projection::Spherical { scale: 1.09 },
-            Projection::Cylindrical { scale: 1.21, axis: 0 },
-            Projection::Cylindrical { scale: 2.19, axis: 1 },
-            Projection::Cylindrical { scale: 0.87, axis: 2 },
-            Projection::Decal(decal),
+            Projection::Triplanar { scale: 0.63, sharpness: 2.1, offset: [0.14, -0.27, 0.31], uv: Default::default(), projector: Default::default() },
+            Projection::Planar { scale: 1.4, axis: 0, offset: [0.04, 0.23, 0.18], uv: Default::default(), projector: Default::default(), placed: None },
+            Projection::Planar { scale: 0.9, axis: 1, offset: [-0.18, -0.34, 1.03], uv: Default::default(), projector: Default::default(), placed: None },
+            Projection::Planar { scale: 1.1, axis: 2, offset: [0.65, -0.26, -0.31], uv: Default::default(), projector: Default::default(), placed: None },
+            Projection::Spherical { scale: 1.09, uv: Default::default(), projector: Default::default(), offset: [0.0; 3] },
+            Projection::Cylindrical { scale: 1.21, axis: 0, uv: Default::default(), projector: Default::default(), offset: [0.0; 3], angle: 360.0 },
+            Projection::Cylindrical { scale: 2.19, axis: 1, uv: Default::default(), projector: Default::default(), offset: [0.0; 3], angle: 360.0 },
+            Projection::Cylindrical { scale: 0.87, axis: 2, uv: Default::default(), projector: Default::default(), offset: [0.0; 3], angle: 360.0 },
+            Projection::decal(decal),
             Projection::Placed(Box::new(PlacedProjection {
                 mode: PlacedMode::Warp { depth: Falloff { on: true, hardness: 0.75 }, grid: WarpGrid { rows: 3, columns: 3, depth: 0.22, points } },
                 volume: Volume { offset: [0.06, 0.024, -0.03], size: [0.85, 0.83, 1.0], rotation: [-86.0, 6.0, 4.0], clip: false },
@@ -4525,13 +6523,17 @@ mod procedural_tests {
                     (Channel::Normal, Source::Image { name: "normal".into(), normal_format: NormalFormat::DirectX }),
                 ]),
                 projection: projection.clone(),
+                sampling: Sampling::SAVED_BEFORE,
                 ..Fill::default()
             };
             let owner = project.alloc_id();
             let mut layer = Layer::new(owner, "Material images", LayerKind::Fill(fill), &channels);
             let mut mask = Mask::new(MaskBackground::Black);
             let mask_source = Source::image("normal");
-            mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Fill { source: mask_source, projection: projection.clone() }));
+            mask.effects.push(Effect::new(
+                project.alloc_id(),
+                EffectKind::Fill { source: mask_source, projection: projection.clone(), sampling: Sampling::SAVED_BEFORE },
+            ));
             layer.mask = Some(mask);
             project.insert_layer(0, layer, None, false).unwrap();
             let pixels = PixelStore::default();
@@ -4623,7 +6625,12 @@ mod paint_window_tests {
             unit_channels: 0,
             mask_preview: false,
             mask_layer: 0,
-            mask_layers: BTreeMap::new(),
+            mask_layers: Vec::new(),
+            image_words: Vec::new(),
+            environment: None,
+            bake_rows: false,
+            udim: 0,
+            udim_layout: None,
         };
         let region = CompositeRegion { min: [0, 0], max: [128, 128] };
         let limit = 6 * 64 * 64 * 2 + 32;

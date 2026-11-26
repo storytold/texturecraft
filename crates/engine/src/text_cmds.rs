@@ -2,6 +2,7 @@
 //! with the brush as its alpha or to place as a decal.
 
 use serde_json::{Value, json};
+use texturecraft_formats::sanitize_resource_name;
 use texturecraft_paint::text::render_text;
 
 use crate::commands::{CommandSpec, always, bad, color_param, f32p, strp};
@@ -94,16 +95,57 @@ fn font_bytes(family: Option<&str>, style: Option<&str>) -> Result<(std::borrow:
     }
 }
 
-fn add_text(s: &mut Session, p: &Value) -> Result<Value> {
-    let cmd = "resource.text";
-    let text = strp(p, "text").ok_or_else(|| bad(cmd, "`text` is required"))?;
-    let (font, index) = font_bytes(strp(p, "font"), strp(p, "style"))?;
-    let size = f32p(p, "size").unwrap_or(256.0).clamp(8.0, 1024.0);
-    let img = render_text(&font, index, text, size).map_err(|e| bad(cmd, e))?;
-    let rgb = color_param(cmd, p, "color")?.unwrap_or([1.0; 3]).map(|c| (texturecraft_texel::linear_to_srgb(c.clamp(0.0, 1.0)) * 255.0).round() as u8);
-    let png = texturecraft_formats::coverage_png(img.width, img.height, &img.coverage, rgb).map_err(|e| bad(cmd, e.to_string()))?;
-    // The resource is named after the text (its first line, shortened) unless a name is given.
-    let label: String = strp(p, "name").unwrap_or_else(|| text.lines().next().unwrap_or_default()).chars().take(32).collect();
-    let name = s.import_resource_bytes(&format!("Text {}.png", label.trim()), png)?;
-    Ok(json!({ "name": name, "width": img.width, "height": img.height }))
+fn add_text(session: &mut Session, params: &Value) -> Result<Value> {
+    const DEFAULT_TEXELS_PER_EM: f32 = 256.0;
+    const MIN_TEXELS_PER_EM: f32 = 8.0;
+    const MAX_TEXELS_PER_EM: f32 = 1024.0;
+    const MAX_LABEL_CHARS: usize = 32;
+
+    let command = "resource.text";
+    let text = strp(params, "text").ok_or_else(|| bad(command, "`text` is required"))?;
+    let (font, face_index) = font_bytes(strp(params, "font"), strp(params, "style"))?;
+    let texels_per_em = f32p(params, "size").unwrap_or(DEFAULT_TEXELS_PER_EM).clamp(MIN_TEXELS_PER_EM, MAX_TEXELS_PER_EM);
+
+    let image = render_text(&font, face_index, text, texels_per_em).map_err(|error| bad(command, error))?;
+    drop(font);
+
+    let srgb_bytes = color_param(command, params, "color")?
+        .unwrap_or([1.0; 3])
+        .map(|channel| (texturecraft_texel::linear_to_srgb(channel.clamp(0.0, 1.0)) * 255.0).round() as u8);
+    let (width, height) = (image.width, image.height);
+    let png_bytes = texturecraft_formats::coverage_png(width, height, &image.coverage, srgb_bytes).map_err(|error| bad(command, error.to_string()))?;
+    drop(image);
+
+    let label: String = strp(params, "name").unwrap_or_else(|| text.lines().next().unwrap_or_default()).chars().take(MAX_LABEL_CHARS).collect();
+
+    // Treat the label as text before the importer extracts a basename
+    let file_name = sanitize_resource_name(&format!("Text {}.png", label.trim()));
+
+    let name = session.import_resource_bytes(&file_name, png_bytes)?;
+
+    Ok(json!({ "name": name, "width": width, "height": height }))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn text_resource_name_keeps_the_label_across_a_slash() {
+        let mut session = crate::sample_session(128, 32).unwrap();
+
+        let resource = crate::execute(&mut session, "resource.text", &json!({"text": "1/2", "font": "Hack", "size": 16})).unwrap();
+
+        assert_eq!(resource["name"], "Text_1_2.png");
+    }
+
+    #[test]
+    fn text_resource_name_keeps_the_explicit_label_across_separators() {
+        let mut session = crate::sample_session(128, 32).unwrap();
+
+        let resource =
+            crate::execute(&mut session, "resource.text", &json!({"text": "Plan", "name": "plan\\detail/page", "font": "Hack", "size": 16})).unwrap();
+
+        assert_eq!(resource["name"], "Text_plan_detail_page.png");
+    }
 }

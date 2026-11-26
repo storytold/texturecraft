@@ -14,6 +14,8 @@ use texturecraft_engine::{Session, StackTarget};
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::file_dialogs::Answer;
 
+use super::layers_panel::click_selected_content_thumbnail;
+
 const BLACK: [f32; 3] = [0.0; 3];
 const WHITE: [f32; 3] = [1.0; 3];
 
@@ -22,7 +24,10 @@ fn id(v: &Value, key: &str) -> u64 {
 }
 
 fn harness_for(session: Session) -> Harness<'static, TextureCraftApp> {
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
 
     // English, so a first-run locale does not change the queried labels
     h.state_mut().ui.prefs.language = "en".into();
@@ -42,7 +47,21 @@ fn save_to(h: &mut Harness<'_, TextureCraftApp>, file: &Path) {
     h.state_mut().file_dialogs.set_override(Some(Box::new(move |_| Answer::Paths(vec![path.clone()]))));
     let ctx = h.ctx.clone();
     texturecraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "file.saveAs");
-    h.run_steps(3);
+
+    // Wait for the app to collect the worker result
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    h.step();
+    let target = file.display().to_string();
+    while !(file.exists() && h.state().session.path.as_deref() == Some(target.as_str()) && texturecraft_ui_egui::menus::enabled(h.state(), "file.saveAs")) {
+        if let Some(toast) = h.state().toasts.iter().find(|toast| toast.error) {
+            panic!("the save failed: {}", toast.text);
+        }
+
+        assert!(std::time::Instant::now() < deadline, "the save did not finish");
+        h.step();
+        std::thread::yield_now();
+    }
+
     assert!(file.exists(), "Save as wrote the project");
     assert!(!h.state().session.modified, "the project counts as saved");
 }
@@ -69,7 +88,9 @@ fn effect_harness() -> (Harness<'static, TextureCraftApp>, u64) {
         "effect",
     );
     texturecraft_engine::execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
-    (harness_for(session), effect)
+    let mut h = harness_for(session);
+    click_selected_content_thumbnail(&mut h);
+    (h, effect)
 }
 
 /// Choose Rename effect from the row's context menu and type `text` over the old name.
@@ -116,8 +137,54 @@ fn renaming_an_effect_row_undoes_redoes_and_survives_save_and_reopen() {
     let layer = h.state().session.doc.project.effect(LayerId(effect)).unwrap().0;
     h.state_mut().run("layer.select", json!({"layer": layer.0}));
     h.run_steps(3);
+    assert!(h.query_by_label("Pitted rust").is_none(), "the reopened stack starts closed");
+    click_selected_content_thumbnail(&mut h);
     assert!(h.query_by_label("Pitted rust").is_some(), "the reopened stack shows the name");
     std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn collapsing_an_effect_stack_finishes_its_rename() {
+    let (mut h, effect) = effect_harness();
+    rename_from_the_menu(&mut h, "Effect A", "Pitted rust");
+    click_selected_content_thumbnail(&mut h);
+    assert!(h.state().ui.rename.is_none(), "the hidden editor has committed the name");
+    assert_eq!(effect_name(&h, effect), "Pitted rust");
+    assert!(h.query_by_label("Pitted rust").is_none(), "the effect stack closed");
+    click_selected_content_thumbnail(&mut h);
+    assert!(h.query_by_label("Pitted rust").is_some());
+}
+
+#[test]
+fn reopening_a_project_discards_an_uncommitted_effect_rename() {
+    let (mut harness, effect) = effect_harness();
+    let file = temp_file("pending-rename");
+    save_to(&mut harness, &file);
+    rename_from_the_menu(&mut harness, "Effect A", "Uncommitted name");
+
+    reopen(&mut harness, &file);
+    std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+
+    assert_eq!(effect_name(&harness, effect), "Effect A");
+    assert!(!harness.state().session.modified);
+    assert!(harness.state().ui.rename.is_none());
+}
+
+#[test]
+fn undoing_an_effect_removal_restores_its_committed_name() {
+    let (mut harness, effect) = effect_harness();
+    rename_from_the_menu(&mut harness, "Effect A", "Uncommitted name");
+
+    harness.state_mut().ui.hide_ui = true;
+    harness.state_mut().run("effect.remove", json!({"effect": effect})).unwrap();
+    harness.run_steps(3);
+    harness.state_mut().run("edit.undo", Value::Null).unwrap();
+    harness.state_mut().ui.hide_ui = false;
+    harness.run_steps(3);
+    click_selected_content_thumbnail(&mut harness);
+
+    assert_eq!(effect_name(&harness, effect), "Effect A");
+    assert!(harness.state().ui.rename.is_none());
 }
 
 #[test]
@@ -162,6 +229,16 @@ fn sphere_session() -> Session {
     Session::new_project("anchors", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 256).unwrap()
 }
 
+/// Opens the Layers toolbar's Add effect menu and clicks its item `item` (the one nearest the menu's button)
+fn add_effect(h: &mut Harness<'_, TextureCraftApp>, item: &str) {
+    let menu = h.get_by_role_and_label(Role::Button, "Add effect").rect();
+    h.get_by_role_and_label(Role::Button, "Add effect").click();
+    h.run_steps(3);
+    let distance = |rect: egui::Rect| rect.center().distance(menu.center());
+    let row = h.get_all_by_role_and_label(Role::Button, item).map(|node| node.rect()).min_by(|a, b| distance(*a).total_cmp(&distance(*b))).unwrap();
+    crate::filter_support::click_at(h, row.center());
+}
+
 fn mask_anchor_of(h: &Harness<'_, TextureCraftApp>, layer: u64) -> Option<u64> {
     let layer = h.state().session.doc.project.layer(LayerId(layer)).unwrap();
     layer.mask.iter().flat_map(|m| m.effects.iter()).find(|e| matches!(e.kind, EffectKind::Anchor)).map(|e| e.id.0)
@@ -180,23 +257,18 @@ fn a_fill_on_a_higher_layer_reads_a_mask_anchor_added_in_the_interface() {
     let low = low_layer(&mut session);
     let mut h = harness_for(session);
 
-    // The wand adds to the mask, since the mask's fill is the selected target of the Low layer
+    // Add effect adds to the mask, since the mask's fill is the selected target of the Low layer
     assert!(matches!(h.state().session.target, StackTarget::Effect(_)));
-    h.get_by_label(egui_phosphor::regular::MAGIC_WAND).click();
-    h.run_steps(3);
-    assert!(h.query_by_label("Add to the mask").is_some(), "the menu offers the mask");
-    h.get_by_label("Add anchor point").click();
-    h.run_steps(3);
+
+    add_effect(&mut h, "Anchor point");
     let anchor = mask_anchor_of(&h, low).expect("the anchor point is in the mask of Low");
     assert!(h.state().session.doc.project.layer(LayerId(low)).unwrap().content_effects.is_empty(), "the anchor point is not on the layer content");
 
     // A higher layer with a mask fill, added through the same menu
     let high = high_layer(&mut h.state_mut().session);
     h.run_steps(3);
-    h.get_by_label(egui_phosphor::regular::MAGIC_WAND).click();
-    h.run_steps(3);
-    h.get_by_label("Add fill").click();
-    h.run_steps(3);
+    add_effect(&mut h, "Fill");
+
     assert!(matches!(reader_source(&h, high), Source::Uniform(_)), "a new fill starts as a uniform value");
 
     // The Anchor points tab lists the mask anchor of the layer below
@@ -207,8 +279,9 @@ fn a_fill_on_a_higher_layer_reads_a_mask_anchor_added_in_the_interface() {
     h.get_by_role_and_label(Role::Tab, "Anchor points").click();
     h.run_steps(3);
 
-    let label = format!("Low / mask / {}", effect_name(&h, anchor));
-    h.get_by_role_and_label(Role::Button, &label).click();
+    // The only anchor below is listed by its name alone
+    let label = effect_name(&h, anchor);
+    h.get_by_role_and_label(Role::ListBoxOption, &label).click();
     h.run_steps(3);
 
     let Source::Anchor { anchor: read, .. } = reader_source(&h, high) else { panic!("the fill reads an anchor: {:?}", reader_source(&h, high)) };
@@ -225,6 +298,7 @@ fn a_fill_on_a_higher_layer_reads_a_mask_anchor_added_in_the_interface() {
     let ref_anchor = id(&texturecraft_engine::execute(&mut reference, "effect.add.anchor", &json!({"target": "mask"})).unwrap(), "effect");
     high_layer(&mut reference);
     texturecraft_engine::execute(&mut reference, "effect.add.fill", &json!({"anchor": ref_anchor})).unwrap();
+
     assert!(close(base_color(&mut h.state_mut().session), base_color(&mut reference)));
 
     // Save and reopen keep the link and the result
@@ -249,12 +323,16 @@ fn a_fill_on_a_higher_layer_reads_a_mask_anchor_added_in_the_interface() {
         .id
         .0;
     h.state_mut().run("effect.set", json!({"effect": fill, "value": 1.0}));
+
     assert!(matches!(reader_source(&h, high), Source::Uniform(_)));
+
     h.state_mut().session.modified = false;
     reopen(&mut h, &file);
+
     assert_eq!(mask_anchor_of(&h, low), Some(anchor), "the anchor point is still in the mask");
     let Source::Anchor { anchor: read, .. } = reader_source(&h, high) else { panic!("the reopened fill reads an anchor") };
     assert_eq!(read.0, anchor, "the reopened fill still reads that anchor");
     assert!(close(base_color(&mut h.state_mut().session), [expected; 3]), "{:?}", base_color(&mut h.state_mut().session));
+
     std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
 }

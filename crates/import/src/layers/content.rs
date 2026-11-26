@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use texturecraft_core::{BlendMode, Channel, ChannelKind, Effect, EffectKind, Fill, LayerId, LayerKind, Levels, Projection, Source};
+use texturecraft_core::{BlendMode, Channel, ChannelKind, Effect, EffectKind, Fill, LayerId, LayerKind, Levels, Projection, Sampling, Source};
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
 use texturecraft_import_reader::model::{
     EffectGroup, EffectHeader, FillEffect, Levels as ProjectLevels, LevelsEffect, PaintEffect, PaintTool, PolygonFillEffect, ProjectEffect, ProjectLayer,
@@ -329,7 +329,7 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
     fn graph_use(&mut self, g: GraphUse, channels: &[Channel], blend: Option<&ResolvedBlend>, visible: bool) {
         let mut e = effect(self.ids.alloc(), "", g.effect, visible);
         if matches!(e.kind, EffectKind::Filter(_)) {
-            e.channels = channels.to_vec();
+            act_on_only(&mut e, channels);
         }
         if let Some(b) = blend {
             e.blend = b.mode();
@@ -546,9 +546,10 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
         }
         // the reference app's levels act on the channels they list only; the others are left as they are. Levels listing
         // none of the set's channels (glossiness only) change nothing: kept, switched off
-        e.channels.clone_from(&channels);
         if channels.is_empty() {
             e.visible = false;
+        } else {
+            act_on_only(&mut e, &channels);
         }
         self.effects.push(e);
         if on {
@@ -565,7 +566,13 @@ impl<'a, 'i> ContentMapper<'a, 'i> {
             let mut e = effect(
                 self.ids.alloc(),
                 &fill.header.label,
-                EffectKind::Material(Fill { sources: sources.clone(), projection: parts.projection.clone(), link: None }),
+                EffectKind::Material(Fill {
+                    sources: sources.clone(),
+                    projection: parts.projection.clone(),
+                    link: None,
+                    material: None,
+                    sampling: Sampling::SAVED_BEFORE,
+                }),
                 on,
             );
             e.blend = blend.mode();
@@ -713,7 +720,18 @@ fn as_base(parts: &FillParts) -> Option<Fill> {
     let [(blend, sources)] = parts.groups.as_slice() else { return None };
     let full = matches!(blend.mode(), BlendMode::Normal | BlendMode::Replace) && blend.opacity >= 1.0;
     let computed = parts.graphs.is_empty() && parts.status.values().all(Status::is_computable);
-    (full && computed).then(|| Fill { sources: sources.clone(), projection: parts.projection.clone(), link: None })
+    (full && computed).then(|| Fill {
+        sources: sources.clone(),
+        projection: parts.projection.clone(),
+        link: None,
+        material: None,
+        sampling: Sampling::SAVED_BEFORE,
+    })
+}
+
+/// Limits `effect` to `channels`: it leaves the other content channels as they are
+fn act_on_only(effect: &mut Effect, channels: &[Channel]) {
+    effect.off_channels = Channel::ALL.into_iter().filter(|channel| !channels.contains(channel)).collect();
 }
 
 /// True if the reference points at no anchor: the file stores 0 once the anchor it read is gone; the original then
@@ -761,6 +779,8 @@ pub fn levels(l: Option<&ProjectLevels>) -> (Levels, Status) {
         gamma: reciprocal(l.gamma[0]),
         out_low: finite(l.output_minimum[0], 0.0),
         out_high: finite(l.output_maximum[0], 1.0),
+        affects: None,
+        clamp: true,
     };
     let same = |a: [f32; 3]| a[1] == a[0] && a[2] == a[0];
     let status = match [l.input_minimum, l.input_maximum, l.gamma, l.output_minimum, l.output_maximum].into_iter().all(same) {
@@ -774,7 +794,7 @@ pub fn levels(l: Option<&ProjectLevels>) -> (Levels, Status) {
 /// (`v / 2 + 0.5`); the gamma stays.
 pub fn signed_levels(l: Levels) -> Levels {
     let unit = |v: f32| v * 0.5 + 0.5;
-    Levels { in_low: unit(l.in_low), in_high: unit(l.in_high), gamma: l.gamma, out_low: unit(l.out_low), out_high: unit(l.out_high) }
+    Levels { in_low: unit(l.in_low), in_high: unit(l.in_high), gamma: l.gamma, out_low: unit(l.out_low), out_high: unit(l.out_high), ..l }
 }
 
 /// What a replayed job counts as: approximated, with its notes.

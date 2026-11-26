@@ -42,7 +42,7 @@ pub(crate) const MAX_BYTES: usize = 512 << 20;
 pub(crate) const EXR_SIGNATURE: &[u8] = &[0x76, 0x2f, 0x31, 0x01];
 
 pub(crate) fn decoded(d: texturecraft_formats::DecodedImage) -> Arc<ImageRes> {
-    Arc::new(ImageRes { width: d.width, height: d.height, rgba: d.rgba, srgb: d.srgb })
+    Arc::new(ImageRes::new(d.width, d.height, d.rgba, d.srgb))
 }
 
 impl Session {
@@ -82,7 +82,7 @@ impl Session {
         let (stem, extension) = base.rfind('.').map_or((base.as_str(), ""), |extension_start| base.split_at(extension_start));
         let mut name = base.clone();
         let mut duplicate_index = 2;
-        while self.doc.resources.contains_key(&name) {
+        while self.doc.resources.contains_key(&name) || crate::fill_alpha::library_alpha_of(&name).is_some() {
             let discriminator = format!("{duplicate_index}_");
             let available = MAX_RESOURCE_NAME_LEN - discriminator.len();
 
@@ -105,6 +105,8 @@ impl Session {
     pub fn sync_images(&mut self) {
         let resources = &self.doc.resources;
         self.images.retain_names(|name| resources.contains_key(name));
+        let images = &self.images;
+        self.library_alphas.retain(|name| images.has_slot(name));
 
         let mut linked_packages = std::collections::HashSet::new();
         let mut linked_images = std::collections::HashMap::new();
@@ -122,6 +124,18 @@ impl Session {
         let package_suffix = format!(".{}", texturecraft_formats::mcmat::MCRAFT_EXT);
         for (name, bytes) in &self.doc.resources {
             if self.images.has_slot(name) || linked_packages.contains(name.as_str()) || name.ends_with(&package_suffix) {
+                continue;
+            }
+
+            // A saved library alpha picture is told by its pixels, so it is decoded now (it is small)
+            if crate::fill_alpha::library_alpha_of(name).is_some()
+                && let Ok(image) = texturecraft_formats::decode_image(bytes)
+            {
+                if crate::fill_alpha::matches_saved_picture(name, &image) {
+                    self.library_alphas.insert(name.clone());
+                }
+
+                self.images.insert(name.clone(), decoded(image));
                 continue;
             }
 
@@ -259,6 +273,7 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     if !s.doc.resources.contains_key(&name) {
         return Err(bad("resource.remove", format!("no resource `{name}`")));
     }
+
     s.edit("Remove resource", |s| {
         s.doc.resources.remove(&name);
         Ok(())
@@ -267,7 +282,7 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
-/// Drop resources unused by layers, mask effects, the brush alpha, the stencil or the environment.
+/// Drop resources no layer, mask effect, the brush alpha, the projection stencil, the mask brush or the environment uses (one undo step)
 fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
     let mut used = Vec::new();
     for set in &s.doc.project.texture_sets {
@@ -277,6 +292,7 @@ fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
     }
     used.extend(s.tool.stencil.as_ref().map(|st| st.image.clone()));
     used.extend(s.tool.brush.alpha_image.clone());
+    used.extend(s.tool.mask_image.clone());
     used.extend(s.doc.project.display.environment_resource().map(str::to_string));
     let unused: Vec<String> = s.doc.resources.keys().filter(|k| !used.contains(k)).cloned().collect();
     if !unused.is_empty() {
@@ -319,7 +335,7 @@ fn add_image_fill(s: &mut Session, p: &Value) -> Result<Value> {
     let raw_name = strp(p, "name").ok_or_else(|| bad("layer.add.image", "`name` is required"))?;
     let name = resolve_resource_name(s, raw_name)?;
     let ch = channel_param("layer.add.image", p, "channel")?.unwrap_or(Channel::BaseColor);
-    let projection = crate::layer_cmds::projection_from(p, "layer.add.image", None)?;
+    let projection = crate::layer_cmds::projection_from(p, "layer.add.image", None, || crate::warp_cmds::fitted_frame(&s.mesh))?;
     let ts = s.ts();
     let label = std::path::Path::new(&name).file_stem().and_then(|n| n.to_str()).unwrap_or("Image").to_string();
     let layer_name = s.doc.project.next_layer_name(ts, &label);

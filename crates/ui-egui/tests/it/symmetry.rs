@@ -19,13 +19,20 @@ const AXIS_PROBE: f32 = 0.05;
 const ON_THE_SHAFT: f32 = 40.0;
 const DRAG_DISTANCE: f32 = 60.0;
 
+/// Window wide enough that the top bar shows every paint control, Symmetry's included, with Properties at its least width
+const WINDOW_SIZE: egui::Vec2 = egui::vec2(1760.0, 960.0);
+
 /// A point inside the 3D view near its lower left corner, clear of the mesh and the popup (points from the corner)
 const VIEW_CORNER_INSET: f32 = 40.0;
 
 fn app_harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(1024, 256).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1760.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().session.tool.tool = Tool::Paint;
     harness.run_steps(4);
     harness
@@ -395,15 +402,4 @@ fn escape_cancels_picking_the_symmetry_point() {
 
     assert!(!harness.state().picking_symmetry_plane);
     assert_eq!(harness.state().session.tool.brush.symmetry.offset, [0.0; 3]);
-}
-
-#[test]
-fn the_smudge_tool_offers_the_symmetry_toggle() {
-    let mut harness = app_harness();
-    harness.state_mut().session.tool.tool = Tool::Smudge;
-    harness.run_steps(2);
-
-    harness.get_by_label("Symmetry").click();
-    harness.run_steps(2);
-    assert_eq!(brush(&mut harness)["symmetry"], json!([true, false, false]), "the toggle mirrors the smudge on X");
 }

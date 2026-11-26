@@ -760,7 +760,7 @@ fn levels_act_on_the_channels_they_list_only() {
     let stack = build(vec![layer(1, "L", ProjectLayerKind::Fill, vec![base, levels])]);
     let ours = by_name(&stack, "L");
     let lv = ours.content_effects.iter().find(|e| matches!(e.kind, EffectKind::Levels(_))).unwrap();
-    assert_eq!(lv.channels, [Channel::Roughness], "base colour is left as it is");
+    assert!(lv.acts_on(Channel::Roughness) && !lv.acts_on(Channel::BaseColor), "base colour is left as it is");
     assert!(lv.visible);
     assert!(stack.verdict.all_exact(), "{:?}", stack.verdict.channels);
     // levels on a channel the set does not hold (64: glossiness) change nothing

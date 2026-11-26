@@ -14,6 +14,8 @@ use crate::gpu::SceneSync;
 /// What the GPU has of bake mode's visualization: the high poly, each set's cage and the missing seams
 #[derive(Default)]
 pub struct BakeSceneLink {
+    mesh_id: Option<u64>,
+    clear_gpu: bool,
     /// The high poly sent to the GPU and the id it was sent under (each new high poly gets the next one)
     high: SharedHandle<Mesh>,
     high_id: u64,
@@ -31,6 +33,7 @@ pub struct BakeSceneLink {
 impl BakeSceneLink {
     /// Send everything again (the GPU lost what it was sent); the cage shells and the reach worked out on the CPU stay
     pub fn resend(&mut self) {
+        self.clear_gpu = true;
         self.high_sent = false;
         self.sent_cage_count = None;
         self.seams_mesh_id = None;
@@ -47,12 +50,25 @@ impl BakeSceneLink {
 
     /// Add to `out` what the GPU needs to draw `visualization` this frame
     pub fn sync(&mut self, session: &Session, visualization: Option<BakeVisualization>, out: &mut SceneSync) {
+        if self.mesh_id.replace(session.mesh_id).is_some_and(|previous| previous != session.mesh_id) {
+            self.high = Default::default();
+            self.reach.reset_for_mesh();
+            self.cages.clear();
+            self.resend();
+        }
+
+        if std::mem::take(&mut self.clear_gpu) {
+            out.bake_high = Some((None, self.high_id));
+            out.bake_cage_count = Some(0);
+            out.missing_seams = Some((session.mesh_id, Vec::new()));
+        }
+
         self.reach.poll();
 
         let Some(visualization) = visualization else { return };
 
         if visualization.high_poly.shown {
-            let high = session.bake_meshes.merged_high().map(|high| high.mesh.clone());
+            let high = session.doc.bake_meshes.merged_high().map(|high| high.mesh.clone());
             let handle = SharedHandle::of(high.as_ref());
             if handle != self.high {
                 self.high = handle;
@@ -226,6 +242,27 @@ mod tests {
         assert_eq!(resent.bake_cages.first().unwrap().2, rebuilt.bake_cages.first().unwrap().2, "the cages are not rebuilt for a lost frame");
         assert_eq!(resent.bake_high.unwrap().1, first.bake_high.unwrap().1, "the high poly goes again under the same id");
         assert!(!link.busy(), "a lost frame doesn't work out the reach again");
+    }
+
+    #[test]
+    fn switching_projects_releases_hidden_cage_shells_and_renderer_buffers() {
+        let mut link = BakeSceneLink::default();
+        for _ in 0..2 {
+            let project = session();
+            let mut frame = sync(&mut link, &project, everything());
+            let shells: Vec<_> = frame.bake_cages.drain(..).filter_map(|(_, cage, _)| cage.map(|upload| Arc::downgrade(&upload.shell))).collect();
+            assert!(shells.len() > 1);
+
+            let empty = Session::new_project("Empty", texturecraft_engine::geom::primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+            let mut hidden = SceneSync::default();
+            link.sync(&empty, None, &mut hidden);
+
+            let retained = shells.iter().filter(|shell| shell.strong_count() > 0).count();
+            eprintln!("hidden project replacement: previous_shells={} retained={retained}", shells.len());
+            assert_eq!(retained, 0);
+            assert!(matches!(hidden.bake_high, Some((None, _))));
+            assert_eq!(hidden.bake_cage_count, Some(0));
+        }
     }
 
     #[test]

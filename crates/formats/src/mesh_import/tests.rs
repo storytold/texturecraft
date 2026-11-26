@@ -173,6 +173,23 @@ fn gltf_embedded_buffers_and_missing_attributes() {
 }
 
 #[test]
+fn gltf_mixed_primitive_uvs_warn_and_unwrap_the_whole_mesh() {
+    let mut json: serde_json::Value = serde_json::from_slice(&embedded_gltf()).unwrap();
+    let primitives = json["meshes"][0]["primitives"].as_array_mut().unwrap();
+    assert_eq!(primitives.len(), 2);
+    assert_eq!(primitives[0]["attributes"]["TEXCOORD_0"], 2);
+    let second_attributes = primitives[1]["attributes"].as_object_mut().unwrap();
+    assert_eq!(second_attributes.remove("TEXCOORD_0"), Some(serde_json::json!(2)));
+
+    let imported = import_mesh_bytes("mixed-uvs.gltf", &serde_json::to_vec(&json).unwrap()).unwrap();
+    assert!(imported.report.uvs_generated);
+    let warning = "some primitives have no UVs; the whole mesh was unwrapped automatically";
+    assert!(imported.report.warnings.iter().any(|w| w == warning));
+    assert_eq!(imported.report.triangles, 2);
+    assert_eq!(imported.mesh.materials, ["Red", "Material_1"]);
+}
+
+#[test]
 fn gltf_external_buffer_needs_a_path() {
     let mut json: serde_json::Value = serde_json::from_slice(&embedded_gltf()).unwrap();
     json["buffers"][0]["uri"] = "scene.bin".into();
@@ -713,4 +730,72 @@ fn base_color_filters_hdr_before_clamping_to_eight_bits() {
     let (w, h, actual) = decode_base_color(&hdr, &mut budget).unwrap();
     assert_eq!((w, h), expected.dimensions());
     assert_eq!(actual, expected.pixels().map(|p| p.0).collect::<Vec<_>>());
+}
+
+#[test]
+fn duplicate_gltf_material_names_keep_first_wins_and_order() {
+    let mut raw = RawMesh {
+        positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+        base_colors: vec![
+            RawBaseColor { material: "Dup".into(), factor: Vec4::new(1.0, 0.0, 0.0, 1.0), image: None },
+            RawBaseColor { material: "Dup".into(), factor: Vec4::new(0.0, 0.0, 1.0, 1.0), image: None },
+            RawBaseColor { material: "Second".into(), factor: Vec4::new(0.0, 1.0, 0.0, 1.0), image: None },
+        ],
+        ..RawMesh::default()
+    };
+    raw.group("Dup", "p1").extend_from_slice(&[0, 1, 2]);
+    raw.group("Second", "p2").extend_from_slice(&[0, 1, 2]);
+    raw.group("Dup", "p3").extend_from_slice(&[0, 1, 2]);
+    let colors = std::mem::take(&mut raw.base_colors);
+    let (mesh, _, _) = geometry(raw).unwrap();
+    assert_eq!(mesh.materials, vec!["Dup", "Second"]);
+    let submesh_materials: Vec<_> = mesh.submeshes.iter().map(|s| (s.name.as_str(), s.material)).collect();
+    assert_eq!(submesh_materials, [("p1", 0), ("p3", 0), ("p2", 1)]);
+    let mut color_by_material: HashMap<&str, &RawBaseColor> = HashMap::with_capacity(colors.len());
+    for color in &colors {
+        color_by_material.entry(color.material.as_str()).or_insert(color);
+    }
+    assert_eq!(color_by_material.get("Dup").unwrap().factor, Vec4::new(1.0, 0.0, 0.0, 1.0));
+}
+
+#[test]
+fn a_saved_layout_reproduces_the_rebuilt_mesh_without_unwrapping() {
+    let rebuilt = import_mesh_bytes_with_uvs("a.obj", OBJ.as_bytes(), true).unwrap().mesh;
+    let layout = corner_uvs(&rebuilt);
+
+    let reopened = import_mesh_bytes_with_layout("a.obj", OBJ.as_bytes(), &layout).unwrap();
+    let short = import_mesh_bytes_with_layout("a.obj", OBJ.as_bytes(), &layout[1..]);
+    let mut non_finite = layout.clone();
+    non_finite[0].x = f32::NAN;
+
+    assert!(!reopened.report.warnings.iter().any(|warning| warning.contains("unwrap")), "{:?}", reopened.report.warnings);
+    assert_eq!((&reopened.mesh.positions, &reopened.mesh.indices, &reopened.mesh.uvs), (&rebuilt.positions, &rebuilt.indices, &rebuilt.uvs));
+    assert_eq!(reopened.mesh.normals, rebuilt.normals);
+    assert!(short.is_err(), "a layout for another mesh is refused");
+    assert!(import_mesh_bytes_with_layout("a.obj", OBJ.as_bytes(), &non_finite).is_err());
+}
+
+#[test]
+fn a_saved_layout_keeps_coincident_vertices_in_different_materials_split() {
+    // Synthetic mesh with coincident triangles in independently packed materials
+    let source = br#"#usda 1.0
+def Mesh "Overlaid" {
+    int[] faceVertexCounts = [3, 3]
+    int[] faceVertexIndices = [0, 1, 2, 0, 1, 2]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+    rel material:binding = </First>
+    def GeomSubset "second" {
+        uniform token familyName = "materialBind"
+        int[] indices = [1]
+        rel material:binding = </Second>
+    }
+}
+"#;
+    let rebuilt = import_mesh_bytes_with_uvs("overlaid.usda", source, true).unwrap().mesh;
+    let layout = corner_uvs(&rebuilt);
+
+    let reopened = import_mesh_bytes_with_layout("overlaid.usda", source, &layout).unwrap().mesh;
+
+    assert_eq!(&layout[..3], &layout[3..], "the independently packed triangles have equal UVs");
+    assert_eq!(reopened, rebuilt);
 }

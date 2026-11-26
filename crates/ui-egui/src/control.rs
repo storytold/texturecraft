@@ -9,7 +9,7 @@
 //! - `ui.menu.list`: the menu catalog with ids, shortcuts and whether each is live.
 //! - `ui.menu.invoke {id}`: behave like a menu click (may open a window; `ui.resetUi` asks first).
 //!   `{id: "ui.layout.apply", name}` switches to the saved panel layout `name` (an error when there is none).
-//! - `ui.reset`: reset the panels and every view setting at once, without the question the menu asks.
+//! - `ui.reset`: reset the panels, view settings and interface language at once, without the question the menu asks.
 //! - `ui.set {...}`: merge fields into the UI state (e.g. `{"layout":"Only3D"}`).
 //! - `viewport.screenshot {view?: "3d"|"2d"}`: PNG of a viewport, base64.
 //! - `ui.screenshot`: PNG of the whole window (replies after the next frame).
@@ -92,6 +92,7 @@ fn refresh_draft_preferences(draft: &mut Prefs, previous: &Prefs, current: &Pref
     refresh_fields!(
         ui_scale,
         autosave_minutes,
+        recent_projects_limit,
         language,
         viewport_texture,
         gpu_compositing,
@@ -113,6 +114,12 @@ fn refresh_draft_preferences(draft: &mut Prefs, previous: &Prefs, current: &Pref
         libraries,
         background,
         render_ram_percent,
+        show_world_axes,
+        show_keyboard_helper,
+        only_selected_material_when_painting,
+        save_preprocessed_scene_files,
+        live_preview_baking,
+        local_cache_directory,
     );
 }
 
@@ -144,6 +151,12 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
         },
         "command.run" => {
             let Some(id) = params.get("id").and_then(Value::as_str) else { return err("`id` is required") };
+
+            #[cfg(not(target_arch = "wasm32"))]
+            if app.save_job.is_some() && crate::manual_save::is_save(id) {
+                return err("A manual project save is already running");
+            }
+
             let command_params = params.get("params").cloned().unwrap_or(Value::Null);
             let before = app.session.camera;
             match texturecraft_engine::execute(&mut app.session, id, &command_params) {
@@ -228,6 +241,7 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
                 .map(|item| json!({
                     "menu": item.menu, "submenu": item.sub, "label": item.label, "id": item.id, "shortcut": crate::keymap::shortcut_of(&app.ui.keymap, item.id),
                     "implemented": crate::menus::implemented(item.id), "enabled": crate::menus::enabled(app, item.id),
+                    "checked": crate::menus::checked(app, item.id),
                 }))
                 .collect::<Vec<_>>()
         )),
@@ -248,7 +262,7 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
 
         // What Window > Reset UI does once the question is answered with Reset
         "ui.reset" => {
-            app.ui.adopt_layout(crate::UiState::default());
+            app.ui.reset_ui();
             ok(Value::Null)
         }
         // the project import's windows, as a person drives them: open a file (the notice shows), acknowledge the
@@ -312,6 +326,7 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
                         refresh_draft_preferences(&mut draft.prefs, &app.ui.prefs, &ui.prefs);
                     }
 
+                    ui.trim_recent();
                     app.ui = ui;
                     app.reschedule_autosave_if_changed(previous_autosave_minutes);
                     app.ui.prefs.apply_resource_limits();

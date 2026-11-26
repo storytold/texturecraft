@@ -1,4 +1,4 @@
-//! The project import's two windows (File › Import project..., or a project file of the reference app opened or
+//! The project import's two windows (File › Import Project, or a project file of the reference app opened or
 //! dropped): a notice that must be acknowledged before anything runs, then the conversion's progress, which opens the
 //! converted project when it finishes and turns into the error view when it fails.
 //!
@@ -487,7 +487,10 @@ mod tests {
         previous.modified = false;
         let original_camera = previous.camera;
         let project_id = previous.project_id;
-        let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, previous));
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1600.0, 960.0))
+            .with_context_setup(crate::framework::install_headless)
+            .build_eframe(|cc| TextureCraftApp::new(cc, previous));
         h.state_mut().ui.prefs.language = "en".into();
         h.state_mut().ui.windows.export = true;
         h.run_steps(5);

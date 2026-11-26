@@ -646,7 +646,7 @@ fn particle_speeds_in_the_imported_files_units_shrink_by_its_radius() {
 #[test]
 fn a_brush_painting_images_only_places_them_on_the_view() {
     let image = || {
-        let res = texturecraft_compose::ImageRes { width: 1, height: 1, rgba: vec![[0.5; 4]], srgb: false };
+        let res = texturecraft_compose::ImageRes::new(1, 1, vec![[0.5; 4]], false);
         ReplaySource::Texels(Arc::new(ReplayTexels::Image(Arc::new(res))))
     };
     let m = [2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.25, 0.0, 1.0];

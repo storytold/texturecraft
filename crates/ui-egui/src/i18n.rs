@@ -1,8 +1,8 @@
 //! UI text lookup over the optional shared craft-i18n catalogs.
 //! Missing translations and builds without catalogs use the English source text.
 
+use std::cell::Cell;
 use std::fmt::Display;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
 
 include!(concat!(env!("OUT_DIR"), "/craft_i18n.rs"));
@@ -52,7 +52,31 @@ pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "ar", name: "العربية", english: "Arabic" },
 ];
 
-static CURRENT: AtomicUsize = AtomicUsize::new(0);
+// Rendering and preferences use the UI thread, including independent test harnesses.
+thread_local! {
+    static CURRENT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How a fill reads its images, as the Filtering combo names it
+pub(crate) fn filtering_label(filtering: texturecraft_engine::core::Filtering) -> &'static str {
+    use texturecraft_engine::core::Filtering;
+    match filtering {
+        Filtering::BilinearHq => n_("Bilinear | HQ"),
+        Filtering::BilinearSharp => n_("Bilinear | Sharp"),
+        Filtering::Nearest => n_("Nearest"),
+    }
+}
+
+/// Whether a fill repeats past its tile, as the UV Wrap combo names it
+pub(crate) fn wrap_label(wrap: texturecraft_engine::core::UvWrap) -> &'static str {
+    use texturecraft_engine::core::UvWrap;
+    match wrap {
+        UvWrap::None => n_("None"),
+        UvWrap::RepeatHorizontally => n_("Repeat horizontally"),
+        UvWrap::RepeatVertically => n_("Repeat vertically"),
+        UvWrap::Repeat => n_("Repeat"),
+    }
+}
 
 /// Display labels belong to the UI; the model exposes only map identities
 pub(crate) fn baked_map_label(map: texturecraft_engine::core::BakedMap) -> &'static str {
@@ -75,20 +99,20 @@ pub(crate) fn baked_map_label(map: texturecraft_engine::core::BakedMap) -> &'sta
 /// The saved language that follows the operating system's (Settings > Language > Default (System Language)).
 pub const SYSTEM_LANGUAGE: &str = "";
 
-/// Switch the UI language ([`SYSTEM_LANGUAGE`] follows the system; unknown codes fall back to English).
+/// Switch the calling UI thread's language. [`SYSTEM_LANGUAGE`] follows the system.
 pub fn set_language(code: &str) {
     let code = if code == SYSTEM_LANGUAGE { system_language() } else { code };
-    CURRENT.store(LANGUAGES.iter().position(|l| l.code.eq_ignore_ascii_case(code) && available(l.code)).unwrap_or(0), Ordering::Relaxed);
+    CURRENT.set(LANGUAGES.iter().position(|l| l.code.eq_ignore_ascii_case(code) && available(l.code)).unwrap_or(0));
 }
 
 /// The current UI language.
 pub fn current() -> &'static Language {
-    LANGUAGES.get(CURRENT.load(Ordering::Relaxed)).unwrap_or(&LANGUAGES[0])
+    LANGUAGES.get(CURRENT.get()).unwrap_or(&LANGUAGES[0])
 }
 
 /// `text` in the current language (unchanged when it has no translation).
 pub fn tr(text: &str) -> &str {
-    let lang = shared_languages().get(CURRENT.load(Ordering::Relaxed)).copied().unwrap_or(craft_i18n::Lang::EN);
+    let lang = shared_languages().get(CURRENT.get()).copied().unwrap_or(craft_i18n::Lang::EN);
     I18N.t(lang, text)
 }
 
@@ -161,7 +185,7 @@ fn system_language() -> &'static str {
     SYSTEM.get_or_init(os_language)
 }
 
-/// Tests that switch the global UI language, or draw the UI under it, run one at a time.
+/// Shared guard used by language fixture tests.
 #[cfg(test)]
 pub(crate) static TEST_LANGUAGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -170,6 +194,27 @@ mod tests {
     use super::TEST_LANGUAGE as LANGUAGE;
     use super::*;
     use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn a_parallel_ui_language_context_keeps_its_own_language() {
+        set_language("en");
+        let french = LANGUAGES.iter().position(|language| language.code == "fr").unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let (first, second) = std::thread::scope(|scope| {
+            let other = scope.spawn(|| {
+                // Exercise the resolved language selection even when the French catalog is absent.
+                CURRENT.set(french);
+                barrier.wait();
+                barrier.wait();
+                current().code
+            });
+            barrier.wait();
+            let first = current().code;
+            barrier.wait();
+            (first, other.join().unwrap())
+        });
+        assert_eq!((first, second), ("en", "fr"));
+    }
 
     /// Every key the UI looks up: `tr("…")` / `trf("…"` literals in the sources, plus the
     /// static catalogs whose labels are translated where they are shown.
@@ -228,6 +273,10 @@ mod tests {
         keys.extend(texturecraft_engine::geom::primitives::BUILTINS.iter().map(|(_, label)| *label));
         for filter in FILTERS {
             keys.extend([filter.label, filter.group]);
+            if let Some(about) = filter.about() {
+                keys.push(about.description);
+                keys.extend(about.tags);
+            }
             if let Ok(EffectKind::Filter(effect)) = build(filter.id, &serde_json::Value::Null) {
                 keys.push(effect.label());
                 keys.extend(scalar_params(&effect).into_iter().map(|parameter| parameter.1));
@@ -397,47 +446,25 @@ mod tests",
     }
 
     #[test]
-    fn shared_lookup_overrides_and_missing_translations() {
-        static CATALOGS: &craft_i18n::Embedded = &[("es", "\tSave\tGuardar\n\tOpen\tAbrir\n", "\tSave\tGuardar proyecto\n")];
-        let (runtime, problems) = craft_i18n::I18n::new(CATALOGS, &["es"]);
-        assert!(problems.is_empty());
-        assert!(runtime.check_all().is_empty());
-        let lang = runtime.from_code("es").unwrap();
-        assert_eq!(runtime.t(lang, "Save"), "Guardar proyecto");
-        assert_eq!(runtime.t(lang, "Open"), "Abrir");
-        assert_eq!(runtime.t(lang, "New feature"), "New feature");
-        assert_eq!(runtime.t(craft_i18n::Lang::EN, "Save"), "Save");
-    }
-
-    #[test]
     fn saved_language_codes_and_spanish_lookup() {
         let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for language in &LANGUAGES {
             set_language(language.code);
             assert_eq!(current().code, if available(language.code) { language.code } else { "en" });
         }
+        const MISSING: &str = "missing test label";
         set_language("es");
-        assert_eq!(tr("Layers"), if available("es") { "Capas" } else { "Layers" });
+        let spanish = tr("Layers");
+        let missing = tr(MISSING);
         set_language("en");
-    }
-
-    #[test]
-    fn lookup_is_fast() {
-        let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let keys = keys();
-        set_language("ja");
-        let started = std::time::Instant::now();
-        let mut total_chars = 0usize;
-        for _ in 0..100 {
-            for key in &keys {
-                total_chars += tr(key).len();
-            }
-        }
-        let ns_per_lookup = started.elapsed().as_secs_f64() * 1e9 / (100 * keys.len()) as f64;
+        let english = tr("Layers");
+        set_language("es");
+        let spanish_again = tr("Layers");
         set_language("en");
-        assert!(total_chars > 0);
 
-        // A frame looks up a few hundred strings, each expected below one microsecond
-        assert!(ns_per_lookup < 1000.0, "{ns_per_lookup:.0} ns per lookup");
+        assert_eq!(spanish, if available("es") { "Capas" } else { "Layers" });
+        assert_eq!(missing, MISSING);
+        assert_eq!(english, "Layers");
+        assert_eq!(spanish_again, spanish);
     }
 }

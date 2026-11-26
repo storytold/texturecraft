@@ -7,7 +7,12 @@ fn image_plane_at(plane: u32, pixel: vec2<i32>) -> u32 {
     return textureLoad(tile_images, origin + pixel, i32(srgb[plane + 2u]), 0).x;
 }
 
-fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>, repeat: vec2<bool>) -> vec4<f32> {
+fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> {
+    return material_image_texel_with_repeat(image, pixel, size, vec2(true));
+}
+
+// The texel wrapped on the axes that repeat and clamped to the edge on the others
+fn material_image_texel_with_repeat(image: u32, pixel: vec2<i32>, size: vec2<i32>, repeat: vec2<bool>) -> vec4<f32> {
     let wrapped = vec2(wrap_coordinate(pixel.x, size.x), wrap_coordinate(pixel.y, size.y));
     let at = select(clamp(pixel, vec2(0), size - 1), wrapped, repeat);
     let planes = image + 3u;
@@ -36,10 +41,10 @@ fn material_image_at_with_repeat(image: u32, uv: vec2<f32>, repeat: vec2<bool>) 
     }
     let at = vec2<i32>(base_grid);
     let f = grid - floor_grid;
-    let a = material_image_texel(image, at, size, repeat);
-    let b = material_image_texel(image, at + vec2(1, 0), size, repeat);
-    let c = material_image_texel(image, at + vec2(0, 1), size, repeat);
-    let d = material_image_texel(image, at + vec2(1, 1), size, repeat);
+    let a = material_image_texel_with_repeat(image, at, size, repeat);
+    let b = material_image_texel_with_repeat(image, at + vec2(1, 0), size, repeat);
+    let c = material_image_texel_with_repeat(image, at + vec2(0, 1), size, repeat);
+    let d = material_image_texel_with_repeat(image, at + vec2(1, 1), size, repeat);
     let top = a + (b - a) * f.x;
     let bottom = c + (d - c) * f.x;
     return top + (bottom - top) * f.y;
@@ -74,23 +79,30 @@ fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> {
 fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
     let image = layer.ids.z;
     let mode = layer.procedural.w;
+    if mode == P1_POINT_PROJECTION {
+        return p1_image_at(image, uv, layer);
+    }
+
     let p = surface.position * layer.projection.w + layer.projection.xyz;
     if mode == 1u {
-        let weights = pow(abs(surface.normal), vec3(layer.balance.w));
-        let w = weights / max(weights.x + weights.y + weights.z, 1e-6);
-        var sampled = vec4(0.0);
+        // The three planes through one material_image_at call (the driver inlines each call site)
+        let w = triplanar_weights(surface.normal, layer.balance.w);
+        var points = array<vec2<f32>, 3>(vec2(p.z, -p.y), p.xz, vec2(p.x, -p.y));
         if measured_blend {
+            // Measured rules mirror each plane by the side the normal faces
             let position = surface.position * layer.projection.w;
             let offset = layer.projection.xyz;
             let side = select(vec3(1.0), vec3(-1.0), surface.normal < vec3(0.0));
-            if w.x > 0.0 { sampled += w.x * material_image_at(image, vec2(offset.z - position.z * side.x, -p.y)); }
-            if w.y > 0.0 { sampled += w.y * material_image_at(image, vec2(p.x, offset.z + position.z * side.y)); }
-            if w.z > 0.0 { sampled += w.z * material_image_at(image, vec2(offset.x + position.x * side.z, -p.y)); }
-            return sampled;
+            points = array<vec2<f32>, 3>(
+                vec2(offset.z - position.z * side.x, -p.y),
+                vec2(p.x, offset.z + position.z * side.y),
+                vec2(offset.x + position.x * side.z, -p.y),
+            );
         }
-        if w.x > 0.0 { sampled += w.x * material_image_at(image, vec2(p.z, -p.y)); }
-        if w.y > 0.0 { sampled += w.y * material_image_at(image, p.xz); }
-        if w.z > 0.0 { sampled += w.z * material_image_at(image, vec2(p.x, -p.y)); }
+        var sampled = vec4(0.0);
+        for (var plane = 0u; plane < 3u; plane++) {
+            if w[plane] > 0.0 { sampled += w[plane] * material_image_at(image, points[plane]); }
+        }
         return sampled;
     }
     var point = uv;
@@ -99,16 +111,18 @@ fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f
         case 3u: { point = p.xz * 0.5 + 0.5; }
         case 4u: { point = vec2(p.x, -p.y) * 0.5 + 0.5; }
         case 5u: {
+            let position = surface.position + layer.projection.xyz;
             var dir = vec3(0.0, 1.0, 0.0);
-            if dot(surface.position, surface.position) > 0.0 { dir = normalize(surface.position); }
-            point = vec2(azimuth(dir.z, dir.x), acos(clamp(dir.y, -1.0, 1.0)) / 3.141592654) * layer.projection.w;
+            if dot(position, position) > 0.0 { dir = normalize(position); }
+            point = vec2(azimuth(dir.z, dir.x), polar_angle(dir.y) / 3.141592654) * layer.projection.w;
         }
         case 6u, 7u, 8u: {
-            let pos = surface.position;
+            let pos = surface.position + layer.projection.xyz;
             let axis = select(select(pos.xyz, pos.yxz, mode == 6u), pos.xzy, mode == 8u);
             point = vec2(azimuth(axis.z, axis.x), 0.5 - axis.y * 0.5) * layer.projection.w;
         }
         case DECAL_PROJECTION: {}
+        case UV_TILE_PROJECTION: { point = fract(uv); }
         default: { point = transformed_uv(layer, uv); }
     }
     return material_image_at(image, point);
@@ -123,10 +137,12 @@ fn placed_image_coord(frame: u32, p: vec2<f32>) -> vec2<f32> {
 
 fn triplanar_sample(image: u32, frame: u32, p: vec3<f32>, n: vec3<f32>, weights: vec3<f32>) -> vec4<f32> {
     let side = select(vec3(1.0), vec3(-1.0), n < vec3(0.0));
+    // The three planes through one material_image_at call (the driver inlines each call site)
+    let points = array<vec2<f32>, 3>(vec2(-p.z * side.x, -p.y), vec2(p.x, p.z * side.y), vec2(p.x * side.z, -p.y));
     var result = vec4(0.0);
-    if weights.x > 0.0 { result += weights.x * material_image_at(image, placed_image_coord(frame, vec2(-p.z * side.x, -p.y))); }
-    if weights.y > 0.0 { result += weights.y * material_image_at(image, placed_image_coord(frame, vec2(p.x, p.z * side.y))); }
-    if weights.z > 0.0 { result += weights.z * material_image_at(image, placed_image_coord(frame, vec2(p.x * side.z, -p.y))); }
+    for (var plane = 0u; plane < 3u; plane++) {
+        if weights[plane] > 0.0 { result += weights[plane] * material_image_at(image, placed_image_coord(frame, points[plane])); }
+    }
     return result;
 }
 
@@ -193,11 +209,18 @@ fn authored_image_triplanar(layer: Operation, surface: Surface, with_alpha: bool
         else { weights = smoothstep(vec3(edge), vec3(1.0), share); }
         weights /= max(weights.x + weights.y + weights.z, 1e-12);
     }
-    let sample = triplanar_sample(image, frame, p, n, weights);
+    // The image, then a graph's matte, through one triplanar_sample call
+    let matte = with_alpha && is_graph_image(layer.ids.w) && layer.procedural.y > 0u;
+    var sample = vec4(0.0);
     var alpha = 1.0;
-    if with_alpha {
-        if layer.ids.w < 8u { alpha = sample.a; }
-        else if layer.procedural.y > 0u { alpha = triplanar_sample(layer.procedural.y - 1u, frame, p, n, weights).r; }
+    for (var read = 0u; read < select(1u, 2u, matte); read++) {
+        let sampled = triplanar_sample(select(image, layer.procedural.y - 1u, read == 1u), frame, p, n, weights);
+        if read == 0u {
+            sample = sampled;
+            if with_alpha && !is_graph_image(layer.ids.w) { alpha = sampled.a; }
+        } else {
+            alpha = sampled.r;
+        }
     }
     return vec4(decode_image_sample(layer, sample.rgb), clamp(alpha, 0.0, 1.0));
 }
@@ -250,21 +273,31 @@ fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> ve
     if layer.ids.z == MISSING_IMAGE {
         return vec3(0.5);
     }
-    return decode_image_sample(layer, image_projection(layer, uv, surface).rgb);
+    let sampled = image_projection(layer, uv, surface);
+    if layer.ids.w == P1_ALPHA_KIND {
+        return vec3(sampled.a);
+    }
+
+    return decode_image_sample(layer, sampled.rgb);
 }
 
 fn authored_image_content(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> {
     if layer.ids.z == MISSING_IMAGE {
         return vec4(vec3(0.5), 1.0);
     }
-    let sampled = image_projection(layer, uv, surface);
-    var alpha = sampled.a;
-    if layer.ids.w >= 8u {
-        alpha = select(1.0, sampled.a, layer.procedural.x == 2u);
-        if layer.procedural.y > 0u {
-            var matte = layer;
-            matte.ids.z = layer.procedural.y - 1u;
-            alpha = image_projection(matte, uv, surface).r;
+    // The image, then a graph's matte, through one image_projection call
+    let matte = is_graph_image(layer.ids.w) && layer.procedural.y > 0u;
+    var sampled = vec4(0.0);
+    var alpha = 1.0;
+    for (var read = 0u; read < select(1u, 2u, matte); read++) {
+        var source = layer;
+        if read == 1u { source.ids.z = layer.procedural.y - 1u; }
+        let projected = image_projection(source, uv, surface);
+        if read == 0u {
+            sampled = projected;
+            alpha = select(projected.a, select(1.0, projected.a, layer.procedural.x == 2u), is_graph_image(layer.ids.w));
+        } else {
+            alpha = projected.r;
         }
     }
     alpha = select(0.0, clamp(alpha, 0.0, 1.0), abs(alpha) <= 3.402823466e38);
@@ -275,12 +308,18 @@ fn authored_image_placed(layer: Operation, uv: vec2<f32>, repeat: vec2<bool>) ->
     if layer.ids.z == MISSING_IMAGE {
         return vec4(vec3(0.5), 1.0);
     }
-    let sampled = material_image_at_with_repeat(layer.ids.z, uv, repeat);
-    var alpha = sampled.a;
-    if layer.ids.w >= 8u {
-        alpha = 1.0;
-        if layer.procedural.y > 0u {
-            alpha = material_image_at_with_repeat(layer.procedural.y - 1u, uv, repeat).r;
+    // The image, then a graph's matte, through one material_image_at_with_repeat call
+    let matte = is_graph_image(layer.ids.w) && layer.procedural.y > 0u;
+    var sampled = vec4(0.0);
+    var alpha = 1.0;
+    for (var read = 0u; read < select(1u, 2u, matte); read++) {
+        let image = select(layer.ids.z, layer.procedural.y - 1u, read == 1u);
+        let read_sample = material_image_at_with_repeat(image, uv, repeat);
+        if read == 0u {
+            sampled = read_sample;
+            alpha = select(read_sample.a, 1.0, is_graph_image(layer.ids.w));
+        } else {
+            alpha = read_sample.r;
         }
     }
     alpha = select(0.0, clamp(alpha, 0.0, 1.0), abs(alpha) <= 3.402823466e38);
@@ -295,7 +334,7 @@ fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f
     }
     let alpha_image = srgb[frame + 11u];
     var gain = decal.z;
-    if layer.ids.y == IMAGE_SOURCE_OPCODE && layer.ids.w >= 8u && layer.procedural.y > 0u {
+    if layer.ids.y == IMAGE_SOURCE_OPCODE && is_graph_image(layer.ids.w) && layer.procedural.y > 0u {
         gain *= clamp(material_image_at(layer.procedural.y - 1u, decal.xy).r, 0.0, 1.0);
     }
     let sample_uv = select(decal.xy, uv, layer.ids.y == 15u);

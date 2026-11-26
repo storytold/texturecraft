@@ -487,14 +487,15 @@ pub fn native_filter(f: &FilterEffect) -> Option<(Filter, String)> {
             (Filter::Invert, "built-in invert")
         }
         "clamp" => (Filter::Clamp { min: tweak(p, "min").unwrap_or(0.0), max: tweak(p, "max").unwrap_or(1.0) }, "built-in clamp"),
-        "blur" | "Blur" | "fx_blur" => {
-            (Filter::Blur { radius: tweak(p, "intensity").unwrap_or(10.0) * 0.004 * 2048.0 }, "built-in blur (size converted by a first-guess factor)")
-        }
+        "blur" | "Blur" | "fx_blur" => (
+            Filter::Blur { radius: tweak(p, "intensity").unwrap_or(10.0) * 0.004 * 2048.0, wrap: false },
+            "built-in blur (size converted by a first-guess factor)",
+        ),
         "sharpen" => (Filter::Sharpen { amount: tweak(p, "intensity").unwrap_or(1.0) }, "built-in sharpen"),
         "hsl_perceptive" => {
             let centred = |id: &str, k: f32| tweak(p, id).map_or(0.0, |v| (v - 0.5) * k);
             (
-                Filter::Hsl { hue: centred("hue", 1.0), saturation: centred("saturation", 2.0), lightness: centred("luminosity", 2.0) },
+                Filter::Hsl { hue: centred("hue", 1.0), saturation: centred("saturation", 2.0), lightness: centred("luminosity", 2.0), perceptive: false },
                 "built-in HSL (perceptive mode left out)",
             )
         }

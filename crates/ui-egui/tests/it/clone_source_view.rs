@@ -15,7 +15,10 @@ const MARKER_STROKE: f32 = 1.2;
 
 fn clone_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.layout = ViewLayout::Only2D;
     execute(&mut harness.state_mut().session, "tool.clone", &serde_json::Value::Null).unwrap();
     harness.run_steps(4);

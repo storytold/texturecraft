@@ -12,13 +12,16 @@ use texturecraft_ui_egui::file_dialogs::{Answer, Request};
 
 use super::temp_dir::TempDir;
 
-const TITLE: &str = "Import resources";
+const TITLE: &str = "Import Resources";
 /// The prefix field's tooltip, which is its accessible label.
 const PREFIX_HINT: &str = "Put in front of the resource's name. Characters other than letters, digits and _ . - become _";
 
 fn app() -> Harness<'static, TextureCraftApp> {
     let session = Session::new_project("Test", texturecraft_engine::geom::primitives::cube(1.0), "builtin:cube", None, 128).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
 
@@ -131,14 +134,48 @@ fn the_usage_defaults_to_undefined_and_the_choice_reaches_the_import() {
     add(&mut h, &[png(&dir, "plain.png"), png(&dir, "brush.png"), png(&dir, "sky.png")]);
     assert_eq!(combos(&h, "undefined").count(), 3);
 
+    click(&mut h, "brush.png");
     choose_usage(&mut h, 1, "alpha");
+
+    h.get_by_label("plain.png").click_modifiers(egui::Modifiers::SHIFT);
+    h.run_steps(3);
+    assert_eq!(h.state().ui.windows.import_resources.as_ref().unwrap().selected.len(), 2);
+
     choose_usage(&mut h, 1, "environment");
+
+    assert_eq!(combos(&h, "undefined").count(), 1, "editing an unselected row keeps the selected images' usages");
+
     click(&mut h, "Import");
 
     assert_eq!(resources(&h), ["brush.png", "plain.png", "sky.png"]);
     let project = &h.state().session.doc.project;
     assert_eq!(project.display.environment_resource(), Some("sky.png"), "the environment usage lights the scene");
     assert_eq!(h.state().session.tool.brush.alpha_image.as_deref(), Some("brush.png"), "the alpha usage sets the brush alpha");
+}
+
+#[test]
+fn choosing_a_usage_updates_the_selected_images() {
+    let dir = TempDir::new("import-resources-multi-usage");
+    let mut h = app();
+    invoke(&mut h);
+    add(&mut h, &[png(&dir, "one.png"), png(&dir, "two.png"), dir.join("material.TCMAT"), dir.join("coat.MTLX"), png(&dir, "three.png")]);
+    choose_usage(&mut h, 1, "alpha");
+
+    click(&mut h, "one.png");
+    h.get_by_label("coat.MTLX").click_modifiers(egui::Modifiers::SHIFT);
+    h.run_steps(3);
+    combos(&h, "All files (5)").next().expect("the filter dropdown").click();
+    h.run_steps(3);
+    h.get_by_label("undefined (4)").click();
+    h.run_steps(3);
+
+    assert_eq!(h.state().ui.windows.import_resources.as_ref().unwrap().selected.len(), 4);
+    assert!(h.query_by_label("two.png").is_none(), "the selected image with a different usage is filtered out");
+
+    choose_usage(&mut h, 0, "texture");
+
+    let rows = &h.state().ui.windows.import_resources.as_ref().unwrap().rows;
+    assert_eq!(rows.iter().map(|row| row.usage.name()).collect::<Vec<_>>(), ["texture", "texture", "undefined", "undefined", "undefined"]);
 }
 
 #[test]
@@ -209,6 +246,33 @@ fn the_engine_command_still_imports_a_path_with_an_optional_prefix() {
 }
 
 #[test]
+fn a_materialx_document_imports_as_a_layer() {
+    let dir = TempDir::new("import-resources-materialx");
+    let file = dir.join("paint.MTLX");
+    std::fs::write(
+        &file,
+        r#"<?xml version="1.0"?>
+<materialx version="1.39">
+  <open_pbr_surface name="S" type="surfaceshader">
+    <input name="base_color" type="color3" value="0.8, 0.2, 0.1" />
+  </open_pbr_surface>
+  <surfacematerial name="Paint" type="material"><input name="surfaceshader" type="surfaceshader" nodename="S" /></surfacematerial>
+</materialx>"#,
+    )
+    .unwrap();
+    let mut h = app();
+    let layers = h.state().session.doc.project.layers.len();
+    invoke(&mut h);
+    add(&mut h, &[file]);
+
+    click(&mut h, "Import");
+
+    assert!(!is_open(&h), "the document was imported");
+    assert!(h.state().session.doc.project.layers.len() > layers, "the material became a layer");
+    assert!(resources(&h).is_empty(), "the document itself is not an image resource");
+}
+
+#[test]
 fn only_failed_rows_remain_after_a_partial_import() {
     let dir = TempDir::new("import-resources-retry");
     let good = png(&dir, "good.png");
@@ -258,7 +322,12 @@ fn import_resources_snapshot() {
     let output_dir = PathBuf::from(std::env::var_os("TC_UI_SNAPSHOTS").expect("set TC_UI_SNAPSHOTS"));
     let dir = TempDir::new("import-resources-snapshot");
     let session = Session::new_project("Resources", texturecraft_engine::geom::primitives::cube(1.0), "builtin:cube", None, 128).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
 
     invoke(&mut h);

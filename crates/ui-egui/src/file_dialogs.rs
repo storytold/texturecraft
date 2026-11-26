@@ -6,7 +6,6 @@
 
 use std::panic::Location;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 pub use craft_dialogs::{Answer, FileDialog, Override, Request};
 
@@ -57,7 +56,7 @@ impl FileDialogs {
     /// The dialogs of the app whose context is `ctx`: an answer wakes its event loop.
     pub fn new(ctx: egui::Context) -> FileDialogs {
         FileDialogs {
-            dialogs: craft_dialogs::Dialogs::new(Arc::new(move || ctx.request_repaint())),
+            dialogs: craft_dialogs::Dialogs::new(craft_dialogs::Wake::new(move || ctx.request_repaint())),
             asked: Vec::new(),
             headless: false,
             shown_folders: Vec::new(),
@@ -162,6 +161,7 @@ impl TextureCraftApp {
 
             let paths = match answer {
                 Answer::Paths(paths) => paths,
+                Answer::Saved { path, .. } => vec![path],
                 Answer::Unavailable(why) => {
                     self.toast(trf("The file dialog couldn't be shown: {error}", &[("error", &why)]), true);
                     Vec::new()

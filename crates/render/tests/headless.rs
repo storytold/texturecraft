@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use texturecraft_compose::{DisplayKind, ImageRes};
 use texturecraft_geom::glam::Vec3;
 use texturecraft_geom::{OrbitCamera, primitives};
@@ -46,9 +49,29 @@ impl Img {
 /// The id `setup` uploads the material ball under
 const MESH_ID: u64 = 1;
 
+/// Holds this test thread's turn until the thread ends, after the test dropped its device: the
+/// NVIDIA driver can deadlock when one test destroys its device while another records commands
+/// on its own. A thread that runs several tests (one test thread) keeps its turn.
+fn take_turn() {
+    static TURN: Mutex<()> = Mutex::new(());
+    thread_local! {
+        static HELD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
+    }
+    HELD.with(|held| {
+        if held.borrow().is_none() {
+            *held.borrow_mut() = Some(TURN.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+    });
+}
+
 /// A headless renderer with the material ball framed in a 480×360 view (None without a GPU).
 fn setup() -> Option<(Headless, Frame)> {
-    let Ok(mut h) = Headless::new() else {
+    setup_with(Headless::new)
+}
+
+fn setup_with(headless: impl FnOnce() -> Result<Headless, String>) -> Option<(Headless, Frame)> {
+    take_turn();
+    let Ok(mut h) = headless() else {
         eprintln!("skipping: no GPU adapter");
         return None;
     };
@@ -595,7 +618,8 @@ fn bake_visualization_draws_the_high_poly_and_the_cage() {
 
 #[test]
 fn oversized_bake_high_poly_leaves_the_view_renderable() {
-    let Some((mut headless, frame)) = setup() else { return };
+    // The WebGPU default buffer limit (256 MiB) keeps the oversized mesh small enough to build
+    let Some((mut headless, frame)) = setup_with(|| Headless::with_limits(|_| texturecraft_render::wgpu::Limits::default())) else { return };
 
     let high = primitives::sphere(0.5, 16, 8);
     headless.renderer.set_bake_high(&headless.device, &headless.queue, Some(&high), 1).unwrap();
@@ -762,16 +786,20 @@ fn warmth(img: &Img) -> f32 {
 fn imported_hdr_environment_lights_the_ball() {
     let Some((mut h, frame)) = setup() else { return };
     let base = render(&mut h, &frame, "env_default");
-    // A procedural HDR: a hot orange sky over a dim blue ground (values far above 1).
+
+    // A procedural HDR: a hot orange sky over a dim blue ground (values far above 1)
     let (w, hh) = (256u32, 128u32);
     let rgba = (0..w * hh).map(|i| if i / w < hh / 2 { [12.0, 4.0, 1.0, 1.0] } else { [0.02, 0.05, 0.2, 1.0] }).collect();
-    let sky = ImageRes { width: w, height: hh, rgba, srgb: false };
+    let sky = ImageRes::new(w, hh, rgba, false);
     h.renderer.set_environment(&h.device, &h.queue, "resource:sky.hdr", Some(&sky));
     let lit = render(&mut h, &frame, "env_hdr_resource");
+
     assert_ne!(lit.px, base.px, "the imported environment changes the lighting");
     assert!(warmth(&lit) > warmth(&base) + 10.0, "the orange sky tints the ball");
     assert!(lit.mean(200, 100, 280, 180) > 20.0, "lit, finite shading (NaNs would render black)");
+
     h.renderer.set_environment(&h.device, &h.queue, "Studio Soft", None);
+
     assert_eq!(render(&mut h, &frame, "env_default_again").px, base.px, "built-ins come back");
 }
 
@@ -1109,6 +1137,58 @@ fn subsurface_blur_spreads_only_scattering_light() {
     assert!((m1 - m0).abs() < 2.0, "the blur moves light, it adds none: {m0} -> {m1}");
 }
 
+#[test]
+fn the_hover_tint_covers_the_blurred_scattering_light_too() {
+    let Some((mut h, frame)) = setup() else { return };
+
+    // Read coverage in the flat base-color view so lighting cannot hide a set at its edge
+    let base_color_view = shaded(&frame, |shade| shade.view_mode = 1);
+    let hovered_set_mask = mesh_mask(&mut h, &base_color_view, &[0]);
+    let neighbour_mask = mesh_mask(&mut h, &base_color_view, &[1]);
+    let lit = shaded(&frame, |s| s.light = LIGHT);
+    fill(&mut h, &[0, 1], DisplayKind::BaseColor, &[150, 150, 150, 255]);
+    fill(&mut h, &[0, 1], DisplayKind::Emissive, &[0, 0, 0, 255]);
+
+    let blur = shaded(&lit, |s| s.sss_blur = Some([0.06, 0.024, 0.015]));
+    let hover = |frame: &Frame| shaded(frame, |s| s.set_hover = Some(texturecraft_render::SetHighlight { set: 0, color: [1.0, 0.5, 0.0] }));
+    let mean = |img: &Img| region_mean(&hovered_set_mask, |x, y| img.luma(x, y));
+    let plain = mean(&render(&mut h, &lit, "hover_sss_plain"));
+    let blurred = mean(&render(&mut h, &blur, "hover_sss_blur"));
+    let hovered_blur = mean(&render(&mut h, &hover(&blur), "hover_sss_blur_hovered"));
+    let hovered_plain = mean(&render(&mut h, &hover(&lit), "hover_sss_plain_hovered"));
+
+    assert!(hovered_plain != plain, "the hover tint changes the set");
+
+    // Hover must dim the light restored by the blur along with the rest of the material
+    assert!(
+        ((hovered_blur - hovered_plain) - (blurred - plain)).abs() < 1.0,
+        "the blur changes the plain set by {} and the hovered set by {}",
+        blurred - plain,
+        hovered_blur - hovered_plain
+    );
+
+    // Use a wide blur so scattering light crosses the boundary between the two sets
+    let wide = shaded(&lit, |s| s.sss_blur = Some([0.2, 0.08, 0.05]));
+    let blurred_img = render(&mut h, &wide, "hover_sss_wide");
+    let hovered_blur_img = render(&mut h, &hover(&wide), "hover_sss_wide_hovered");
+
+    // Skip pixels that legitimately include samples of the hovered set after MSAA resolve
+    let width = blurred_img.w;
+    let mut checked = 0;
+    let mut worst_delta = 0.0f32;
+    for (index, &neighbour) in neighbour_mask.iter().enumerate() {
+        if neighbour && !hovered_set_mask[index] {
+            let (x, y) = (index as u32 % width, index as u32 / width);
+            let delta = (hovered_blur_img.luma(x, y) - blurred_img.luma(x, y)).abs();
+            checked += 1;
+            worst_delta = worst_delta.max(delta);
+        }
+    }
+
+    assert!(checked > 0, "the neighbour has pixels with no coverage from the hovered set");
+    assert!(worst_delta <= 1.0, "hovering set 0 changes the neighbouring set by up to {worst_delta} luma across {checked} pixels");
+}
+
 /// An environment that is bright only around `dir` (world space, rotation 0).
 fn spot_environment(dir: texturecraft_geom::glam::Vec3) -> ImageRes {
     let (w, hh) = (256u32, 128u32);
@@ -1118,7 +1198,7 @@ fn spot_environment(dir: texturecraft_geom::glam::Vec3) -> ImageRes {
             if d.dot(dir) > 0.5 { [6.0, 6.0, 6.0, 1.0] } else { [0.02, 0.02, 0.02, 1.0] }
         })
         .collect();
-    ImageRes { width: w, height: hh, rgba, srgb: false }
+    ImageRes::new(w, hh, rgba, false)
 }
 
 #[test]

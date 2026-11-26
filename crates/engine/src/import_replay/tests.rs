@@ -543,7 +543,7 @@ fn path_strokes_and_ribbons_paint_into_their_target() {
 /// An image source 16 × 16 (grey, linear): `value(x, y)` per pixel.
 fn image_source(value: impl Fn(u32, u32) -> f32) -> ReplaySource {
     let rgba = (0..256u32).map(|i| [value(i % 16, i / 16); 3]).map(|v| [v[0], v[1], v[2], 1.0]).collect();
-    let image = texturecraft_compose::ImageRes { width: 16, height: 16, rgba, srgb: false };
+    let image = texturecraft_compose::ImageRes::new(16, 16, rgba, false);
     ReplaySource::Texels(Arc::new(ReplayTexels::Image(Arc::new(image))))
 }
 

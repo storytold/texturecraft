@@ -1,6 +1,6 @@
 //! The editing session: document, mesh, per-texture-set caches, history, tool state.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -36,6 +36,8 @@ pub struct Document {
     pub graphs: texturecraft_compose::GraphStore,
     /// Stroke records behind imported pixels, by the id that keys the pixels (saved with the project).
     pub strokes: BTreeMap<texturecraft_core::LayerId, texturecraft_core::StoredStrokes>,
+    /// High-definition meshes and cage for baking (saved inside the project)
+    pub bake_meshes: crate::BakeMeshes,
 }
 
 /// A released dab keeps priority until its display upload is sent.
@@ -375,6 +377,9 @@ pub struct ToolState {
     pub material: Option<String>,
     /// Gray painted into masks.
     pub mask_value: f32,
+    /// Image resource whose gray is painted into masks in place of `mask_value`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_image: Option<String>,
     pub fill_mode: FillMode,
     /// How a polygon fill box decides which polygons it selects
     #[serde(default)]
@@ -449,6 +454,7 @@ impl Default for ToolState {
             enabled: [Channel::BaseColor, Channel::Metallic, Channel::Roughness, Channel::Height, Channel::Normal].into_iter().collect(),
             material: None,
             mask_value: 1.0,
+            mask_image: None,
             fill_mode: FillMode::Triangle,
             fill_hit_test: Default::default(),
             fill_visible_only: default_fill_visible_only(),
@@ -467,7 +473,7 @@ impl Default for ToolState {
 }
 
 /// What is selected in the layer stack.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum StackTarget {
     #[default]
     Content,
@@ -484,13 +490,13 @@ pub(crate) struct DisplayStrokeEnd {
     pub previous_revision: u64,
     pub revision: u64,
     pub tiles: BTreeSet<(u32, u32)>,
+    /// The other texture sets the stroke fed: set, revision before and revision after.
+    pub fed: Vec<(usize, u64, u64)>,
 }
 
 pub(crate) struct ActiveStroke {
     pub display_id: u64,
     pub display_tiles: BTreeSet<(u32, u32)>,
-    /// Gray used for the most recently queued display of a mask stroke.
-    pub displayed_mask_value: f32,
     pub ts: usize,
     /// None: the stroke edits the quick mask.
     pub target: Option<PaintTarget>,
@@ -507,6 +513,8 @@ pub(crate) struct ActiveStroke {
     pub camera: OrbitCamera,
     pub viewport: Vec2,
     pub values: BTreeMap<Channel, [f32; 3]>,
+    /// What a mask stroke paints, resolved once so staging, preview and commit read one image
+    pub mask_gray: texturecraft_compose::MaskGray,
     pub erase: bool,
     /// Projection tool: the stencil captured with the stroke's camera.
     pub stencil: Option<texturecraft_compose::Stencil>,
@@ -575,9 +583,7 @@ pub struct Session {
     pub(crate) source: Arc<Mesh>,
     pub bvh: Arc<Bvh>,
     /// Original mesh file (saved inside the project); None for built-in meshes.
-    pub mesh_source: Option<(String, Vec<u8>)>,
-    /// High-definition meshes and cage for baking (saved inside the project).
-    pub bake_meshes: crate::BakeMeshes,
+    pub mesh_source: Option<(String, Arc<Vec<u8>>)>,
     pub caches: Vec<SetCache>,
     pub(crate) undo: Vec<(String, Document)>,
     pub(crate) redo: Vec<(String, Document)>,
@@ -610,8 +616,12 @@ pub struct Session {
     pub(crate) display_stroke_end: Option<DisplayStrokeEnd>,
     /// Layer clipboard: a document snapshot and the copied layer (or effect).
     pub clipboard: Option<(Document, LayerId)>,
+    /// Channel blending copied from an effect (see [`crate::effect_blending_cmds`])
+    pub blending_clipboard: Option<crate::effect_blending_cmds::CopiedBlending>,
     /// Decoded image resources (rebuilt from `doc.resources` by `Session::sync_images`).
     pub images: texturecraft_compose::ImageStore,
+    /// Resource names whose decoded pixels match a library alpha.
+    pub(crate) library_alphas: BTreeSet<String>,
     /// Temporary texel mask limiting paint strokes (not saved, not in the history).
     pub quick_mask: crate::quick_mask::QuickMask,
     /// A path sublayer is being repainted from its paths (the only way to paint into one).
@@ -628,6 +638,9 @@ pub struct Session {
     /// (see [`crate::commands::check_enabled`]).
     pub project_open: bool,
     pub modified: bool,
+    /// Edits to saved data, independent of viewport and tool changes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) save_revision: u64,
     /// Bumps on every document change.
     pub revision: u64,
     /// Messages for the UI (status bar / toasts).
@@ -636,6 +649,8 @@ pub struct Session {
     pub log_id: u64,
     /// Reuses the visible geometry and camera depth across 3D strokes.
     pub(crate) stroke_visibility: Option<crate::painting::StrokeVisibility>,
+    /// Projection fill depth maps shared by this session's tile batches.
+    projector_depth_cache: texturecraft_compose::ProjectorDepthCache,
     /// The polygon fill box being dragged
     pub(crate) polygon_fill_drag: Option<crate::polygon_fill_drag::PolygonFillDrag>,
     /// The user's export presets (kept when another project opens).
@@ -658,6 +673,7 @@ impl Session {
 
         let source = Arc::new(mesh);
         let mesh = tiled_mesh(&source, &doc.project);
+
         let bvh = Bvh::new(&mesh);
         let mut camera = OrbitCamera { yaw: 0.6, pitch: 0.25, ..OrbitCamera::default() };
         let (bounds_min, bounds_max) = mesh.bounds();
@@ -684,8 +700,7 @@ impl Session {
             source,
             mesh,
             bvh: Arc::new(bvh),
-            mesh_source,
-            bake_meshes: Default::default(),
+            mesh_source: mesh_source.map(|(extension, bytes)| (extension, Arc::new(bytes))),
             caches,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -707,7 +722,9 @@ impl Session {
             stroke: None,
             display_stroke_end: None,
             clipboard: None,
+            blending_clipboard: None,
             images: Default::default(),
+            library_alphas: BTreeSet::new(),
             quick_mask: Default::default(),
             painting_paths: false,
             path_cache: None,
@@ -716,10 +733,13 @@ impl Session {
             path: None,
             project_open: true,
             modified: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            save_revision: 0,
             revision: 1,
             log: crate::log::SessionLog::new(),
             log_id: next_mesh_id(),
             stroke_visibility: None,
+            projector_depth_cache: Default::default(),
             polygon_fill_drag: None,
             export_presets: Default::default(),
             brush_presets: Default::default(),
@@ -745,6 +765,10 @@ impl Session {
     pub fn switch_to(&mut self, mut next: Session) {
         // Invalidate caches even when both projects were loaded with the same revision
         next.revision = self.revision.wrapping_add(1);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            next.save_revision = self.save_revision.wrapping_add(1);
+        }
 
         next.viewport = self.viewport;
         next.export_presets = std::mem::take(&mut self.export_presets);
@@ -765,8 +789,7 @@ impl Session {
         Session::new_project_tiled(name, mesh, mesh_ref, mesh_source, resolution, None)
     }
 
-    /// [`Session::new_project`] choosing the UV tile (UDIM) mode: `Some(true)` for every
-    /// set, `Some(false)` for none, `None` for the sets whose UVs leave tile 1001.
+    /// [`Session::new_project`] choosing the UV tile (UDIM) mode: `Some(true)` every set, `Some(false)` none, `None` the sets whose UVs leave tile 1001
     pub fn new_project_tiled(
         name: &str,
         mesh: Mesh,
@@ -789,8 +812,10 @@ impl Session {
             ts.stack.push(id);
             project.texture_sets.push(ts);
         }
+
         let mut s = Session::new(
             Document {
+                bake_meshes: Default::default(),
                 bake_paint: BTreeMap::new(),
                 project,
                 pixels: PixelStore::default(),
@@ -803,6 +828,7 @@ impl Session {
             mesh,
             mesh_source,
         )?;
+
         s.log.append(log);
         Ok(s)
     }
@@ -918,8 +944,7 @@ impl Session {
             self.path_steps = Default::default();
         }
 
-        self.modified = true;
-        self.revision = self.revision.wrapping_add(1);
+        self.mark_modified();
         if !(merge && self.undo.last().is_some_and(|(l, _)| l == label)) {
             self.undo.push((label.to_string(), before));
         }
@@ -930,8 +955,7 @@ impl Session {
 
     /// A change from `other` to the current document that is not an undo step (a path preview)
     pub(crate) fn changed_without_history(&mut self, other: &Document) {
-        self.modified = true;
-        self.revision = self.revision.wrapping_add(1);
+        self.mark_modified();
         self.invalidate_changed(other);
     }
 
@@ -950,16 +974,38 @@ impl Session {
             self.path_cache = None;
         }
 
+        // Cached path pixels were painted with the mask images their paths name
+        let resource_changed = |name: &str| match (previous_document.resources.get(name), self.doc.resources.get(name)) {
+            (Some(previous), Some(current)) => !Arc::ptr_eq(previous, current),
+            (previous, current) => previous.is_some() != current.is_some(),
+        };
+        if self.path_cache.as_ref().is_some_and(|cache| cache.images().any(resource_changed)) {
+            self.path_cache = None;
+        }
+
         // Removed or replaced resources may change any set's rendered content
         let removed_or_replaced_resource =
             previous_document.resources.iter().any(|(name, previous)| !self.doc.resources.get(name).is_some_and(|current| Arc::ptr_eq(previous, current)));
-        let added_resource_names: BTreeSet<_> = self.doc.resources.keys().filter(|name| !previous_document.resources.contains_key(*name)).collect();
-        let uses_added_resource = |texture_set_index: usize| {
-            use texturecraft_core::{EffectKind, Fill, GraphInput, Source};
+        if removed_or_replaced_resource {
+            // a set whose new caches were prepared from this document is already right
+            for (texture_set_index, cache) in self.caches.iter_mut().enumerate() {
+                if Some(texture_set_index) != prepared_set {
+                    cache.invalidate_all();
+                }
+            }
 
-            let uses_source = |source: &Source| source.images().into_iter().any(|name| added_resource_names.iter().any(|added| added.as_str() == name));
-            let uses_fill =
-                |fill: &Fill| fill.sources.values().any(uses_source) || fill.link.as_ref().is_some_and(|link| added_resource_names.contains(&link.package));
+            return;
+        }
+
+        let added_resource_names: BTreeSet<&str> =
+            self.doc.resources.keys().filter(|name| !previous_document.resources.contains_key(*name)).map(String::as_str).collect();
+        let is_added = |name: &str| added_resource_names.contains(name);
+        let added_environment = self.doc.project.display.environment_resource().is_some_and(is_added);
+        let uses_added_resource = |texture_set_index: usize| {
+            use texturecraft_core::{EffectKind, Fill, Filter, GraphInput};
+
+            let uses_link = |fill: &Fill| fill.link.as_ref().is_some_and(|link| is_added(&link.package));
+            let uses_fill = |fill: &Fill| fill.sources.values().any(|source| source.images().into_iter().any(is_added)) || uses_link(fill);
             let project = &self.doc.project;
             !added_resource_names.is_empty()
                 && project.texture_sets.get(texture_set_index).is_some_and(|set| {
@@ -970,12 +1016,11 @@ impl Session {
                                 .into_iter()
                                 .flat_map(|graph| graph.graphs())
                                 .flat_map(|graph| graph.inputs.values())
-                                .any(|input| matches!(input, GraphInput::Image(name) if added_resource_names.contains(name)))
-                            || layer.mask.iter().flat_map(|mask| &mask.effects).chain(&layer.content_effects).any(|effect| match &effect.kind {
-                                EffectKind::Fill { source, .. } => uses_source(source),
-                                EffectKind::Material(fill) => uses_fill(fill),
-                                EffectKind::Generator(generator) => generator.inputs.values().any(uses_source),
-                                _ => false,
+                                .any(|input| matches!(input, GraphInput::Image(name) if is_added(name)))
+                            || layer.mask.iter().flat_map(|mask| &mask.effects).chain(&layer.content_effects).any(|effect| {
+                                effect.images_read().any(is_added)
+                                    || matches!(&effect.kind, EffectKind::Material(fill) if uses_link(fill))
+                                    || (added_environment && matches!(effect.kind, EffectKind::Filter(Filter::EnvironmentLighting { .. })))
                             })
                     })
                 })
@@ -992,22 +1037,18 @@ impl Session {
                 stack,
             )
         };
-        for texture_set_index in 0..self.caches.len() {
+        for (texture_set_index, cache) in self.caches.iter_mut().enumerate() {
             if Some(texture_set_index) == prepared_set {
                 continue;
             }
-            let before = stack_key(previous_document, texture_set_index);
-            let after = stack_key(&self.doc, texture_set_index);
-            let resource_changed = removed_or_replaced_resource || uses_added_resource(texture_set_index);
-            let Some(cache) = self.caches.get_mut(texture_set_index) else {
-                continue;
-            };
 
-            if resource_changed {
+            if uses_added_resource(texture_set_index) {
                 cache.invalidate_all();
                 continue;
             }
 
+            let before = stack_key(previous_document, texture_set_index);
+            let after = stack_key(&self.doc, texture_set_index);
             if before == after {
                 continue;
             }
@@ -1035,9 +1076,11 @@ impl Session {
         if changed.is_empty() && before.texture_sets.len() == self.doc.project.texture_sets.len() {
             return;
         }
+
         self.mesh = mesh.unwrap_or_else(|| tiled_mesh(&self.source, &self.doc.project));
         self.mesh_id = next_mesh_id();
         self.stroke_visibility = None;
+        self.projector_depth_cache = Default::default();
         for ts in changed {
             if Some(ts) == prepared_set {
                 continue;
@@ -1051,11 +1094,20 @@ impl Session {
 
     /// Mark the document changed and every texture set dirty.
     pub fn touched(&mut self) {
-        self.modified = true;
-        self.revision = self.revision.wrapping_add(1);
+        self.mark_modified();
         self.sync_caches();
         for c in &mut self.caches {
             c.invalidate_all();
+        }
+    }
+
+    /// Mark saved data changed without invalidating the texture sets.
+    pub fn mark_modified(&mut self) {
+        self.modified = true;
+        self.revision = self.revision.wrapping_add(1);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.save_revision = self.save_revision.wrapping_add(1);
         }
     }
 
@@ -1171,11 +1223,10 @@ impl Session {
     fn after_history(&mut self, other: &Document) {
         // Pending operations may still hold layer IDs from the discarded snapshot
         self.doc.project.next_id = self.doc.project.next_id.max(other.project.next_id);
-        self.modified = true;
+        self.mark_modified();
 
         // Layers picked together belong to the stack they were picked in
         self.multi.clear();
-        self.revision = self.revision.wrapping_add(1);
         self.invalidate_changed(other);
 
         // An undone add or duplicate takes the selected effect away
@@ -1358,7 +1409,7 @@ impl Session {
                 opacity: stroke.stroke.settings.opacity,
                 erase: stroke.erase,
                 values: stroke.values.clone(),
-                mask_value: self.tool.mask_value,
+                mask_gray: stroke.mask_gray.clone(),
                 stencil: stroke.stencil.clone(),
                 carried_mask: stroke.canvas.pickup.as_ref().and_then(|pickup| pickup.mask_values()).cloned(),
                 carried: stroke.canvas.pickup.as_ref().map(|pickup| pickup.values.clone()).unwrap_or_default(),
@@ -1370,6 +1421,7 @@ impl Session {
             self.set_solo(None);
         }
         let solo_view = if self.pending_tiles() > 0 { self.solo_view() } else { None };
+        let mut mesh_bounds = None;
         let mut changed = false;
         for &ts in order {
             // room for this set's caches before it composites
@@ -1437,12 +1489,19 @@ impl Session {
                     preview,
                     images: &self.images,
                     graphs: &self.doc.graphs,
-                    bounds: self.mesh.bounds(),
+                    bounds: *mesh_bounds.get_or_insert_with(|| self.mesh.bounds()),
                 };
 
                 // Look ahead so sliced updates filter a run of tiles once
                 cache.below.ahead = if budget_ms.is_finite() { tiles_ahead(&cache.dirty, &tiles) } else { Vec::new() };
-                texturecraft_compose::composite_tiles_cached(&inputs, &mut cache.composite, &tiles, Some(&mut cache.below));
+                texturecraft_compose::composite_tiles_with_projectors(
+                    &inputs,
+                    &self.mesh,
+                    &mut self.projector_depth_cache,
+                    &mut cache.composite,
+                    &tiles,
+                    Some(&mut cache.below),
+                );
 
                 // The composited tiles and the neighbours their padding reached change
                 let padded = cache.dilation.apply_to_tiles(&mut cache.composite, &tiles);
@@ -1512,8 +1571,9 @@ impl Session {
                     c.material_revision = c.material_revision.wrapping_add(1);
                 }
                 c.queue_painted(&self.doc.project, i, target, &tiles, |c| if settle { &mut c.settle } else { &mut c.dirty });
-            } else if settle {
-                // Resampled instances first see the stroke when its source pixels are committed.
+            } else if settle || changed_document {
+                // Resampled instances first see paint when its source pixels are committed (a
+                // settled stroke, or a document edit such as a path repaint)
                 c.invalidate_all();
             }
         }
@@ -1549,10 +1609,11 @@ impl Session {
         })
     }
 
-    /// Grayscale RGBA8 of layer `id`'s mask at `size²` for the mask view (None without a mask).
-    pub fn mask_view_rgba(&self, id: LayerId, size: u32) -> Option<Vec<u8>> {
+    /// Grayscale RGBA8 of layer `id`'s mask at `extent` (width, height) for the mask view (None
+    /// without a mask).
+    pub fn mask_view_rgba(&self, id: LayerId, extent: (u32, u32)) -> Option<Vec<u8>> {
         let (ts, _, _) = self.doc.project.locate(id)?;
-        let gray = self.with_inputs(ts, |inp| texturecraft_compose::mask_image(inp, id, size))?;
+        let gray = self.with_inputs(ts, |inp| texturecraft_compose::mask_image_sized(inp, id, extent))?;
         Some(gray.iter().flat_map(|g| [*g, *g, *g, 255]).collect())
     }
 
@@ -1599,10 +1660,17 @@ impl Session {
 
     /// Histogram (`bins` buckets over 0..1) of the values entering effect `effect`: its layer's
     /// mask, or for a content effect the layer's `channel` (None for an unknown effect).
-    pub fn effect_histogram(&self, effect: LayerId, channel: Channel, bins: usize) -> Option<Vec<u32>> {
+    pub fn effect_histogram(&self, effect: LayerId, channel: Channel, bins: usize) -> Option<texturecraft_compose::EffectHistogram> {
         let (owner, _) = self.doc.project.effect(effect)?;
         let (ts, _, _) = self.doc.project.locate(owner)?;
         self.with_inputs(ts, |inp| texturecraft_compose::effect_histogram(inp, effect, channel, bins))
+    }
+
+    /// Histograms (`bins` buckets over 0..1) of what the two sides of compare mask `effect` read, left then right (None for an unknown effect or one that is no compare mask)
+    pub fn compare_histograms(&self, effect: LayerId, bins: usize) -> Option<[Vec<u32>; 2]> {
+        let (owner, _) = self.doc.project.effect(effect)?;
+        let (ts, _, _) = self.doc.project.locate(owner)?;
+        self.with_inputs(ts, |inp| texturecraft_compose::compare_histograms(inp, effect, bins))
     }
 
     pub fn baked(&self, ts: usize) -> Option<&BakedMaps> {
@@ -1653,7 +1721,7 @@ pub const COOK_BUDGET: usize = 512 << 20;
 /// The most a budgeted update spends on settling tiles (what they show is already right).
 pub const SETTLE_BUDGET_MS: f64 = 6.0;
 
-/// Take up to `n` dirty tiles, block by block (16 × 16 tiles) so neighbourhood filters
+/// Take up to `max_tiles` dirty tiles, block by block (16 × 16 tiles) so neighbourhood filters
 /// evaluate compact regions.
 fn next_chunk(dirty: &mut BTreeSet<(u32, u32)>, max_tiles: usize) -> Vec<(u32, u32)> {
     // A zero-sized request cannot select a pivot
@@ -1665,17 +1733,26 @@ fn next_chunk(dirty: &mut BTreeSet<(u32, u32)>, max_tiles: usize) -> Vec<(u32, u
         return std::mem::take(dirty).into_iter().collect();
     }
 
-    let mut tiles: Vec<(u32, u32)> = dirty.iter().copied().collect();
-
-    // Partition by block order so only the requested chunk needs sorting
-    tiles.select_nth_unstable_by_key(max_tiles - 1, |&(x, y)| (y / texturecraft_compose::BLOCK, x / texturecraft_compose::BLOCK, y, x));
-    tiles.truncate(max_tiles);
-    tiles.sort_by_key(|&(x, y)| (y / texturecraft_compose::BLOCK, x / texturecraft_compose::BLOCK, y, x));
-    for tile in &tiles {
-        dirty.remove(tile);
+    // Keep only the earliest block-ordered tiles in this chunk
+    let block_order = |(x, y)| (y / texturecraft_compose::BLOCK, x / texturecraft_compose::BLOCK, y, x);
+    let mut keys = dirty.iter().copied().map(block_order);
+    let mut selected: BinaryHeap<_> = keys.by_ref().take(max_tiles).collect();
+    for key in keys {
+        if let Some(mut latest) = selected.peek_mut()
+            && key < *latest
+        {
+            *latest = key;
+        }
     }
 
-    tiles
+    selected
+        .into_sorted_vec()
+        .into_iter()
+        .map(|(_, _, y, x)| {
+            dirty.remove(&(x, y));
+            (x, y)
+        })
+        .collect()
 }
 
 /// Dirty tiles a neighbourhood filter runs over ahead of the chunk being composited.

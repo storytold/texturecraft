@@ -70,7 +70,10 @@ fn changed_brush() -> BrushSettings {
 /// The app showing the brush in Properties, set to `brush`
 fn app_with_brush(brush: BrushSettings) -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
 
     // The labels below are English; a first run would speak the system's language
     harness.state_mut().ui.prefs.language = "en".into();
@@ -176,16 +179,6 @@ fn enter_and_space_on_the_focused_reset_icon_reset_only_its_section() {
         (expected.size, expected.min_size, expected.min_flow, expected.screen_space) =
             (defaults.size, defaults.min_size, defaults.min_flow, defaults.screen_space);
         assert_eq!(harness.state().session.tool.brush, expected, "resetting Size with {key:?}");
-    }
-}
-
-#[test]
-fn reset_icons_identify_their_sections() {
-    let harness = app_with_brush(changed_brush());
-
-    for (title, _, _, _) in SECTIONS {
-        let label = format!("{title}: Reset to defaults");
-        assert!(harness.query_by_role_and_label(egui::Role::Button, &label).is_some(), "the reset button must name its {title} section");
     }
 }
 

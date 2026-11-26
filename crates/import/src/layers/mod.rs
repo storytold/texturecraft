@@ -17,7 +17,7 @@ pub mod projection;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use texturecraft_core::{Channel, Effect, EffectKind, Fidelity, Layer, LayerId, LayerKind, LayerReport, Lock, SafetyFlag, SafetyFlagKind};
+use texturecraft_core::{Channel, ContentsOffset, Effect, EffectKind, Fidelity, Layer, LayerId, LayerKind, LayerReport, Lock, SafetyFlag, SafetyFlagKind};
 use texturecraft_import_reader::blockers::Blocker;
 use texturecraft_import_reader::model::{LayerKind as ProjectLayerKind, MeshMapRef, ProjectEffect, ProjectLayer, ProjectTextureSet, UnhandledSetting};
 
@@ -313,7 +313,7 @@ impl<'a> Builder<'a> {
                 }
                 layer.content_effects = folder_fx.0;
                 let kids: Vec<LayerId> = children.iter().map(|c| self.layer(c, &inner)).collect();
-                layer.kind = LayerKind::Group { children: kids, collapsed: false };
+                layer.kind = LayerKind::Group { children: kids, collapsed: false, contents: ContentsOffset::NONE, randomized: Vec::new() };
             }
             kind => {
                 let mut mapped = content::ContentMapper::new(self.input, self.anchors, &mut self.ids).map(l, id, &path);

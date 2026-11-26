@@ -24,7 +24,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select camera",
             [],
             None,
-            "{index? | name?} (neither, or name \"Default camera\": the default camera framing the mesh)",
+            "{index? | name?} (an omitted or null index and an omitted, null, or \"Default camera\" name frame the mesh)",
             always,
             select
         ),
@@ -226,24 +226,29 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
-fn select(s: &mut Session, p: &Value) -> Result<Value> {
-    if u64p(p, "index").is_none() && strp(p, "name").is_none_or(|n| n == DEFAULT_CAMERA) {
-        // The default camera: fov and projection from the display settings, framing the mesh
-        s.selected_camera_name = None;
-        s.camera.fov = s.doc.project.display.fov;
-        s.camera.ortho = false;
-        return crate::execute(s, "viewport.frame", &Value::Null);
+fn select(session: &mut Session, params: &Value) -> Result<Value> {
+    if !params.is_object() && !params.is_null() {
+        return Err(bad("camera.select", "expected a parameter object or null"));
     }
 
-    let i = which(s, "camera.select", p)?;
-    if let Some(camera) = s.doc.project.cameras.get(i) {
-        // A saved view is clamped against the whole mesh, not against a part framed with F
-        s.camera.scene_radius = s.mesh.radius();
-        apply(&mut s.camera, camera);
-        s.selected_camera_name = Some(camera.name.clone());
+    let default_name = params.get("name").is_none_or(|name| name.is_null() || name.as_str() == Some(DEFAULT_CAMERA));
+    if params.get("index").is_none_or(Value::is_null) && default_name {
+        session.selected_camera_name = None;
+        session.camera.fov = session.doc.project.display.fov;
+        session.camera.ortho = false;
+        return crate::execute(session, "viewport.frame", &Value::Null);
     }
-    s.revision = s.revision.wrapping_add(1);
-    Ok(crate::view_cmds::camera_json(s))
+
+    let camera_index = which(session, "camera.select", params)?;
+    if let Some(camera) = session.doc.project.cameras.get(camera_index) {
+        // Use the whole mesh radius even after framing a texture set
+        session.camera.scene_radius = session.mesh.radius();
+        apply(&mut session.camera, camera);
+        session.selected_camera_name = Some(camera.name.clone());
+    }
+
+    session.revision = session.revision.wrapping_add(1);
+    Ok(crate::view_cmds::camera_json(session))
 }
 
 /// The fixed views: name, yaw and pitch in degrees. Yaw 0 puts the eye on +Z (the front), yaw 90
@@ -451,6 +456,49 @@ mod tests {
         assert!(execute(&mut s, "camera.rename", &json!({"index": 0})).is_err(), "`to` is required");
         execute(&mut s, "edit.undo", &Value::Null).unwrap();
         assert_eq!(s.doc.project.cameras.len(), 2, "removing is undoable");
+    }
+
+    #[test]
+    fn malformed_camera_selectors_leave_the_current_view_intact() {
+        let mut session = session();
+        execute(&mut session, "camera.set", &json!({"yaw": 30, "target": [1, 2, 3], "fov": 25, "ortho": true})).unwrap();
+        let saved_view = session.camera;
+        execute(&mut session, "camera.add", &json!({"name": "Side"})).unwrap();
+        execute(&mut session, "camera.orbit", &json!({"dx": 15})).unwrap();
+
+        execute(&mut session, "camera.select", &json!({"index": 0, "name": DEFAULT_CAMERA})).unwrap();
+
+        assert_eq!(session.camera, saved_view);
+        assert_eq!(session.selected_camera_name.as_deref(), Some("Side"));
+
+        let revision = session.revision;
+        for params in [
+            json!({"index": -1}),
+            json!({"index": -0.5}),
+            json!({"index": "0"}),
+            json!({"name": false}),
+            json!({"index": -1, "name": DEFAULT_CAMERA}),
+            json!([{"index": 0}]),
+            json!("Side"),
+        ] {
+            let result = execute(&mut session, "camera.select", &params);
+
+            assert!(matches!(result, Err(crate::EngineError::BadParams { .. })), "{params}: {result:?}");
+            assert_eq!(session.camera, saved_view);
+            assert_eq!(session.selected_camera_name.as_deref(), Some("Side"));
+            assert_eq!(session.revision, revision);
+        }
+
+        for params in [Value::Null, json!({"index": null, "name": null}), json!({"name": DEFAULT_CAMERA})] {
+            execute(&mut session, "camera.select", &json!({"index": null, "name": "Side"})).unwrap();
+            assert_eq!(session.camera, saved_view);
+
+            execute(&mut session, "camera.select", &params).unwrap();
+
+            assert_eq!(session.selected_camera_name, None);
+            assert!(!session.camera.ortho);
+            assert_eq!(session.camera.fov, session.doc.project.display.fov);
+        }
     }
 
     #[test]

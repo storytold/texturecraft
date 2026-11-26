@@ -87,7 +87,7 @@ impl Layer {
         if let Some(m) = &mut l.mask {
             m.enabled = true;
         }
-        if let LayerKind::Group { children, collapsed } = &mut l.kind {
+        if let LayerKind::Group { children, collapsed, .. } = &mut l.kind {
             children.clear();
             *collapsed = false;
         }
@@ -99,7 +99,7 @@ impl Layer {
 mod tests {
     use super::*;
     use crate::layer::{GeometryMask, LayerId, Mask, MaskBackground};
-    use crate::{BlendMode, Channel};
+    use crate::{BlendMode, Channel, ContentsOffset};
 
     #[test]
     fn summary_names_source_and_reasons_and_keys_are_distinct() {
@@ -139,7 +139,9 @@ mod tests {
         let mut c = a.clone();
         c.mask = Some(Mask::new(MaskBackground::Black));
         assert_ne!(a.content_view(), c.content_view(), "the mask is content");
-        let g = |children| Layer::new(LayerId(2), "g", LayerKind::Group { children, collapsed: false }, &[]);
+        let g = |children| {
+            Layer::new(LayerId(2), "g", LayerKind::Group { children, collapsed: false, contents: ContentsOffset::NONE, randomized: Vec::new() }, &[])
+        };
         assert_eq!(g(vec![LayerId(3)]).content_view(), g(Vec::new()).content_view(), "a folder's children are arranged, not edited");
     }
 

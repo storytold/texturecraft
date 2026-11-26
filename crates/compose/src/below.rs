@@ -7,14 +7,16 @@
 //! identical to a full evaluation.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::Arc;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Weak};
 
 use texturecraft_core::project::MAX_DEPTH;
-use texturecraft_core::{BakedMap, Channel, CompositeRules, EffectKind, GraphInput, Layer, LayerId, LayerKind, Project, Source, TextureSet};
+use texturecraft_core::{BakedMap, Channel, CompositeRules, EffectKind, Filter, GraphInput, Layer, LayerId, LayerKind, Project, Source, TextureSet};
+use texturecraft_geom::Mesh;
 use texturecraft_texel::TileImage;
 
-use crate::eval::{Inputs, PaintTarget};
-use crate::field_cache::FieldCache;
+use crate::eval::{Inputs, PaintTarget, lights_material};
+use crate::field_cache::SetFieldCache;
 use crate::held_fields::HeldFields;
 use crate::image_identity::ImageIdentity;
 use crate::store::{BakedMaps, ImageStore, PixelStore};
@@ -26,6 +28,8 @@ pub const BELOW_BUDGET: usize = 256 << 20;
 /// See the module docs. One per texture set.
 #[derive(Debug)]
 pub struct BelowCache {
+    mesh: Weak<Mesh>,
+    borrowed_mesh_key: Option<u64>,
     hot: Option<LayerId>,
     key: Option<StackKey>,
     /// Tiles with the stamp of their last use.
@@ -44,8 +48,8 @@ pub struct BelowCache {
     /// pass). A pass larger than the cache records only what fits.
     pub pass: usize,
     /// Whole-set fields of graph filters reading the stack, kept across composites (see
-    /// [`FieldCache`]). Not emptied with the tiles: they do not depend on the hot layer.
-    pub fields: FieldCache,
+    /// [`SetFieldCache`]). Not emptied with the tiles: they do not depend on the hot layer.
+    pub fields: SetFieldCache,
     /// Tiles the caller composites next in this pass, after those of the coming composite (empty: none, or a pass that is one
     /// composite). A stack with neighbourhood filters then filters the coming tiles and these at once and keeps the result for
     /// the composites that follow, instead of filtering each small chunk's surroundings again.
@@ -56,6 +60,8 @@ pub struct BelowCache {
 impl Default for BelowCache {
     fn default() -> Self {
         BelowCache {
+            mesh: Weak::new(),
+            borrowed_mesh_key: None,
             hot: None,
             key: None,
             tiles: HashMap::new(),
@@ -65,7 +71,7 @@ impl Default for BelowCache {
             budget: BELOW_BUDGET,
             levels: 1,
             pass: 0,
-            fields: FieldCache::default(),
+            fields: SetFieldCache::default(),
             ahead: Vec::new(),
             held: None,
         }
@@ -104,6 +110,8 @@ pub struct StackKey {
     pixels: Vec<(LayerId, Option<Channel>, Shared)>,
     baked: (u32, Vec<(BakedMap, usize)>),
     images: Vec<(String, ImageIdentity)>,
+    /// The viewport environment, its rotation (bits) and its image when it is an imported one, where Baked Lighting Environment lights with them
+    environment: Option<(String, u32, Option<ImageIdentity>)>,
 }
 
 impl StackKey {
@@ -148,35 +156,45 @@ impl StackKey {
 
         // Compare only referenced image origins. Looking up an origin does not decode its pixels.
         let mut image_identities = BTreeMap::new();
-        let mut image_reference = |name: &str| {
+        let mut record_image_name = |name: &str| {
             if let Some((name, origin)) = images.origin(name) {
                 image_identities.entry(name).or_insert_with(|| ImageIdentity::new(origin));
             }
         };
         for layer in render_tree.iter().filter_map(|id| project.layers.get(id)) {
-            let mut source_reference = |source: &Source| {
-                source.images().into_iter().for_each(&mut image_reference);
-            };
             if let LayerKind::Fill(fill) = &layer.kind {
-                fill.sources.values().for_each(&mut source_reference);
+                fill.sources.values().flat_map(Source::images).for_each(&mut record_image_name);
             }
             for effect in layer.mask.iter().flat_map(|mask| &mask.effects).chain(&layer.content_effects) {
+                // A filter's image inputs, also one its mode leaves unread: that only empties the cache more often
+                effect.inputs.values().flat_map(Source::images).for_each(&mut record_image_name);
                 match &effect.kind {
-                    EffectKind::Fill { source, .. } => source_reference(source),
-                    EffectKind::Material(fill) => fill.sources.values().for_each(&mut source_reference),
-                    EffectKind::Generator(generator) => generator.inputs.values().for_each(&mut source_reference),
+                    EffectKind::Fill { source, .. } => source.images().into_iter().for_each(&mut record_image_name),
+                    EffectKind::Material(fill) => fill.sources.values().flat_map(Source::images).for_each(&mut record_image_name),
+                    EffectKind::Generator(generator) => generator.sources().flat_map(Source::images).for_each(&mut record_image_name),
+                    EffectKind::ColorSelection(selection) => selection.id_map.iter().for_each(|name| record_image_name(name)),
                     _ => {}
                 }
             }
             for graph in layer.graphs().into_iter().flat_map(|graph| graph.graphs()) {
                 for input in graph.inputs.values() {
                     if let GraphInput::Image(name) = input {
-                        image_reference(name);
+                        record_image_name(name);
                     }
                 }
             }
         }
         let image_identities = image_identities.into_iter().map(|(name, identity)| (name.clone(), identity)).collect();
+
+        let lit = render_tree
+            .iter()
+            .filter_map(|id| project.layers.get(id))
+            .flat_map(|layer| layer.content_effects.iter())
+            .any(|effect| matches!(effect.kind, EffectKind::Filter(Filter::EnvironmentLighting { .. })));
+        let environment = lit.then(|| {
+            let image = project.display.environment_resource().and_then(|name| images.origin(name)).map(|(_, origin)| ImageIdentity::new(origin));
+            (project.display.environment.clone(), project.display.env_rotation.to_bits(), image)
+        });
 
         Some(StackKey {
             set,
@@ -186,6 +204,7 @@ impl StackKey {
             pixels: pixel_handles,
             baked: (baked.resolution, baked.maps.iter().map(|(map, data)| (*map, Arc::as_ptr(data) as usize)).collect()),
             images: image_identities,
+            environment,
         })
     }
 }
@@ -206,12 +225,15 @@ impl StackKey {
             || self.layers != other.layers
             || self.baked != other.baked
             || self.images != other.images
+            || self.environment != other.environment
         {
             return None;
         }
+
         if self.pixels.len() != other.pixels.len() {
             return None;
         }
+
         let size = self.set.size();
         let mut changed = BTreeMap::new();
         for ((left_id, left_channel, left_image), (right_id, right_channel, right_image)) in self.pixels.iter().zip(&other.pixels) {
@@ -225,6 +247,7 @@ impl StackKey {
             if !same_shape {
                 return None;
             }
+
             if left_image.same_tiles(right_image) {
                 continue;
             }
@@ -294,6 +317,52 @@ fn render_view(l: &Layer) -> Layer {
 }
 
 impl BelowCache {
+    pub(crate) fn bind_mesh(&mut self, mesh: &Arc<Mesh>) {
+        if !std::ptr::eq(self.mesh.as_ptr(), mesh.as_ref()) {
+            self.clear();
+
+            // Whole-set fields are keyed by the stack only, so another mesh drops them too
+            self.fields.clear();
+            self.borrowed_mesh_key = None;
+            self.mesh = Arc::downgrade(mesh);
+        }
+    }
+
+    pub(crate) fn bind_borrowed_mesh(&mut self, mesh: &Mesh) {
+        if std::ptr::eq(self.mesh.as_ptr(), mesh) {
+            return;
+        }
+
+        // A borrow alone cannot distinguish in-place edits or reuse of the same address
+        let mut key = DefaultHasher::new();
+        for attribute in [&mesh.positions, &mesh.normals] {
+            attribute.len().hash(&mut key);
+            for value in attribute {
+                value.to_array().map(f32::to_bits).hash(&mut key);
+            }
+        }
+        mesh.tangents.len().hash(&mut key);
+        for value in &mesh.tangents {
+            value.to_array().map(f32::to_bits).hash(&mut key);
+        }
+        mesh.uvs.len().hash(&mut key);
+        for value in &mesh.uvs {
+            value.to_array().map(f32::to_bits).hash(&mut key);
+        }
+        mesh.indices.hash(&mut key);
+        for part in &mesh.submeshes {
+            (&part.name, part.start, part.count, part.material).hash(&mut key);
+        }
+
+        let key = key.finish();
+        if self.borrowed_mesh_key != Some(key) {
+            self.clear();
+            self.fields.clear();
+            self.mesh = Weak::new();
+            self.borrowed_mesh_key = Some(key);
+        }
+    }
+
     /// Cache the stack around `hot` from now on (a different layer empties the cache).
     pub fn set_hot(&mut self, hot: Option<LayerId>) {
         if self.hot != hot {
@@ -408,13 +477,21 @@ impl BelowCache {
         }
         let set = project.texture_set(inp.ts).ok()?;
 
-        // Anchor readers and effect layers depend on the stack below them
-        let reads_below = |layer: &Layer| layer.reads_anchor() || Channel::ALL.iter().any(|channel| crate::eval::starts_from_below(layer, *channel));
+        // Stack readers, effect layers and lighting or validation effects read the stack below them
+        let reads_below = |layer: &Layer| {
+            layer.reads_stack()
+                || Channel::ALL.iter().any(|channel| crate::eval::starts_from_below(layer, *channel))
+                || layer.content_effects.iter().any(|effect| effect.visible && lights_material(&effect.kind))
+        };
         if project
             .render_tree(&set.stack)
             .iter()
             .any(|id| project.layers.get(id).is_some_and(reads_below) || project.content_layer(*id).is_some_and(reads_below))
         {
+            if self.key.is_some() {
+                self.clear();
+            }
+
             return None;
         }
 

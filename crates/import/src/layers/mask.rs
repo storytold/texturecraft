@@ -11,7 +11,7 @@
 //! flat (approximated unless they pass through or blend normally at full strength). A group of nothing but polygon fills with its
 //! own blending is one paint effect of their picks.
 
-use texturecraft_core::{BakedMap, BlendMode, Effect, EffectKind, Mask, MaskBackground, Source};
+use texturecraft_core::{BakedMap, BlendMode, ColorSelection, Effect, EffectKind, Mask, MaskBackground, Sampling, Source};
 use texturecraft_import_reader::blockers::{Blocker, BlockerKey, BlockerKind};
 use texturecraft_import_reader::model::{
     BitmapSource, ColorSelectionEffect, EffectGroup, EffectHeader, FillEffect, MaskInitial, MeshMapRef, PaintTool, PolygonFillEffect, ProjectEffect,
@@ -425,7 +425,9 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
             }
         };
         let colors = c.colors.iter().map(|v| v.map(|x| if x.is_finite() { x } else { 0.0 })).collect();
-        self.push(Some(&c.header), EffectKind::ColorSelection { colors, tolerance, map }, on);
+        let mut selection = ColorSelection::new(colors, tolerance);
+        selection.map = map;
+        self.push(Some(&c.header), EffectKind::ColorSelection(selection), on);
     }
 
     /// A fill, by its (first) source.
@@ -442,7 +444,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
                 if projection::shapes_coverage(fill) {
                     self.note(counts, &mapped.status);
                 }
-                self.push(Some(&fill.header), EffectKind::Fill { source: Source::Uniform([v; 3]), projection }, on);
+                self.push(Some(&fill.header), EffectKind::Fill { source: Source::Uniform([v; 3]), projection, sampling: Sampling::SAVED_BEFORE }, on);
             }
             ProjectSource::Bitmap(b) => self.bitmap(fill, b, counts, on, mapped),
             ProjectSource::Procedural(p) => {
@@ -462,7 +464,7 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
             ProjectSource::Reference(r) => match reference(self.anchors, r, texturecraft_core::Channel::Height) {
                 Ok(Some((source, status))) => {
                     self.note(counts, &status);
-                    self.push(Some(&fill.header), EffectKind::Fill { source, projection }, on);
+                    self.push(Some(&fill.header), EffectKind::Fill { source, projection, sampling: Sampling::SAVED_BEFORE }, on);
                 }
                 Ok(None) => {}
                 Err(why) => self.placeholder(Some(&fill.header), "reference to an anchor", "what the anchor holds is not computed", on, why),
@@ -479,7 +481,11 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
         let url = match mesh_map_alias(&b.url, self.input.mesh_maps) {
             MeshMapAlias::Unassigned(name) => {
                 self.note(counts, &Status::approximated(format!("mask bitmap of the empty mesh map slot \"{name}\" read as black")));
-                self.push(Some(&fill.header), EffectKind::Fill { source: Source::Uniform([0.0; 3]), projection: mapped.projection }, on);
+                self.push(
+                    Some(&fill.header),
+                    EffectKind::Fill { source: Source::Uniform([0.0; 3]), projection: mapped.projection, sampling: Sampling::SAVED_BEFORE },
+                    on,
+                );
                 return;
             }
             MeshMapAlias::Assigned(url) => {
@@ -495,7 +501,11 @@ impl<'a, 'i> MaskBuilder<'a, 'i> {
         };
         self.note(counts, &mapped.status);
         match self.input.images.load(url) {
-            Ok(loaded) => self.push(Some(&fill.header), EffectKind::Fill { source: Source::image(loaded.name), projection: mapped.projection }, on),
+            Ok(loaded) => self.push(
+                Some(&fill.header),
+                EffectKind::Fill { source: Source::image(loaded.name), projection: mapped.projection, sampling: Sampling::SAVED_BEFORE },
+                on,
+            ),
             Err(why) => {
                 let why = Status::not_computable(Blocker::feature("unreadable-bitmap", why));
                 self.placeholder(Some(&fill.header), "bitmap", "the bitmap could not be read", on, why);

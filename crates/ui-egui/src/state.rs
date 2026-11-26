@@ -121,6 +121,9 @@ pub struct Windows {
     /// Window ▸ Reset UI is waiting for its answer.
     #[serde(skip)]
     pub confirm_reset_ui: bool,
+    /// The generator effect whose preview is open enlarged in its own window
+    #[serde(skip)]
+    pub generator_preview: Option<u64>,
 }
 
 /// An action that replaces or ends the project, held while the project has unsaved changes.
@@ -146,6 +149,8 @@ pub struct Prefs {
     pub ui_scale: f32,
     /// Minutes between autosaves of a modified project (0: off; desktop).
     pub autosave_minutes: u32,
+    /// Maximum recent projects retained (0 disables the history, capped at 100).
+    pub recent_projects_limit: u16,
     /// UI language code (`i18n::LANGUAGES`), or `i18n::SYSTEM_LANGUAGE` to follow the system.
     pub language: String,
     /// Viewport texture resolution: 0 full, 1 half, 2 quarter of each texture set's size (lighter
@@ -169,7 +174,8 @@ pub struct Prefs {
     pub reserved_cores: u32,
     /// Maximum decompressed project size accepted on open, in GiB (at least one).
     pub project_open_limit_gib: u32,
-    /// Percent of the free RAM a project save may hold at once (desktop; 1 to 100).
+    /// Percentage of free RAM available to a project save on desktop (0 to 100).
+    /// A stored zero uses the minimum budget of 1%.
     pub save_ram_percent: u8,
     /// Worker threads for painting, baking and export (desktop; 0: one per logical CPU). Read at
     /// startup, before the first parallel job.
@@ -189,6 +195,21 @@ pub struct Prefs {
     /// The plain background of the 3D and 2D views at Environment Opacity 0 (Settings > General >
     /// Background color): the color at the top and at the bottom, linear RGB.
     pub background: [[f32; 3]; 2],
+    /// The 3D view draws the X, Y and Z axes in its corner.
+    pub show_world_axes: bool,
+    /// Settings > General > Show keyboard helper. Stored only: TextureCraft has no keyboard helper yet.
+    pub show_keyboard_helper: bool,
+    /// Settings > General > Only display the selected material when painting. Stored only: the
+    /// views always show every texture set.
+    pub only_selected_material_when_painting: bool,
+    /// Settings > Baking options > Save preprocessed scene files. Stored only: bakes keep no
+    /// preprocessed scene files.
+    pub save_preprocessed_scene_files: bool,
+    /// Settings > Baking options > Enable live preview baking process.
+    pub live_preview_baking: bool,
+    /// Settings > Preview options > Local cache directory (desktop). Empty or relative uses the
+    /// app's default cache directory. Stored only until TextureCraft has a preview cache.
+    pub local_cache_directory: String,
     /// Percent of the machine's RAM graph renders running at once may take (imports, composites, exports; 1 to
     /// 100): a render waits while the others leave no room for its estimated peak.
     pub render_ram_percent: u8,
@@ -204,7 +225,8 @@ impl Default for Prefs {
         Prefs {
             ui_scale: 1.0,
             autosave_minutes: 10,
-            language: "en".into(),
+            recent_projects_limit: 10,
+            language: crate::i18n::SYSTEM_LANGUAGE.into(),
             viewport_texture: 0,
             gpu_compositing: true,
             material_start_preview: true,
@@ -224,6 +246,12 @@ impl Default for Prefs {
             gpu_raytracing: true,
             libraries: Vec::new(),
             background: texturecraft_render::DEFAULT_BACKGROUND,
+            show_world_axes: true,
+            show_keyboard_helper: true,
+            only_selected_material_when_painting: false,
+            save_preprocessed_scene_files: true,
+            live_preview_baking: true,
+            local_cache_directory: String::new(),
             render_ram_percent: texturecraft_engine::compose::graphs::budget::DEFAULT_PERCENT,
         }
     }
@@ -306,6 +334,9 @@ pub struct NewProject {
     /// Import settings > Import cameras: keep the cameras stored in the mesh file
     #[serde(default = "import_cameras_default")]
     pub import_cameras: bool,
+    /// Import settings > Rebuild mesh UVs.
+    #[serde(default)]
+    pub rebuild_uvs: bool,
     /// Color management as chosen in the window (the project is always created as Legacy)
     #[serde(skip)]
     pub color_management: crate::project_form::ColorManagement,
@@ -343,6 +374,7 @@ impl Default for NewProject {
             template: default_template(),
             normal_format: None,
             import_cameras: true,
+            rebuild_uvs: false,
             color_management: crate::project_form::ColorManagement::Legacy,
             baked_maps: Vec::new(),
         }
@@ -374,6 +406,14 @@ pub struct ExportUi {
     /// "" (by file format: sRGB, or linear for float files), or a colour space name.
     #[serde(default)]
     pub color_space: String,
+    /// Also write `<mesh>.usd`: the mesh and a material per texture set that reads the exported
+    /// textures (`usdAsset` of `file.exportTextures`).
+    #[serde(default)]
+    pub usd_asset: bool,
+    /// Also write an OpenPBR MaterialX (`.mtlx`) file per texture set (`materialX` of
+    /// `file.exportTextures`).
+    #[serde(default)]
+    pub materialx: bool,
     /// Texture sets excluded from export.
     pub skip: Vec<usize>,
     /// Per texture set (by index) overrides of the settings above.
@@ -400,6 +440,17 @@ pub struct ExportUi {
     /// Output templates tab: the saved template `draft_maps` counts from.
     #[serde(skip)]
     pub draft_base: Option<texturecraft_engine::formats::ExportPreset>,
+    /// Output templates tab: for each map of `draft`, whether its R, G and B show as separate
+    /// channel swatches (R+G+B) instead of one RGB swatch.
+    #[serde(skip)]
+    pub draft_split: Vec<bool>,
+    /// LIST OF EXPORTS: the console's width, set by dragging the strip at its left edge.
+    #[serde(skip, default = "default_console_width")]
+    pub console_width: f32,
+    /// Output templates tab: a map dropped on an output channel, waiting for the source channel
+    /// ("Which part of <map>?").
+    #[serde(skip)]
+    pub pending_drop: Option<crate::export_templates::PendingDrop>,
     /// Output templates tab: the new name while renaming the selected preset.
     #[serde(skip)]
     pub renaming: Option<String>,
@@ -435,6 +486,8 @@ impl Default for ExportUi {
             size: 0,
             normal_format: String::new(),
             color_space: String::new(),
+            usd_asset: false,
+            materialx: false,
             skip: Vec::new(),
             sets: Default::default(),
             owner: Vec::new(),
@@ -444,6 +497,9 @@ impl Default for ExportUi {
             draft: None,
             draft_maps: Vec::new(),
             draft_base: None,
+            draft_split: Vec::new(),
+            console_width: default_console_width(),
+            pending_drop: None,
             renaming: None,
             rename_key: false,
             ask: None,
@@ -453,6 +509,11 @@ impl Default for ExportUi {
             console_hidden: false,
         }
     }
+}
+
+/// The LIST OF EXPORTS console's width when the window opens, as in the reference
+fn default_console_width() -> f32 {
+    300.0
 }
 
 fn default_export_dir() -> String {
@@ -488,6 +549,11 @@ fn default_wireframe_opacity() -> f32 {
     40.0
 }
 
+/// The Layers panel's channel list starts on Material, so the Material tab's orb shows the whole material
+fn default_layer_material_view() -> bool {
+    true
+}
+
 /// Settings that start on, for saved states that predate them
 fn default_true() -> bool {
     true
@@ -519,6 +585,11 @@ pub struct UiState {
     pub(crate) inactive_mode_dock: Dock,
     #[serde(default)]
     pub(crate) dock_is_baking: bool,
+    /// Rendering's saved dock, or Painting's while Rendering is active. Older states start from Painting.
+    #[serde(default)]
+    pub(crate) inactive_render_dock: Option<Dock>,
+    #[serde(default)]
+    pub(crate) dock_is_rendering: bool,
     /// Window ▸ Toolbars ▸ Docks: the right bar of panel icons
     #[serde(default = "default_true")]
     pub toolbar_docks: bool,
@@ -541,6 +612,9 @@ pub struct UiState {
     pub uv_rotation: f32,
     /// Channel whose blending the layer rows show.
     pub layer_channel: Channel,
+    /// The Layers panel's channel list is on Material: the Material tab's orb shows the whole material, else `layer_channel` alone
+    #[serde(default = "default_layer_material_view")]
+    pub layer_material_view: bool,
     pub shelf_filter: String,
     /// The asset shelf's picked type: an index into the shelf's types, or past them for every type
     #[serde(default)]
@@ -596,6 +670,9 @@ pub struct UiState {
     /// How the 3D view shows symmetry
     #[serde(default)]
     pub symmetry: crate::symmetry::SymmetryDisplay,
+    /// The warp tool bar: the gizmo's mode and space, its size, and the steps its drags snap to
+    #[serde(default)]
+    pub warp_toolbar: crate::frame_gizmo::warp_toolbar::WarpToolbarSettings,
     /// The brush, symmetry and other tool settings of the last session, which the next one starts with
     #[serde(default)]
     pub tool_settings: texturecraft_engine::ToolSettings,
@@ -631,15 +708,34 @@ pub struct UiState {
     pub log_id: u64,
 }
 
+pub(crate) const MAX_RECENT_PROJECTS: u16 = 100;
+
 impl UiState {
+    /// Keep recent-file history bounded, including values supplied through automation or old settings.
+    pub(crate) fn trim_recent(&mut self) {
+        self.prefs.recent_projects_limit = self.prefs.recent_projects_limit.min(MAX_RECENT_PROJECTS);
+        self.recent.truncate(usize::from(self.prefs.recent_projects_limit));
+    }
+
     /// Replace an outdated or unreadable saved bake dock by the bake layout, then give the mode its dock
     pub(crate) fn sync_mode_dock(&mut self) {
+        if self.dock_is_rendering {
+            if let Some(other) = self.inactive_render_dock.as_mut() {
+                std::mem::swap(&mut self.dock, other);
+            }
+            self.dock_is_rendering = false;
+        }
         self.reset_outdated_bake_dock();
 
         let baking = self.mode == Mode::Baking;
         if baking != self.dock_is_baking {
             std::mem::swap(&mut self.dock, &mut self.inactive_mode_dock);
             self.dock_is_baking = baking;
+        }
+        if self.mode == Mode::Rendering {
+            let other = self.inactive_render_dock.get_or_insert_with(|| self.dock.clone());
+            std::mem::swap(&mut self.dock, other);
+            self.dock_is_rendering = true;
         }
     }
 
@@ -654,13 +750,20 @@ impl UiState {
         self.bake_layout_version = BAKE_LAYOUT_VERSION;
     }
 
-    /// Put the panels, tabs and floating panels of both modes back to their defaults; the view split,
+    /// Put the panels, tabs and floating panels of every mode back to their defaults; the view split,
     /// zoom, wireframes, symmetry display, mode and every setting stay as they are
     pub fn reset_panel_layout(&mut self) {
         let (painting, baking) = (Dock::default(), Dock::for_baking());
         (self.dock, self.inactive_mode_dock) = if self.dock_is_baking { (baking, painting) } else { (painting, baking) };
+        self.inactive_render_dock = self.dock_is_rendering.then(Dock::default);
         self.bake_layout_version = BAKE_LAYOUT_VERSION;
         self.rail_panel = None;
+    }
+
+    /// Reset the workspace and return the interface to the system language.
+    pub(crate) fn reset_ui(&mut self) {
+        self.adopt_layout(Self::default());
+        self.prefs.language.clear();
     }
 
     /// Take `layout`'s panels, windows and view settings, keeping this state's dialogs, settings, files and shelf query
@@ -683,6 +786,7 @@ impl UiState {
         self.nav_buttons = keep.nav_buttons;
         self.keymap = keep.keymap;
         self.tool_settings = keep.tool_settings;
+        self.warp_toolbar = keep.warp_toolbar;
         self.named_layouts = keep.named_layouts;
         self.bake_presets = keep.bake_presets;
         self.layout_dialog = None;
@@ -707,6 +811,8 @@ impl Default for UiState {
             rail_panel: None,
             inactive_mode_dock: Dock::for_baking(),
             dock_is_baking: false,
+            inactive_render_dock: None,
+            dock_is_rendering: false,
             toolbar_docks: true,
             toolbar_tools: true,
             bake_layout_version: BAKE_LAYOUT_VERSION,
@@ -718,6 +824,7 @@ impl Default for UiState {
             uv_rotation: 0.0,
             layer_channel: Channel::BaseColor,
             blend_clipboard: None,
+            layer_material_view: true,
             shelf_filter: String::new(),
             shelf_tab: 0,
             shelf_path: Vec::new(),
@@ -740,6 +847,7 @@ impl Default for UiState {
             keymap: Keymap::new(),
             bake_paint_brush: crate::bake_mode::BakePaintBrush::default(),
             symmetry: crate::symmetry::SymmetryDisplay::default(),
+            warp_toolbar: crate::frame_gizmo::warp_toolbar::WarpToolbarSettings::default(),
             tool_settings: Default::default(),
             bake_visualization: crate::bake_mode::BakeVisualizationToggles::default(),
             named_layouts: Vec::new(),
@@ -794,8 +902,12 @@ mod tests {
     }
 
     #[test]
-    fn adopting_a_layout_keeps_recent_files_export_settings_and_shortcuts() {
+    fn adopting_a_layout_keeps_recent_files_and_user_settings() {
+        use crate::frame_gizmo::warp_toolbar::{GizmoMode, GizmoSpace, WarpToolbarSettings};
+
+        let warp_toolbar = WarpToolbarSettings { mode: GizmoMode::Rotate, space: GizmoSpace::World, manipulator_size: 0.4, grid_steps: 0.5, angle_steps: 30.0 };
         let mut ui = UiState { recent: vec!["a.tcraft".into()], ..UiState::default() };
+        ui.warp_toolbar = warp_toolbar;
         ui.export.preset = "Mine".into();
         ui.keymap.insert("file.save".into(), "F5".into());
         let mut layout = UiState::default();
@@ -807,6 +919,7 @@ mod tests {
         assert_eq!(ui.recent, vec!["a.tcraft".to_string()]);
         assert_eq!(ui.export.preset, "Mine");
         assert_eq!(ui.keymap.get("file.save").map(String::as_str), Some("F5"));
+        assert_eq!(ui.warp_toolbar, warp_toolbar, "loading a layout keeps the user's warp settings");
     }
 
     #[test]

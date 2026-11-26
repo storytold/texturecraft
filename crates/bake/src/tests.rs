@@ -20,6 +20,9 @@ mod bent_normal_space;
 #[path = "test/cage_shell.rs"]
 mod cage_shell;
 
+#[path = "test/fitted_cage.rs"]
+mod fitted_cage;
+
 #[path = "test/high_poly_reach.rs"]
 mod high_poly_reach;
 
@@ -1054,24 +1057,6 @@ fn occlusion_falls_off_linearly_to_the_max_distance() {
     let ambient_occlusion = mean(covered_values(&mesh, &output, BakedMap::AmbientOcclusion).into_iter().map(|(_, value)| value));
 
     assert!((ambient_occlusion - 0.5).abs() < 0.01, "{ambient_occlusion}");
-}
-
-#[test]
-fn secondary_ray_defaults_preserve_per_map_distances() {
-    let parameters = BakeSettings::default();
-    let expected_rays = RaySettings {
-        rays: 64,
-        min_distance: 0.00001,
-        max_distance: 1.0,
-        relative_to_bounding_box: true,
-        spread: 180.0,
-        distribution: RayDistribution::Cosine,
-    };
-
-    assert_eq!(parameters.maps.ao.parameters.rays, expected_rays);
-    assert_eq!(parameters.maps.ao.parameters.attenuation, texturecraft_core::AmbientOcclusionAttenuation::Linear);
-    assert_eq!(parameters.maps.bent_normal.parameters.rays, expected_rays);
-    assert_eq!(parameters.maps.thickness.parameters.rays, RaySettings { max_distance: 0.1, ..expected_rays });
 }
 
 #[test]

@@ -60,7 +60,7 @@ fn solo(project: &Project, texture_set: usize, id: LayerId, channel: Option<Chan
     let mut cut = project.clone();
 
     // Ordinary previews need no neighbouring layers or their filter allocations
-    if !project.render_tree(&[id]).iter().any(|layer| crate::eval::reads_anchor(project, *layer)) {
+    if !project.render_tree(&[id]).iter().any(|layer| crate::eval::reads_stack(project, *layer)) {
         cut.texture_sets.get_mut(texture_set)?.stack = vec![id];
     }
 

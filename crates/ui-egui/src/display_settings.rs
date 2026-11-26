@@ -43,28 +43,34 @@ pub(crate) fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
         0 => import_hdr = environment(app, ui, &mut display),
         1 => camera(app, ui, &mut display),
         2 => post_effects(ui, &mut display),
-        3 => render_settings(ui, &mut display),
+        3 => render_settings(app, ui, &mut display),
         _ => visualization(app, ui, &mut display),
     });
 
     if display != app.session.doc.project.display {
-        if display.fov != app.session.doc.project.display.fov {
-            app.session.camera.fov = display.fov;
-            if let Some(glide) = &mut app.camera_glide {
-                glide.from.fov = display.fov;
-                glide.to.fov = display.fov;
-            }
-        }
-
-        app.session.doc.project.display = display;
-        app.session.modified = true;
-        app.session.revision = app.session.revision.wrapping_add(1);
+        apply_display(app, display);
     }
 
     if import_hdr {
         let ctx = ui.ctx().clone();
         crate::web_files::import_environment(app, &ctx);
     }
+}
+
+/// Take the panel's edited display settings: the camera's field of view follows, and the layers
+/// Baked Lighting Environment lights composite again when the environment turned or changed
+fn apply_display(app: &mut TextureCraftApp, display: DisplaySettings) {
+    if display.fov != app.session.doc.project.display.fov {
+        app.session.camera.fov = display.fov;
+        if let Some(glide) = &mut app.camera_glide {
+            glide.from.fov = display.fov;
+            glide.to.fov = display.fov;
+        }
+    }
+
+    let before = std::mem::replace(&mut app.session.doc.project.display, display);
+    texturecraft_engine::view_cmds::relight_environment(&mut app.session, &before.environment, before.env_rotation);
+    app.session.mark_modified();
 }
 
 /// A sub-heading inside a section, as the reference's "Environment" and "Shadows"
@@ -255,9 +261,19 @@ fn post_effects(ui: &mut Ui, display: &mut DisplaySettings) {
     }
 }
 
-/// Temporal anti-aliasing
-fn render_settings(ui: &mut Ui, display: &mut DisplaySettings) {
+/// Temporal anti-aliasing and the viewport texture resolution (an app setting, not the project's)
+fn render_settings(app: &mut TextureCraftApp, ui: &mut Ui, display: &mut DisplaySettings) {
     ui.checkbox(&mut display.taa, tr("Temporal anti-aliasing (refines the 3D view while it is still)"));
+    ui.horizontal(|ui| {
+        ui.label(tr("Texture resolution"));
+        for (value, label) in [(0_u8, tr("Full")), (1, tr("Half")), (2, tr("Quarter"))] {
+            ui.selectable_value(&mut app.ui.prefs.viewport_texture, value, label);
+        }
+    })
+    .response
+    .on_hover_text(tr(
+        "Size of the textures the viewport shows: lower uses less GPU memory with large texture sets. Painting and export keep full resolution.",
+    ));
 }
 
 /// The mesh wireframe and the single-channel views
@@ -287,7 +303,11 @@ mod tests {
 
     fn display_harness() -> Harness<'static, TextureCraftApp> {
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
-        let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_step_dt(0.01).build_eframe(|cc| TextureCraftApp::new(cc, session));
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1600.0, 1200.0))
+            .with_step_dt(0.01)
+            .with_context_setup(crate::framework::install_headless)
+            .build_eframe(|cc| TextureCraftApp::new(cc, session));
         harness.state_mut().ui.prefs.language = "en".into();
         harness.state_mut().ui.dock.focus(crate::docking::Panel::Display);
         harness.run_steps(4);
@@ -352,5 +372,27 @@ mod tests {
 
         let names: Vec<_> = harness.state().session.doc.project.cameras.iter().map(|camera| camera.name.as_str()).collect();
         assert_eq!(names, [edited.as_str(), "Third"]);
+    }
+
+    /// The panel's turned environment composites the layers Baked Lighting Environment lights
+    /// again, as `display.set` does: the CPU material keeps the old light otherwise
+    #[test]
+    fn a_turned_environment_on_the_panel_relights_the_layers_lit_by_it() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut harness = display_harness();
+        let app = harness.state_mut();
+        app.run("layer.add.fill", json!({})).unwrap();
+        app.run("effect.add.filter", json!({"target": "content", "filter": "bakedLightingEnvironment"})).unwrap();
+        let revisions = |app: &TextureCraftApp| app.session.caches.iter().map(|cache| cache.material_revision).collect::<Vec<_>>();
+        let before = revisions(app);
+
+        let mut display = app.session.doc.project.display.clone();
+        display.env_rotation += 40.0;
+        apply_display(app, display);
+
+        // Only the set holding the lit layer composites again
+        let (after, lit) = (revisions(app), app.session.ts());
+        let changed: Vec<usize> = before.iter().zip(&after).enumerate().filter(|(_, (before, after))| before != after).map(|(set, _)| set).collect();
+        assert_eq!(changed, [lit], "{before:?} {after:?}");
     }
 }

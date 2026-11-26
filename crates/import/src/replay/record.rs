@@ -447,7 +447,7 @@ mod tests {
     fn notes_and_brush_images_are_not_kept() {
         let mut s = step(PaintMode::Paint);
         s.notes.push("a note for the report".into());
-        let image = ImageRes { width: 1, height: 1, rgba: vec![[1.0; 4]], srgb: false };
+        let image = ImageRes::new(1, 1, vec![[1.0; 4]], false);
         s.sources.push((Channel::Metallic, ReplaySource::Texels(Arc::new(ReplayTexels::Image(Arc::new(image)))), 1.0));
         s.sources.push((Channel::Height, ReplaySource::Failed("did not render".into()), 1.0));
         let original = ReplayJob { target: ReplayTarget::Content(LayerId(1)), label: String::new(), steps: vec![s] };

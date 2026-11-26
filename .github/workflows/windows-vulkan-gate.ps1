@@ -48,6 +48,8 @@ $env:TC_CI_LAVAPIPE = '1'
 # Keep software devices from contending for all runner cores at once.
 $env:RUST_TEST_THREADS = '2'
 $env:LP_NUM_THREADS = '2'
+# LLVM's optimisation passes cost more than the tests' shaders then run
+$env:GALLIVM_PERF = 'nopt'
 
 Write-Host 'Windows CI using Mesa Lavapipe 26.3.0 with Vulkan loader 1.4.363.0'
 $summary = & (Join-Path $loaderBin 'vulkaninfo.exe') --summary
