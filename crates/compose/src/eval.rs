@@ -598,6 +598,11 @@ pub fn painted_tile_margin(project: &Project, ts: usize, target: PaintTarget) ->
                 PaintTarget::Layer(_) => layer.content_effects.as_slice(),
                 PaintTarget::Mask(_) => layer.mask.as_ref().map_or(&[][..], |mask| mask.effects.as_slice()),
             };
+            // A wrapping filter reads past the set's edges from the far side: an edit near one
+            // edge changes the opposite one, which no margin around the edit holds
+            if neighbourhood_filters(effects, resolution, None).any(|(index, _, _)| wraps(effects, index)) {
+                return None;
+            }
             max_reach = neighbourhood_filters(effects, resolution, None)
                 .map(|(_, radius, op)| filter_reach(radius, op, width.max(height), width.max(height)).1)
                 .fold(0u32, u32::saturating_add);
