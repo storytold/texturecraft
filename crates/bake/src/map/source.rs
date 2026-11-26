@@ -123,6 +123,8 @@ impl<'a> Source<'a> {
     }
 }
 
+/// The material's base colour at `uv` (bilinear, wrapping), sRGB RGBA times its factor; white
+/// where there is no texture or the UV is not finite.
 fn base_color(material: &BaseColor, uv: Vec2) -> Vec4 {
     let sampled_color = if material.texels.is_empty() || !uv.is_finite() {
         Vec4::ONE
@@ -134,11 +136,31 @@ fn base_color(material: &BaseColor, uv: Vec2) -> Vec4 {
             Vec4::new(srgb_to_linear(color(0)), srgb_to_linear(color(1)), srgb_to_linear(color(2)), color(3))
         };
         let (fx, fy) = (uv.x * width as f32 - 0.5, uv.y * height as f32 - 0.5);
-        let (x0, y0) = (fx.floor(), fy.floor());
-        let (tx, ty) = (fx - x0, fy - y0);
-        let (x, y) = (x0 as i64, y0 as i64);
-        texel(x, y).lerp(texel(x + 1, y), tx).lerp(texel(x, y + 1).lerp(texel(x + 1, y + 1), tx), ty)
+        if fx.is_finite() && fy.is_finite() {
+            let (x0, y0) = (fx.floor(), fy.floor());
+            let (tx, ty) = (fx - x0, fy - y0);
+            let (x, y) = (x0 as i64, y0 as i64);
+            let (x1, y1) = (x.saturating_add(1), y.saturating_add(1));
+            texel(x, y).lerp(texel(x1, y), tx).lerp(texel(x, y1).lerp(texel(x1, y1), tx), ty)
+        } else {
+            Vec4::ONE
+        }
     };
     let color = sampled_color * material.factor;
     Vec4::new(linear_to_srgb(color.x), linear_to_srgb(color.y), linear_to_srgb(color.z), color.w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sampling at huge but finite UVs returns a finite colour instead of overflowing.
+    #[test]
+    fn base_color_sampling_survives_huge_finite_uvs() {
+        let material = BaseColor { factor: Vec4::ONE, width: 2, height: 2, texels: vec![[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255; 4]] };
+        for uv in [Vec2::new(1.0e30, 0.5), Vec2::new(0.5, -1.0e30), Vec2::splat(f32::MAX), Vec2::splat(1.0e6)] {
+            let c = base_color(&material, uv);
+            assert!(c.is_finite(), "{uv}: {c}");
+        }
+    }
 }
