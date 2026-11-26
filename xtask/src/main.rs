@@ -174,7 +174,8 @@ fn render_ci_env() -> Result<Vec<(&'static str, String)>, String> {
         return Ok(Vec::new());
     }
     // A driver file the caller named under either variable, else lavapipe's from the system
-    let given = std::env::var("VK_DRIVER_FILES").or_else(|_| std::env::var("VK_ICD_FILENAMES")).ok().filter(|files| !files.is_empty());
+    let set = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let given = set("VK_DRIVER_FILES").or_else(|| set("VK_ICD_FILENAMES"));
     let driver =
         match given {
             Some(files) => files,
@@ -198,7 +199,8 @@ fn render_ci_env() -> Result<Vec<(&'static str, String)>, String> {
         ("LP_NUM_THREADS", "2".to_owned()),
         ("TC_CI_LAVAPIPE", "1".to_owned()),
     ];
-    Ok(defaults.into_iter().filter(|(name, _)| std::env::var_os(name).is_none()).collect())
+    // A variable the caller set wins; an empty one counts as unset
+    Ok(defaults.into_iter().filter(|(name, _)| std::env::var_os(name).is_none_or(|value| value.is_empty())).collect())
 }
 
 /// `cargo test --workspace`. The render crate's unit tests run in a few processes at once, with
