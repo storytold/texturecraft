@@ -1,4 +1,4 @@
-//! Window > Layouts: save the panel arrangement under a name and switch to it from the menu.
+//! Saved named-layout commands remain available to shortcuts and automation after their menu is removed.
 
 use egui::Role;
 use egui_kittest::Harness;
@@ -9,20 +9,32 @@ use texturecraft_ui_egui::state::Mode;
 
 fn app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_accessibility_check(false).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_accessibility_check(false)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(4);
     harness
 }
 
-/// Open Window > Layouts, click `entry`, and let the app answer
+/// Exercise the existing dialog through a bound shortcut; named layouts are no longer in the menu.
 fn layouts_menu(harness: &mut Harness<'_, TextureCraftApp>, entry: &str) {
-    harness.get_by_role_and_label(Role::Button, "Window").click();
+    let id = match entry {
+        "Save current layout as..." => "ui.layout.saveAs",
+        "Manage layouts..." => "ui.layout.manage",
+        name => {
+            let reply = invoke(harness, serde_json::json!({"id": "ui.layout.apply", "name": name}));
+            assert_eq!(reply["ok"], true);
+            harness.run_steps(3);
+            return;
+        }
+    };
+    harness.state_mut().ui.keymap.insert(id.into(), "F12".into());
+    harness.run_steps(2);
+    harness.key_press(egui::Key::F12);
     harness.run_steps(3);
-    harness.get_by_role_and_label(Role::Button, "Layouts").click();
-    harness.run_steps(3);
-    harness.get_by_role_and_label(Role::Button, entry).click();
-    harness.run_steps(3);
+    harness.state_mut().ui.keymap.remove(id);
 }
 
 /// The dialog's text field: the one nearest the window center, where dialogs open (the shelf search is another)
@@ -43,7 +55,7 @@ fn save_as(harness: &mut Harness<'_, TextureCraftApp>, name: &str) {
 }
 
 #[test]
-fn a_layout_saved_from_the_menu_comes_back_from_the_menu() {
+fn a_layout_saved_from_a_shortcut_comes_back_through_automation() {
     let mut harness = app();
     harness.state_mut().ui.dock.close(Panel::Assets);
     save_as(&mut harness, "No shelf");
@@ -51,7 +63,7 @@ fn a_layout_saved_from_the_menu_comes_back_from_the_menu() {
 
     harness.state_mut().ui.dock.focus(Panel::Assets);
     harness.state_mut().ui.uv_zoom = 4.0;
-    harness.state_mut().ui.wireframe_3d = true;
+    harness.state_mut().ui.mesh_wireframe = true;
     harness.state_mut().ui.mode = Mode::Rendering;
     harness.run_steps(2);
 
@@ -59,7 +71,7 @@ fn a_layout_saved_from_the_menu_comes_back_from_the_menu() {
 
     let ui = &harness.state().ui;
     assert!(!ui.dock.is_open(Panel::Assets), "the saved panels are back");
-    assert_eq!((ui.uv_zoom, ui.wireframe_3d, ui.mode), (4.0, true, Mode::Rendering), "zoom, wireframe and mode stay");
+    assert_eq!((ui.uv_zoom, ui.mesh_wireframe, ui.mode), (4.0, true, Mode::Rendering), "zoom, wireframe and mode stay");
 }
 
 #[test]
@@ -110,23 +122,14 @@ fn invoke(harness: &mut Harness<'_, TextureCraftApp>, params: serde_json::Value)
 }
 
 #[test]
-fn the_layout_items_are_in_the_menu_catalog_and_open_their_dialogs() {
-    use texturecraft_ui_egui::menus::CATALOG;
-    use texturecraft_ui_egui::named_layouts::LayoutDialog;
-
-    for id in ["ui.layout.saveAs", "ui.layout.manage"] {
-        assert!(CATALOG.iter().any(|item| item.id == id && item.menu == "Window" && item.sub == Some("Layouts")), "{id}");
-    }
+fn managing_layouts_requires_a_saved_layout() {
     let mut harness = app();
-    assert!(!texturecraft_ui_egui::menus::enabled(harness.state(), "ui.layout.manage"), "nothing to manage yet");
-
-    assert_eq!(invoke(&mut harness, serde_json::json!({"id": "ui.layout.saveAs"}))["ok"], true);
-    assert!(matches!(harness.state().ui.layout_dialog, Some(LayoutDialog::Save(_))));
+    let command = "ui.layout.manage";
+    assert!(!texturecraft_ui_egui::menus::enabled(harness.state(), command));
 
     harness.state_mut().ui.save_named_layout("A");
-    harness.state_mut().ui.layout_dialog = None;
-    assert_eq!(invoke(&mut harness, serde_json::json!({"id": "ui.layout.manage"}))["ok"], true);
-    assert!(matches!(harness.state().ui.layout_dialog, Some(LayoutDialog::Manage { .. })));
+
+    assert!(texturecraft_ui_egui::menus::enabled(harness.state(), command));
 }
 
 #[test]

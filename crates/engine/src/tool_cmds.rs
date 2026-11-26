@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Tool material",
             [],
             None,
-            "{channel, color?: ([r,g,b] linear or \"#rrggbb\" sRGB)|value?, enabled?, solo?: true (paint this channel only)} or {maskValue?: 0..1} or {material: id or label of a simple material (see material.list, smart: false)} — the brush paints that material's pattern (colour, metallic, roughness, height…, fixed to the surface, its size following the brush size) in the channels that are on; no layer is added, smart materials are refused (add them with material.apply)",
+            "{channel, color?: ([r,g,b] linear or \"#rrggbb\" sRGB)|value?, enabled?, solo?: true (paint this channel only)} or {maskValue?: 0..1, maskImage?: image resource | null (paint its gray into masks; null = maskValue)} or {material: id or label of a simple material (see material.list, smart: false)} — the brush paints that material's pattern (colour, metallic, roughness, height…, fixed to the surface, its size following the brush size) in the channels that are on; no layer is added, smart materials are refused (add them with material.apply)",
             always,
             material
         ),
@@ -315,6 +315,22 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
     let channel = channel_param("tool.material", p, "channel")?;
     let color = color_param("tool.material", p, "color")?;
     let value = color_param("tool.material", p, "value")?;
+
+    // Every param is checked before the tool changes, so a refused call changes nothing
+    let mask_image = match p.get("maskImage") {
+        Some(Value::Null) => Some(None),
+        Some(name) => {
+            let name = name.as_str().ok_or_else(|| bad("tool.material", "maskImage must be an image resource name or null"))?;
+
+            // The brush reads the decoded image: a resource that is not one (an environment, a linked package) is refused
+            if !s.images.contains_key(name) {
+                return Err(bad("tool.material", format!("no image resource '{name}'")));
+            }
+
+            Some(Some(name.to_owned()))
+        }
+        None => None,
+    };
     if let Some(id) = strp(p, "material") {
         let values = crate::materials::brush_values(id).ok_or_else(|| {
             bad("tool.material", format!("`{id}` is not a simple material (a brush paints plain values; add smart materials with material.apply)"))
@@ -332,35 +348,40 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
         }
         s.tool.material = Some(crate::materials::find(id).map_or_else(|| id.to_string(), |m| m.id.to_string()));
     }
-    if let Some(v) = f32p(p, "maskValue") {
-        s.tool.mask_value = v.clamp(0.0, 1.0);
+    if let Some(mask_value) = f32p(p, "maskValue") {
+        s.tool.mask_value = mask_value.clamp(0.0, 1.0);
     }
-    if let Some(c) = channel {
-        if let Some(v) = color.or(value) {
-            let v = if c == Channel::Height { v.map(|x| x.clamp(-1.0, 1.0)) } else { v.map(|x| x.clamp(0.0, 1.0)) };
-            s.tool.values.insert(c, v);
-            s.tool.enabled.insert(c);
+    if let Some(mask_image) = mask_image {
+        s.tool.mask_image = mask_image;
+    }
+    if let Some(channel) = channel {
+        if let Some(picked) = color.or(value) {
+            let picked =
+                if channel == Channel::Height { picked.map(|component| component.clamp(-1.0, 1.0)) } else { picked.map(|component| component.clamp(0.0, 1.0)) };
+            s.tool.values.insert(channel, picked);
+            s.tool.enabled.insert(channel);
             s.tool.material = None;
         }
         match boolp(p, "enabled") {
             Some(true) => {
-                s.tool.enabled.insert(c);
+                s.tool.enabled.insert(channel);
             }
             Some(false) => {
-                s.tool.enabled.remove(&c);
+                s.tool.enabled.remove(&channel);
             }
             None => {}
         }
         if boolp(p, "solo") == Some(true) {
-            s.tool.enabled = std::iter::once(c).collect();
+            s.tool.enabled = std::iter::once(channel).collect();
         }
     }
     s.revision = s.revision.wrapping_add(1);
     Ok(json!({
         "material": s.tool.material,
-        "values": s.tool.values.iter().map(|(c, v)| (c.id().to_string(), json!(v))).collect::<serde_json::Map<_, _>>(),
-        "enabled": s.tool.enabled.iter().map(|c| c.id()).collect::<Vec<_>>(),
+        "values": s.tool.values.iter().map(|(channel, value)| (channel.id().to_string(), json!(value))).collect::<serde_json::Map<_, _>>(),
+        "enabled": s.tool.enabled.iter().map(|channel| channel.id()).collect::<Vec<_>>(),
         "maskValue": s.tool.mask_value,
+        "maskImage": s.tool.mask_image,
     }))
 }
 
@@ -432,12 +453,11 @@ fn stencil(session: &mut Session, params: &Value) -> Result<Value> {
 }
 
 /// A `[a, b]` param of two finite numbers.
-fn pair(p: &Value, key: &str) -> Option<[f32; 2]> {
-    let a = p.get(key)?.as_array()?;
-    let [x, y] = a.as_slice() else { return None };
-    let x = x.as_f64()? as f32;
-    let y = y.as_f64()? as f32;
-    (x.is_finite() && y.is_finite()).then_some([x, y])
+pub(crate) fn pair(params: &Value, key: &str) -> Option<[f32; 2]> {
+    let [x, y] = params.get(key)?.as_array()?.as_slice() else { return None };
+    let pair = [x.as_f64()? as f32, y.as_f64()? as f32];
+
+    pair.iter().all(|component| component.is_finite()).then_some(pair)
 }
 
 fn clone_source(s: &mut Session, p: &Value) -> Result<Value> {

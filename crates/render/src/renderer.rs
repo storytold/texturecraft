@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use texturecraft_compose::{DisplayKind, ImageRes};
-use texturecraft_core::{Channel, DisplaySettings, Project, ToneMapping};
+use texturecraft_core::{Channel, DisplaySettings, EnvAlignment, Project, ToneMapping};
 use texturecraft_geom::glam::{Mat4, Vec3};
 use texturecraft_geom::{Mesh, OrbitCamera};
 use texturecraft_texel::TILE;
@@ -50,6 +50,20 @@ pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Prefiltered environment levels (roughness 0..1).
 pub const ENV_LEVELS: u32 = 6;
 const SHADOW_SIZE: u32 = 2048;
+
+/// The plain background behind the scene at Environment Opacity 0: the top and the bottom color (linear RGB). The default is
+/// #242425 at both ends; Settings > General > Background color sets them.
+pub const DEFAULT_BACKGROUND: [[f32; 3]; 2] = [[0.01762, 0.01762, 0.01851]; 2];
+
+/// The camera's turn about the vertical axis, in radians (the direction it looks from, whether it is constrained or free)
+pub(crate) fn camera_yaw(camera: &OrbitCamera) -> f32 {
+    let from_target = camera.eye() - camera.target;
+    from_target.x.atan2(from_target.z)
+}
+
+/// The last channel index (base color, metallic, roughness, normal, height) a lit single-channel view can show; the others stay flat
+const SOLO_LIT_LAST_CHANNEL: u32 = 4;
+
 /// Bloom pyramid levels (1/2 .. 1/32 resolution).
 const BLOOM_LEVELS: u32 = 5;
 /// Bright-pass threshold on the exposed scene value, and the glow gain at strength 1.
@@ -86,6 +100,7 @@ struct GlobalsRaw {
     refr: [f32; 4],
     highlight: [f32; 4],
     highlight_shift: [f32; 4],
+    set_hover: [f32; 4],
     bake_high: [f32; 4],
     bake_matching_error: [f32; 4],
     bake_cage: [f32; 4],
@@ -94,6 +109,7 @@ struct GlobalsRaw {
     bake_neutral_color: [f32; 4],
     bake_neutral: [f32; 4],
     bake_bent_normal: [f32; 4],
+    uv_rotation: [f32; 4],
 }
 
 /// The post pass uniform (see `Post` in post.wgsl).
@@ -105,6 +121,8 @@ struct PostRaw {
     c: [f32; 4],
     d: [f32; 4],
     e: [f32; 4],
+    back_top: [f32; 4],
+    back_bottom: [f32; 4],
 }
 
 #[repr(C)]
@@ -119,6 +137,9 @@ const HIGHLIGHT_WIDTH_PX: f32 = 1.5;
 
 /// Opacity of the highlighted set's edge lines
 const HIGHLIGHT_OPACITY: f32 = 0.9;
+
+/// Opacity of the texture-set hover tint over the shaded material.
+const SET_HOVER_OPACITY: f32 = 0.35;
 
 /// Copies of each highlight line, shifted diagonally to the four corners of its extra width (`vs_wire_highlight`)
 const HIGHLIGHT_SHIFTS: u32 = 4;
@@ -142,6 +163,12 @@ pub struct Shade {
     pub view_mode: u32,
     /// Channel index for view mode 1 (channel order, see the shader).
     pub channel: u32,
+    /// Single-channel views of Base color, Metallic, Roughness, Normal and Height show the channel
+    /// on a lit neutral material instead of flat (Display settings > "Display solo view without
+    /// lighting (unlit)" off); 3D view only.
+    pub solo_lit: bool,
+    /// The background color at the top and at the bottom of the view (linear RGB), see [`DEFAULT_BACKGROUND`].
+    pub background: [[f32; 3]; 2],
     /// Direction to an optional key light and its intensity (0 = off). The direction is in
     /// environment space: it turns with `env_rotation_deg` like the lights painted into the
     /// environment, so rotating the environment sweeps the key light and its shadows too.
@@ -151,6 +178,12 @@ pub struct Shade {
     /// Key-light shadow map (needs `light[3] > 0`; 3D material view only). Shadows dim the key
     /// light, not the image-based lighting.
     pub shadows: bool,
+    /// Edge of the shadow map in texels (the shadows' computation mode).
+    pub shadow_size: u32,
+    /// How dark the shadows are: 0 leaves the key light unshadowed, 1 blocks it fully.
+    pub shadow_opacity: f32,
+    /// The environment turns with the camera about the vertical axis (Environment Alignment: Camera), on top of `env_rotation_deg`.
+    pub env_camera: bool,
     /// Master switch of the effects below ("Post effects"); off costs no extra pass.
     /// Effects never apply to data views (channels, mesh maps, UV checker, 2D view).
     pub post_effects: bool,
@@ -161,8 +194,12 @@ pub struct Shade {
     pub grain: f32,
     /// Draw the mesh edges over the shaded 3D view (depth tested).
     pub wireframe_3d: bool,
+    /// Opacity of the 3D wireframe and the UV wireframe, 0..1.
+    pub wireframe_opacity: f32,
     /// One texture set's mesh edges in a highlight color over the 3D view (the set under a shelf drag)
     pub highlight: Option<SetHighlight>,
+    /// The texture set whose visible surfaces are tinted in the 3D view.
+    pub set_hover: Option<SetHighlight>,
     /// Specular/glossiness shading: base color is the diffuse color and the Specular channel the
     /// F0 color (roughness arrives as 1 - glossiness from the display conversion).
     pub spec_gloss: bool,
@@ -211,9 +248,12 @@ impl Shade {
             env_blur: d.env_blur,
             env_opacity: d.env_opacity,
             ao_intensity: d.ao_intensity,
-            // The key light (on with shadows), in environment space.
+            // The key light (on with shadows), in environment space
             light: if d.shadows { [0.5, 0.8, 0.4, 2.5] } else { [0.0; 4] },
             shadows: d.shadows,
+            shadow_size: d.shadow_mode.map_size(),
+            shadow_opacity: d.shadow_opacity,
+            env_camera: d.env_alignment == EnvAlignment::Camera,
             post_effects: d.post_effects,
             bloom: d.bloom,
             vignette: d.vignette,
@@ -226,6 +266,7 @@ impl Shade {
             ior: d.ior,
             dof: d.dof.enabled.then_some([d.dof.focus_distance, d.dof.aperture]),
             displacement: d.displacement,
+            solo_lit: !d.solo_unlit,
             ..Shade::default()
         }
     }
@@ -257,16 +298,23 @@ impl Default for Shade {
             normal_y: 1.0,
             view_mode: 0,
             channel: 0,
+            solo_lit: false,
+            background: DEFAULT_BACKGROUND,
             light: [0.0; 4],
             wireframe: false,
             shadows: false,
+            shadow_size: SHADOW_SIZE,
+            shadow_opacity: 1.0,
+            env_camera: false,
             post_effects: false,
             bloom: 0.0,
             vignette: 0.0,
             sharpen: 0.0,
             grain: 0.0,
             wireframe_3d: false,
+            wireframe_opacity: 0.4,
             highlight: None,
+            set_hover: None,
             spec_gloss: false,
             parallax: false,
             taa: false,
@@ -285,8 +333,9 @@ impl Default for Shade {
 pub enum ViewKind {
     /// The 3D viewport.
     Scene,
-    /// The 2D UV view of texture set `ts`: zoom (1 = fit) and pan (clip-space offset).
-    Uv { ts: usize, zoom: f32, pan: [f32; 2] },
+    /// The 2D UV view of texture set `ts`: zoom (1 = fit), pan (clip-space offset) and rotation
+    /// (radians, counter-clockwise on screen, turning the UV square about its centre before the pan).
+    Uv { ts: usize, zoom: f32, pan: [f32; 2], rotation: f32 },
 }
 
 /// One view to render this frame.
@@ -315,11 +364,17 @@ fn mip_count(size: u32) -> u32 {
     32 - size.max(1).leading_zeros()
 }
 
+/// Lowest 2D zoom: the UV tile shrinks to about 2 px, as in the reference app (about 62 wheel notches out)
+pub const UV_VIEW_MIN_ZOOM: f32 = 0.0026;
+
+/// Highest 2D zoom: about ×220 of the fit, as in the reference app (54 wheel notches in)
+pub const UV_VIEW_MAX_ZOOM: f32 = 220.0;
+
 /// Clip-space half extents of the 2D view's UV square in a view of `aspect` (width / height)
 /// at `zoom`: fit into the view and stretched to the set's `size` (a UV tile atlas is wider or
 /// taller), keeping texels square.
 pub fn uv_view_scale(aspect: f32, zoom: f32, size: (u32, u32)) -> [f32; 2] {
-    let z = zoom.clamp(0.05, 64.0) * 0.92;
+    let z = zoom.clamp(UV_VIEW_MIN_ZOOM, UV_VIEW_MAX_ZOOM) * 0.92;
     let (sx, sy) = if aspect >= 1.0 { (z / aspect, z) } else { (z, z * aspect) };
     let a = size.0.max(1) as f32 / size.1.max(1) as f32;
     if a >= 1.0 { [sx, sy / a] } else { [sx * a, sy] }
@@ -590,6 +645,7 @@ pub struct Renderer {
     accum_pipeline: wgpu::RenderPipeline,
     env: Tex,
     env_name: String,
+    env_is_imported: bool,
     sh: [[f32; 4]; 9],
     /// Bumped by every change of what the views show (uploads, mesh, environment): restarts
     /// accumulation.
@@ -1230,6 +1286,7 @@ impl Renderer {
             memory_failures: Vec::new(),
             env,
             env_name: String::new(),
+            env_is_imported: false,
             sh: [[0.0; 4]; 9],
             content_rev: 0,
             mesh: None,
@@ -1264,11 +1321,14 @@ impl Renderer {
     /// any image, linearized), prefiltered on the CPU (rayon); otherwise the built-in of that
     /// name (no-op when already current; unknown names give the default studio).
     pub fn set_environment(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, name: &str, image: Option<&ImageRes>) {
-        let img = match image.and_then(|i| ibl::EnvImage::from_rgba(i.width, i.height, &i.rgba, i.srgb)) {
+        let imported = image.and_then(|image| ibl::EnvImage::from_rgba(image.width, image.height, &image.rgba, image.srgb));
+        let is_imported = imported.is_some();
+        let img = match imported {
             Some(img) => img,
-            None if self.env_name == name => return,
-            None => ibl::environment(name, 512),
+            None if !self.env_is_imported && self.env_name == name => return,
+            None => ibl::environment(name, texturecraft_compose::environment_sky::VIEWPORT_WIDTH),
         };
+
         let levels = ibl::prefilter(&img, ENV_LEVELS);
         if self.env.texture.width() != img.width || self.env.texture.height() != img.height {
             self.env = Tex::new(device, "tc_env", img.width, img.height, wgpu::TextureFormat::Rgba16Float, ENV_LEVELS);
@@ -1285,6 +1345,7 @@ impl Renderer {
         let sh = ibl::sh9(&img);
         self.sh = sh.map(|c| [c[0], c[1], c[2], 0.0]);
         self.env_name = name.to_string();
+        self.env_is_imported = is_imported;
         self.content_rev += 1;
         for v in self.views.values_mut() {
             v.globals_bg = None;
@@ -1887,8 +1948,8 @@ impl Renderer {
         ranges: &'a [(u32, u32, usize)],
         visible: &'a [bool],
         only: Option<usize>,
-    ) -> impl Iterator<Item = (std::ops::Range<u32>, &'a SetGpu)> + 'a {
-        drawable_ranges(ranges, &self.material_sets, visible, only).filter_map(|(range, ts)| Some((range, self.sets.get(ts)?)))
+    ) -> impl Iterator<Item = (std::ops::Range<u32>, usize, &'a SetGpu)> + 'a {
+        drawable_ranges(ranges, &self.material_sets, visible, only).filter_map(|(range, texture_set)| Some((range, texture_set, self.sets.get(texture_set)?)))
     }
 
     /// Keep the key-light shadow map current; returns its view-projection. `light` points to
@@ -1907,12 +1968,13 @@ impl Renderer {
         light: Vec3,
         disp: [f32; 4],
         visible: &[bool],
+        size: u32,
     ) -> Option<Mat4> {
         let l = light.try_normalize()?;
         let (id, center, radius) = self.mesh.as_ref().map(|m| (m.id, m.center, m.radius))?;
-        if self.shadow.size != SHADOW_SIZE {
-            self.shadow.view = shadow_view(device, SHADOW_SIZE);
-            self.shadow.size = SHADOW_SIZE;
+        if self.shadow.size != size {
+            self.shadow.view = shadow_view(device, size);
+            self.shadow.size = size;
             self.shadow.key = None;
             for v in self.views.values_mut() {
                 v.globals_bg = None;
@@ -1948,7 +2010,7 @@ impl Renderer {
             let geo = m.dense.as_ref().filter(|_| displacing).unwrap_or(&m.geo);
             pass.set_vertex_buffer(0, geo.vb.slice(..));
             pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&geo.draws, visible, None) {
+            for (range, _, set) in self.drawable(&geo.draws, visible, None) {
                 pass.set_bind_group(1, &set.bind_group, &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
@@ -1989,21 +2051,24 @@ impl Renderer {
             vp = Mat4::from_translation(Vec3::new(2.0 * jx / frame.size[0].max(1) as f32, 2.0 * jy / frame.size[1].max(1) as f32, 0.0)) * vp;
         }
         let s = &frame.shade;
-        let (uv_view, uv_xform) = match frame.kind {
-            ViewKind::Scene => (0.0, [1.0, 1.0, 0.0, 0.0]),
-            ViewKind::Uv { ts, zoom, pan } => {
+        let (uv_view, uv_xform, uv_rotation) = match frame.kind {
+            ViewKind::Scene => (0.0, [1.0, 1.0, 0.0, 0.0], [1.0, 0.0, 1.0, 0.0]),
+            ViewKind::Uv { ts, zoom, pan, rotation } => {
                 let [sx, sy] = uv_view_scale(aspect, zoom, self.sets.get(ts).map_or((1, 1), |s| s.size));
-                (1.0, [sx, sy, pan[0], pan[1]])
+                let (sin, cos) = rotation.sin_cos();
+                (1.0, [sx, sy, pan[0], pan[1]], [cos, sin, aspect, 0.0])
             }
         };
 
-        // Data views bypass exposure, tone mapping, effects and shadows
-        let data = uv_view > 0.5 || s.view_mode != 0;
+        // A lit single-channel view is shaded like the material; the other data views bypass exposure, tone mapping, effects and shadows
+        let solo_lit = s.solo_lit && s.view_mode == 1 && s.channel <= SOLO_LIT_LAST_CHANNEL && uv_view < 0.5;
+        let data = uv_view > 0.5 || (s.view_mode != 0 && !solo_lit);
         let fx = |v: f32| if s.post_effects && !data { v.clamp(0.0, 1.0) } else { 0.0 };
         let bloom = fx(s.bloom) > 0.0;
 
-        // Turn the key light with the environment
-        let (sin, cos) = s.env_rotation_deg.to_radians().sin_cos();
+        // Turn the key light with the environment, which follows the camera's turn about the vertical axis when aligned to it
+        let env_radians = s.env_rotation_deg.to_radians() + if s.env_camera { camera_yaw(&frame.camera) } else { 0.0 };
+        let (sin, cos) = env_radians.sin_cos();
         let [lx, ly, lz, lw] = s.light;
         let light = Vec3::new(cos * lx + sin * lz, ly, cos * lz - sin * lx);
         let displace = s.displacement && frame.kind == ViewKind::Scene;
@@ -2016,7 +2081,8 @@ impl Renderer {
             None => [0.0; 4],
         };
         let shadow_disp = [disp[0], disp[1] * s.height_strength, disp[2], 0.0];
-        let shadow_vp = if !data && s.shadows && lw > 0.0 { self.update_shadow(device, queue, encoder, light, shadow_disp, &frame.visible) } else { None };
+        let shadow_vp =
+            if !data && s.shadows && lw > 0.0 { self.update_shadow(device, queue, encoder, light, shadow_disp, &frame.visible, s.shadow_size) } else { None };
         let radius = self.mesh.as_ref().map_or(1.0, |m| m.radius);
 
         // Perspective background rays prevent flat color in orthographic views
@@ -2046,22 +2112,29 @@ impl Renderer {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: bg_vp.inverse().to_cols_array_2d(),
             eye: [e.x, e.y, e.z, 0.0],
-            env: [s.env_rotation_deg.to_radians(), (ENV_LEVELS - 1) as f32, s.ao_intensity, 0.0],
+            env: [env_radians, (ENV_LEVELS - 1) as f32, s.ao_intensity, if solo_lit { 1.0 } else { 0.0 }],
             sh: self.sh,
             mode: [s.view_mode as f32, s.channel as f32, s.height_strength, s.normal_y],
-            bg: [s.env_opacity, s.env_blur * (ENV_LEVELS - 1) as f32, uv_view, 0.0],
+            bg: [s.env_opacity, s.env_blur * (ENV_LEVELS - 1) as f32, uv_view, s.wireframe_opacity.clamp(0.0, 1.0)],
             uv_xform,
+            uv_rotation,
             light: [light.x, light.y, light.z, lw],
             light_vp: shadow_vp.unwrap_or(Mat4::IDENTITY).to_cols_array_2d(),
             // Offset by 1.5 shadow texels to avoid self-shadowing
-            shadow: [if shadow_vp.is_some() { 1.0 } else { 0.0 }, 1.0 / SHADOW_SIZE as f32, radius * 3.0 / SHADOW_SIZE as f32, 0.0],
+            shadow: [
+                if shadow_vp.is_some() { 1.0 } else { 0.0 },
+                1.0 / s.shadow_size as f32,
+                radius * 3.0 / s.shadow_size as f32,
+                s.shadow_opacity.clamp(0.0, 1.0),
+            ],
             material: [if s.spec_gloss { 1.0 } else { 0.0 }, if s.parallax { 1.0 } else { 0.0 }, sample as f32, s.ior],
             scatter: [s.scatter[0], s.scatter[1], s.scatter[2], if sss.is_some() { 1.0 } else { 0.0 }],
             fwd: [fwd.x, fwd.y, fwd.z, 0.0],
             disp,
             refr: [if refraction { 1.0 } else { 0.0 }, (BEHIND_LEVELS - 1) as f32, REFRACTION_DEPTH * radius, 0.0],
-            highlight: highlight_globals(s, data),
+            highlight: highlight_globals(s.highlight, HIGHLIGHT_OPACITY, s, data),
             highlight_shift: highlight_shift(frame.size),
+            set_hover: highlight_globals(s.set_hover, SET_HOVER_OPACITY, s, data),
             ..bake_globals(s.bake)
         };
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
@@ -2070,9 +2143,12 @@ impl Renderer {
             b: [fx(s.vignette), fx(s.sharpen), fx(s.grain), BLOOM_THRESHOLD],
             c: dof_c,
             d: sss_d,
-            e: [flag(cam.ortho), sample as f32, 0.0, 0.0],
+            e: [flag(cam.ortho), sample as f32, raw.set_hover[3], 0.0],
+            back_top: [s.background[0][0], s.background[0][1], s.background[0][2], 0.0],
+            back_bottom: [s.background[1][0], s.background[1][1], s.background[1][2], 0.0],
         };
         let Some(v) = self.targets(device, frame.view_id, frame.size, bloom, fx_on, refraction) else { return };
+
         queue.write_buffer(&v.globals, 0, bytemuck::bytes_of(&raw));
         queue.write_buffer(&v.post_buf, 0, bytemuck::bytes_of(&post));
         upload_overlay(device, queue, v, &frame.overlay, (!data).then_some(s.exposure_ev));
@@ -2147,9 +2223,13 @@ impl Renderer {
         let geo = self.geometry(m, frame);
         pass.set_vertex_buffer(0, geo.vb.slice(..));
         pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
-        for (range, set) in self.drawable(&geo.draws, &frame.visible, None) {
+
+        // Instance index 1 lets the G-buffer mark the hovered set for the scattering composite
+        let hover_set = frame.shade.set_hover.filter(|_| frame.kind == ViewKind::Scene).map(|hover| hover.set);
+        for (range, texture_set, set) in self.drawable(&geo.draws, &frame.visible, None) {
             pass.set_bind_group(1, &set.bind_group, &[]);
-            pass.draw_indexed(range, 0, 0..1);
+            let first_instance = u32::from(hover_set == Some(texture_set));
+            pass.draw_indexed(range, 0, first_instance..first_instance + 1);
         }
     }
 
@@ -2274,22 +2354,25 @@ impl Renderer {
         let bake = frame.shade.bake.filter(|_| uv_set.is_none());
         let low_poly_shown = bake.is_none_or(|bake| bake.low_poly.shown);
         let (highlight, highlight_set) = highlight.filter(|(_, set)| low_poly_shown && uv_set.is_none_or(|only| only == *set)).unzip();
+        let hover_set = frame.shade.set_hover.filter(|_| uv_set.is_none()).map(|hover| hover.set);
 
         // The wireframe and the highlight draw the mesh's own edges (displaced in the vertex shader too)
         let passes = [
-            (low_poly_shown.then_some(mesh_pipeline), &geometry.vb, &geometry.ib, &geometry.draws, uv_set, 1),
-            (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, uv_set, 1),
-            (highlight, &mesh.geo.vb, &mesh.lines, &mesh.line_draws, highlight_set, HIGHLIGHT_SHIFTS),
+            (low_poly_shown.then_some(mesh_pipeline), &geometry.vb, &geometry.ib, &geometry.draws, uv_set, 1, hover_set),
+            (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, uv_set, 1, None),
+            (highlight, &mesh.geo.vb, &mesh.lines, &mesh.line_draws, highlight_set, HIGHLIGHT_SHIFTS, None),
         ];
-        for (pipeline, vertices, indices, ranges, only_set, instances) in passes {
+        for (pipeline, vertices, indices, ranges, only_set, instances, hover_set) in passes {
             let Some(pipeline) = pipeline else { continue };
 
             pass.set_pipeline(pipeline);
             pass.set_vertex_buffer(0, vertices.slice(..));
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(ranges, &frame.visible, only_set) {
+            for (range, texture_set, set) in self.drawable(ranges, &frame.visible, only_set) {
+                // Instance index 1 lets the mesh shader tint the hovered draw
+                let first_instance = u32::from(hover_set == Some(texture_set));
                 pass.set_bind_group(1, &set.bind_group, &[]);
-                pass.draw_indexed(range, 0, 0..instances);
+                pass.draw_indexed(range, 0, first_instance..first_instance + instances);
             }
         }
 
@@ -2303,7 +2386,7 @@ impl Renderer {
             pass.set_pipeline(&self.uv_missing_seam_pipeline);
             pass.set_vertex_buffer(0, mesh.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, Some(texture_set)) {
+            for (range, _, set) in self.drawable(&seams.line_draws, &frame.visible, Some(texture_set)) {
                 pass.set_bind_group(1, &set.bind_group, &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
@@ -2337,7 +2420,7 @@ impl Renderer {
             pass.set_pipeline(&self.missing_seam_pipeline);
             pass.set_vertex_buffer(0, low_poly.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, None) {
+            for (range, _, set) in self.drawable(&seams.line_draws, &frame.visible, None) {
                 pass.set_bind_group(1, &set.bind_group, &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
@@ -2474,12 +2557,12 @@ fn upload_overlay(device: &wgpu::Device, queue: &wgpu::Queue, view: &mut ViewTar
     }
 }
 
-/// Globals `highlight`: the highlight's color and opacity, all zero without one. Data views skip exposure and tone mapping, so they take the color as it is
-fn highlight_globals(shade: &Shade, data: bool) -> [f32; 4] {
-    let Some(highlight) = shade.highlight else { return [0.0; 4] };
+/// The highlight's color and opacity. Data views take the color as it is.
+fn highlight_globals(highlight: Option<SetHighlight>, opacity: f32, shade: &Shade, data: bool) -> [f32; 4] {
+    let Some(highlight) = highlight else { return [0.0; 4] };
 
     let [r, g, b] = if data { highlight.color } else { highlight.scene_color(shade.exposure_ev, shade.aces) };
-    [r, g, b, HIGHLIGHT_OPACITY]
+    [r, g, b, opacity]
 }
 
 /// The globals of bake mode's overlays and neutral material for `bake` (all zero without it)
@@ -2611,8 +2694,8 @@ mod tests {
         let color = [0.8, 0.25, 0.08];
         let shade = Shade { highlight: Some(SetHighlight { set: 0, color }), exposure_ev: 1.0, ..Shade::default() };
 
-        assert_eq!(highlight_globals(&shade, true), [0.8, 0.25, 0.08, HIGHLIGHT_OPACITY]);
-        assert_ne!(highlight_globals(&shade, false)[..3], color, "the material view undoes exposure and tone mapping");
+        assert_eq!(highlight_globals(shade.highlight, HIGHLIGHT_OPACITY, &shade, true), [0.8, 0.25, 0.08, HIGHLIGHT_OPACITY]);
+        assert_ne!(highlight_globals(shade.highlight, HIGHLIGHT_OPACITY, &shade, false)[..3], color, "the material view undoes exposure and tone mapping");
     }
 
     #[test]

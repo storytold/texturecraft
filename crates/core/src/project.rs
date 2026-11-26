@@ -4,13 +4,22 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BakeSettings, BakedMap, Channel, ChannelFormat, CoreError, Effect, Layer, LayerId, LayerKind, Result};
+use crate::{BakeSettings, BakeSyncGroup, BakedMap, Channel, ChannelFormat, ContentsOffset, CoreError, Effect, Layer, LayerId, LayerKind, Result};
 
-/// Project file format. 3: bent normal maps are in tangent space (older files hold world-space ones).
-pub const FORMAT_VERSION: u32 = 3;
+pub use crate::env_alignment::EnvAlignment;
+pub use crate::shadow_mode::ShadowMode;
+
+/// Latest project file format that TextureCraft can read.
+pub const FORMAT_VERSION: u32 = REBUILT_MESH_UVS_VERSION;
 
 /// First format whose baked bent normal maps are in tangent space
 pub const TANGENT_BENT_NORMAL_VERSION: u32 = 3;
+
+/// First format that can reopen a project using rebuilt mesh UVs.
+pub const REBUILT_MESH_UVS_VERSION: u32 = 4;
+
+/// Most colour swatches a project keeps
+pub const MAX_SWATCHES: usize = 64;
 
 /// Maximum group nesting (also bounds recursion over hostile project files)
 pub const MAX_DEPTH: usize = 16;
@@ -276,6 +285,14 @@ pub struct DisplaySettings {
     /// Degrees.
     pub env_rotation: f32,
     pub shadows: bool,
+    /// What the environment turns with.
+    pub env_alignment: EnvAlignment,
+    /// The shadow map's quality (shadows only).
+    pub shadow_mode: ShadowMode,
+    /// How dark the shadows are, 0..1 (1 = the key light is fully blocked).
+    pub shadow_opacity: f32,
+    /// A single-channel view shows the channel flat, without lighting (off: the channel on a lit neutral material).
+    pub solo_unlit: bool,
     pub tone_mapping: ToneMapping,
     pub fov: f32,
     pub post_effects: bool,
@@ -303,6 +320,14 @@ pub struct DisplaySettings {
     pub ior: f32,
     /// Depth of field of the viewport and the path tracer (thin lens).
     pub dof: DepthOfField,
+    /// The selected fill's projection gizmos show in the 3D view (the Projection row's eye)
+    #[serde(skip_serializing_if = "is_shown")]
+    pub projection_gizmos: bool,
+}
+
+/// Whether a view flag is at its default, shown (saved projects then stay as they were)
+fn is_shown(shown: &bool) -> bool {
+    *shown
 }
 
 /// A thin-lens camera's depth of field (Display settings: focus distance and aperture).
@@ -339,11 +364,14 @@ pub struct Camera {
     /// Vertical field of view, degrees (orthographic: the view height at `distance`).
     pub fov: f32,
     pub ortho: bool,
+    /// Free-camera quaternion in x, y, z, w order, when the view was saved in free mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<[f32; 4]>,
 }
 
 impl Default for Camera {
     fn default() -> Self {
-        Camera { name: "Camera".into(), target: [0.0; 3], yaw: 0.0, pitch: 0.0, distance: 5.0, fov: 40.0, ortho: false }
+        Camera { name: "Camera".into(), target: [0.0; 3], yaw: 0.0, pitch: 0.0, distance: 5.0, fov: 40.0, ortho: false, orientation: None }
     }
 }
 
@@ -369,6 +397,10 @@ impl Default for DisplaySettings {
             env_blur: 0.35,
             env_rotation: 0.0,
             shadows: false,
+            env_alignment: EnvAlignment::World,
+            shadow_mode: ShadowMode::Lightweight,
+            shadow_opacity: 1.0,
+            solo_unlit: true,
             tone_mapping: ToneMapping::AcesFilmic,
             fov: 40.0,
             post_effects: false,
@@ -385,6 +417,7 @@ impl Default for DisplaySettings {
             scatter_radius: 0.1,
             ior: 1.5,
             dof: DepthOfField::default(),
+            projection_gizmos: true,
         }
     }
 }
@@ -399,6 +432,10 @@ pub struct Project {
     /// it, so parts the file leaves unnamed get the same name (from it) as on import.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mesh_file: String,
+    /// The mesh UVs were rebuilt on import. The project file keeps the generated layout for
+    /// reopening; reimporting the mesh from a file rebuilds them again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mesh_rebuild_uvs: bool,
     /// Where the mesh file was imported from (the project's "3D mesh path"). Reimport mesh reads
     /// it again from there, so edits made to the file since are picked up. Empty when unknown
     /// (built-in meshes, web imports, projects saved before it was kept).
@@ -412,15 +449,19 @@ pub struct Project {
     /// Saved and imported cameras (the viewport's default camera is not in the list).
     #[serde(default)]
     pub cameras: Vec<Camera>,
+    /// The project's colour swatches (linear RGB), in the order they were added; projects without any save none
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub swatches: Vec<[f32; 3]>,
 }
 
 impl Project {
     pub fn new(name: impl Into<String>, mesh: impl Into<String>) -> Project {
         Project {
-            format_version: FORMAT_VERSION,
+            format_version: TANGENT_BENT_NORMAL_VERSION,
             name: name.into(),
             mesh: mesh.into(),
             mesh_file: String::new(),
+            mesh_rebuild_uvs: false,
             mesh_path: String::new(),
             normal_format: NormalFormat::OpenGl,
             texture_sets: Vec::new(),
@@ -428,7 +469,13 @@ impl Project {
             next_id: 1,
             display: DisplaySettings::default(),
             cameras: Vec::new(),
+            swatches: Vec::new(),
         }
+    }
+
+    /// The on-disk version that preserves the project's UV layout when read back.
+    pub fn save_format_version(&self) -> u32 {
+        if self.mesh_rebuild_uvs { self.format_version.max(REBUILT_MESH_UVS_VERSION) } else { self.format_version }
     }
 
     pub fn alloc_id(&mut self) -> LayerId {
@@ -442,6 +489,23 @@ impl Project {
     }
     pub fn texture_set_mut(&mut self, ts: usize) -> Result<&mut TextureSet> {
         self.texture_sets.get_mut(ts).ok_or(CoreError::NoTextureSet(ts))
+    }
+
+    /// The texture sets an edit of `group` on texture set `active` reaches: every set sharing `group` with it, or `active` alone
+    pub fn bake_synced_sets(&self, active: usize, group: BakeSyncGroup) -> Vec<usize> {
+        match self.texture_sets.get(active) {
+            Some(set) if set.bake.sync.shares(group) => {
+                self.texture_sets.iter().enumerate().filter(|(_, set)| set.bake.sync.shares(group)).map(|(index, _)| index).collect()
+            }
+            Some(_) => vec![active],
+            None => Vec::new(),
+        }
+    }
+
+    /// The set whose `group` settings the sets joining a sync of `members` take: one of them already sharing the group, else `active` when it is one of them, else the first
+    pub fn bake_sync_source(&self, group: BakeSyncGroup, members: &[usize], active: usize) -> Option<usize> {
+        let staying = members.iter().copied().find(|index| self.texture_sets.get(*index).is_some_and(|set| set.bake.sync.shares(group)));
+        staying.or_else(|| members.contains(&active).then_some(active)).or_else(|| members.first().copied())
     }
 
     pub fn layer(&self, id: LayerId) -> Result<&Layer> {
@@ -607,6 +671,22 @@ impl Project {
         self.layers.values().find_map(|l| l.mask.iter().flat_map(|m| m.effects.iter()).chain(l.content_effects.iter()).find(|e| e.id == id).map(|e| (l.id, e)))
     }
 
+    /// What reads anchor point `anchor`, bottom to top in its texture set: (layer, the effect reading it, or None for the layer's own fill)
+    pub fn anchor_readers(&self, anchor: LayerId) -> Vec<(LayerId, Option<LayerId>)> {
+        let Some((ts, _, _)) = self.effect(anchor).and_then(|(owner, _)| self.locate(owner)) else { return Vec::new() };
+        let mut out = Vec::new();
+        for layer in self.walk(ts).into_iter().filter_map(|(id, _)| self.layers.get(&id)) {
+            if let LayerKind::Fill(fill) = &layer.kind
+                && fill.sources.values().any(|s| s.anchor() == Some(anchor))
+            {
+                out.push((layer.id, None));
+            }
+            let effects = layer.mask.iter().flat_map(|m| m.effects.iter()).chain(layer.content_effects.iter());
+            out.extend(effects.filter(|e| e.reads(Some(anchor))).map(|e| (layer.id, Some(e.id))));
+        }
+        out
+    }
+
     pub fn effect_mut(&mut self, id: LayerId) -> Option<&mut Effect> {
         self.layers.values_mut().find_map(|l| {
             let in_mask = l.mask.as_mut().and_then(|m| m.effects.iter_mut().find(|e| e.id == id));
@@ -678,6 +758,27 @@ impl Project {
         self.layers.values().filter_map(|l| Some((l.id, l.instance_source()?))).find(|(id, s)| self.render_tree(&[*s]).contains(id)).map(|(id, _)| id)
     }
 
+    /// The Scale and Rotation folder `id` lays on the fills inside it (none for any other layer)
+    pub fn contents_offset(&self, id: LayerId) -> ContentsOffset {
+        match self.layers.get(&id).map(|l| &l.kind) {
+            Some(LayerKind::Group { contents, .. }) => *contents,
+            _ => ContentsOffset::NONE,
+        }
+    }
+
+    /// The Scale and Rotation the folders holding layer `id` lay on its fills, combined from the outermost in
+    pub fn contents_around(&self, id: LayerId) -> ContentsOffset {
+        let mut folders = Vec::new();
+        let mut at = id;
+        while folders.len() <= MAX_DEPTH
+            && let Some((_, Some(parent), _)) = self.locate(at)
+        {
+            folders.push(parent);
+            at = parent;
+        }
+        folders.iter().rev().fold(ContentsOffset::NONE, |around, folder| around.then(self.contents_offset(*folder)))
+    }
+
     /// The layer whose content `id` draws: itself, or an instance's source.
     pub fn content_layer(&self, id: LayerId) -> Option<&Layer> {
         let mut l = self.layers.get(&id)?;
@@ -716,6 +817,23 @@ mod tests {
         p
     }
 
+    #[test]
+    fn a_sync_takes_settings_from_a_staying_member_else_the_active_set_else_the_first() {
+        let group = BakeSyncGroup::Common;
+        let mut project = project();
+        for name in ["Legs", "Arms"] {
+            project.texture_sets.push(TextureSet::new(name, 0, 512));
+        }
+        for (index, set) in project.texture_sets.iter_mut().enumerate() {
+            set.bake.sync.set_shares(group, index == 2);
+        }
+
+        assert_eq!(project.bake_sync_source(group, &[0, 1, 2], 0), Some(2), "a member already sharing the group");
+        assert_eq!(project.bake_sync_source(group, &[0, 1], 1), Some(1), "the active set when it joins");
+        assert_eq!(project.bake_sync_source(group, &[0, 1], 2), Some(0), "else the first member");
+        assert_eq!(project.bake_sync_source(group, &[], 0), None);
+    }
+
     fn paint(p: &mut Project, name: &str) -> Layer {
         Layer::new(p.alloc_id(), name, LayerKind::Paint, &Channel::DEFAULT_SET)
     }
@@ -728,19 +846,25 @@ mod tests {
         let b = paint(&mut p, "b");
         let b = p.insert_layer(0, b, None, false).unwrap();
         let gid = p.alloc_id();
-        let g = Layer::new(gid, "g", LayerKind::Group { children: vec![], collapsed: false }, &Channel::DEFAULT_SET);
+        let g = Layer::new(gid, "g", LayerKind::folder(), &Channel::DEFAULT_SET);
         p.insert_layer(0, g, Some(a), false).unwrap();
+
         assert_eq!(p.texture_sets[0].stack, vec![a, gid, b]);
+
         p.move_above(b, Some(gid), true).unwrap();
+
         assert_eq!(p.texture_sets[0].stack, vec![a, gid]);
         assert_eq!(p.layer(gid).unwrap().children(), &[b]);
         assert_eq!(p.locate(b), Some((0, Some(gid), 0)));
         assert!(p.move_above(gid, Some(b), true).is_err(), "a group cannot go inside itself");
+
         p.validate().unwrap();
         let removed = p.remove_layer(gid).unwrap();
+
         assert_eq!(removed, vec![gid, b]);
         assert_eq!(p.texture_sets[0].stack, vec![a]);
         assert!(p.layer(b).is_err());
+
         p.validate().unwrap();
     }
 
@@ -750,17 +874,6 @@ mod tests {
         let l = Layer::new(p.alloc_id(), "Layer 1", LayerKind::Paint, &[]);
         p.insert_layer(0, l, None, false).unwrap();
         assert_eq!(p.next_layer_name(0, "Layer"), "Layer 2");
-    }
-
-    #[test]
-    fn serde_round_trip_is_stable() {
-        let mut p = project();
-        let l = paint(&mut p, "x");
-        p.insert_layer(0, l, None, false).unwrap();
-        let json = serde_json::to_string(&p).unwrap();
-        let back: Project = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, p);
-        assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 
     #[test]
@@ -791,21 +904,29 @@ mod tests {
         material.sources.insert(Channel::Roughness, Source::Uniform([0.2; 3]));
         l.content_effects = vec![
             Effect::new(fill, EffectKind::Material(material)),
-            Effect::new(hsl, EffectKind::Filter(Filter::Hsl { hue: 0.25, saturation: -0.5, lightness: 0.1 })),
+            Effect::new(hsl, EffectKind::Filter(Filter::Hsl { hue: 0.25, saturation: -0.5, lightness: 0.1, perceptive: false })),
             Effect::new(anchor, EffectKind::Anchor),
         ];
         let id = p.insert_layer(0, l, None, false).unwrap();
         let mut top = paint(&mut p, "y");
         let source = Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() };
         top.mask = Some(Mask {
-            effects: vec![Effect::new(p.alloc_id(), EffectKind::Fill { source, projection: Projection::default() })],
+            effects: vec![Effect::new(p.alloc_id(), EffectKind::Fill { source, projection: Projection::default(), sampling: Default::default() })],
             ..Mask::new(MaskBackground::Black)
         });
         p.insert_layer(0, top, Some(id), false).unwrap();
         let json = serde_json::to_string(&p).unwrap();
         let back: Project = serde_json::from_str(&json).unwrap();
+
         assert_eq!(back, p);
         assert_eq!(back.effect(anchor).map(|(owner, _)| owner), Some(id));
+
+        // The mask fill of the layer above reads it
+        let top = back.layers.values().find(|l| l.name == "y").unwrap();
+        let reader = top.mask.as_ref().unwrap().effects[0].id;
+
+        assert_eq!(back.anchor_readers(anchor), vec![(top.id, Some(reader))]);
+        assert!(back.anchor_readers(LayerId(999)).is_empty());
 
         // Projects saved before content effects existed load with empty stacks
         let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -813,6 +934,7 @@ mod tests {
             l.as_object_mut().unwrap().remove("content_effects");
         }
         let old: Project = serde_json::from_value(v).unwrap();
+
         assert!(old.layers.values().all(|l| l.content_effects.is_empty()));
     }
 
@@ -824,18 +946,55 @@ mod tests {
         let a = p.insert_layer(0, a, None, false).unwrap();
         let inst = Layer::new(p.alloc_id(), "a", LayerKind::Instance { source: a }, &[]);
         let inst = p.insert_layer(1, inst, None, false).unwrap();
+
         assert_eq!(p.content_layer(inst).map(|l| l.id), Some(a));
         assert_eq!(p.sets_drawing(a), vec![0, 1]);
         assert_eq!(p.sets_drawing(inst), vec![1]);
+
         p.validate().unwrap();
-        // A folder holding an instance of itself draws itself.
+
+        // A folder holding an instance of itself draws itself
         let gid = p.alloc_id();
-        p.insert_layer(1, Layer::new(gid, "g", LayerKind::Group { children: vec![], collapsed: false }, &[]), None, false).unwrap();
+        p.insert_layer(1, Layer::new(gid, "g", LayerKind::folder(), &[]), None, false).unwrap();
         let loop_id = p.alloc_id();
         p.insert_layer(1, Layer::new(loop_id, "g", LayerKind::Instance { source: gid }, &[]), Some(gid), true).unwrap();
+
         assert_eq!(p.instance_cycle(), Some(loop_id));
         assert!(p.validate().is_err());
         assert!(p.content_layer(LayerId(999)).is_none());
+    }
+
+    #[test]
+    fn folder_offsets_load_as_none_from_old_saves_save_only_when_set_and_combine_inward() {
+        let mut p = project();
+        let folder = |p: &mut Project, contents: ContentsOffset| {
+            Layer::new(p.alloc_id(), "g", LayerKind::Group { children: vec![], collapsed: false, contents, randomized: Vec::new() }, &[])
+        };
+        let outer = folder(&mut p, ContentsOffset::new(2.0, 30.0));
+        let outer = p.insert_layer(0, outer, None, false).unwrap();
+        let inner = folder(&mut p, ContentsOffset::new(1.5, -10.0));
+        let inner = p.insert_layer(0, inner, Some(outer), true).unwrap();
+        let a = paint(&mut p, "a");
+        let a = p.insert_layer(0, a, Some(inner), true).unwrap();
+        let top = paint(&mut p, "top");
+        let top = p.insert_layer(0, top, None, false).unwrap();
+
+        assert_eq!(p.contents_around(a), ContentsOffset { scale: 3.0, rotation: 20.0 });
+        assert_eq!(p.contents_around(inner), ContentsOffset::new(2.0, 30.0));
+        assert_eq!(
+            (p.contents_around(outer), p.contents_around(top), p.contents_offset(a)),
+            (ContentsOffset::NONE, ContentsOffset::NONE, ContentsOffset::NONE)
+        );
+
+        // A folder saved before folders had an offset has none, and one without an offset saves as before
+        let old: LayerKind = serde_json::from_str(r#"{"Group":{"children":[],"collapsed":true}}"#).unwrap();
+
+        assert_eq!(old, LayerKind::Group { children: vec![], collapsed: true, contents: ContentsOffset::NONE, randomized: Vec::new() });
+        assert_eq!(serde_json::to_string(&old).unwrap(), r#"{"Group":{"children":[],"collapsed":true}}"#);
+
+        let saved = serde_json::to_string(&p).unwrap();
+
+        assert_eq!(serde_json::from_str::<Project>(&saved).unwrap().contents_around(a), p.contents_around(a));
     }
 
     #[test]

@@ -9,14 +9,13 @@ use texturecraft_engine::Session;
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::file_dialogs::{Answer, Request};
 
-mod temp_dir;
-use temp_dir::TempDir;
+use super::temp_dir::TempDir;
 
 const QUAD: &str = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nf 1/1 2/2 3/3 4/4\n";
 const TRIANGLE: &str = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n";
 /// The format combo's tooltip, which is its accessible label.
 const FORMAT_HINT: &str = "For the whole project: how normal map images set as mesh maps are read (set them again after a change), and the default for export";
-const TITLE: &str = "Project configuration";
+const TITLE: &str = "Project Configuration";
 
 fn temp_dir(test: &str) -> TempDir {
     TempDir::new(test)
@@ -29,7 +28,10 @@ fn app_on_a_quad(dir: &std::path::Path) -> Harness<'static, TextureCraftApp> {
     let mut session = Session::from_mesh_bytes("quad.obj", QUAD.as_bytes(), 128, "quad").unwrap();
     texturecraft_engine::execute(&mut session, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
     session.doc.project.mesh_path = file.display().to_string();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
 
@@ -84,21 +86,6 @@ fn own_tick(h: &Harness<'_, TextureCraftApp>) -> bool {
 }
 
 #[test]
-fn the_menu_opens_the_window() {
-    let dir = temp_dir("menu");
-    let mut h = app_on_a_quad(&dir);
-
-    assert!(!window_is_open(&h));
-
-    open_window(&mut h);
-
-    assert!(window_is_open(&h));
-    assert!(h.query_by_label("3D MESH").is_some(), "the 3D mesh section");
-    assert!(!reimport_ticked(&h), "nothing is ticked at first");
-    assert!(h.state().ui.rail_panel.is_none(), "the Display panel stays where it was");
-}
-
-#[test]
 fn many_texture_sets_keep_dialog_actions_reachable_in_a_short_viewport() {
     let dir = temp_dir("many-tiles");
     let mut h = app_on_a_quad(&dir);
@@ -127,27 +114,45 @@ fn many_texture_sets_keep_dialog_actions_reachable_in_a_short_viewport() {
 }
 
 #[test]
-fn every_setting_has_an_info_icon_and_the_window_ends_with_a_note() {
-    let dir = temp_dir("info");
+fn unsupported_project_settings_are_disabled() {
+    let dir = temp_dir("unsupported-settings");
     let mut h = app_on_a_quad(&dir);
-
+    h.set_size(egui::vec2(1600.0, 2000.0));
     open_window(&mut h);
 
-    let icons: Vec<_> = h.get_all_by_label(egui_phosphor::regular::INFO).collect();
-    let tip = "Green channel convention of normal maps: OpenGL (Y+) or DirectX (Y-). Imported and exported normal maps follow it.";
+    for (role, label) in [
+        (Role::CheckBox, "Compute tangent space per fragment"),
+        (Role::CheckBox, "Use UV Tile workflow"),
+        (Role::RadioButton, "Keep UV tiles together per material"),
+        (Role::RadioButton, "Use a separate texture set for each tile"),
+        (Role::CheckBox, "Import cameras"),
+        (Role::CheckBox, "Auto-unwrap"),
+        (Role::Button, "Auto-unwrap options"),
+    ] {
+        assert!(h.get_by_role_and_label(role, label).accesskit_node().is_disabled(), "{label}");
+    }
+}
 
-    assert!(h.query_by_label("Choosing or reimporting a mesh recomputes all channels.").is_some(), "the note above the buttons");
-    assert_eq!(icons.len(), 6, "mesh path, Select, Reimport mesh, Preserve strokes, Normal map format, UV tiles");
-    assert!(h.query_by_label(tip).is_none(), "no tooltip before hovering");
+#[test]
+fn opencolorio_can_be_looked_at_but_changes_nothing() {
+    let dir = temp_dir("ocio");
+    let mut h = app_on_a_quad(&dir);
+    h.set_size(egui::vec2(1600.0, 2000.0));
+    open_window(&mut h);
+    let before = h.state().session.doc.project.clone();
 
-    // The format icon is fifth in the window's rows
-    let mut centers: Vec<_> = icons.iter().map(|n| n.rect().center()).collect();
-    centers.sort_by(|a, b| a.y.total_cmp(&b.y));
-    let format_center = centers[4];
-    h.hover_at(format_center);
-    h.run_steps(30);
+    h.get_by_value("Legacy").click();
+    h.run_steps(3);
+    h.get_by_label("OpenColorIO").click();
+    h.run_steps(3);
 
-    assert!(h.query_by_label(tip).is_some(), "hovering the normal map format icon explains it");
+    assert!(h.query_by_label("Bitmap import color space defaults").is_some());
+    assert!(h.query_by_label("Export color spaces").is_some());
+
+    click(&mut h, Role::Button, "OK");
+
+    assert!(!window_is_open(&h));
+    assert_eq!(h.state().session.doc.project, before, "OK applies nothing for color management");
 }
 
 #[test]
@@ -553,8 +558,9 @@ fn uv_tiles_are_shown_read_only() {
     open_window(&mut h);
 
     assert!(h.query_by_label("UV Tile settings (UDIMs)").is_some());
-    assert!(h.query_by_label("No UV tiles").is_some(), "a project without UV tiles");
-    assert!(h.query_by_label("Change them in Texture Set Settings").is_some());
+    hover_uv_tile_box(&mut h);
+    assert!(h.query_by_label_contains("No UV tiles").is_some(), "a project without UV tiles");
+    assert!(h.query_by_label("Change the UV tiles of a texture set in Texture Set Settings").is_some());
 
     click(&mut h, Role::Button, "Cancel");
 
@@ -562,8 +568,16 @@ fn uv_tiles_are_shown_read_only() {
 
     open_window(&mut h);
 
-    assert!(h.query_by_label("No UV tiles").is_none());
-    assert!(h.query_by_label("1001").is_some(), "the tile list of a UDIM project");
+    hover_uv_tile_box(&mut h);
+    assert!(h.query_by_label_contains("No UV tiles").is_none());
+    assert!(h.query_by_label_contains("1001").is_some(), "the tile list of a UDIM project");
+}
+
+/// Hover the disabled Use UV Tile workflow box, whose hint lists the project's UV tiles.
+fn hover_uv_tile_box(h: &mut Harness<'_, TextureCraftApp>) {
+    let center = h.get_by_role_and_label(Role::CheckBox, "Use UV Tile workflow").rect().center();
+    h.hover_at(center);
+    h.run_steps(30);
 }
 
 #[test]
@@ -719,4 +733,35 @@ fn a_format_the_project_already_has_is_not_set_again() {
 
     assert_eq!(project_normal_format(&h), NormalFormat::DirectX);
     assert_eq!(h.state().session.history_labels().len(), steps, "no extra undo step");
+}
+
+#[test]
+#[ignore = "offscreen GPU snapshots; set TC_UI_SNAPSHOTS to an output directory"]
+fn project_config_snapshots() {
+    let output_dir = std::path::PathBuf::from(std::env::var_os("TC_UI_SNAPSHOTS").expect("set TC_UI_SNAPSHOTS"));
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let dir = temp_dir("snapshots");
+    let file = dir.join("quad.obj");
+    std::fs::write(&file, QUAD).unwrap();
+    let mut session = Session::from_mesh_bytes("quad.obj", QUAD.as_bytes(), 128, "quad").unwrap();
+    session.doc.project.mesh_path = file.display().to_string();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
+    h.run_steps(6);
+    open_window(&mut h);
+    h.run_steps(6);
+    h.render().unwrap().save(output_dir.join("project-config-legacy.png")).unwrap();
+    h.get_by_value("Legacy").scroll_to_me();
+    h.run_steps(3);
+    h.get_by_value("Legacy").click();
+    h.run_steps(3);
+    h.get_by_label("OpenColorIO").click();
+    h.run_steps(3);
+    h.get_by_label("Export color spaces").scroll_to_me();
+    h.run_steps(6);
+    h.render().unwrap().save(output_dir.join("project-config-ocio.png")).unwrap();
 }

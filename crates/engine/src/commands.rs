@@ -111,18 +111,25 @@ pub fn command_specs() -> &'static [CommandSpec] {
         let mut v = Vec::new();
         v.extend(crate::view_cmds::edit_specs());
         v.extend(crate::layer_cmds::specs());
+        v.extend(crate::fill_material_cmds::specs());
+        v.extend(crate::fill_reset_cmds::specs());
+        v.extend(crate::folder_cmds::specs());
         v.extend(crate::layer_ops::specs());
         v.extend(crate::instance_cmds::specs());
         v.extend(crate::mask_cmds::specs());
+        v.extend(crate::generator_pick::specs());
         v.extend(crate::mask_export::specs());
+        v.extend(crate::add_mask_cmds::specs());
         v.extend(crate::color_selection_cmds::specs());
         v.extend(crate::effect_clipboard::specs());
+        v.extend(crate::effect_blending_cmds::specs());
         v.extend(crate::tool_cmds::specs());
         v.extend(crate::brush_preset_cmds::specs());
         v.extend(crate::path_tool::specs());
         v.extend(crate::view_cmds::specs());
         v.extend(crate::solo::specs());
         v.extend(crate::camera_cmds::specs());
+        v.extend(crate::swatch_cmds::specs());
         v.extend(crate::quick_mask::specs());
         v.extend(crate::set_cmds::specs());
         v.extend(crate::meshmap_cmds::specs());
@@ -142,6 +149,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::smart_masks::specs());
         v.extend(crate::filter_lib::specs());
         v.extend(crate::decal_cmds::specs());
+        v.extend(crate::warp_cmds::specs());
         v.extend(crate::text_cmds::specs());
         v
     })
@@ -441,7 +449,7 @@ mod tests {
     fn no_bindable_command_asks_for_a_parameter() {
         // Effect commands need a selected effect, which this session lacks
         for spec in command_specs().iter().filter(|c| c.bindable() && c.shortcut.is_none() && !c.id.starts_with("effect.")) {
-            let mut session = crate::sample_session(256, 64).unwrap();
+            let mut session = crate::sample_session(texturecraft_core::MIN_RESOLUTION, 16).unwrap();
             if (spec.enabled)(&session).is_ok()
                 && let Err(err) = execute(&mut session, spec.id, &Value::Null)
             {

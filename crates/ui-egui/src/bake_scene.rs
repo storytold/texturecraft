@@ -7,5 +7,7 @@ mod cage_upload;
 mod reach_link;
 mod shared_handle;
 
+pub(crate) use shared_handle::SharedHandle;
+
 pub use bake_scene_link::BakeSceneLink;
 pub use cage_upload::CageUpload;

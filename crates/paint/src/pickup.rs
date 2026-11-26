@@ -366,7 +366,13 @@ mod tests {
         let mut project = Project::new("test", "builtin:plane");
         project.texture_sets.push(TextureSet::new("Set", 0, size));
         let id = project.alloc_id();
-        let fill = Fill { sources: [(Channel::Roughness, Source::Uniform([0.25; 3]))].into(), projection: Default::default(), link: None };
+        let fill = Fill {
+            sources: [(Channel::Roughness, Source::Uniform([0.25; 3]))].into(),
+            projection: Default::default(),
+            sampling: Default::default(),
+            link: None,
+            material: None,
+        };
         let mut layer = Layer::new(id, "fill", LayerKind::Fill(fill), &[Channel::Roughness]);
         layer.mask = Some(Mask::new(MaskBackground::White));
         project.insert_layer(0, layer, None, false).unwrap();
@@ -384,6 +390,7 @@ mod tests {
             };
             let mut pickup = Pickup::from_snapshot(PickupMode::Clone { offset: [i64::from(TILE), 0] }, snapshot, gbuf.clone(), [Channel::Roughness]);
             let mut alpha = TileImage::new(size, size, 1);
+
             assert!(pickup.loaded.is_empty());
 
             for x in [8, 12, TILE + 8] {

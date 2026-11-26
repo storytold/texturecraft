@@ -4,13 +4,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use rayon::prelude::*;
-use texturecraft_core::{BakedMap, BlockScales, CurvatureDetail};
+use texturecraft_core::{BakedMap, BlockScales};
 use texturecraft_texel::dilate::{DilationMap, NONE};
 
 use crate::curvature_size_level::{CurvatureSizeLevel, DEVIATION_SCALE};
 use crate::eval::{BLUR_BOX_PASSES, Inputs, blur};
 
-/// The curvature map padded past its UV islands and blurred at each size of [`CurvatureDetail::SIZES`] after the first.
+/// The blur radius of each level in texels at 2K: the detail sizes of [`texturecraft_core::CurvatureDetail::SIZES`] after the first, then wider ones the wear generators' edges smoothness reaches
+pub const LEVEL_RADII: [f32; 8] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
+
+/// The curvature map padded past its UV islands and blurred at each radius of [`LEVEL_RADII`]
 pub struct CurvatureSizes {
     /// One per blurred size, built once a generator gives that size a weight above 0.
     pub levels: Vec<Option<Arc<CurvatureSizeLevel>>>,
@@ -31,7 +34,11 @@ const CACHE_MAPS: usize = 16;
 impl CurvatureSizes {
     /// The sizes of the texture set `inp` composites, holding at least those `needed` marks (one flag per blurred size); None without a baked curvature map or a needed size.
     pub fn of(inp: &Inputs, needed: &[bool]) -> Option<Arc<CurvatureSizes>> {
-        let curvature = inp.baked.maps.get(&BakedMap::Curvature)?;
+        CurvatureSizes::of_map(inp, inp.baked.maps.get(&BakedMap::Curvature)?, needed)
+    }
+
+    /// The sizes of `curvature`, a map in the baked curvature map's layout (the baked map or one derived from it)
+    pub fn of_map(inp: &Inputs, curvature: &Arc<Vec<f32>>, needed: &[bool]) -> Option<Arc<CurvatureSizes>> {
         let (width, height) = (inp.baked.resolution, inp.baked.height(BakedMap::Curvature));
         if !needed.contains(&true) || width == 0 || height == 0 {
             return None;
@@ -70,14 +77,14 @@ impl CurvatureSizes {
             padding.src.par_iter().map(|&source| if source == NONE { 0.0 } else { curvature.get(source as usize).copied().unwrap_or(0.5) - 0.5 }).collect();
         let (block_width, block_height) = (block.0.max(1).min(width), block.1.max(1).min(height));
 
-        let levels = CurvatureDetail::SIZES
+        let levels = LEVEL_RADII
             .iter()
-            .skip(1)
             .enumerate()
             .map(|(level, size)| {
                 if let Some(existing) = built.and_then(|sizes| sizes.levels.get(level)).and_then(Option::clone) {
                     return Some(existing);
                 }
+
                 if !needed.get(level).copied().unwrap_or(false) {
                     return None;
                 }
@@ -85,6 +92,7 @@ impl CurvatureSizes {
                 // Sizes are texels at 2K; a blur this wide holds nothing finer than half its radius, so it is stored that much coarser
                 let radius = (size * block_width as f32 / 2048.0).round().max(1.0) as u32;
                 let mut step = (radius / 2).max(1).next_power_of_two();
+
                 // A coarse cell must not average curvature from different UV tiles
                 while !block_width.is_multiple_of(step) || !block_height.is_multiple_of(step) {
                     step /= 2;
@@ -247,6 +255,8 @@ fn coarsen(data: &[f32], (width, height): (u32, u32), step: u32, block: (u32, u3
 
 #[cfg(test)]
 mod tests {
+    use texturecraft_core::CurvatureDetail;
+
     use super::*;
 
     #[test]
@@ -472,5 +482,10 @@ mod tests {
                 assert!(Arc::ptr_eq(built, earlier), "sizes already built are kept, not rebuilt");
             }
         }
+    }
+
+    #[test]
+    fn the_first_levels_are_the_detail_sizes() {
+        assert_eq!(LEVEL_RADII[..CurvatureDetail::BLURRED_SIZES], CurvatureDetail::SIZES[1..]);
     }
 }

@@ -6,7 +6,7 @@ use crate::i18n::tr;
 pub use crate::nav_button::NavButton;
 pub use crate::nav_view::NavView;
 use crate::theme::Tokens;
-use crate::viewport::{DRAG_ZOOM_PER_POINT, ORBIT_RADIANS_PER_POINT, UV_VIEW_MAX_ZOOM, UV_VIEW_MIN_ZOOM, UV_WHEEL_ZOOM_PER_POINT};
+use crate::viewport::{DRAG_ZOOM_PER_POINT, UV_VIEW_MAX_ZOOM, UV_VIEW_MIN_ZOOM, UV_WHEEL_ZOOM_PER_POINT};
 use egui::{Area, CursorIcon, Order, PointerButton, Rect, Sense, Ui, Vec2, pos2, vec2};
 
 /// Button side, gap between buttons and the distance from the view's right edge, in points
@@ -17,8 +17,8 @@ const EDGE_MARGIN: f32 = 8.0;
 /// Distance from the view's top edge to the first button: below the row of pickers that sits at the top centre, so the two never overlap
 const TOP_OFFSET: f32 = 40.0;
 
-/// Room kept below the column for the 2D view's texture set name and the view's own corner
-const BOTTOM_ROOM: f32 = 40.0;
+/// Room kept below the column for the 2D view's axis gizmo (bottom right) and the view's own corner
+const BOTTOM_ROOM: f32 = 64.0;
 
 /// Narrowest a view may be and still show the column
 const MIN_VIEW_WIDTH: f32 = BUTTON_SIZE + 2.0 * EDGE_MARGIN + 20.0;
@@ -88,9 +88,9 @@ pub(crate) fn show(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, view: NavView
 fn apply(app: &mut TextureCraftApp, rect: Rect, view: NavView, button: NavButton, delta: Vec2) {
     let size = rect.size();
     match (view, button) {
-        (NavView::Scene, NavButton::Orbit) => app.session.camera.orbit(delta.x * ORBIT_RADIANS_PER_POINT, delta.y * ORBIT_RADIANS_PER_POINT),
+        (NavView::Scene, NavButton::Orbit) => crate::viewport::orbit(app, delta),
         (NavView::Scene, NavButton::Pan) => app.session.camera.pan(delta.x / size.y, delta.y / size.y),
-        (NavView::Scene, NavButton::Zoom) => app.session.camera.zoom(-delta.y * DRAG_ZOOM_PER_POINT),
+        (NavView::Scene, NavButton::Zoom) => app.session.camera.zoom(-delta.y * DRAG_ZOOM_PER_POINT * app.ui.prefs.drag_zoom_scale()),
         (NavView::Uv, NavButton::Pan) => {
             app.ui.uv_pan[0] += delta.x / size.x * 2.0;
             app.ui.uv_pan[1] -= delta.y / size.y * 2.0;

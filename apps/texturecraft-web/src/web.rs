@@ -58,6 +58,7 @@ async fn run(canvas: web_sys::HtmlCanvasElement) -> Result<(), String> {
             canvas,
             options,
             Box::new(|cc| {
+                texturecraft_ui_egui::framework::install_headless(&cc.egui_ctx);
                 let mut app = TextureCraftApp::new(cc, session);
                 if let Some(rs) = &cc.wgpu_render_state {
                     let backend = rs.adapter.get_info().backend;
@@ -93,7 +94,7 @@ async fn step(progress: f32, status: &str) {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
-/// The app's shortcuts (Ctrl+S, Ctrl+O, Ctrl+D, F8…) would also trigger the browser's own
+/// The app's shortcuts (Ctrl+S, Ctrl+O, Ctrl+D, F5…) would also trigger the browser's own
 /// actions; take them first. Copy, cut and paste stay with the browser, which turns them into
 /// the clipboard events egui reads. Shortcuts the browser reserves (Ctrl+N, Ctrl+T, Ctrl+W)
 /// never reach the page.

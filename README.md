@@ -154,11 +154,11 @@ cargo run --release -p texturecraft-cli -- new builtin:crate crate.tcraft --samp
 cargo run --release -p texturecraft-cli -- render crate.tcraft crate.png --samples 256   # path traced
 cargo run --release -p texturecraft-cli -- export crate.tcraft textures                 # headless export
 cd apps/texturecraft-web && trunk serve                      # web build
-cargo xtask ci                                               # fmt, clippy, tests, layering, wasm
+cargo xtask ci                                               # fmt, clippy, tests, layering, wasm (not on Windows)
 ```
 
-You need Rust 1.95 or newer. The app opens with no project (**File ▸ Open sample project** loads a baked one; **File ▸ Close** returns to this empty state); **File ▸ New project** starts
-from a built-in mesh, a project template or your own mesh file (UVs are generated if it has none).
+You need Rust 1.95 or newer. The app opens with no project (**File ▸ Open sample project** loads a baked one, and **File ▸ Close** returns to the empty state).
+**File ▸ New project** starts from your own mesh file and a project template. TextureCraft generates UVs if the mesh has none.
 
 Japanese, Chinese, Korean and Arabic interface text uses the fonts of
 [storytold/craft-fonts](https://github.com/storytold/craft-fonts) where it has them, an optional
@@ -256,6 +256,7 @@ are built, signed and published. Every bundled asset is listed with its licence 
 | Build | File |
 |---|---|
 | x86_64 | `texturecraft-<ver>-freebsd-x86_64.tar.gz` |
+| aarch64 (ARM64) | `texturecraft-<ver>-freebsd-aarch64.tar.gz` |
 
 ### Web (WebAssembly)
 

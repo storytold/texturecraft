@@ -12,7 +12,10 @@ const SEARCH_STEP: f32 = 8.0;
 /// The sample project (the ball is set 0, the base set 1) with the Ball active and the paint tool, at 1600 x 960
 fn sample_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(4);
     assert_eq!(harness.state().session.ts(), 0);
     assert_eq!(harness.state().session.tool.tool, Tool::Paint);

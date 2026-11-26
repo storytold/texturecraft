@@ -1,252 +1,236 @@
-//! MaterialCraft portable materials (`.mcmat`, read only): a zip with `material.json` (the
-//! manifest: maps by usage, exposed parameters, image inputs, presets), `maps/<usage>.png`
-//! (8-bit sRGB for color usages, 16-bit linear otherwise; OpenGL normals) and the
-//! source package. The shared reader handles the portable container and manifest.
-//!
-//! Also the 16-bit PNG encoder that hands baked mesh maps to MaterialCraft as graph inputs.
-
-use std::io::Cursor;
-
-use serde::Deserialize;
-use texturecraft_core::{LinkParam, LinkPreset};
-
+//! Validate a procedural MCMAT and encode caller-supplied mesh maps for MaterialCraft.
 use crate::{FormatError, Result};
+use std::io::Write;
 
-/// The portable material extension.
+mod version_marker;
+use version_marker::VersionMarker;
+
 pub const MCMAT_EXT: &str = "mcmat";
-/// MaterialCraft's package extension.
 pub const MCRAFT_EXT: &str = "mcraft";
-const VERSION: u32 = 2;
-/// Largest entry read (maps are at most 8192² × 16 bits, compressed).
-const MAX_ENTRY: u64 = 512 << 20;
-/// Most map entries one manifest may name (a material has at most nine usages).
-const MAX_MAPS: usize = 64;
-/// Largest total payload read from one `.mcmat`: maps and source together (audit: TextureCraft #4).
-const MAX_TOTAL: u64 = 1 << 30;
-const KIND: &str = "MaterialCraft material";
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Manifest {
-    pub format: String,
-    pub version: u32,
-    pub name: String,
-    pub graph: String,
-    pub size: [u32; 2],
-    pub maps: Vec<MapEntry>,
-    #[serde(default)]
-    pub parameters: Vec<LinkParam>,
-    #[serde(default)]
-    pub inputs: Vec<ImageInput>,
-    #[serde(default)]
-    pub presets: Vec<LinkPreset>,
-    pub source: String,
-}
+/// Diagnose old versions before starting the CLI. The shared reader in MaterialCraft
+/// validates and extracts the full archive.
+pub fn validate_mcmat_version(bytes: &[u8], manifest_budget_bytes: u64) -> Result<()> {
+    let limits = craft_mcmat::Limits::default();
+    let mut archive = craft_zip::Archive::open(bytes, craft_zip::Limits { max_entries: limits.max_entries, max_total_bytes: manifest_budget_bytes })
+        .map_err(mcmat_archive_error)?;
+    let bytes = archive
+        .read(craft_mcmat::MANIFEST_ENTRY, limits.max_manifest_bytes.min(manifest_budget_bytes))
+        .map_err(mcmat_archive_error)?
+        .ok_or_else(|| mcmat_invalid("missing material.json"))?;
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MapEntry {
-    /// `baseColor`, `normal`, `roughness`, `metallic`, `height`, `ambientOcclusion`, `emissive`,
-    /// `opacity` or `specular`.
-    pub usage: String,
-    pub file: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-pub struct ImageInput {
-    pub identifier: String,
-}
-
-/// A read `.mcmat`: the manifest, each map's PNG bytes by usage, the source package.
-#[derive(Clone, Debug)]
-pub struct PortableMaterial {
-    pub manifest: Manifest,
-    pub maps: Vec<(String, Vec<u8>)>,
-    pub source: Vec<u8>,
-}
-
-fn malformed(msg: impl Into<String>) -> FormatError {
-    FormatError::Malformed { kind: KIND, msg: msg.into() }
-}
-
-fn shared_error(error: craft_mcmat::Error) -> FormatError {
-    match error {
-        craft_mcmat::Error::Version(version) => FormatError::Unsupported(format!("{KIND} version {version} (this version reads up to {VERSION})")),
-        craft_mcmat::Error::Limit(message) => malformed(message),
-        craft_mcmat::Error::Archive(ref archive) if archive.is_limit() => FormatError::TooLarge(error.to_string()),
-        other => malformed(other.to_string()),
+    // A marker must be an object even though Serde also accepts positional struct fields
+    if !bytes.trim_ascii_start().starts_with(b"{") {
+        return Err(mcmat_invalid("expected a version object"));
     }
+
+    let marker: VersionMarker = serde_json::from_slice(&bytes).map_err(mcmat_invalid)?;
+    if marker.version != craft_mcmat::VERSION {
+        return Err(FormatError::Unsupported(craft_mcmat::Error::Version(marker.version).to_string()));
+    }
+
+    Ok(())
 }
 
-/// Read `.mcmat` bytes within TextureCraft's existing per-entry and total payload limits.
-pub fn read_mcmat(bytes: &[u8]) -> Result<PortableMaterial> {
-    let limits = craft_mcmat::Limits {
-        min_version: 0,
-        max_version: VERSION,
-        max_entries: 100_000,
-        max_maps: MAX_MAPS,
-        max_manifest_bytes: MAX_ENTRY,
-        max_entry_bytes: MAX_ENTRY,
-        max_total_bytes: MAX_TOTAL,
-    };
-    let mut archive = craft_mcmat::Material::open(bytes, limits).map_err(shared_error)?;
-    // Consume the JSON values rather than cloning the entire untrusted manifest into a second tree.
-    let parameters = std::mem::take(&mut archive.manifest.parameters)
-        .into_iter()
-        .map(serde_json::from_value)
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|e| malformed(format!("material.json: {e}")))?;
-    let inputs = std::mem::take(&mut archive.manifest.inputs)
-        .into_iter()
-        .map(serde_json::from_value)
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|e| malformed(format!("material.json: {e}")))?;
-    let presets = std::mem::take(&mut archive.manifest.presets)
-        .into_iter()
-        .map(serde_json::from_value)
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|e| malformed(format!("material.json: {e}")))?;
-    let shared = &archive.manifest;
-    let manifest = Manifest {
-        format: shared.format.clone(),
-        version: shared.version,
-        name: shared.name.clone(),
-        graph: shared.graph.clone(),
-        size: shared.size,
-        maps: shared.maps.iter().map(|m| MapEntry { usage: m.usage.clone(), file: m.file.clone() }).collect(),
-        parameters,
-        inputs,
-        presets,
-        source: shared.source.clone(),
-    };
-    let maps = manifest.maps.iter().map(|map| Ok((map.usage.clone(), archive.read(&map.file).map_err(shared_error)?))).collect::<Result<Vec<_>>>()?;
-    let source = archive.read_source().map_err(shared_error)?;
-    Ok(PortableMaterial { manifest, maps, source })
+fn mcmat_invalid(error: impl std::fmt::Display) -> FormatError {
+    FormatError::Malformed { kind: "MaterialCraft material", msg: error.to_string() }
+}
+
+fn mcmat_archive_error(error: craft_zip::Error) -> FormatError {
+    if error.is_limit() {
+        return FormatError::TooLarge(error.to_string());
+    }
+
+    mcmat_invalid(error)
 }
 
 /// Whether `bytes` contain a portable material manifest within the ZIP entry limit.
 pub fn is_mcmat(bytes: &[u8]) -> bool {
-    craft_mcmat::is_material(bytes, 100_000)
+    craft_mcmat::is_material(bytes, craft_mcmat::Limits::default().max_entries)
 }
 
 pub fn is_mcraft(bytes: &[u8]) -> bool {
-    let Ok(mut archive) = craft_zip::Archive::open(bytes, craft_zip::Limits { max_entries: 100_000, max_total_bytes: 0 }) else { return false };
-    // A portable material may itself contain source.sbs, so it is not a source archive.
-    if archive.has_duplicate_names() || archive.contains("material.json") {
+    let limits = craft_zip::Limits { max_entries: craft_mcmat::Limits::default().max_entries, max_total_bytes: 0 };
+    let Ok(mut archive) = craft_zip::Archive::open(bytes, limits) else {
+        return false;
+    };
+
+    // A portable material may contain source.sbs inside its envelope
+    if archive.has_duplicate_names() || archive.contains(craft_mcmat::MANIFEST_ENTRY) {
         return false;
     }
+
     if archive.contains("package.json") {
         return true;
     }
-    (0..archive.len()).any(|i| archive.entry_name(i).ok().flatten().is_some_and(|name| !name.contains('/') && name.to_ascii_lowercase().ends_with(".sbs")))
+
+    (0..archive.len()).any(|index| archive.entry_name(index).ok().flatten().as_deref().is_some_and(is_root_sbs))
+}
+
+pub(crate) fn is_root_sbs(name: &str) -> bool {
+    !name.contains('/') && name.rsplit_once('.').is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("sbs"))
 }
 
 /// A baked mesh map (`components` floats per texel, 0..1, rows top first) as a 16-bit PNG
 /// (grayscale for one component, RGB for three).
 pub fn mesh_map_png(width: u32, components: usize, data: &[f32]) -> Result<Vec<u8>> {
-    let per_row = (width as usize).saturating_mul(components);
-    let height = data.len().checked_div(per_row).unwrap_or(0) as u32;
-    if height == 0 || !matches!(components, 1 | 3) {
-        return Err(FormatError::Invalid(format!("mesh map of {} values, {width} wide, {components} components", data.len())));
+    let mut encoded = Vec::new();
+    write_mesh_map_png(&mut encoded, width, components, data)?;
+    Ok(encoded)
+}
+
+/// Estimated temporary workspace for `write_mesh_map_png` with a file destination.
+pub fn mesh_map_png_working_bytes(width_px: u32, height_px: u32, components: usize) -> u64 {
+    // PngRows in the pinned codec deflates bands of up to 512 KiB filtered bytes,
+    // or one scanline for wider images.
+    const DEFLATE_BAND_BYTES: u64 = 512 << 10;
+    const DEFLATE_WORKSPACE_BYTES: u64 = 1 << 20;
+
+    let row_bytes = u64::from(width_px).saturating_mul(components as u64).saturating_mul(std::mem::size_of::<u16>() as u64);
+    let filtered_row_bytes = row_bytes.saturating_add(1);
+    let band_rows = (DEFLATE_BAND_BYTES / filtered_row_bytes).max(1).min(u64::from(height_px));
+    let pending = row_bytes.saturating_mul(band_rows).saturating_mul(2);
+    let filtered = filtered_row_bytes.saturating_mul(band_rows);
+    let deflated = filtered.saturating_add(filtered / 8).saturating_add(1_024);
+    // Include spare row capacity and keep both the deflate output and the
+    // assembled zlib buffer in the estimate. Input floats are already charged.
+    let row_buffers = row_bytes.saturating_mul(8);
+    row_buffers.saturating_add(pending).saturating_add(filtered).saturating_add(deflated.saturating_mul(2)).saturating_add(DEFLATE_WORKSPACE_BYTES)
+}
+
+/// Encode a mesh map directly into its destination using one row of quantized samples.
+pub fn write_mesh_map_png(output: impl Write, width_px: u32, components: usize, data: &[f32]) -> Result<()> {
+    let invalid_size = || FormatError::Invalid(format!("mesh map of {} values, {width_px} wide, {components} components", data.len()));
+    let layout = match components {
+        1 => craft_image_codecs::ChannelLayout::Gray,
+        3 => craft_image_codecs::ChannelLayout::Rgb,
+        _ => return Err(invalid_size()),
+    };
+    let samples_per_row = (width_px as usize).checked_mul(components).filter(|&count| count != 0).ok_or_else(invalid_size)?;
+    if data.is_empty() || !data.len().is_multiple_of(samples_per_row) {
+        return Err(invalid_size());
     }
-    let px: Vec<u16> = data.iter().take(per_row * height as usize).map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16).collect();
-    let img = if components == 1 {
-        image::ImageBuffer::<image::Luma<u16>, _>::from_raw(width, height, px).map(image::DynamicImage::ImageLuma16)
-    } else {
-        image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(width, height, px).map(image::DynamicImage::ImageRgb16)
+
+    let height_px = u32::try_from(data.len() / samples_per_row).map_err(|_| invalid_size())?;
+    let mut scanline = Vec::new();
+    scanline.try_reserve_exact(samples_per_row).map_err(|error| FormatError::TooLarge(error.to_string()))?;
+
+    let mut opts = craft_image_codecs::EncodeOptions::default();
+    opts.png_compression = craft_image_codecs::PngCompression::Fast;
+    opts.embed_icc = false;
+    opts.embed_metadata = false;
+
+    let codec_err = |error: craft_image_codecs::CodecError| FormatError::Invalid(error.to_string());
+    let mut rows = data.chunks_exact(samples_per_row);
+    let first_row = rows.next().ok_or_else(invalid_size)?;
+    scanline.extend(first_row.iter().map(|value| (value.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16));
+    let first_band = craft_image_codecs::Image::from_u16(width_px, 1, layout, &scanline).map_err(codec_err)?;
+    let mut writer = craft_image_codecs::PngRows::new(output, &first_band, height_px, &opts).map_err(codec_err)?;
+    writer.push(&first_band).map_err(codec_err)?;
+    for row in rows {
+        scanline.clear();
+        scanline.extend(row.iter().map(|value| (value.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16));
+        let band = craft_image_codecs::Image::from_u16(width_px, 1, layout, &scanline).map_err(codec_err)?;
+        writer.push(&band).map_err(codec_err)?;
     }
-    .ok_or_else(|| FormatError::Invalid("mesh map size".into()))?;
-    let mut out = Vec::new();
-    img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png).map_err(|e| FormatError::Invalid(e.to_string()))?;
-    Ok(out)
+    writer.finish().map_err(codec_err)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::Cursor;
 
-    /// A `.mcmat` as MaterialCraft writes it (see its `formats/src/material.rs`).
-    pub(crate) fn sample(version: u32) -> Vec<u8> {
-        let source = if version >= 2 { "source.sbs" } else { "source.mcraft" };
-        let manifest = serde_json::json!({
-            "format": "craft-material", "version": version, "name": "Brick wall", "graph": "Brick_wall", "size": [4, 4],
-            "maps": [{"usage": "baseColor", "file": "maps/baseColor.png", "colorSpace": "srgb"}],
-            "parameters": [{"id": "wear", "label": "Wear", "default": {"t": "float", "v": 0.5}, "min": 0.0, "max": 1.0, "value": {"t": "float", "v": 0.25}}],
-            "inputs": [{"identifier": "curvature", "kind": "gray"}],
-            "presets": [{"name": "Worn", "values": {"wear": {"t": "float", "v": 1.0}}}],
-            "source": source, "futureField": true
-        });
-        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let o = zip::write::SimpleFileOptions::default();
-        z.start_file("material.json", o).unwrap();
-        z.write_all(manifest.to_string().as_bytes()).unwrap();
-        z.start_file("maps/baseColor.png", o).unwrap();
-        z.write_all(&mesh_map_png(4, 3, &[0.5; 48]).unwrap()).unwrap();
-        z.start_file(source, o).unwrap();
-        z.write_all(b"pkg").unwrap();
-        z.finish().unwrap().into_inner()
+    #[test]
+    fn mesh_map_png_budget_covers_live_band_allocations() {
+        // The pinned encoder holds 85 rows for a 1024px RGB16 map. These
+        // three reserves coexist while deflating, even for compressible data.
+        const PENDING_BYTES: u64 = 522_240;
+        const FILTERED_BYTES: u64 = 522_325;
+        const DEFLATE_OUTPUT_BYTES: u64 = 588_639;
+        let unavoidable_workspace = PENDING_BYTES + FILTERED_BYTES + DEFLATE_OUTPUT_BYTES;
+        let estimate = mesh_map_png_working_bytes(1_024, 1_024, 3);
+        assert!(estimate >= unavoidable_workspace, "estimated {estimate} bytes for at least {unavoidable_workspace} bytes of workspace");
+        assert!(mesh_map_png_working_bytes(1_024, 1, 3) < estimate);
+        assert_eq!(mesh_map_png_working_bytes(u32::MAX, u32::MAX, usize::MAX), u64::MAX);
     }
 
     #[test]
-    fn reads_manifest_maps_and_source() {
-        let bytes = sample(1);
-
-        assert!(is_mcmat(&bytes) && !is_mcraft(&bytes));
-        let material = read_mcmat(&bytes).unwrap();
-
-        assert_eq!(material.manifest.graph, "Brick_wall");
-        assert_eq!(material.manifest.parameters[0].id, "wear");
-        assert_eq!(material.manifest.parameters[0].value, serde_json::json!({"t": "float", "v": 0.25}));
-        assert_eq!(material.manifest.presets[0].name, "Worn");
-        assert_eq!(material.manifest.inputs[0].identifier, "curvature");
-        assert_eq!(material.maps[0].0, "baseColor");
-        assert_eq!(crate::decode_image(&material.maps[0].1).unwrap().width, 4);
-        assert_eq!(material.source, b"pkg");
-        let current = read_mcmat(&sample(2)).unwrap();
-        assert_eq!(current.manifest.source, "source.sbs");
-        assert_eq!(current.source, b"pkg");
-        assert!(matches!(read_mcmat(&sample(3)), Err(FormatError::Unsupported(_))));
-        assert!(read_mcmat(b"junk").is_err());
-    }
-
-    #[test]
-    fn recognizes_both_generations_of_source_archive_without_confusing_portable_materials() {
-        for entry in ["package.json", "package.sbs"] {
+    fn recognizes_v3_and_directs_older_authors_to_republish() {
+        let source = craft_mcmat::write(b"<package/>", []).unwrap();
+        assert!(is_mcmat(&source) && !is_mcraft(&source));
+        validate_mcmat_version(&source, 1 << 20).unwrap();
+        for version in [1, 2] {
             let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-            zip.start_file(entry, zip::write::SimpleFileOptions::default()).unwrap();
-            zip.write_all(b"source").unwrap();
-            let bytes = zip.finish().unwrap().into_inner();
-            assert!(is_mcraft(&bytes), "{entry}");
+            zip.start_file("material.json", zip::write::SimpleFileOptions::default()).unwrap();
+            write!(zip, r#"{{"version":{version}}}"#).unwrap();
+            let err = validate_mcmat_version(&zip.finish().unwrap().into_inner(), 1 << 20).unwrap_err();
+            assert!(err.to_string().contains("Republish"));
         }
-        assert!(!is_mcraft(&sample(2)), "a portable material contains source.sbs too");
     }
 
     #[test]
-    fn an_unbounded_map_list_is_refused() {
-        let maps: Vec<_> = (0..=MAX_MAPS).map(|_| serde_json::json!({"usage": "baseColor", "file": "maps/baseColor.png"})).collect();
-        let manifest = serde_json::json!({"format": craft_mcmat::FORMAT, "version": VERSION, "name": "n", "graph": "g", "size": [4, 4], "maps": maps, "source": "source.mcraft"});
-        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let options = zip::write::SimpleFileOptions::default();
-        archive.start_file("material.json", options).unwrap();
-        archive.write_all(manifest.to_string().as_bytes()).unwrap();
-        archive.start_file("maps/baseColor.png", options).unwrap();
-        archive.write_all(&mesh_map_png(4, 3, &[0.5; 48]).unwrap()).unwrap();
-        archive.start_file("source.mcraft", options).unwrap();
-        archive.write_all(b"pkg").unwrap();
+    fn version_marker_requires_one_named_version() {
+        for marker in [r#"{"version":2,"version":3}"#, "[3]"] {
+            let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            zip.start_file(craft_mcmat::MANIFEST_ENTRY, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(marker.as_bytes()).unwrap();
+            let bytes = zip.finish().unwrap().into_inner();
 
-        let result = read_mcmat(&archive.finish().unwrap().into_inner());
-
-        assert!(matches!(result, Err(FormatError::Malformed { .. })));
+            assert!(validate_mcmat_version(&bytes, 1 << 20).is_err());
+        }
     }
 
     #[test]
     fn mesh_maps_encode_as_16_bit() {
         let png = mesh_map_png(2, 1, &[0.0, 0.25, 0.5, 1.0]).unwrap();
-        let d = crate::decode_image(&png).unwrap();
-        assert_eq!((d.width, d.height), (2, 2));
-        assert!((d.rgba[1][0] - 0.25).abs() < 1e-4);
+        let decoded = crate::decode_image(&png).unwrap();
+
+        assert_eq!((decoded.width, decoded.height), (2, 2));
+        assert!((decoded.rgba[1][0] - 0.25).abs() < 1e-4);
+        assert!(mesh_map_png(2, 1, &[0.0; 3]).is_err());
         assert!(mesh_map_png(0, 1, &[]).is_err());
         assert!(mesh_map_png(2, 2, &[0.0; 8]).is_err());
+    }
+
+    #[test]
+    fn mesh_maps_encode_gray16_and_rgb16_with_exact_png_headers() {
+        let decode_raw_16 = |bytes: &[u8]| {
+            let decoder = png::Decoder::new(Cursor::new(bytes));
+            let mut reader = decoder.read_info().unwrap();
+            let info = reader.info().clone();
+            let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+            let frame = reader.next_frame(&mut buf).unwrap();
+            let samples: Vec<u16> = buf[..frame.buffer_size()].as_chunks::<2>().0.iter().copied().map(u16::from_be_bytes).collect();
+            (info, samples)
+        };
+
+        let gray = mesh_map_png(2, 1, &[-0.5, 0.25, 0.5, 1.5]).unwrap();
+        let (gray_info, gray_samples) = decode_raw_16(&gray);
+        assert_eq!(gray_info.bit_depth, png::BitDepth::Sixteen);
+        assert_eq!(gray_info.color_type, png::ColorType::Grayscale);
+        assert_eq!(gray_samples, [0, 16384, 32768, 65535]);
+
+        let rgb = mesh_map_png(2, 3, &[0.0, 0.25, 0.5, 1.0, 0.75, 0.125, 0.5, 0.5, 0.5, 0.0, 1.0, 0.0]).unwrap();
+        let (rgb_info, rgb_samples) = decode_raw_16(&rgb);
+        assert_eq!(rgb_info.bit_depth, png::BitDepth::Sixteen);
+        assert_eq!(rgb_info.color_type, png::ColorType::Rgb);
+        assert_eq!(rgb_samples, [0, 16384, 32768, 65535, 49151, 8192, 32768, 32768, 32768, 0, 65535, 0]);
+    }
+
+    #[test]
+    fn write_mesh_map_png_propagates_writer_errors() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = write_mesh_map_png(FailingWriter, 2, 1, &[0.0, 0.25, 0.5, 1.0]).unwrap_err();
+        assert!(matches!(error, FormatError::Invalid(_)), "{error}");
     }
 }

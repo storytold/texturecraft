@@ -5,6 +5,7 @@ mod bake_checks;
 mod bake_mesh;
 mod bake_meshes;
 mod bake_task;
+mod high_poly_load;
 mod high_poly_missed;
 mod layout;
 mod merged_high;
@@ -14,15 +15,17 @@ mod paint_command;
 mod preserve_tiles;
 mod streamed_bake;
 mod streamed_map;
+mod sync_command;
 mod tile_command;
 
 pub use bake_cage_inputs::BakeCageInputs;
 pub use bake_mesh::BakeMesh;
 pub use bake_meshes::BakeMeshes;
 pub use bake_task::BakeTask;
+pub use high_poly_load::HighPolyLoad;
 pub use high_poly_missed::{HIDDEN_HIGH_POLY_VERTEX, high_poly_missed};
 pub use merged_high::MergedHigh;
-pub use mesh_map_command::{install_gpu_tracer, meshes_json, settings_params};
+pub use mesh_map_command::{install_gpu_tracer, meshes_json, set_gpu_raytracing, settings_params};
 pub use model_patch::settings_patch;
 pub use streamed_bake::StreamedBake;
 pub use streamed_map::StreamedMap;
@@ -36,5 +39,6 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
     let mut commands = mesh_map_command::specs();
     commands.extend(paint_command::specs());
     commands.extend(tile_command::specs());
+    commands.extend(sync_command::specs());
     commands
 }

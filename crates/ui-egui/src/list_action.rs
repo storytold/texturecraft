@@ -5,10 +5,12 @@ use texturecraft_engine::formats::ExportPreset;
 pub enum ListAction {
     Select(String),
     New,
-    Duplicate,
+    /// Copy this template, select the copy
+    Duplicate(String),
     StartRename(String),
     Rename(String),
-    Remove,
+    /// Delete this template (after asking)
+    Remove(String),
     Import,
     /// A template read from a file, added and selected
     Imported(ExportPreset),

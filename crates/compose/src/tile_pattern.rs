@@ -599,7 +599,7 @@ mod tests {
     fn halves(left: f32, right: f32) -> std::sync::Arc<ImageRes> {
         let size = 8;
         let rgba = (0..size * size).map(|texel| if texel % size < size / 2 { [left, left, left, 1.0] } else { [right, right, right, 1.0] }).collect();
-        std::sync::Arc::new(ImageRes { width: size as u32, height: size as u32, rgba, srgb: false })
+        std::sync::Arc::new(ImageRes::new(size as u32, size as u32, rgba, false))
     }
 
     #[test]

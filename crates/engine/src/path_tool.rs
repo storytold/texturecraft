@@ -156,12 +156,19 @@ impl PathState {
 #[derive(Clone)]
 pub(crate) struct PathCache {
     pub(crate) eid: LayerId,
-    // Alpha image resources are not part of this cache key
-    // Replacing an alpha takes effect when a cached path changes
+    // Session::invalidate_changed discards the prefix when an image it reads changes
     key: (u64, Option<(u32, u32)>),
     below: Vec<PathShape>,
     mask: Option<texturecraft_texel::TileImage>,
     layers: Vec<((LayerId, Channel), texturecraft_texel::TileImage)>,
+}
+
+impl PathCache {
+    /// The image resources the cached paths painted their mask with
+    pub(crate) fn images(&self) -> impl Iterator<Item = &str> + '_ {
+        // Only successfully painted paths enter the prefix
+        self.below.iter().filter_map(|shape| shape.paint.get("mask_image")?.as_str())
+    }
 }
 
 /// What a stored path is painted with ([`PathShape::paint`]).
@@ -171,6 +178,8 @@ struct PathPaint {
     values: BTreeMap<Channel, [f32; 3]>,
     enabled: BTreeSet<Channel>,
     mask_value: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mask_image: Option<String>,
     camera: OrbitCamera,
 }
 
@@ -337,6 +346,7 @@ fn edit_path(s: &mut Session, p: &Value) -> Result<Value> {
     s.tool.values = paint.values;
     s.tool.enabled = paint.enabled;
     s.tool.mask_value = paint.mask_value;
+    s.tool.mask_image = paint.mask_image;
     s.tool.path = PathState { editing: Some((eid, index)), ..state_of(&shape) };
     s.path_steps = Default::default();
     s.target = StackTarget::Effect(eid);
@@ -367,6 +377,12 @@ fn read_paint(shape: &PathShape) -> Result<PathPaint> {
     let mut paint: PathPaint = serde_json::from_value(shape.paint.clone()).map_err(|e| EngineError::Other(format!("unreadable path settings: {e}")))?;
     paint.brush = paint.brush.sanitized();
     Ok(paint)
+}
+
+/// The image resources a path sublayer's paths paint their mask with (none for any other effect)
+pub(crate) fn path_images(kind: &EffectKind) -> Vec<String> {
+    let EffectKind::Path(shapes) = kind else { return Vec::new() };
+    shapes.iter().filter_map(|shape| read_paint(shape).ok()?.mask_image).collect()
 }
 
 /// The Path tool state showing a stored path (finite points only, at most [`MAX_PATH_POINTS`])
@@ -459,7 +475,14 @@ impl Session {
     /// The Path tool's curve with the current brush and material, as painted from `camera`.
     fn path_shape(&self, camera: OrbitCamera, viewport: Vec2) -> PathShape {
         let (t, path) = (&self.tool, &self.tool.path);
-        let paint = PathPaint { brush: t.brush.clone(), values: t.values.clone(), enabled: t.enabled.clone(), mask_value: t.mask_value, camera };
+        let paint = PathPaint {
+            brush: t.brush.clone(),
+            values: t.values.clone(),
+            enabled: t.enabled.clone(),
+            mask_value: t.mask_value,
+            mask_image: t.mask_image.clone(),
+            camera,
+        };
         PathShape {
             points: path.points.iter().map(|p| p.to_array()).collect(),
             corners: path.corner_flags(),
@@ -815,7 +838,7 @@ impl Session {
         let from = if back { &self.path_steps.0 } else { &self.path_steps.1 };
         let Some((index, state)) = from.iter().enumerate().rfind(|(_, state)| !state.same_curve(&self.tool.path)) else { return Ok(false) };
 
-        // Returning false here would let undo/redo consume document history instead.
+        // Keep undo and redo within the active path history
         if self.quick_mask.editing {
             return Err(EngineError::Other("paths can't edit the quick mask: stop editing it first".into()));
         }
@@ -1008,6 +1031,7 @@ impl Session {
         self.tool.values = paint.values;
         self.tool.enabled = paint.enabled;
         self.tool.mask_value = paint.mask_value;
+        self.tool.mask_image = paint.mask_image;
         self.camera = camera;
         self.tool.path = state_of(shape);
         self.paint_path(viewport)
@@ -1157,7 +1181,7 @@ impl Session {
         }
 
         let tiles = canvas.dirty.len();
-        self.commit_fill("Path fill", texture_set, &canvas)?;
+        self.commit_fill("Path fill", texture_set, &canvas, &self.mask_gray())?;
         Ok(tiles)
     }
 }
@@ -1193,12 +1217,17 @@ mod tests {
         for v in [0.4, 0.45] {
             execute(&mut s, "tool.path", &json!({"uvPoints": [[0.1, v], [0.5, v], [0.9, v]]})).unwrap();
         }
+
         assert_eq!(s.path_cache.as_ref().map(|c| c.below.len()), Some(1));
+
         let r = s.render_paths(eid, 1).unwrap();
+
         assert!(r[0].is_null() && !r[1].is_null(), "the bottom path came from the cache: {r:?}");
+
         let cached = pixels(&s, eid);
         s.path_cache = None;
         s.render_paths(eid, 0).unwrap();
+
         assert_eq!(cached, pixels(&s, eid), "same pixels as painting every path");
         assert!(!cached.is_empty());
 
@@ -1211,6 +1240,38 @@ mod tests {
         let remaining_tiles = s.path_cache.as_ref().map_or(0, |cache| cache.layers.iter().map(|(_, image)| image.allocated_count()).sum::<usize>());
         assert_eq!(remaining_tiles, 0);
         assert!(s.path_cache.is_none(), "deleting the path effect releases its cached tiles");
+    }
+
+    #[test]
+    fn removing_a_cached_paths_mask_image_repaints_it_with_the_mask_value() {
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::sphere(1.0, 24, 12), "builtin:test", None, 128).unwrap();
+        s.update();
+        let layer = execute(&mut s, "layer.add.paint", &Value::Null).unwrap()["layer"].as_u64().unwrap();
+        execute(&mut s, "mask.add.black", &json!({"layer": layer})).unwrap();
+        execute(&mut s, "layer.select", &json!({"layer": layer, "target": "mask"})).unwrap();
+        execute(&mut s, "tool.brush", &json!({"size": 6})).unwrap();
+        let white = texturecraft_formats::gray16_png(1, 1, [1.0].into_iter()).unwrap();
+        let image = s.import_resource_bytes("brush.png", white).unwrap();
+        execute(&mut s, "tool.material", &json!({"maskImage": image, "maskValue": 0.5})).unwrap();
+        let mut eid = 0;
+        for v in [0.3, 0.7] {
+            let r = execute(&mut s, "tool.path", &json!({"uvPoints": [[0.1, v], [0.9, v + 0.05]], "commit": true})).unwrap();
+            eid = r["committed"]["effect"].as_u64().unwrap();
+        }
+        let eid = LayerId(eid);
+        execute(&mut s, "path.edit", &json!({"effect": eid.0, "index": 1})).unwrap();
+        execute(&mut s, "tool.path", &json!({"uvPoints": [[0.1, 0.6], [0.9, 0.6]]})).unwrap();
+
+        assert_eq!(s.path_cache.as_ref().map(|c| c.below.len()), Some(1), "the bottom path is cached");
+
+        execute(&mut s, "resource.remove", &json!({"name": image})).unwrap();
+        execute(&mut s, "tool.path", &json!({"uvPoints": [[0.1, 0.65], [0.9, 0.65]]})).unwrap();
+        let mask = |s: &Session| format!("{:?}", s.doc.pixels.masks.get(&eid));
+        let edited = mask(&s);
+        s.path_cache = None;
+        s.render_paths(eid, 0).unwrap();
+
+        assert_eq!(edited, mask(&s), "the bottom path paints the mask value as a full repaint does");
     }
 
     #[test]

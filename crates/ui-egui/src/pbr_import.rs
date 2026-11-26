@@ -100,7 +100,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
     let mut open = true;
     let (mut import_clicked, mut cancel_clicked) = (false, false);
-    crate::windows::dialog("pbrImport", tr("Import PBR textures"), &mut open).show(ctx, |ui| {
+    crate::windows::dialog(ctx, "pbrImport", tr("Import PBR Textures"), &mut open).show(ctx, |ui| {
         ui.set_min_width(380.0);
         ui.horizontal(|ui| {
             ui.label(tr("Layer name"));
@@ -202,7 +202,7 @@ fn run(app: &mut TextureCraftApp, dialog_state: &PbrDialog) -> bool {
 
     let name = reply.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
     for warning in reply.get("warnings").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
-        app.session.log.push(format!("PBR {name}: {warning}"));
+        app.session.log.warn(texturecraft_engine::log::LIBRARY_SOURCE, format!("PBR {name}: {warning}"));
     }
 
     app.toast(trf("Imported {name}", &[("name", &name)]), false);

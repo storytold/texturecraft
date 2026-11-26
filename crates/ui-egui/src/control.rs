@@ -20,6 +20,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::TextureCraftApp;
+use crate::state::Prefs;
 
 pub struct ControlRequest {
     pub method: String,
@@ -47,7 +48,7 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let reqs: Vec<ControlRequest> = rx.try_iter().collect();
     for r in reqs {
         if r.method == "ui.screenshot" {
-            // Replies when the next frame has been captured.
+            // Reply after the next frame is captured
             let reply = r.reply;
             let repaint = ctx.clone();
             let callback = egui::ScreenshotCallback::new(move |img| {
@@ -61,6 +62,7 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
             ctx.request_repaint();
             continue;
         }
+
         let reply = handle(app, ctx, &r.method, &r.params);
         let _ = r.reply.send(reply);
         ctx.request_repaint();
@@ -68,10 +70,48 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
 }
 
 pub(crate) fn encode_png(w: u32, h: u32, rgba: Vec<u8>) -> Option<(u32, u32, Vec<u8>)> {
-    let img = image::RgbaImage::from_raw(w, h, rgba)?;
-    let mut png = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+    let img = craft_image_codecs::Image::from_u8(w, h, craft_image_codecs::ChannelLayout::Rgba, rgba).ok()?;
+    let png = craft_image_codecs::encode(&img, craft_image_codecs::Format::Png, &Default::default()).ok()?;
     Some((w, h, png))
+}
+
+fn refresh_draft_preferences(draft: &mut Prefs, previous: &Prefs, current: &Prefs) {
+    // Exhaustive destructuring requires reconciliation for every new preference
+    macro_rules! refresh_fields {
+        ($($field:ident),+ $(,)?) => {
+            let Prefs { $($field),+ } = current;
+
+            $(
+                if &previous.$field != $field {
+                    draft.$field.clone_from($field);
+                }
+            )+
+        };
+    }
+
+    refresh_fields!(
+        ui_scale,
+        autosave_minutes,
+        recent_projects_limit,
+        language,
+        viewport_texture,
+        brightness,
+        accent,
+        system_title_bar,
+        data_folder,
+        reserved_cores,
+        project_open_limit_gib,
+        save_ram_percent,
+        work_threads,
+        rotation_speed,
+        zoom_speed,
+        zoom_inverse,
+        wheel_speed,
+        wheel_inverse,
+        gpu_raytracing,
+        libraries,
+        background,
+    );
 }
 
 pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, params: &Value) -> Value {
@@ -188,6 +228,7 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
                 .map(|item| json!({
                     "menu": item.menu, "submenu": item.sub, "label": item.label, "id": item.id, "shortcut": crate::keymap::shortcut_of(&app.ui.keymap, item.id),
                     "implemented": crate::menus::implemented(item.id), "enabled": crate::menus::enabled(app, item.id),
+                    "checked": crate::menus::checked(app, item.id),
                 }))
                 .collect::<Vec<_>>()
         )),
@@ -219,9 +260,34 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
                 }
             }
 
-            match serde_json::from_value(current_state) {
-                Ok(ui) => {
+            match serde_json::from_value::<crate::UiState>(current_state) {
+                Ok(mut ui) => {
+                    let previous_autosave_minutes = app.ui.prefs.autosave_minutes;
+                    if ui.prefs.libraries != app.ui.prefs.libraries {
+                        app.library = None;
+                    }
+
+                    // Pending dialogs and editor text do not appear in the serialized state
+                    if params.get("windows").is_none() {
+                        ui.windows = std::mem::take(&mut app.ui.windows);
+                    } else {
+                        ui.windows.mesh_export_options = app.ui.windows.mesh_export_options;
+                        if ui.windows.settings {
+                            ui.windows.settings_draft = app.ui.windows.settings_draft.take();
+                        }
+                    }
+                    ui.bake_preset_name = std::mem::take(&mut app.ui.bake_preset_name);
+
+                    // Live changes take precedence only for the fields they affect
+                    if params.get("prefs").is_some()
+                        && let Some(draft) = &mut ui.windows.settings_draft
+                    {
+                        refresh_draft_preferences(&mut draft.prefs, &app.ui.prefs, &ui.prefs);
+                    }
+
+                    ui.trim_recent();
                     app.ui = ui;
+                    app.reschedule_autosave_if_changed(previous_autosave_minutes);
                     app.ui.prefs.apply_resource_limits();
                     ok(Value::Null)
                 }
@@ -250,4 +316,40 @@ pub fn screenshot(app: &TextureCraftApp, view: u64) -> Option<(u32, u32, Vec<u8>
     let gpu = renderer.callback_resources.get::<crate::gpu::GpuState>()?;
     let (w, h, rgba) = gpu.renderer.read_view(&rs.device, &rs.queue, view)?;
     encode_png(w, h, rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_rgba_buffer_to_png() {
+        let (w, h, png) = encode_png(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255]).unwrap();
+        assert_eq!((w, h), (2, 1));
+        let decoded = craft_image_codecs::decode(&png).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
+        assert_eq!(decoded.to_rgba8(), vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        assert!(encode_png(2, 1, vec![0; 3]).is_none());
+    }
+
+    #[test]
+    fn a_live_background_change_reaches_an_open_settings_draft() {
+        let previous = Prefs::default();
+        let mut current = previous.clone();
+        current.background = [[0.5, 0.0, 0.0], [0.0, 0.0, 0.5]];
+
+        let mut draft = previous.clone();
+        draft.language = "de".into();
+        refresh_draft_preferences(&mut draft, &previous, &current);
+        assert_eq!(draft.background, current.background, "the control change shows in the open window");
+        assert_eq!(draft.language, "de", "the window's own edit stays");
+
+        // A background edited in the window and not by the control stays as edited
+        let mut edited = previous.clone();
+        edited.background[0] = [0.1, 0.2, 0.3];
+        let mut language_only = previous.clone();
+        language_only.language = "fr".into();
+        refresh_draft_preferences(&mut edited, &previous, &language_only);
+        assert_eq!(edited.background[0], [0.1, 0.2, 0.3]);
+    }
 }

@@ -60,7 +60,8 @@ mod limits {
     pub fn available_ram() -> u64 {
         let Ok(mut sys) = sysinfo::System::new() else { return FALLBACK_AVAILABLE_RAM_BYTES };
         sys.refresh_memory();
-        reported_ram(sys.available_memory(), sys.total_memory())
+        let available_bytes = reported_ram(sys.available_memory(), sys.total_memory());
+        sys.cgroup_limits().map_or(available_bytes, |limits| available_bytes.min(limits.free_memory))
     }
 
     fn reported_ram(available: u64, total: u64) -> u64 {
@@ -107,6 +108,12 @@ pub fn available_save_resources() -> (usize, u64) {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_ram_budget(available_ram_bytes: u64, ram_percent: u8) -> u64 {
     u64::try_from(u128::from(available_ram_bytes) * u128::from(ram_percent.clamp(1, 100)) / 100).unwrap_or(u64::MAX)
+}
+
+/// The configured Settings share of currently available RAM, in bytes.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn configured_ram_budget() -> u64 {
+    save_ram_budget(limits::available_ram(), limits::get().1)
 }
 
 /// Worker threads and in-flight byte budget for a save of `entries` entries.

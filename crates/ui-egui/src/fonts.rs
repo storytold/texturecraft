@@ -161,7 +161,7 @@ impl UiFonts {
                 defs.families.entry(family).or_default().push(name.clone());
             }
         }
-        ctx.set_fonts(defs);
+        crate::theme::load_fonts(ctx, defs);
         self.installed = want;
     }
 

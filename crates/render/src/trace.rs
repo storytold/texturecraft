@@ -23,7 +23,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use texturecraft_compose::{Composite, ImageRes};
 use texturecraft_core::Channel;
-use texturecraft_core::project::{DisplaySettings, ToneMapping};
+use texturecraft_core::project::{DisplaySettings, EnvAlignment, ToneMapping};
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera};
 
@@ -47,6 +47,8 @@ pub struct TraceScene {
     pub env: Arc<EnvImage>,
     /// Environment rotation around +Y (radians), as in the viewport.
     pub env_rotation: f32,
+    /// The environment turns with the camera about the vertical axis (Environment Alignment: Camera).
+    pub env_camera: bool,
     /// Texture set per triangle (`usize::MAX`: none, default material).
     pub(crate) tri_set: Arc<Vec<usize>>,
     /// Importance sampling of the environment (None for an empty image).
@@ -93,6 +95,7 @@ impl TraceScene {
             sets,
             env,
             env_rotation,
+            env_camera: false,
             tri_set: Arc::new(tri_set),
             light,
             spec_gloss: false,
@@ -130,6 +133,7 @@ impl TraceScene {
     /// [`TraceScene::for_display`] under `env`, from [`TraceScene::display_env`] of the same display.
     pub fn for_display_env(mesh: Arc<Mesh>, bvh: Arc<Bvh>, sets: Vec<TraceSet>, display: &DisplaySettings, env: Arc<EnvImage>) -> TraceScene {
         let mut scene = TraceScene::new(mesh, bvh, sets, env, display.env_rotation.to_radians());
+        scene.env_camera = display.env_alignment == EnvAlignment::Camera;
         scene.spec_gloss = display.spec_gloss;
         scene.set_scatter(display.scatter_color, display.scatter_radius);
         scene.ior = display.ior;
@@ -159,25 +163,23 @@ impl TraceScene {
     }
 
     /// World direction to environment space.
-    fn to_env(&self, d: Vec3) -> Vec3 {
-        let (s, c) = self.env_rotation.sin_cos();
-        Vec3::new(c * d.x - s * d.z, d.y, s * d.x + c * d.z)
+    fn to_env(direction: Vec3, (sin, cos): (f32, f32)) -> Vec3 {
+        Vec3::new(cos * direction.x - sin * direction.z, direction.y, sin * direction.x + cos * direction.z)
     }
 
-    fn env(&self, d: Vec3) -> Vec3 {
-        self.env.sample(self.to_env(d))
+    fn env(&self, direction: Vec3, rotation: (f32, f32)) -> Vec3 {
+        self.env.sample(Self::to_env(direction, rotation))
     }
 
     /// Solid-angle density of [`Self::sample_env`] picking world direction `d`.
-    fn env_pdf(&self, d: Vec3) -> f32 {
-        self.light.as_ref().map_or(0.0, |l| l.pdf(self.to_env(d)))
+    fn env_pdf(&self, direction: Vec3, rotation: (f32, f32)) -> f32 {
+        self.light.as_ref().map_or(0.0, |light| light.pdf(Self::to_env(direction, rotation)))
     }
 
     /// A world direction toward the environment, chosen by brightness, with its density.
-    fn sample_env(&self, rng: &mut Rng) -> Option<(Vec3, f32)> {
-        let (e, pdf) = self.light.as_ref()?.sample(rng.next(), rng.next(), rng.next(), rng.next())?;
-        let (s, c) = self.env_rotation.sin_cos();
-        Some((Vec3::new(c * e.x + s * e.z, e.y, -s * e.x + c * e.z), pdf))
+    fn sample_env(&self, rng: &mut Rng, (sin, cos): (f32, f32)) -> Option<(Vec3, f32)> {
+        let (direction, pdf) = self.light.as_ref()?.sample(rng.next(), rng.next(), rng.next(), rng.next())?;
+        Some((Vec3::new(cos * direction.x + sin * direction.z, direction.y, -sin * direction.x + cos * direction.z), pdf))
     }
 }
 
@@ -255,12 +257,20 @@ pub struct TraceDisplay {
     pub env_opacity: f32,
     /// Filter the remaining noise (edge-aware; keeps texture detail).
     pub denoise: bool,
+    /// The plain background behind the mesh at the top and at the bottom of the view (linear RGB).
+    pub background: [[f32; 3]; 2],
 }
 
 impl TraceDisplay {
     /// Exposure, tone mapping and background as the viewport shows them.
     pub fn from_display(d: &DisplaySettings) -> TraceDisplay {
-        TraceDisplay { exposure: d.env_exposure.exp2(), aces: d.tone_mapping == ToneMapping::AcesFilmic, env_opacity: d.env_opacity, denoise: false }
+        TraceDisplay {
+            exposure: d.env_exposure.exp2(),
+            aces: d.tone_mapping == ToneMapping::AcesFilmic,
+            env_opacity: d.env_opacity,
+            denoise: false,
+            background: crate::DEFAULT_BACKGROUND,
+        }
     }
 }
 
@@ -325,6 +335,8 @@ impl Tracer {
     /// new sample then counts in [`Tracer::samples`]). Lets a single-threaded caller spread a
     /// pass over several frames.
     pub fn pass_rows(&mut self, scene: &TraceScene, cam: &OrbitCamera, settings: &TraceSettings, rows: u32) -> bool {
+        let rotation = if scene.env_camera { scene.env_rotation + crate::renderer::camera_yaw(cam) } else { scene.env_rotation };
+        let env_rotation = rotation.sin_cos();
         let (w, h, pass) = (self.width, self.height, self.samples);
         let aspect = w as f32 / h as f32;
         let (y0, y1) = (self.row, self.row.saturating_add(rows.max(1)).min(h));
@@ -335,7 +347,7 @@ impl Tracer {
                 let mut rng = Rng::new(x as u32, y as u32, pass);
                 let ndc = Vec2::new((x as f32 + rng.next()) / w as f32 * 2.0 - 1.0, 1.0 - (y as f32 + rng.next()) / h as f32 * 2.0);
                 let ray = scene.camera_ray(cam, ndc, aspect, &mut rng);
-                match trace(scene, ray.origin, ray.dir, settings, &mut rng) {
+                match trace(scene, ray.origin, ray.dir, settings, env_rotation, &mut rng) {
                     Some(s) => {
                         px.hit += s.radiance;
                         px.hit_lum2 += luminance(s.radiance).powi(2);
@@ -344,7 +356,7 @@ impl Tracer {
                         px.depth += s.depth;
                         px.hits += 1.0;
                     }
-                    None => px.env += scene.env(ray.dir),
+                    None => px.env += scene.env(ray.dir, env_rotation),
                 }
             }
         });
@@ -368,7 +380,7 @@ impl Tracer {
             let uv = Vec2::new(((i as u32 % self.width) as f32 + 0.5) / w, ((i as u32 / self.width) as f32 + 0.5) / h);
             let a = px.hits / n;
             let misses = n - px.hits;
-            let back = if misses > 0.0 { backdrop(uv).lerp(tonemap(px.env / misses, d), d.env_opacity.clamp(0.0, 1.0)) } else { backdrop(uv) };
+            let back = if misses > 0.0 { backdrop(uv, d).lerp(tonemap(px.env / misses, d), d.env_opacity.clamp(0.0, 1.0)) } else { backdrop(uv, d) };
             let mean = denoised.get(i).copied().unwrap_or(px.hit / px.hits.max(1.0));
             let scene = if px.hits > 0.0 { tonemap(mean, d) } else { Vec3::ZERO };
             let c = back.lerp(scene, a);
@@ -455,10 +467,9 @@ impl Tracer {
     }
 }
 
-/// The viewport's studio backdrop: a cool slate, lighter at the top (matches the post pass).
-fn backdrop(uv: Vec2) -> Vec3 {
-    let d = uv * 2.0 - Vec2::ONE;
-    Vec3::new(0.0295, 0.0343, 0.0437).lerp(Vec3::new(0.0110, 0.0130, 0.0168), uv.y) * (1.0 - 0.09 * d.length_squared())
+/// The viewport's plain background, top to bottom (matches the post pass).
+fn backdrop(uv: Vec2, d: &TraceDisplay) -> Vec3 {
+    Vec3::from(d.background[0]).lerp(Vec3::from(d.background[1]), uv.y)
 }
 
 fn tonemap(hdr: Vec3, d: &TraceDisplay) -> Vec3 {
@@ -957,41 +968,48 @@ fn clamp_firefly(c: Vec3) -> Vec3 {
 
 /// Next-event estimation toward the environment from `pos` (geometric normal `geo`): `eval`
 /// gives the BRDF × cos toward a direction and the density of the path's own sampling of it.
-fn next_event(scene: &TraceScene, pos: Vec3, geo: Vec3, thr: Vec3, rng: &mut Rng, eval: impl Fn(Vec3) -> (Vec3, f32)) -> Vec3 {
-    let Some((wl, pdf_env)) = scene.sample_env(rng) else { return Vec3::ZERO };
+fn next_event(scene: &TraceScene, pos: Vec3, geo: Vec3, thr: Vec3, env_rotation: (f32, f32), rng: &mut Rng, eval: impl Fn(Vec3) -> (Vec3, f32)) -> Vec3 {
+    let Some((wl, pdf_env)) = scene.sample_env(rng, env_rotation) else { return Vec3::ZERO };
+
     if wl.dot(geo) <= 0.0 {
         return Vec3::ZERO;
     }
+
     let (f, pdf_brdf) = eval(wl);
     if f.max_element() <= 0.0 || scene.bvh.occluded(pos + geo * scene.eps, wl, f32::MAX) {
         return Vec3::ZERO;
     }
-    clamp_firefly(thr * f * scene.env(wl) * (mis(pdf_env, pdf_brdf) / pdf_env))
+
+    clamp_firefly(thr * f * scene.env(wl, env_rotation) * (mis(pdf_env, pdf_brdf) / pdf_env))
 }
 
 /// Radiance along a camera ray; None when it misses the mesh. Environment light is gathered
 /// both by sampling it directly (next-event estimation) and by BRDF sampling, combined with MIS.
-fn trace(scene: &TraceScene, mut o: Vec3, mut d: Vec3, settings: &TraceSettings, rng: &mut Rng) -> Option<Sample> {
+fn trace(scene: &TraceScene, mut o: Vec3, mut d: Vec3, settings: &TraceSettings, env_rotation: (f32, f32), rng: &mut Rng) -> Option<Sample> {
     let origin = o;
     let mut first: Option<(Vec3, Vec3, f32)> = None;
     let mut thr = Vec3::ONE;
     let mut l = Vec3::ZERO;
     let mut bounce = 0u32;
-    // Density of the BRDF sample that produced `d` (None for the camera ray).
+
+    // Density of the BRDF sample that produced `d` (None for the camera ray)
     let mut brdf_pdf: Option<f32> = None;
-    // Cutout surfaces don't count as bounces; cap them so a stack of cards can't loop forever.
+
+    // Cutout surfaces don't count as bounces; cap them so a stack of cards can't loop forever
     for _ in 0..settings.bounces + 24 {
         let Some(hit) = scene.bvh.closest(o, d, f32::MAX) else {
             let pdf = brdf_pdf?;
-            let w = if scene.light.is_some() { mis(pdf, scene.env_pdf(d)) } else { 1.0 };
-            l += clamp_firefly(thr * scene.env(d) * w);
+            let w = if scene.light.is_some() { mis(pdf, scene.env_pdf(d, env_rotation)) } else { 1.0 };
+            l += clamp_firefly(thr * scene.env(d, env_rotation) * w);
             break;
         };
+
         let Some(s) = surface(scene, hit.tri, hit.u, hit.v, o, d, hit.t) else { break };
         if rng.next() > s.opacity {
             o = s.pos - s.geo * scene.eps;
             continue;
         }
+
         if first.is_none() {
             first = Some(((s.diffuse + s.f0).min(Vec3::ONE), s.n, (s.pos - origin).length()));
         }
@@ -999,14 +1017,15 @@ fn trace(scene: &TraceScene, mut o: Vec3, mut d: Vec3, settings: &TraceSettings,
         if bounce >= settings.bounces {
             break;
         }
-        // Transmission is picked by its weight (a glass event, without next-event estimation);
-        // otherwise the surface shades as if it had none.
+
+        // Transmission weight selects a glass event that skips next-event estimation
         let glass = s.transmission > 0.0 && rng.next() < s.transmission;
         let bsdf = Bsdf::new(&s, -d);
-        // The BRDF is sampled with probability 1 − p_walk (densities below include that).
+
+        // The BRDF is sampled with probability 1 − p_walk (densities below include that)
         let keep = 1.0 - bsdf.p_walk;
         if !glass {
-            l += next_event(scene, s.pos, s.geo, thr, rng, |wl| {
+            l += next_event(scene, s.pos, s.geo, thr, env_rotation, rng, |wl| {
                 let (f, pdf) = bsdf.eval(wl);
                 (f, pdf * keep)
             });
@@ -1020,8 +1039,9 @@ fn trace(scene: &TraceScene, mut o: Vec3, mut d: Vec3, settings: &TraceSettings,
         } else if bsdf.p_walk > 0.0 && rng.next() < bsdf.p_walk {
             let Some((exit, out, w)) = random_walk(scene, &s, rng) else { break };
             thr *= bsdf.walk_albedo * w / bsdf.p_walk;
-            // The light leaves the exit point like a Lambertian emitter.
-            l += next_event(scene, exit, out, thr, rng, |wl| {
+
+            // The light leaves the exit point like a Lambertian emitter
+            l += next_event(scene, exit, out, thr, env_rotation, rng, |wl| {
                 let c = wl.dot(out).max(0.0) / PI;
                 (Vec3::splat(c), c)
             });
@@ -1035,6 +1055,7 @@ fn trace(scene: &TraceScene, mut o: Vec3, mut d: Vec3, settings: &TraceSettings,
             if pdf <= 0.0 {
                 break;
             }
+
             thr *= f / (pdf * keep);
             brdf_pdf = Some(pdf * keep);
             o = s.pos;
@@ -1045,6 +1066,7 @@ fn trace(scene: &TraceScene, mut o: Vec3, mut d: Vec3, settings: &TraceSettings,
             if rng.next() > p {
                 break;
             }
+
             thr /= p;
         }
         let side = if wi.dot(geo) >= 0.0 { 1.0 } else { -1.0 };
@@ -1083,11 +1105,12 @@ mod tests {
             tr.pass(&s, &camera(), &TraceSettings::default());
         }
         assert_eq!(tr.samples, 8);
-        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: false };
+        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: false, background: crate::DEFAULT_BACKGROUND };
         let img = tr.rgba8(&d);
         assert_eq!(img.len(), 48 * 32 * 4);
         let px = |x: usize, y: usize| &img[(y * 48 + x) * 4..(y * 48 + x) * 4 + 3];
-        // The sphere (default material, lit by the studio) is brighter than the dark backdrop corner.
+
+        // The sphere (default material, lit by the studio) is brighter than the dark backdrop corner
         let center: u32 = px(24, 16).iter().map(|v| *v as u32).sum();
         let corner: u32 = px(0, 0).iter().map(|v| *v as u32).sum();
         assert!(center > corner + 60, "center {center} corner {corner}");
@@ -1095,11 +1118,32 @@ mod tests {
     }
 
     #[test]
+    fn the_cpu_tracer_turns_the_environment_with_the_camera_when_aligned_to_it() {
+        // The environment shows as the background, so the whole image follows its turn
+        let view = |camera_aligned: bool, yaw: f32| {
+            let mut s = scene("Sunset");
+            s.env_camera = camera_aligned;
+            let mut cam = camera();
+            cam.set_angles(yaw, 0.0);
+            let mut tr = Tracer::new(24, 12);
+            tr.pass(&s, &cam, &TraceSettings::default());
+            tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: 1.0, denoise: false, background: crate::DEFAULT_BACKGROUND })
+        };
+        let difference = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as f32).sum::<f32>() / a.len() as f32;
+        let world = difference(&view(false, 0.0), &view(false, 1.8));
+        let camera_aligned = difference(&view(true, 0.0), &view(true, 1.8));
+        assert!(world > 3.0, "World: the environment stays put ({world})");
+        assert!(camera_aligned < world / 3.0, "Camera: the environment turns with the view ({camera_aligned} against {world})");
+    }
+
+    #[test]
     fn environment_shows_behind_the_mesh_with_opacity() {
         let s = scene("Overcast");
         let mut tr = Tracer::new(16, 8);
         tr.pass(&s, &camera(), &TraceSettings::default());
-        let corner = |opacity: f32| tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: opacity, denoise: false })[0];
+        let corner = |opacity: f32| {
+            tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: opacity, denoise: false, background: crate::DEFAULT_BACKGROUND })[0]
+        };
         assert!(corner(1.0) > corner(0.0) + 40);
     }
 
@@ -1112,8 +1156,15 @@ mod tests {
             let n = 40_000;
             let mut sum = Vec3::ZERO;
             for _ in 0..n {
-                sum += trace(s, Vec3::new(0.3, 0.4, 4.0), Vec3::new(-0.07, -0.1, -1.0).normalize(), &TraceSettings { bounces: 3 }, &mut rng)
-                    .map_or(Vec3::ZERO, |s| s.radiance);
+                sum += trace(
+                    s,
+                    Vec3::new(0.3, 0.4, 4.0),
+                    Vec3::new(-0.07, -0.1, -1.0).normalize(),
+                    &TraceSettings { bounces: 3 },
+                    s.env_rotation.sin_cos(),
+                    &mut rng,
+                )
+                .map_or(Vec3::ZERO, |s| s.radiance);
             }
             sum / n as f32
         };
@@ -1125,7 +1176,7 @@ mod tests {
     fn passes_split_into_row_slices_match_whole_passes() {
         let s = scene("Studio Soft");
         let (mut whole, mut sliced) = (Tracer::new(40, 30), Tracer::new(40, 30));
-        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: false };
+        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: false, background: crate::DEFAULT_BACKGROUND };
         for _ in 0..2 {
             whole.pass(&s, &camera(), &TraceSettings::default());
             let mut done = false;
@@ -1144,9 +1195,10 @@ mod tests {
         for _ in 0..4 {
             tr.pass(&s, &camera(), &TraceSettings::default());
         }
-        let raw = tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: false });
-        let clean = tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: true });
-        // Neighbour differences inside the ball (rows 18..30, columns 26..38) drop; the mean stays.
+        let raw = tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: false, background: crate::DEFAULT_BACKGROUND });
+        let clean = tr.rgba8(&TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.0, denoise: true, background: crate::DEFAULT_BACKGROUND });
+
+        // Neighbour differences inside the ball (rows 18..30, columns 26..38) drop; the mean stays
         let stats = |img: &[u8]| {
             let px = |x: usize, y: usize| img[(y * 64 + x) * 4] as f32;
             let (mut diff, mut sum, mut n) = (0.0, 0.0, 0.0);
@@ -1196,7 +1248,8 @@ mod tests {
             if x * x + y * y > 0.97 {
                 continue;
             }
-            sum += trace(&s, Vec3::new(x, y, 4.0), Vec3::NEG_Z, &TraceSettings { bounces: 8 }, &mut rng).map_or(Vec3::ZERO, |s| s.radiance);
+            sum += trace(&s, Vec3::new(x, y, 4.0), Vec3::NEG_Z, &TraceSettings { bounces: 8 }, s.env_rotation.sin_cos(), &mut rng)
+                .map_or(Vec3::ZERO, |s| s.radiance);
             n += 1;
         }
         sum / n as f32
@@ -1225,8 +1278,7 @@ mod tests {
 
     #[test]
     fn lobes_sample_and_evaluate_consistently() {
-        // Light sampling and BRDF sampling (MIS) against BRDF sampling alone: equal means only
-        // when every lobe's density matches what it samples.
+        // Equal MIS and BSDF-only means require every lobe's density to match its sampling
         use Channel::*;
         let env = Arc::new(crate::ibl::environment("Studio Soft", 128));
         let lit = material_scene(
@@ -1249,8 +1301,15 @@ mod tests {
             let n = 100_000;
             let mut sum = Vec3::ZERO;
             for _ in 0..n {
-                sum += trace(s, Vec3::new(0.3, 0.4, 4.0), Vec3::new(-0.07, -0.1, -1.0).normalize(), &TraceSettings { bounces: 3 }, &mut rng)
-                    .map_or(Vec3::ZERO, |s| s.radiance);
+                sum += trace(
+                    s,
+                    Vec3::new(0.3, 0.4, 4.0),
+                    Vec3::new(-0.07, -0.1, -1.0).normalize(),
+                    &TraceSettings { bounces: 3 },
+                    s.env_rotation.sin_cos(),
+                    &mut rng,
+                )
+                .map_or(Vec3::ZERO, |s| s.radiance);
             }
             sum / n as f32
         };
@@ -1284,7 +1343,7 @@ mod tests {
 
     #[test]
     fn white_furnace_keeps_energy_bounded() {
-        // A uniform white environment: a white diffuse sphere must not exceed the environment.
+        // A uniform white environment: a white diffuse sphere must not exceed the environment
         let mesh = Arc::new(primitives::sphere(1.0, 24, 12));
         let bvh = Arc::new(Bvh::new(&mesh));
         let env = Arc::new(EnvImage { width: 8, height: 4, data: vec![[1.0; 3]; 32] });
@@ -1293,7 +1352,8 @@ mod tests {
         let mut sum = Vec3::ZERO;
         let n = 4000;
         for _ in 0..n {
-            sum += trace(&s, Vec3::new(0.0, 0.0, 4.0), Vec3::NEG_Z, &TraceSettings { bounces: 8 }, &mut rng).map_or(Vec3::ZERO, |s| s.radiance);
+            sum += trace(&s, Vec3::new(0.0, 0.0, 4.0), Vec3::NEG_Z, &TraceSettings { bounces: 8 }, s.env_rotation.sin_cos(), &mut rng)
+                .map_or(Vec3::ZERO, |s| s.radiance);
         }
         let avg = sum / n as f32;
         assert!(avg.max_element() <= 1.05 && avg.min_element() > 0.3, "{avg}");
@@ -1317,7 +1377,12 @@ mod tests {
         let s = material_scene(Arc::new(EnvImage { width: w, height: h, data }), values);
         let mut rng = Rng::new(3, 1, 4);
         let n = 2000;
-        (0..n).map(|_| trace(&s, Vec3::new(0.0, 0.0, 4.0), Vec3::NEG_Z, &TraceSettings::default(), &mut rng).map_or(Vec3::ZERO, |s| s.radiance)).sum::<Vec3>()
+        (0..n)
+            .map(|_| {
+                trace(&s, Vec3::new(0.0, 0.0, 4.0), Vec3::NEG_Z, &TraceSettings::default(), s.env_rotation.sin_cos(), &mut rng)
+                    .map_or(Vec3::ZERO, |s| s.radiance)
+            })
+            .sum::<Vec3>()
             / n as f32
     }
 

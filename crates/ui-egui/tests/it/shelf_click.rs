@@ -12,7 +12,10 @@ const SMART_TYPE: usize = 1;
 /// The sample project with the shelf on type `tab`, filtered to `label`
 fn shelf(tab: usize, label: &str) -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1920.0, 1032.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1920.0, 1032.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.shelf_tab = tab;
     harness.state_mut().ui.shelf_filter = label.to_lowercase();
     harness.run_steps(4);

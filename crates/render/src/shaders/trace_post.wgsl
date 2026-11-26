@@ -5,6 +5,8 @@
 struct Post {
     size: vec4<u32>,    // width, height, samples, à-trous step
     display: vec4<f32>, // exposure multiplier, ACES (1) or linear (0), environment opacity, denoise (1)
+    back_top: vec4<f32>, // rgb background color at the top (linear), a -
+    back_bottom: vec4<f32>, // rgb background color at the bottom (linear), a -
 };
 
 @group(0) @binding(0) var<uniform> Q: Post;
@@ -104,10 +106,9 @@ fn denoise_step(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 }
 
-// The viewport's studio backdrop (matches post.wgsl).
+// The viewport's plain background (matches post.wgsl).
 fn backdrop(uv: vec2<f32>) -> vec3<f32> {
-    let d = uv * 2.0 - 1.0;
-    return mix(vec3<f32>(0.0295, 0.0343, 0.0437), vec3<f32>(0.0110, 0.0130, 0.0168), uv.y) * (1.0 - 0.09 * dot(d, d));
+    return mix(Q.back_top.rgb, Q.back_bottom.rgb, uv.y);
 }
 
 fn tonemap(hdr: vec3<f32>) -> vec3<f32> {

@@ -4,5 +4,7 @@ use serde::{Deserialize, Serialize};
 pub enum CageType {
     #[default]
     DistanceBased,
+    /// Distances fitted to the high poly at every low-poly vertex
+    Automatic,
     CustomFile,
 }

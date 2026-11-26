@@ -1,2 +1,102 @@
 [alias]
 xtask = "run -p xtask --"
+
+# An explicit level for dependencies: Cargo drops the profile's default debug level from crates only build scripts and
+# macros use, and then clippy and test each build their own copy of them.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
+# Test builds compile the craft UI framework below the workspace's opt-level 2: the Windows test
+# build spends most of its time on these crates and the generics they share, and their tests run
+# no heavy pixel code. Crates whose tests run on the 2 MiB Windows test stack stay at 1; the rest
+# and ui-egui use 0. `cargo run` and `cargo build` use the dev profile and are unaffected.
+
+[profile.test.package.craft-ui]
+opt-level = 1
+
+[profile.test.package.craft-ui-contract]
+opt-level = 1
+
+[profile.test.package.craft-ui-shell]
+opt-level = 1
+
+[profile.test.package.craft-ui-canvas]
+opt-level = 1
+
+[profile.test.package.craft-ui-panels]
+opt-level = 1
+
+[profile.test.package.craft-ui-widgets]
+opt-level = 1
+
+[profile.test.package.craft-host]
+opt-level = 1
+
+[profile.test.package.craft-theme]
+opt-level = 1
+
+[profile.test.package.craft-behavior]
+opt-level = 1
+
+[profile.test.package.craft-font-catalog]
+opt-level = 1
+
+[profile.test.package.craft-ui-patterns]
+opt-level = 0
+
+[profile.test.package.craft-update]
+opt-level = 0
+
+[profile.test.package.craft-keymap]
+opt-level = 0
+
+[profile.test.package.craft-dialogs]
+opt-level = 0
+
+[profile.test.package.craft-settings]
+opt-level = 0
+
+[profile.test.package.craft-platform]
+opt-level = 0
+
+[profile.test.package.craft-window]
+opt-level = 0
+
+[profile.test.package.craft-cloud-ui]
+opt-level = 0
+
+[profile.test.package.craft-pdf]
+opt-level = 0
+
+[profile.test.package.texturecraft-ui-egui]
+opt-level = 0
+
+# The TLS stack and the dialog, browser and screen capture crates: no test makes a TLS connection, opens a file dialog or
+# captures the screen, so their optimized builds only cost test build time.
+
+[profile.test.package.ring]
+opt-level = 0
+
+[profile.test.package.rustls]
+opt-level = 0
+
+[profile.test.package.rustls-webpki]
+opt-level = 0
+
+[profile.test.package.rustls-platform-verifier]
+opt-level = 0
+
+[profile.test.package.ureq]
+opt-level = 0
+
+[profile.test.package.ureq-proto]
+opt-level = 0
+
+[profile.test.package.webbrowser]
+opt-level = 0
+
+[profile.test.package.rfd]
+opt-level = 0
+
+[profile.test.package.xcap]
+opt-level = 0

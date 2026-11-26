@@ -1,4 +1,4 @@
-//! Window > Layouts: panel arrangements saved under a name and switched from the menu.
+//! Named panel arrangements retained for shortcuts and automation.
 //!
 //! A named layout holds the painting and the baking dock (which panels are shown, where, and
 //! how big). Switching to one touches nothing else: not the mode, the zoom, the wireframes, the
@@ -30,7 +30,13 @@ impl UiState {
             return false;
         }
 
-        let (painting, baking) = if self.dock_is_baking { (&self.inactive_mode_dock, &self.dock) } else { (&self.dock, &self.inactive_mode_dock) };
+        let (painting, baking) = if self.dock_is_baking {
+            (&self.inactive_mode_dock, &self.dock)
+        } else if self.dock_is_rendering {
+            (self.inactive_render_dock.as_ref().unwrap_or(&self.dock), &self.inactive_mode_dock)
+        } else {
+            (&self.dock, &self.inactive_mode_dock)
+        };
         let layout = NamedLayout { name: name.to_string(), painting: painting.clone(), baking: baking.clone() };
         match self.named_layout_index(name) {
             Some(index) => self.named_layouts[index] = layout,
@@ -71,21 +77,6 @@ impl UiState {
 
     pub fn delete_named_layout(&mut self, name: &str) {
         self.named_layouts.retain(|layout| layout.name != name);
-    }
-}
-
-/// One entry per saved layout, under the catalog's items of the Layouts submenu
-pub(crate) fn entries(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
-    if app.ui.named_layouts.is_empty() {
-        return;
-    }
-
-    ui.separator();
-    for name in app.ui.named_layouts.iter().map(|layout| layout.name.clone()).collect::<Vec<_>>() {
-        if ui.button(&name).clicked() {
-            app.ui.apply_named_layout(&name);
-            ui.close();
-        }
     }
 }
 
@@ -136,7 +127,7 @@ fn focus_once(ui: &egui::Ui, edit: &egui::Response, key: &'static str, what: Str
 
 fn save_dialog(app: &mut TextureCraftApp, ctx: &egui::Context, open: &mut bool, mut name: String) -> Option<LayoutDialog> {
     let mut done = None;
-    dialog("save_layout", tr("Save layout"), open).show(ctx, |ui| {
+    dialog(ctx, "save_layout", tr("Save Layout"), open).show(ctx, |ui| {
         ui.label(tr("Name of the layout"));
         let edit = ui.add(egui::TextEdit::singleline(&mut name).desired_width(240.0));
         focus_once(ui, &edit, SAVE_FOCUS, String::new());
@@ -167,7 +158,7 @@ fn save_dialog(app: &mut TextureCraftApp, ctx: &egui::Context, open: &mut bool, 
 
 fn overwrite_dialog(app: &mut TextureCraftApp, ctx: &egui::Context, open: &mut bool, name: String) -> Option<LayoutDialog> {
     let mut answer = None;
-    dialog("overwrite_layout", tr("Replace layout"), open).show(ctx, |ui| {
+    dialog(ctx, "overwrite_layout", tr("Replace Layout"), open).show(ctx, |ui| {
         ui.label(trf("A layout named {name} already exists. Replace it?", &[("name", &name)]));
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -199,7 +190,7 @@ fn manage_dialog(
     mut deleting: Option<String>,
 ) -> Option<LayoutDialog> {
     let mut finished = false;
-    dialog("manage_layouts", tr("Manage layouts"), open).show(ctx, |ui| {
+    dialog(ctx, "manage_layouts", tr("Manage Layouts"), open).show(ctx, |ui| {
         ui.set_min_width(320.0);
         if let Some(name) = deleting.clone() {
             ui.label(trf("Delete the layout {name}?", &[("name", &name)]));
@@ -288,8 +279,7 @@ mod tests {
         ui.dock.close(Panel::Layers);
         ui.uv_zoom = 3.0;
         ui.uv_pan = [0.25, 0.5];
-        ui.uv_wireframe = false;
-        ui.wireframe_3d = true;
+        ui.mesh_wireframe = true;
         ui.layout = ViewLayout::Only3D;
         ui.split_ratio = 0.2;
         ui.shelf_filter = "rust".into();

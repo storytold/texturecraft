@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashSet};
 use texturecraft_geom::glam::Mat3;
 
 use crate::session::Session;
-use crate::triangle_partition::TrianglePartition;
+use texturecraft_geom::TrianglePartition;
 
 /// How far a mirrored face centre may be from the surface and still count as on it, as a fraction of the mesh's bounding-box diagonal
 const MIRROR_TOLERANCE: f32 = 1e-3;

@@ -10,14 +10,17 @@ use texturecraft_ui_egui::state::{Mode, ViewLayout};
 /// An app with the Assets panel closed, a changed view split, zoom, wireframe and mode.
 fn changed_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     let ui = &mut h.state_mut().ui;
     ui.dock.close(Panel::Assets);
     ui.layout = ViewLayout::Only3D;
     ui.uv_zoom = 2.5;
-    ui.wireframe_3d = true;
+    ui.mesh_wireframe = true;
     ui.mode = Mode::Rendering;
     h.run_steps(2);
     h
@@ -31,7 +34,7 @@ fn invoke(h: &mut Harness<'_, TextureCraftApp>, id: &str) {
 
 fn view_kept(h: &Harness<'_, TextureCraftApp>) -> bool {
     let ui = &h.state().ui;
-    ui.layout == ViewLayout::Only3D && ui.uv_zoom == 2.5 && ui.wireframe_3d && ui.mode == Mode::Rendering
+    ui.layout == ViewLayout::Only3D && ui.uv_zoom == 2.5 && ui.mesh_wireframe && ui.mode == Mode::Rendering
 }
 
 #[test]
@@ -66,7 +69,7 @@ fn reset_ui_ok_resets_everything_as_before() {
     let ui = &h.state().ui;
     assert!(!ui.windows.confirm_reset_ui);
     assert!(ui.dock.is_open(Panel::Assets));
-    assert_eq!((ui.layout, ui.uv_zoom, ui.wireframe_3d, ui.mode), (ViewLayout::Split, 1.0, false, Mode::Painting));
+    assert_eq!((ui.layout, ui.uv_zoom, ui.mesh_wireframe, ui.mode), (ViewLayout::Split, 1.0, false, Mode::Painting));
 }
 
 #[test]
@@ -108,7 +111,7 @@ fn the_ui_reset_control_command_resets_without_asking() {
     let ui = &h.state().ui;
     assert!(!ui.windows.confirm_reset_ui, "no question for a script");
     assert!(ui.dock.is_open(Panel::Assets));
-    assert_eq!((ui.layout, ui.uv_zoom, ui.wireframe_3d, ui.mode), (ViewLayout::Split, 1.0, false, Mode::Painting));
+    assert_eq!((ui.layout, ui.uv_zoom, ui.mesh_wireframe, ui.mode), (ViewLayout::Split, 1.0, false, Mode::Painting));
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! F5 and F6 switch the projection, the Viewport menu goes to fixed views, and Alt+Shift+drag orbits
+//! F5 and F6 switch the projection, bound shortcuts go to fixed views, and Alt+Shift+drag orbits
 //! in 90° steps.
 
 use std::f32::consts::FRAC_PI_2;
@@ -11,7 +11,10 @@ use texturecraft_ui_egui::TextureCraftApp;
 
 fn harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     h
 }
@@ -54,7 +57,7 @@ fn f6_switches_to_orthographic_and_f5_back_to_perspective_keeping_the_view() {
 }
 
 #[test]
-fn the_viewport_menu_goes_to_the_front_view_and_orbit_works_afterwards() {
+fn a_bound_front_view_shortcut_keeps_orbit_working_afterwards() {
     let mut h = harness();
     h.state_mut().run("camera.set", json!({"yaw": 70, "pitch": 30, "ortho": true}));
     h.run_steps(2);
@@ -62,7 +65,11 @@ fn the_viewport_menu_goes_to_the_front_view_and_orbit_works_afterwards() {
     // The menu bar's "Viewport", above the dock's tab of the same name
     h.get_all_by_label("Viewport").min_by(|a, b| a.rect().top().total_cmp(&b.rect().top())).unwrap().click();
     h.run_steps(2);
-    h.get_by_label_contains("Front view").click();
+    assert!(h.query_by_label_contains("Front view").is_none(), "fixed views are absent from the menu");
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    h.state_mut().ui.keymap.insert("camera.view.front".into(), "F12".into());
+    h.key_press(Key::F12);
 
     // The UI glides there over about a third of a second
     h.run_steps(6);
@@ -104,7 +111,11 @@ fn alt_shift_drag_orbits_in_quarter_turns() {
 /// A harness whose frames are 10 ms apart, so a 0.35 s glide spans about 35 frames and a drag fits inside it.
 fn slow_glide_harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_step_dt(0.01).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_step_dt(0.01)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     h
 }
@@ -272,4 +283,85 @@ fn the_wheel_during_a_glide_is_not_overwritten_by_it() {
         h.state().session.camera.distance
     };
     assert!(end_distance(100.0) != end_distance(0.0), "the wheel zoom stays");
+}
+
+#[test]
+fn the_rotation_dropdown_switches_to_free_rotation_and_alt_drag_turns_the_model_over() {
+    let mut h = harness();
+    assert!(!h.state().session.camera.free);
+    h.get_by_label("Constrained rotation").click();
+    h.run_steps(2);
+    h.get_by_label_contains("Free rotation").click();
+    h.run_steps(2);
+    assert!(h.state().session.camera.free, "the dropdown picks free rotation");
+
+    // A long vertical drag goes over the pole: the horizon is no longer level
+    let center = h.state().viewport_rect.center();
+    drag(&mut h, center, vec2(0.0, 300.0), Modifiers::ALT);
+    let camera = h.state().session.camera;
+    assert!(camera.up().y < 0.0, "the model is turned over: {}", camera.up());
+}
+
+#[test]
+fn constrained_rotation_keeps_the_horizon_on_the_same_drag() {
+    let mut h = harness();
+    let center = h.state().viewport_rect.center();
+    drag(&mut h, center, vec2(0.0, 300.0), Modifiers::ALT);
+    let camera = h.state().session.camera;
+    assert!(camera.up().y == 1.0 && camera.pitch <= 89f32.to_radians() + 1e-6);
+}
+
+#[test]
+fn snap_rotate_and_next_camera_are_bindable_and_a_bound_key_runs_them() {
+    let ids = ["camera.snapRotate.right", "camera.next", "camera.previous", "camera.rotation.free", "camera.rotation.constrained"];
+    for id in ids {
+        assert!(texturecraft_ui_egui::keymap::bindings().iter().any(|binding| binding.id == id), "{id} can be bound");
+    }
+    let mut h = harness();
+    h.state_mut().run("camera.set", json!({"yaw": 0, "pitch": 0}));
+    h.state_mut().ui.keymap.insert("camera.snapRotate.right".into(), "F12".into());
+    h.run_steps(2);
+    press(&mut h, Key::F12);
+    h.run_steps(30);
+    let camera = h.state().session.camera;
+    assert!((camera.yaw - FRAC_PI_2).abs() < 1e-3, "one step to the right: {}", camera.yaw);
+}
+
+#[test]
+fn next_and_previous_camera_commands_move_between_saved_cameras() {
+    let mut h = harness();
+    for (name, yaw) in [("A", 20), ("B", 50)] {
+        h.state_mut().run("camera.set", json!({"yaw": yaw}));
+        h.state_mut().run("camera.add", json!({"name": name}));
+    }
+    h.state_mut().run("camera.select", json!({}));
+    h.run_steps(2);
+    h.state_mut().run("camera.next", json!({}));
+    h.run_steps(30);
+    assert!((h.state().session.camera.yaw.to_degrees() - 20.0).abs() < 0.5);
+    h.state_mut().run("camera.next", json!({}));
+    h.run_steps(30);
+    assert!((h.state().session.camera.yaw.to_degrees() - 50.0).abs() < 0.5);
+    h.state_mut().run("camera.previous", json!({}));
+    h.run_steps(30);
+    assert!((h.state().session.camera.yaw.to_degrees() - 20.0).abs() < 0.5);
+}
+
+#[test]
+fn next_camera_advances_from_the_destination_before_the_glide_ends() {
+    let mut harness = slow_glide_harness();
+    for (name, yaw) in [("Near", 20), ("Far", 50)] {
+        let app = harness.state_mut();
+        app.run("camera.set", json!({"yaw": yaw})).unwrap();
+        app.run("camera.add", json!({"name": name})).unwrap();
+    }
+    let app = harness.state_mut();
+    app.run("camera.set", json!({"yaw": 0})).unwrap();
+    app.run("camera.next", json!({})).unwrap();
+    app.run("camera.next", json!({})).unwrap();
+    assert!(app.session.camera.yaw.abs() < 1e-3, "the glide starts at the displayed view");
+
+    harness.run_steps(60);
+
+    assert!((harness.state().session.camera.yaw.to_degrees() - 50.0).abs() < 0.5, "two presses reach the second camera");
 }

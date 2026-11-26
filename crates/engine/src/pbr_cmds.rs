@@ -358,7 +358,8 @@ pub fn common_name(files: &[String]) -> Option<String> {
 
 // Parameters and sources (native)
 
-fn options(cmd: &str, p: &Value) -> Result<PbrOptions> {
+/// The import options in `p`; a warp projection is fitted to `mesh`
+fn options(cmd: &str, p: &Value, mesh: &texturecraft_geom::Mesh) -> Result<PbrOptions> {
     let normal_format = match strp(p, "normalFormat") {
         None | Some("auto") => None,
         Some("openGl" | "opengl") => Some(NormalFormat::OpenGl),
@@ -377,7 +378,7 @@ fn options(cmd: &str, p: &Value) -> Result<PbrOptions> {
     Ok(PbrOptions {
         name: strp(p, "name").filter(|name| !name.trim().is_empty()).map(str::to_string),
         normal_format,
-        projection: crate::layer_cmds::projection_from(p, cmd, None)?,
+        projection: crate::layer_cmds::projection_from(p, cmd, None, || crate::warp_cmds::fitted_frame(mesh))?,
         choose,
     })
 }
@@ -414,7 +415,7 @@ mod native;
 #[cfg(not(target_arch = "wasm32"))]
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.importPbrFolder";
-    let mut options = options(cmd, p)?;
+    let mut options = options(cmd, p, &s.mesh)?;
     let found = native::find(cmd, p)?;
     if options.name.is_none() {
         options.name = found.name.clone();
@@ -425,7 +426,7 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(not(target_arch = "wasm32"))]
 fn scan(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.scanPbrFolder";
-    let options = options(cmd, p)?;
+    let options = options(cmd, p, &s.mesh)?;
     let found = native::find(cmd, p)?;
     let set = detect_with(&found.files, &options.choose)?;
     let mut reply = report(&set, options.normal_format);
@@ -440,8 +441,8 @@ fn scan(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn import(_: &mut Session, p: &Value) -> Result<Value> {
-    let _ = options("file.importPbrFolder", p)?;
+fn import(s: &mut Session, p: &Value) -> Result<Value> {
+    let _ = options("file.importPbrFolder", p, &s.mesh)?;
     Err(EngineError::Other("file paths are not available in the browser".into()))
 }
 

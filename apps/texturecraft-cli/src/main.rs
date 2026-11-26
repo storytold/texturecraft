@@ -28,7 +28,7 @@ USAGE:
   texturecraft-cli bake <input> [-o <out.tcraft>] [--resolution <px>] [--maps <id,id,...>]
       Bake mesh maps for every texture set (a project is saved in place without -o).
   texturecraft-cli export <input> <dir> [--preset <name>] [--format <ext>] [--padding <mode>] [--size <px>]
-      Export textures (default preset: Document channels + Normal + AO).
+      Export textures (default preset: Document channels + Normal + AO (No Alpha)).
   texturecraft-cli render <input> <out.png> [--size <W>x<H>] [--view 3d|2d] [--camera <name>] [--yaw <deg>]
                    [--pitch <deg>] [--samples <n>] [--bounces <n>] [--cpu]
       Render the viewport to PNG (needs a GPU or software adapter); --camera looks through a
@@ -120,8 +120,18 @@ fn version() -> String {
     }
 }
 
+/// The desktop app's Nightly launch options. The CLI never takes them: a Nightly install ships the
+/// GUI only, and a script that passes them to the CLI has the wrong program.
+fn is_launch_profile_flag(arg: &str) -> bool {
+    arg == "--launch-profile" || arg == "--profile-root" || arg.starts_with("--launch-profile=") || arg.starts_with("--profile-root=")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(flag) = args.iter().find(|arg| is_launch_profile_flag(arg.as_str())) {
+        eprintln!("texturecraft-cli: `{flag}` is a TextureCraft desktop launch option, not a CLI argument");
+        std::process::exit(2);
+    }
     let code = match args.first().map(String::as_str) {
         None => {
             eprint!("{USAGE}");
@@ -270,21 +280,39 @@ fn run(a: &Args) -> R {
     }
 }
 
-fn batch(a: &Args) -> R {
-    let path = a.pos(0, "<script.json>")?;
-    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let script: Value = serde_json::from_str(&text).map_err(|e| format!("{path} is not JSON: {e}"))?;
+fn batch(args: &Args) -> R {
+    let path = args.pos(0, "<script.json>")?;
+    let script: Value = {
+        let script_text = std::fs::read_to_string(path).map_err(|err| format!("cannot read {path}: {err}"))?;
+        serde_json::from_str(&script_text).map_err(|err| format!("{path} is not JSON: {err}"))?
+    };
+
     let steps =
         script.as_array().or_else(|| script.get("steps").and_then(Value::as_array)).ok_or("the script must be a list of steps or {\"steps\": [...]}")?;
-    let field = |k: &str| script.get(k).and_then(Value::as_str);
-    let mut h = open(field("open").unwrap_or("builtin:material_ball"), None)?;
-    let reply = h.batch(steps);
+    let path_field = |field: &str| -> Result<Option<&str>, String> {
+        match script.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(path)) => Ok(Some(path.as_str())),
+            Some(_) => Err(format!("the script's `{field}` field must be a string")),
+        }
+    };
+    let input = path_field("open")?.unwrap_or("builtin:material_ball");
+    let output = path_field("save")?;
+
+    let mut headless = open(input, None)?;
+    let reply = headless.batch(steps);
     print_json(&reply)?;
-    if let Some(f) = reply.get("failed").filter(|f| !f.is_null()) {
-        return Err(format!("step {} (`{}`) failed: {}", f["index"], f["id"].as_str().unwrap_or_default(), f["error"].as_str().unwrap_or_default()));
+    if let Some(failure) = reply.get("failed").filter(|failure| !failure.is_null()) {
+        return Err(format!(
+            "step {} (`{}`) failed: {}",
+            failure["index"],
+            failure["id"].as_str().unwrap_or_default(),
+            failure["error"].as_str().unwrap_or_default()
+        ));
     }
-    match field("save") {
-        Some(out) => save(&mut h, out),
+
+    match output {
+        Some(output_path) => save(&mut headless, output_path),
         None => Ok(()),
     }
 }

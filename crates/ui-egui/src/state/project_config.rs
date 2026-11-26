@@ -9,6 +9,8 @@ pub struct ProjectConfig {
     pub preserve: bool,
     /// The selected normal map format when it differs from the project's
     pub normal_format: Option<texturecraft_engine::core::NormalFormat>,
+    /// Color management as chosen in the window; nothing is applied (the project stays Legacy)
+    pub color_management: crate::project_form::ColorManagement,
     /// Whether Enter requested confirmation in the next frame
     pub confirm: bool,
     /// The project that was open when this window opened

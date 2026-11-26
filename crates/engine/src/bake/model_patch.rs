@@ -9,7 +9,8 @@ pub fn settings_patch(before: &BakeSettings, after: &BakeSettings) -> Value {
     changed_fields(&json!(before), &json!(after)).unwrap_or_else(|| json!({}))
 }
 
-fn changed_fields(before: &Value, after: &Value) -> Option<Value> {
+/// The fields of `after` that differ from `before`, nested as a `bake.settings` patch; `None` when nothing changed
+pub(super) fn changed_fields(before: &Value, after: &Value) -> Option<Value> {
     if before == after {
         return None;
     }

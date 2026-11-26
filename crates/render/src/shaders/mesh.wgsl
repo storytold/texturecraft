@@ -11,14 +11,14 @@ struct Globals {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>, // background rays: a perspective camera even when the view is orthographic
     eye: vec4<f32>,      // xyz eye position, w -
-    env: vec4<f32>,      // x rotation (radians), y max lod, z AO intensity, w -
+    env: vec4<f32>,      // x rotation (radians), y max lod, z AO intensity, w lit single-channel view (1: the channel on a lit neutral material)
     sh: array<vec4<f32>, 9>,
     mode: vec4<f32>,     // x view mode (0 material, 1 channel, 2 mesh map, 3 UV checker), y channel index, z height strength, w normal Y sign
     bg: vec4<f32>,       // x environment opacity, y background blur lod, z UV view (1) or 3D (0), w wireframe opacity
     uv_xform: vec4<f32>, // UV view: scale xy, offset zw (clip space)
     light: vec4<f32>,    // xyz world direction to the key light (rotated with the environment), w intensity (0 = off)
     light_vp: mat4x4<f32>, // world -> shadow map clip space
-    shadow: vec4<f32>,   // x shadows on (1), y shadow map texel (uv), z normal offset (world units), w -
+    shadow: vec4<f32>,   // x shadows on (1), y shadow map texel (uv), z normal offset (world units), w shadow opacity (0..1)
     material: vec4<f32>, // x specular/glossiness shading (1), y parallax occlusion (1), z accumulation sample index, w IOR of transmission
     scatter: vec4<f32>,  // xyz per-channel diffuse wrap at scattering weight 1 (0 = Lambert), w G-buffer holds the scattering light (1)
     fwd: vec4<f32>,      // xyz camera view direction (unit), w -
@@ -26,6 +26,7 @@ struct Globals {
     refr: vec4<f32>,     // x screen-space refraction on (1), y lods of the scene behind, z refraction depth (world units), w -
     highlight: vec4<f32>, // rgb highlighted set's edge color in the scene (before exposure and tone mapping), a opacity
     highlight_shift: vec4<f32>, // xy sideways shift of each highlight line copy (clip units), zw -
+    set_hover: vec4<f32>, // rgb hovered set's scene color, a opacity
     bake_high: vec4<f32>, // bake mode: rgb high poly color, a -
     bake_matching_error: vec4<f32>, // rgb color where the bake's rays miss the high poly, a its strength (0 hidden)
     bake_cage: vec4<f32>, // rgb cage surface color, a opacity
@@ -34,6 +35,7 @@ struct Globals {
     bake_neutral_color: vec4<f32>, // rgb the neutral material's color, a its reflection samples this frame
     bake_neutral: vec4<f32>, // x roughness, y metallic, z AO intensity of the neutral material, w on (1)
     bake_bent_normal: vec4<f32>, // x, y how much the bent normal (in the aux texture) turns the diffuse light and dims reflections, zw -
+    uv_rotation: vec4<f32>, // UV view: x cos, y sin of the view rotation (counter-clockwise on screen), z view aspect (width / height), w -
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -69,6 +71,7 @@ struct VOut {
     @location(1) nrm: vec3<f32>,
     @location(2) tan: vec4<f32>,
     @location(3) uv: vec2<f32>,
+    @location(4) @interpolate(flat) hover: u32,
 };
 
 // The vertex moved along its normal by the height channel (displacement).
@@ -80,7 +83,7 @@ fn displaced(v: VIn) -> vec3<f32> {
 }
 
 @vertex
-fn vs_mesh(v: VIn) -> VOut {
+fn vs_mesh(v: VIn, @builtin(instance_index) instance_index: u32) -> VOut {
     var o: VOut;
     let p = displaced(v);
     o.clip = g.view_proj * vec4<f32>(p, 1.0);
@@ -88,13 +91,21 @@ fn vs_mesh(v: VIn) -> VOut {
     o.nrm = v.nrm;
     o.tan = v.tan;
     o.uv = v.uv;
+    o.hover = instance_index;
     return o;
 }
 
 @vertex
 fn vs_uv(v: VIn) -> VOut {
     var o: VOut;
-    let p = vec2<f32>(v.uv.x * 2.0 - 1.0, 1.0 - v.uv.y * 2.0) * g.uv_xform.xy + g.uv_xform.zw;
+    let scaled = vec2<f32>(v.uv.x * 2.0 - 1.0, 1.0 - v.uv.y * 2.0) * g.uv_xform.xy;
+
+    // The rotation turns the square in pixels, not in clip space, so it stays square on a wide view
+    let aspect = g.uv_rotation.z;
+    let c = g.uv_rotation.x;
+    let s = g.uv_rotation.y;
+    let turned = vec2<f32>((c * scaled.x * aspect - s * scaled.y) / aspect, s * scaled.x * aspect + c * scaled.y);
+    let p = turned + g.uv_xform.zw;
     o.clip = vec4<f32>(p, 0.5, 1.0);
     o.wpos = v.pos;
     o.nrm = v.nrm;
@@ -342,16 +353,26 @@ fn unlit(c: vec4<f32>) -> Shaded {
 
 fn mesh_color(i: VOut, front: bool) -> vec4<f32> {
     let o = shade_mesh(i, front);
+
+    // The subsurface pass restores the scattering light after blurring
     if (g.scatter.w > 0.5) {
-        // The subsurface blur pass adds the scattering light back, blurred (fx.wgsl).
         return o.color - vec4<f32>(o.sss, 0.0);
     }
+
     return o.color;
 }
 
+const HOVERED_SET_INSTANCE: u32 = 1u;
+
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    return mesh_color(i, front);
+    let color = mesh_color(i, front);
+
+    if (i.hover == HOVERED_SET_INSTANCE) {
+        return vec4<f32>(mix(color.rgb, g.set_hover.rgb * color.a, g.set_hover.a), color.a);
+    }
+
+    return color;
 }
 
 // The scene behind transmissive surfaces: everything but them (what they refract).
@@ -365,17 +386,23 @@ fn fs_opaque(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     return c;
 }
 
-// The depth of field / subsurface G-buffer: rgb the scattering diffuse light (when the blur is
-// on), a the view depth (the clear value 0 marks the background).
+// G-buffer RGB holds scattering light and alpha holds view depth
+// Zero depth marks the background
+// Negative depth marks the hovered set when subsurface blur is active
 @fragment
 fn fs_gbuf(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    let z = max(dot(i.wpos - g.eye.xyz, g.fwd.xyz), 1e-4);
+    var z = max(dot(i.wpos - g.eye.xyz, g.fwd.xyz), 1e-4);
     var sss = vec3<f32>(0.0);
+
     if (g.scatter.w > 0.5) {
         sss = shade_mesh(i, front).sss;
+        if (i.hover == HOVERED_SET_INSTANCE) {
+            z = -z;
+        }
     } else if (textureSample(t_base, samp, i.uv).a < hash12(i.clip.xy)) {
         discard;
     }
+
     return vec4<f32>(sss, z);
 }
 
@@ -417,15 +444,33 @@ fn shade_mesh(i: VOut, front: bool) -> Shaded {
         uv = parallax_uv(uv, vec3<f32>(dot(v, t), dot(v, b), dot(v, n_geo)));
     }
 
-    let base_s = textureSample(t_base, samp, uv);
-    let orm = textureSample(t_orm, samp, uv);
+    // A lit single-channel view puts the channel on a plain lit material: the other channels' lobes are left out
+    let solo_lit = g.env.w > 0.5 && i32(g.mode.x + 0.5) == 1;
+    var base_s = textureSample(t_base, samp, uv);
+    var orm = textureSample(t_orm, samp, uv);
     let nrm_t = textureSample(t_nrm, samp, uv);
     let nrm_s = nrm_t.xyz;
-    let emis_t = textureSample(t_emis, samp, uv);
+    var emis_t = textureSample(t_emis, samp, uv);
+    var lobes = textureSample(t_lobes, samp, uv);
+    var sheen_t = textureSample(t_sheen, samp, uv);
+    var extra = textureSample(t_extra, samp, uv);
+    if (solo_lit) {
+        // Base color shows itself; metallic and roughness show as a grey base color; normal and height show on neutral grey
+        var shown = vec3<f32>(0.5);
+        switch i32(g.mode.y + 0.5) {
+            case 0: { shown = base_s.rgb; }
+            case 1: { shown = vec3<f32>(orm.b); }
+            case 2: { shown = vec3<f32>(orm.g); }
+            default: {}
+        }
+        base_s = vec4<f32>(shown, base_s.a);
+        orm = vec4<f32>(1.0, 0.5, 0.0, 0.5);
+        emis_t = vec4<f32>(0.0);
+        lobes = vec4<f32>(0.0);
+        sheen_t = vec4<f32>(0.0);
+        extra = vec4<f32>(0.0);
+    }
     let emis = emis_t.rgb;
-    let lobes = textureSample(t_lobes, samp, uv);
-    let sheen_t = textureSample(t_sheen, samp, uv);
-    let extra = textureSample(t_extra, samp, uv);
     let aux = textureSample(t_aux, samp, uv);
     let dims = vec2<f32>(textureDimensions(t_height));
     let ts = 1.0 / dims;
@@ -448,7 +493,7 @@ fn shade_mesh(i: VOut, front: bool) -> Shaded {
     let n = normalize(t * n_ts.x + b * n_ts.y + n_geo * n_ts.z);
 
     let mode = i32(g.mode.x + 0.5);
-    if (mode == 1) {
+    if (mode == 1 && !solo_lit) {
         let ch = i32(g.mode.y + 0.5);
         if (ch >= 11) {
             return unlit(lobe_view(ch, lobes, sheen_t, nrm_t.a, emis_t.a, extra));
@@ -471,6 +516,11 @@ fn shade_mesh(i: VOut, front: bool) -> Shaded {
 
     if (mode == 2) {
         return unlit(raw_out(aux.rgb));
+    }
+
+    if (mode == 4) {
+        // The normal the shading uses (mesh, height slope and normal channel), as a world-space normal
+        return unlit(raw_out(n * 0.5 + 0.5));
     }
 
     if (mode == 3) {
@@ -500,8 +550,8 @@ fn shade_mesh(i: VOut, front: bool) -> Shaded {
     let nov = clamp(abs(dot(n, v)), GRAZING_COSINE_FLOOR, 1.0);
     var f0 = mix(vec3<f32>(0.08 * orm.a), albedo, metal);
     var diffuse_col = albedo * (1.0 - metal);
-    if (g.material.x > 0.5) {
-        // Specular color gives F0; remove its energy from diffuse
+    if (g.material.x > 0.5 && !solo_lit) {
+        // Specular color gives F0 (a solo-lit channel view keeps its neutral material); remove its energy from diffuse
         f0 = hgt.gba;
         diffuse_col = albedo * (1.0 - max(f0.r, max(f0.g, f0.b)));
     }
@@ -628,7 +678,7 @@ fn shade_mesh(i: VOut, front: bool) -> Shaded {
         }
 
         if (g.shadow.x > 0.5 && nol > 0.0) {
-            let sh = shadow_factor(i.wpos, n_geo);
+            let sh = mix(1.0, shadow_factor(i.wpos, n_geo), g.shadow.w);
             direct *= sh;
             direct_diffuse *= sh;
         }
@@ -668,6 +718,21 @@ fn fs_uv(i: VOut) -> @location(0) vec4<f32> {
 
     if (mode == 2) {
         return raw_out(textureSample(t_aux, samp, i.uv).rgb);
+    }
+
+    if (mode == 4) {
+        // The tangent-space normal the shading uses: the height slope turned by the normal channel
+        let dims = vec2<f32>(textureDimensions(t_height));
+        let ts = 1.0 / dims;
+        let hl = textureSample(t_height, samp, i.uv - vec2<f32>(ts.x, 0.0)).r;
+        let hr = textureSample(t_height, samp, i.uv + vec2<f32>(ts.x, 0.0)).r;
+        let hu = textureSample(t_height, samp, i.uv - vec2<f32>(0.0, ts.y)).r;
+        let hd = textureSample(t_height, samp, i.uv + vec2<f32>(0.0, ts.y)).r;
+        let k = g.mode.z * dims.x / 16.0 * tile_scale(i.uv);
+        let n_height = normalize(vec3<f32>(-(hr - hl) * 0.5 * k, (hd - hu) * 0.5 * k, 1.0));
+        var n_detail = clamp(textureSample(t_nrm, samp, i.uv).rgb, vec3<f32>(-1.0), vec3<f32>(1.0));
+        n_detail.y *= g.mode.w;
+        return raw_out(rnm(n_height, normalize(n_detail)) * 0.5 + 0.5);
     }
 
     if (mode == 3) {
@@ -712,7 +777,7 @@ fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
 // UV wireframe in the 2D view.
 @fragment
 fn fs_wire(i: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(0.6, 0.6, 0.6, 0.16);
+    return vec4<f32>(0.9, 0.2, 0.2, g.bg.w);
 }
 
 // 3D wireframe over the shaded mesh: depth-tested, pulled slightly toward the camera so the
@@ -735,7 +800,7 @@ fn vs_wire3d(v: VIn) -> VOut {
 
 @fragment
 fn fs_wire3d(i: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(0.35, 0.35, 0.35, 0.45);
+    return vec4<f32>(0.35, 0.35, 0.35, g.bg.w);
 }
 
 // How far overlay quads move toward the eye, as a fraction of their distance (as the wireframe does)

@@ -181,8 +181,8 @@ fn full_turn() -> f32 {
     FULL_TURN_DEGREES
 }
 
-/// [`Symmetry::angle_span`] of a full turn
-pub const FULL_TURN_DEGREES: f32 = 360.0;
+// A full turn is the angle span every crate measures turns against
+pub use texturecraft_core::FULL_TURN_DEGREES;
 
 /// Most radial copies a brush paints
 pub const MAX_RADIAL_COPIES: u8 = 32;
@@ -445,8 +445,9 @@ mod tests {
     #[test]
     fn image_alpha_follows_the_image_and_is_zero_outside() {
         // Left half white, right half black (2×1 image, sampled at texel centers)
-        let img = ImageRes { width: 2, height: 1, rgba: vec![[1.0; 4], [0.0, 0.0, 0.0, 1.0]], srgb: true };
+        let img = ImageRes::new(2, 1, vec![[1.0; 4], [0.0, 0.0, 0.0, 1.0]], true);
         let shape = Shape { alpha: BrushAlpha::Round, image: Some(&img), library: None, params: AlphaParams::default(), level: 0 };
+
         assert!(shape.sample(-0.5, 0.0, 0.5, 0) > 0.99);
         assert!(shape.sample(0.5, 0.0, 0.5, 0) < 0.01);
         assert_eq!(shape.sample(1.5, 0.0, 0.5, 0), 0.0);
@@ -483,12 +484,7 @@ mod tests {
 
     #[test]
     fn default_parameters_reproduce_every_alpha_exactly() {
-        let img = ImageRes {
-            width: 3,
-            height: 2,
-            rgba: vec![[1.0; 4], [0.3, 0.3, 0.3, 1.0], [0.0, 0.0, 0.0, 1.0], [0.6, 0.6, 0.6, 1.0], [0.9; 4], [0.1, 0.1, 0.1, 1.0]],
-            srgb: true,
-        };
+        let img = ImageRes::new(3, 2, vec![[1.0; 4], [0.3, 0.3, 0.3, 1.0], [0.0, 0.0, 0.0, 1.0], [0.6, 0.6, 0.6, 1.0], [0.9; 4], [0.1, 0.1, 0.1, 1.0]], true);
         let library = crate::alphas::library().first().map(|alpha| alpha.image());
         let kinds = BrushAlpha::ALL.map(|alpha| Shape { alpha, image: None, library: None, params: AlphaParams::default(), level: 0 });
         for shape in kinds.into_iter().chain([
@@ -501,6 +497,7 @@ mod tests {
                     (None, Some(lib)) => lib.sample(shape.level, x, y),
                     (None, None) => shape.alpha.sample(x, y, 0.4, 7),
                 };
+
                 assert_eq!(shape.sample(x, y, 0.4, 7).to_bits(), before.to_bits(), "{:?} at ({x}, {y})", shape.alpha);
             }
         }
@@ -522,9 +519,10 @@ mod tests {
 
     #[test]
     fn sizes_apply_to_image_and_library_alphas_too() {
-        let img = ImageRes { width: 1, height: 1, rgba: vec![[1.0; 4]], srgb: true };
+        let img = ImageRes::new(1, 1, vec![[1.0; 4]], true);
         let params = AlphaParams { size_x: 0.5, ..AlphaParams::default() };
         let image = Shape { alpha: BrushAlpha::Round, image: Some(&img), library: None, params, level: 0 };
+
         assert_eq!((image.sample(0.4, 0.0, 0.5, 0) > 0.99, image.sample(0.6, 0.0, 0.5, 0)), (true, 0.0));
 
         let library = crate::alphas::find("square").map(|alpha| alpha.image());

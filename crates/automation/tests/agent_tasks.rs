@@ -86,6 +86,29 @@ async fn inspect(c: &Conn) -> Value {
     tool(c, "session_inspect", json!({})).await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn textures_export_accepts_per_map_settings() {
+    let dir = tmp("map-options");
+    let (client, server) = connect(workspace(&dir)).await;
+
+    let result = tool(
+        &client,
+        "textures_export",
+        json!({"dir": "textures", "preset": "glTF PBR Metal Roughness", "maps": [
+            {"map": 0, "format": "pgm", "bitDepth": 16},
+            {"map": 1, "enabled": false}
+        ]}),
+    )
+    .await;
+
+    let files = result["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{result}");
+    let graymap = files.iter().filter_map(Value::as_str).find(|path| path.ends_with(".pgm")).unwrap();
+    assert!(std::fs::read(dir.join(graymap)).unwrap().starts_with(b"P5\n128 128\n65535\n"));
+    shutdown(client, server).await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn top(s: &Value) -> &Value {
     &s["layers"][0]
 }

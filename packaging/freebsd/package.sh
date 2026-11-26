@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Build and package TextureCraft for FreeBSD:
+# Build and package TextureCraft for FreeBSD. The archive's <arch> is x86_64 or aarch64.
 #
-#   $DIST/texturecraft-<version>-freebsd-x86_64.tar.gz   a /usr/local-style tree:
-#       texturecraft-<version>-freebsd-x86_64/{bin, share/applications, share/icons, share/mime,
+#   $DIST/texturecraft-<version>-freebsd-<arch>.tar.gz   a /usr/local-style tree:
+#       texturecraft-<version>-freebsd-<arch>/{bin, share/applications, share/icons, share/mime,
 #       share/metainfo, share/doc/texturecraft}
 #
 # Install by copying the tree's contents into /usr/local:
-#   tar -xzf texturecraft-<version>-freebsd-x86_64.tar.gz --strip-components 1 -C /usr/local
+#   tar -xzf texturecraft-<version>-freebsd-<arch>.tar.gz --strip-components 1 -C /usr/local
 #
 # Usage: packaging/freebsd/package.sh [--skip-build] [--dry-run]
 #   --dry-run   stage the tree from stub binaries and list it, without building (works on any OS)
@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-build) SKIP_BUILD=1; shift ;;
     --dry-run) DRY_RUN=1; SKIP_BUILD=1; shift ;;
-    -h | --help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h | --help) sed -n '1d; /^#/!q; p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done

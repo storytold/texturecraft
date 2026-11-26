@@ -3,13 +3,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use rayon::prelude::*;
 use texturecraft_engine::Session;
 use texturecraft_engine::compose::{DisplayKind, ImageRes, kinds_for, tile_bytes};
-use texturecraft_engine::core::{BakedMap, Channel};
+use texturecraft_engine::core::{BakedMap, Channel, LayerId};
 use texturecraft_engine::geom::Mesh;
 use texturecraft_render::{BakeVisualization, CageGeometry, Frame, Renderer, wgpu};
 
@@ -19,9 +19,13 @@ use crate::bake_scene::{BakeSceneLink, CageUpload};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AuxView {
     MeshMap(BakedMap),
-    Mask(texturecraft_engine::core::LayerId),
+    Mask(LayerId),
     /// The quick mask being edited, over the base color.
     QuickMask,
+    /// The project image of the view picker's "Other..." (`Session::view_image`)
+    Image,
+    /// The image a color selection reads as its ID mask on its texture set, the ID mesh map on the others (its pick mode)
+    IdMask(LayerId),
 }
 
 /// A texture set's texels across and down, and its mesh material.
@@ -41,6 +45,8 @@ pub struct SceneSync {
     pub env: Option<(String, Option<Arc<ImageRes>>)>,
     pub tiles: Vec<(usize, DisplayKind, u32, u32, Vec<u8>)>,
     pub aux: Vec<(usize, u32, Vec<u8>)>,
+    /// One image buffer per resolution, with all texture sets that need it.
+    pub image_aux: BTreeMap<u32, (Vec<usize>, Vec<u8>)>,
     /// Bake mode's high poly (`None` removes it) and the id it is sent under
     pub bake_high: Option<(Option<Arc<Mesh>>, u64)>,
     /// Which vertices of the high poly (by its id) the bake's rays miss (1) or reach (0)
@@ -91,9 +97,13 @@ pub struct GpuLink {
     /// The display shift the GPU has (`Prefs::viewport_texture`).
     shift: u32,
     /// The environment the GPU has: name and image identity (a re-imported resource differs).
-    env: (String, usize),
-    /// What each set's aux texture holds: (mesh map or mask key, revision).
+    env: (String, Option<Weak<ImageRes>>),
+    /// What each set's aux texture holds: (view key, revision).
     aux: BTreeMap<usize, (String, u64)>,
+    /// Image identity without holding its decoded pixels alive.
+    aux_image: Option<Weak<ImageRes>>,
+    /// Weak identity of the last uploaded ID mask image.
+    aux_id_mask: Option<Weak<ImageRes>>,
     /// The display kinds sent to the GPU per set: kinds the set has no channels for are not
     /// converted, unless an earlier upload gave them content that must be overwritten. Only the
     /// renderer recreating a set's textures ([`GpuState::recreated`]) replaces its entry with
@@ -123,8 +133,8 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
     let reset = Arc::new(AtomicBool::new(false));
     let recreated = Arc::new(Mutex::new(BTreeMap::new()));
     let reports = Arc::new(Mutex::new(GpuReports::default()));
-    // wgpu's default handler panics on any error no scope caught (an out-of-memory texture, a
-    // driver hiccup): report it instead, so the user keeps the session.
+
+    // Report uncaptured wgpu errors to preserve the session when texture allocation or the driver fails
     let (sink, wake) = (reports.clone(), ctx.clone());
     rs.device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
         log::error!("GPU error: {e}");
@@ -133,7 +143,8 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         if r.errors.len() < MAX_GPU_ERRORS && !r.errors.contains(&text) {
             r.errors.push(text);
         }
-        // The UI may be idle: draw a frame to show it.
+
+        // The UI may be idle: draw a frame to show it
         wake.request_repaint();
     }));
     let renderer = Renderer::new(&rs.device, &rs.queue, rs.target_format);
@@ -155,6 +166,8 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         shift: 0,
         env: Default::default(),
         aux: BTreeMap::new(),
+        aux_image: None,
+        aux_id_mask: None,
         sent: HashMap::new(),
         adapter: format!("{} ({:?})", info.name, info.backend),
         composite_total: 0,
@@ -201,12 +214,16 @@ impl GpuLink {
             out.mesh = Some((session.mesh.clone(), session.mesh_id));
             self.mesh_id = session.mesh_id;
             self.aux.clear();
+            self.aux_id_mask = None;
         }
 
         let sets: Vec<SetLayout> = session.doc.project.texture_sets.iter().map(|texture_set| (texture_set.size(), texture_set.material)).collect();
         if sets != self.sets || shift != self.shift || out.mesh.is_some() {
             // Retained GPU sets need their prior kinds to overwrite stale textures
             self.sent.retain(|&texture_set, _| texture_set < sets.len());
+
+            // Recreated sets start with blank aux textures: resend the shown view
+            self.aux.clear();
 
             out.sets = Some((sets.clone(), session.mesh.materials.len().max(1), shift));
             self.sets = sets;
@@ -215,9 +232,8 @@ impl GpuLink {
 
         let display = &session.doc.project.display;
         let image = display.environment_resource().and_then(|name| session.images.get(name));
-        let image_identity = image.map_or(0, |image| Arc::as_ptr(image) as usize);
-        if self.env.0 != display.environment || self.env.1 != image_identity {
-            self.env = (display.environment.clone(), image_identity);
+        if self.env.0 != display.environment || self.env.1.as_ref().map(Weak::as_ptr) != image.map(Arc::as_ptr) {
+            self.env = (display.environment.clone(), image.map(Arc::downgrade));
             out.env = Some((display.environment.clone(), image.cloned()));
         }
 
@@ -270,30 +286,20 @@ impl GpuLink {
             }
         }
 
+        if self.aux_image.as_ref().is_some_and(|image| image.strong_count() == 0) {
+            self.aux_image = None;
+            self.aux.retain(|_, (view, _)| view != "image");
+        }
+
+        if self.aux_id_mask.as_ref().is_some_and(|image| image.strong_count() == 0) {
+            self.aux_id_mask = None;
+        }
+
         match aux_map {
-            Some(AuxView::MeshMap(map)) => {
-                for texture_set in 0..session.caches.len() {
-                    // Streamed bake maps replace document maps while the bake is visible
-                    let preview = session.bake_preview_baked(texture_set);
-                    let baked = preview.or_else(|| session.doc.baked.get(&texture_set));
-                    let have = baked.and_then(|baked| baked.maps.get(&map));
-                    let revision = have.map(|data| Arc::as_ptr(data) as u64).unwrap_or(0);
-                    let key = (format!("{map:?}{}", if preview.is_some() { "~" } else { "" }), revision);
-                    if self.aux.get(&texture_set) == Some(&key) {
-                        continue;
-                    }
-
-                    let Some(cache) = session.caches.get(texture_set) else { continue };
-
-                    let resolution = texturecraft_render::aux_size(cache.size);
-                    let rgba = if preview.is_some() && have.is_none() {
-                        texturecraft_render::mesh_maps::neutral_rgba(map, resolution)
-                    } else {
-                        texturecraft_render::mesh_maps::mesh_map_rgba(baked, map, resolution, cache.size, &cache.composite.block_scales)
-                    };
-                    out.aux.push((texture_set, resolution, rgba));
-                    self.aux.insert(texture_set, key);
-                }
+            Some(AuxView::MeshMap(map)) => self.sync_mesh_maps(session, map, None, &mut out),
+            Some(AuxView::IdMask(effect)) => {
+                let shown = self.sync_id_mask(session, effect, &mut out);
+                self.sync_mesh_maps(session, BakedMap::Id, shown, &mut out);
             }
             Some(AuxView::Mask(id)) => {
                 if let Some((texture_set, _, _)) = session.doc.project.locate(id) {
@@ -319,6 +325,32 @@ impl GpuLink {
                     }
                 }
             }
+            Some(AuxView::Image) => {
+                let shown = session.view_image.as_deref().and_then(|name| session.images.get(name));
+                let same_image = match (&self.aux_image, shown) {
+                    (Some(previous), Some(image)) => std::ptr::eq(previous.as_ptr(), Arc::as_ptr(image)),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same_image {
+                    self.aux.clear();
+                    self.aux_image = shown.map(Arc::downgrade);
+                }
+
+                for (texture_set, cache) in session.caches.iter().enumerate() {
+                    if self.aux.get(&texture_set).is_some_and(|(view, _)| view == "image") {
+                        continue;
+                    }
+
+                    let resolution = texturecraft_render::aux_size(cache.size);
+                    let (sets, _) = out.image_aux.entry(resolution).or_insert_with(|| {
+                        let rgba = session.image_view_rgba(resolution).unwrap_or_else(|| MASK_VIEW_BLANK.repeat((resolution * resolution) as usize));
+                        (Vec::new(), rgba)
+                    });
+                    sets.push(texture_set);
+                    self.aux.insert(texture_set, ("image".into(), 0));
+                }
+            }
             Some(AuxView::QuickMask) => {
                 for texture_set in 0..session.caches.len() {
                     let Some(cache) = session.caches.get(texture_set) else { continue };
@@ -340,6 +372,59 @@ impl GpuLink {
 
         self.bake_scene.sync(session, bake, &mut out);
         out
+    }
+
+    /// Queues mesh map `map` for every texture set but `skip` whose aux texture shows something else
+    fn sync_mesh_maps(&mut self, session: &Session, map: BakedMap, skip: Option<usize>, out: &mut SceneSync) {
+        for texture_set in 0..session.caches.len() {
+            if skip == Some(texture_set) {
+                continue;
+            }
+
+            // Streamed bake maps replace document maps while the bake is visible
+            let preview = session.bake_preview_baked(texture_set);
+            let baked = preview.or_else(|| session.doc.baked.get(&texture_set));
+            let have = baked.and_then(|baked| baked.maps.get(&map));
+            let revision = have.map(|data| Arc::as_ptr(data) as u64).unwrap_or(0);
+            let key = (format!("{map:?}{}", if preview.is_some() { "~" } else { "" }), revision);
+            if self.aux.get(&texture_set) == Some(&key) {
+                continue;
+            }
+
+            let Some(cache) = session.caches.get(texture_set) else { continue };
+            let resolution = texturecraft_render::aux_size(cache.size);
+            let rgba = if preview.is_some() && have.is_none() {
+                texturecraft_render::mesh_maps::neutral_rgba(map, resolution)
+            } else {
+                texturecraft_render::mesh_maps::mesh_map_rgba(baked, map, resolution, cache.size, &cache.composite.block_scales)
+            };
+            out.aux.push((texture_set, resolution, rgba));
+            self.aux.insert(texture_set, key);
+        }
+    }
+
+    /// Queues the image color selection `effect` reads as its ID mask on its texture set; the texture set it shows on, None when it reads the ID mesh map
+    fn sync_id_mask(&mut self, session: &Session, effect: LayerId, out: &mut SceneSync) -> Option<usize> {
+        let Some((texture_set, image)) = session.id_mask_image(effect) else {
+            self.aux_id_mask = None;
+            return None;
+        };
+
+        let cache = session.caches.get(texture_set)?;
+        let resolution = texturecraft_render::aux_size(cache.size);
+        let key = (format!("idMask{}:{resolution}", effect.0), Arc::as_ptr(image) as u64);
+        let same_image = self.aux_id_mask.as_ref().is_some_and(|previous| std::ptr::eq(previous.as_ptr(), Arc::as_ptr(image)));
+        if (!same_image || self.aux.get(&texture_set) != Some(&key))
+            && let Some(rgba) = session.id_mask_view_rgba(effect, resolution)
+        {
+            out.aux.push((texture_set, resolution, rgba));
+            self.aux.insert(texture_set, key);
+
+            // A weak owner keeps the address unique without retaining the decoded pixels
+            self.aux_id_mask = Some(Arc::downgrade(image));
+        }
+
+        Some(texture_set)
     }
 }
 
@@ -416,6 +501,11 @@ impl CallbackTrait for ViewCallback {
             }
             for (texture_set, size, bytes) in &sync.aux {
                 gpu.renderer.upload_aux(device, queue, *texture_set, *size, bytes);
+            }
+            for (size, (sets, bytes)) in &sync.image_aux {
+                for &texture_set in sets {
+                    gpu.renderer.upload_aux(device, queue, texture_set, *size, bytes);
+                }
             }
             if let Some((high, id)) = &sync.bake_high
                 && let Err(error) = gpu.renderer.set_bake_high(device, queue, high.as_deref(), *id)
@@ -501,6 +591,8 @@ mod tests {
             shift: 0,
             env: Default::default(),
             aux: BTreeMap::new(),
+            aux_image: None,
+            aux_id_mask: None,
             sent: HashMap::new(),
             adapter: String::new(),
             composite_total: 0,
@@ -555,6 +647,105 @@ mod tests {
         let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0);
         assert_eq!(out.aux.len(), 1, "re-enabling the mask uploads its values again");
         assert!(out.aux[0].2.chunks(4).any(|pixel| pixel != MASK_VIEW_BLANK));
+    }
+
+    #[test]
+    fn a_resized_set_gets_the_shown_image_view_again() {
+        let mut gpu = link();
+        let mut s = texturecraft_engine::sample_session(128, 64).unwrap();
+        let mut png = Vec::new();
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([9, 9, 9, 255]));
+        image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let name = s.import_resource_bytes("stone.png", png).unwrap();
+        execute(&mut s, "viewport.view", &json!({"mode": "image", "image": name})).unwrap();
+
+        let out = gpu.sync(&mut s, Some(AuxView::Image), None, 0, 0.0);
+
+        assert_eq!(out.image_aux.len(), 1, "equal resolutions share a single pixel buffer");
+
+        let (targets, bytes) = out.image_aux.values().next().unwrap();
+
+        assert!(targets.len() > 1);
+        assert_eq!(targets.len(), s.caches.len());
+        assert!(bytes.as_chunks::<4>().0.iter().all(|pixel| *pixel == [9, 9, 9, 255]));
+
+        drop(out);
+        let out = gpu.sync(&mut s, Some(AuxView::Image), None, 0, 0.0);
+        assert!(out.image_aux.is_empty(), "nothing is sent again while the view stays");
+
+        drop(out);
+
+        // The renderer recreates a resized set's textures blank, in the same frame as this sync
+        let shown = s.doc.project.texture_set(0).unwrap().size().0;
+        let resolution = if shown == 256 { 512 } else { 256 };
+        execute(&mut s, "textureSet.resolution", &json!({"resolution": resolution})).unwrap();
+        let out = gpu.sync(&mut s, Some(AuxView::Image), None, 0, 0.0);
+        assert!(out.sets.is_some());
+        assert_eq!(out.image_aux.get(&resolution).unwrap().0, [0], "the resized set gets pixels at its new resolution");
+
+        // Switching images leaves the previous decoded image owned only by the session
+        let original = Arc::downgrade(s.images.get(&name).unwrap());
+        execute(&mut s, "resource.remove", &json!({"name": name})).unwrap();
+
+        assert!(original.upgrade().is_none(), "even a pending upload does not hold the decoded source");
+        assert!(gpu.sync(&mut s, None, None, 0, 0.0).image_aux.is_empty());
+        assert!(gpu.aux_image.is_none());
+
+        let replacement = Arc::new(ImageRes::new(1, 1, vec![[1.0, 0.0, 0.0, 1.0]], true));
+        s.images.insert(name.clone(), replacement);
+        execute(&mut s, "viewport.view", &json!({"mode": "image", "image": name})).unwrap();
+        let updated = gpu.sync(&mut s, Some(AuxView::Image), None, 0, 0.0);
+        assert_eq!(updated.image_aux.len(), 2);
+        assert!(updated.image_aux.values().all(|(_, pixels)| pixels.as_chunks::<4>().0.iter().all(|pixel| *pixel == [255, 0, 0, 255])));
+    }
+
+    #[test]
+    fn the_id_mask_view_uploads_reimported_pixels_even_if_the_address_was_reused() {
+        let mut gpu = link();
+        let mut session = session(false);
+        execute(&mut session, "layer.add.fill", &json!({})).unwrap();
+        let selection = execute(&mut session, "effect.add.colorSelection", &json!({})).unwrap();
+        let effect = LayerId(selection["effect"].as_u64().unwrap());
+        let resource = "selection.png";
+        let image = |color| Arc::new(ImageRes::new(1, 1, vec![color], false));
+        session.images.insert(resource.into(), image([1.0, 0.0, 0.0, 1.0]));
+        execute(&mut session, "effect.set", &json!({"effect": effect.0, "idMap": resource})).unwrap();
+
+        let first = gpu.sync(&mut session, Some(AuxView::IdMask(effect)), None, 0, 0.0);
+
+        assert!(first.aux[0].2.as_chunks::<4>().0.iter().all(|pixel| *pixel == [255, 0, 0, 255]));
+
+        let (set, original) = session.id_mask_image(effect).unwrap();
+        let retired = Arc::downgrade(original);
+        drop(session.images.remove(resource));
+
+        assert!(retired.upgrade().is_none(), "upload ownership must drop independently of decoded source pixels");
+
+        let replacement = image([0.0, 0.0, 1.0, 1.0]);
+
+        // Simulate an allocator returning the previous address for the new image
+        gpu.aux.get_mut(&set).unwrap().1 = Arc::as_ptr(&replacement) as u64;
+        session.images.insert(resource.into(), replacement);
+
+        let updated = gpu.sync(&mut session, Some(AuxView::IdMask(effect)), None, 0, 0.0);
+
+        assert_eq!(updated.aux.len(), 1, "replacement pixels must be sent even when the raw address key matches");
+        assert!(updated.aux[0].2.as_chunks::<4>().0.iter().all(|pixel| *pixel == [0, 0, 255, 255]));
+        assert!(gpu.sync(&mut session, Some(AuxView::IdMask(effect)), None, 0, 0.0).aux.is_empty());
+
+        gpu.sync(&mut session, None, None, 0, 0.0);
+
+        assert!(gpu.sync(&mut session, Some(AuxView::IdMask(effect)), None, 0, 0.0).aux.is_empty(), "an unchanged pick reuses the existing upload");
+
+        let (_, active) = session.id_mask_image(effect).unwrap();
+        let active = Arc::downgrade(active);
+        drop(session.images.remove(resource));
+
+        assert!(active.upgrade().is_none(), "only the resource store owns the decoded pixels");
+
+        gpu.sync(&mut session, None, None, 0, 0.0);
+
+        assert!(gpu.aux_id_mask.is_none(), "the upload identity expires with the removed image");
     }
 
     fn kinds(out: &SceneSync) -> BTreeSet<DisplayKind> {

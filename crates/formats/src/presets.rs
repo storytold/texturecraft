@@ -85,18 +85,22 @@ pub(crate) fn gltf_pbr_maps(file: impl Fn(&str) -> String) -> Vec<MapSpec> {
 pub fn builtin_presets() -> Vec<ExportPreset> {
     let preset = |name: &str, maps: Vec<MapSpec>| ExportPreset { name: name.into(), maps };
     vec![
-        preset("Document channels + Normal + AO", {
+        preset(DEFAULT_PRESET, {
             let mut maps: Vec<MapSpec> =
                 Channel::ALL.into_iter().filter(|c| !matches!(c, Channel::Normal | Channel::AmbientOcclusion)).map(channel_map).collect();
             maps.push(map("normal", 8, rgb(|k| ch(Channel::Normal, k))));
             maps.push(map("ambientOcclusion", 8, gray(virt(VirtualMap::AoMixed, 0))));
             maps
         }),
+        // Spec: https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#metallic-roughness-material
         preset("glTF PBR Metal Roughness", gltf_pbr_maps(|s| format!("$mesh_$textureSet_{s}"))),
+        // Spec: https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#metallic-roughness-material (R occlusion, G roughness, B metallic) and the base color, roughness, metallic and normal inputs of
+        // https://dev.epicgames.com/documentation/en-us/unreal-engine/physically-based-materials-in-unreal-engine
         preset(
             "Unreal Engine (Packed)",
             vec![map("BaseColor", 8, base_with_alpha()), map("OcclusionRoughnessMetallic", 8, orm()), map("Normal", 8, normal(VirtualMap::NormalDirectX))],
         ),
+        // Spec: https://docs.unity3d.com/Packages/com.unity.render-pipelines.high-definition@17.0/manual/Mask-Map-and-Detail-Map.html
         preset(
             "Unity HDRP (Mask Map)",
             vec![
@@ -107,7 +111,7 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                     vec![
                         (Dest::R, ch(Channel::Metallic, 0)),
                         (Dest::G, virt(VirtualMap::AoMixed, 0)),
-                        // Detail mask: none.
+                        // The preset has no detail mask
                         (Dest::B, SourceRef::Constant(0.0)),
                         (Dest::A, virt(VirtualMap::Glossiness, 0)),
                     ],
@@ -115,6 +119,7 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                 map("Normal", 8, normal(VirtualMap::NormalOpenGl)),
             ],
         ),
+        // Spec: https://docs.unity3d.com/Manual/StandardShaderMaterialParameterMetallic.html (smoothness in the metallic map's alpha)
         preset(
             "Unity Standard (Metallic Smoothness)",
             vec![
@@ -133,6 +138,7 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                 map("Occlusion", 8, gray(virt(VirtualMap::AoMixed, 0))),
             ],
         ),
+        // Spec: https://docs.blender.org/manual/en/latest/render/shader_nodes/shader/principled.html
         preset(
             "Blender (Principled BSDF)",
             vec![
@@ -145,6 +151,7 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                 map("Specular", 8, gray(ch(Channel::SpecularLevel, 0))),
             ],
         ),
+        // Spec: https://docs.godotengine.org/en/stable/tutorials/3d/standard_material_3d.html (ORM material: R occlusion, G roughness, B metallic)
         preset(
             "Godot 4 (ORM)",
             vec![
@@ -154,7 +161,8 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                 map("emission", 8, rgb(|k| ch(Channel::Emissive, k))),
             ],
         ),
-        // OpenPBR Surface inputs, one map each (maps of channels a set lacks are skipped).
+        // Spec: https://academysoftwarefoundation.github.io/OpenPBR/
+        // One map per OpenPBR input present in the texture set
         preset("OpenPBR (separate maps)", {
             let gray8 = |name: &str, c: Channel| map(name, 8, gray(ch(c, 0)));
             let rgb8 = |name: &str, c: Channel| map(name, 8, rgb(|k| ch(c, k)));
@@ -176,6 +184,41 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                 map("height", 16, gray(ch(Channel::Height, 0))),
             ]
         }),
+        // Spec: https://docs.unity3d.com/Packages/com.unity.render-pipelines.universal@17.0/manual/lit-shader.html (smoothness in the metallic map's alpha)
+        preset(
+            "Unity URP Lit (Metallic Smoothness)",
+            vec![
+                map("BaseMap", 8, base_with_alpha()),
+                map(
+                    "MetallicMap",
+                    8,
+                    vec![
+                        (Dest::R, ch(Channel::Metallic, 0)),
+                        (Dest::G, SourceRef::Constant(0.0)),
+                        (Dest::B, SourceRef::Constant(0.0)),
+                        (Dest::A, virt(VirtualMap::Glossiness, 0)),
+                    ],
+                ),
+                map("NormalMap", 8, normal(VirtualMap::NormalOpenGl)),
+                map("OcclusionMap", 8, gray(virt(VirtualMap::AoMixed, 0))),
+                map("EmissionMap", 8, rgb(|k| ch(Channel::Emissive, k))),
+            ],
+        ),
+        // Spec: https://openusd.org/release/spec_usdpreviewsurface.html (one texture per input, named like it)
+        preset(
+            "USD Preview Surface (separate maps)",
+            vec![
+                map("diffuseColor", 8, rgb(|k| ch(Channel::BaseColor, k))),
+                map("emissiveColor", 8, rgb(|k| ch(Channel::Emissive, k))),
+                map("metallic", 8, gray(ch(Channel::Metallic, 0))),
+                map("roughness", 8, gray(ch(Channel::Roughness, 0))),
+                map("normal", 8, normal(VirtualMap::NormalOpenGl)),
+                map("occlusion", 8, gray(virt(VirtualMap::AoMixed, 0))),
+                map("opacity", 8, gray(ch(Channel::Opacity, 0))),
+                map("clearcoat", 8, gray(ch(Channel::CoatWeight, 0))),
+                map("clearcoatRoughness", 8, gray(ch(Channel::CoatRoughness, 0))),
+            ],
+        ),
         preset("Separate maps", Channel::ALL.into_iter().map(channel_map).collect()),
         preset(
             "Mesh maps",
@@ -190,9 +233,18 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
     ]
 }
 
+/// The default export template.
+pub const DEFAULT_PRESET: &str = "Document channels + Normal + AO (No Alpha)";
+
+/// The default template's name before it took the reference's "(No Alpha)" (saved settings and
+/// scripts still use it).
+const OLD_DEFAULT_PRESET: &str = "Document channels + Normal + AO";
+
 /// A built-in preset by name (case-insensitive).
 pub fn builtin_preset(name: &str) -> Option<ExportPreset> {
-    builtin_presets().into_iter().find(|p| p.name.eq_ignore_ascii_case(name.trim()))
+    let name = name.trim();
+    let name = if name.eq_ignore_ascii_case(OLD_DEFAULT_PRESET) { DEFAULT_PRESET } else { name };
+    builtin_presets().into_iter().find(|p| p.name.eq_ignore_ascii_case(name))
 }
 
 /// Parse and validate a user preset.

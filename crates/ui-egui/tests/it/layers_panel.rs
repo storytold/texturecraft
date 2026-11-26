@@ -2,12 +2,14 @@
 //! fold without touching the document, and the thumbnails arrive from the worker.
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use serde_json::{Value, json};
 use texturecraft_engine::compose::ThumbTarget;
 use texturecraft_engine::core::{Channel, LayerId};
 use texturecraft_engine::{StackTarget, execute};
 use texturecraft_ui_egui::TextureCraftApp;
+
+use crate::SETTLE_FRAMES;
 
 fn id(v: Value, key: &str) -> u64 {
     v[key].as_u64().unwrap()
@@ -22,7 +24,10 @@ fn harness() -> (Harness<'static, TextureCraftApp>, LayerId) {
     execute(&mut session, "mask.add.black", &Value::Null).unwrap();
     execute(&mut session, "effect.add.generator", &json!({"generator": "position", "level": 0.5, "name": "Effect M"})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     (h, layer)
 }
@@ -34,6 +39,9 @@ fn thumb(h: &Harness<'_, TextureCraftApp>, name: &str, mask: bool) -> egui::Pos2
     let x = row.left() + 7.0 + 20.0 + 18.0 + if mask { 40.0 } else { 0.0 };
     egui::pos2(x, row.center().y)
 }
+
+/// The accessible name of the mask thumbnail of the layer "Masked fill"
+const MASK_THUMBNAIL_NAME: &str = "Select the mask (Alt+click: show it in the viewport, Shift+click: switch it on or off) (Masked fill)";
 
 /// The `label` header that follows the "Masked fill" row (other layers have groups too).
 fn header(h: &mut Harness<'_, TextureCraftApp>, label: &str) {
@@ -97,27 +105,39 @@ fn visible_rows_get_their_thumbnails() {
 
 #[test]
 fn deeply_nested_effect_visibility_is_reachable_in_a_narrow_panel() {
-    use craft_ui::docking::Node;
-    use craft_ui::layout::SplitSize;
+    use craft_behavior::dock::Node;
+    use craft_behavior::dock::SplitSize;
     use texturecraft_ui_egui::docking::Dock;
 
-    let (mut h, layer) = harness();
+    let (mut harness, layer) = harness();
     for _ in 0..6 {
-        execute(&mut h.state_mut().session, "layer.group", &Value::Null).unwrap();
+        execute(&mut harness.state_mut().session, "layer.group", &Value::Null).unwrap();
     }
-    let mut workspace = h.state().ui.dock.workspace().clone();
-    let Some(Node::Split { second, .. }) = workspace.layout.root.as_mut() else { panic!("default columns") };
-    let Node::Split { size, .. } = second.as_mut() else { panic!("viewport and right column") };
+
+    let workspace = harness.state().ui.dock.workspace().clone();
+    let mut layout = workspace.layout().clone();
+    let Some(Node::Split { second, .. }) = layout.root.as_mut() else { panic!("default columns") };
+    let Node::Split { size, second: column, .. } = second.as_mut() else { panic!("viewport and right column") };
     *size = SplitSize::Ratio(0.99);
-    h.state_mut().ui.dock = Dock::from_value(serde_json::to_value(workspace).unwrap());
-    h.run_steps(4);
 
-    let row = h.get_by_label("Effect A").rect();
+    // Give Layers enough height to show the nested stack
+    let Node::Split { second: below_sets, .. } = column.as_mut() else { panic!("texture sets and the rest") };
+    let Node::Split { size: layers_share, .. } = below_sets.as_mut() else { panic!("layers and properties") };
+    *layers_share = SplitSize::Ratio(0.9);
+    let workspace = texturecraft_ui_egui::docking::Workspace::from_parts(layout, workspace.hidden().to_vec(), workspace.floated().to_vec());
+    harness.state_mut().ui.dock = Dock::from_value(serde_json::to_value(workspace).unwrap());
+
+    // Closing Properties lets the column shrink to the Layers minimum
+    harness.state_mut().ui.dock.close(texturecraft_ui_egui::docking::Panel::Properties);
+    harness.run_steps(4);
+
+    let row = harness.get_by_label("Effect A").rect();
     assert!(row.width() < 180.0, "the test must use a compact panel: {row:?}");
-    let indent = (row.width() - 7.0 - 22.0 - 21.6 - 8.0 - 20.0 - 6.0).max(0.0);
-    click(&mut h, egui::pos2(row.left() + 15.0 + indent, row.center().y));
 
-    let content = &h.state().session.doc.project.layers[&layer].content_effects;
+    let indent = (row.width() - 7.0 - 22.0 - 21.6 - 8.0 - 20.0 - 6.0).max(0.0);
+    click(&mut harness, egui::pos2(row.left() + 15.0 + indent, row.center().y));
+
+    let content = &harness.state().session.doc.project.layers[&layer].content_effects;
     assert!(!content.iter().find(|effect| effect.name == "Effect A").unwrap().visible, "the compact eye toggles the effect instead of missing the panel");
 }
 
@@ -139,7 +159,11 @@ fn hidpi_harness() -> (Harness<'static, TextureCraftApp>, LayerId) {
     let layer = LayerId(id(execute(&mut session, "layer.add.fill", &json!({"color": "#336699"})).unwrap(), "layer"));
     execute(&mut session, "layer.rename", &json!({"layer": layer.0, "name": "Active one"})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": layer.0})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1200.0, 800.0)).with_pixels_per_point(2.0).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .with_pixels_per_point(2.0)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     (h, layer)
 }
@@ -245,7 +269,10 @@ fn narrow_harness() -> Harness<'static, TextureCraftApp> {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     let layer = id(execute(&mut session, "layer.add.fill", &json!({"color": "#336699"})).unwrap(), "layer");
     execute(&mut session, "layer.rename", &json!({"layer": layer, "name": LONG_NAME})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 800.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     h
@@ -256,13 +283,7 @@ fn layer_toolbar_stays_on_one_row_in_a_1280_by_800_window() {
     let h = narrow_harness();
     let buttons = ["Add paint layer", "Add fill layer", "Add folder"].map(|label| h.get_by_label(label).rect());
 
-    // The effect menu button is the wand left of the paint button (effect rows draw wands too)
-    let wand = h
-        .query_all_by_label(egui_phosphor::regular::MAGIC_WAND)
-        .map(|n| n.rect())
-        .filter(|r| r.right() < buttons[0].left())
-        .max_by(|a, b| a.right().total_cmp(&b.right()))
-        .expect("the effect menu button");
+    let wand = h.get_by_label("Add effect").rect();
     let remove = h.query_all_by_label_contains("Remove layer").next().expect("the remove button").rect();
     for rect in buttons.into_iter().chain([remove]) {
         assert!((rect.center().y - wand.center().y).abs() < 1.0, "the toolbar wrapped: {rect:?} against {wand:?}");
@@ -289,7 +310,10 @@ fn an_effect_name_cut_short_shows_in_full_on_hover() {
     let layer = id(execute(&mut session, "layer.add.fill", &json!({"color": "#336699"})).unwrap(), "layer");
     execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
     execute(&mut session, "effect.add.filter", &json!({"target": "content", "filter": "invert", "name": LONG_EFFECT_NAME})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 800.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
 
@@ -306,6 +330,64 @@ fn right_click(h: &mut Harness<'_, TextureCraftApp>, at: egui::Pos2) {
         h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE });
     }
     h.run_steps(3);
+}
+
+#[test]
+fn thumbnail_menus_apply_actions_to_the_clicked_layer_and_stack() {
+    let (mut h, clicked) = harness();
+    let selected = {
+        let session = &mut h.state_mut().session;
+        let layer = LayerId(id(execute(session, "layer.add.fill", &json!({"name": "Another fill"})).unwrap(), "layer"));
+        execute(session, "mask.add.white", &Value::Null).unwrap();
+        layer
+    };
+    h.run_steps(3);
+    assert_eq!(h.state().session.selected_layer(), Some(selected));
+
+    let at = thumb(&h, "Masked fill", true);
+    right_click(&mut h, at);
+    assert!(h.query_by_label("Flatten layer").is_none());
+    h.get_by_label("Toggle mask").click();
+    h.run_steps(3);
+    let project = &h.state().session.doc.project;
+    assert!(!project.layers[&clicked].mask.as_ref().unwrap().enabled);
+    assert!(project.layers[&selected].mask.as_ref().unwrap().enabled);
+    assert_eq!(h.state().session.target, StackTarget::Mask);
+
+    // The same layer's mask is still selected when its material menu opens.
+    let at = thumb(&h, "Masked fill", false);
+    right_click(&mut h, at);
+    assert!(h.query_by_label("Toggle mask").is_none());
+    // The same items as the toolbar's Add effect on the content: a generator can't go there, so it is greyed
+    assert!(h.get_by_label_contains("Add generator").accesskit_node().is_disabled());
+    h.get_by_label_contains("Add levels").click();
+    h.run_steps(3);
+    let layer = &h.state().session.doc.project.layers[&clicked];
+    assert_eq!(layer.content_effects.len(), 2);
+    assert_eq!(layer.mask.as_ref().unwrap().effects.len(), 1);
+}
+
+#[test]
+fn focused_mask_thumbnail_opens_and_dismisses_its_menu_from_the_keyboard() {
+    let (mut harness, _) = harness();
+
+    harness.get_by_label(MASK_THUMBNAIL_NAME).focus();
+    harness.run_steps(3);
+    assert!(harness.get_by_label(MASK_THUMBNAIL_NAME).is_focused());
+
+    harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F10);
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Toggle mask").is_some());
+
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run_steps(3);
+    assert!(harness.get_by_label("Toggle mask").is_focused());
+
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(3);
+
+    assert!(harness.query_by_label("Toggle mask").is_none());
+    assert!(harness.get_by_label(MASK_THUMBNAIL_NAME).is_focused());
 }
 
 /// Click the eye of the top-level row `name` with `modifiers` held (the eye sits in the first 20 points after the 7-point edge).
@@ -364,12 +446,18 @@ fn alt_click_on_the_eye_solos_and_a_plain_click_still_hides() {
 }
 
 fn alt_click(h: &mut Harness<'_, TextureCraftApp>, at: egui::Pos2) {
-    h.event(egui::Event::ModifiersChanged(egui::Modifiers::ALT));
-    h.hover_at(at);
+    click_with(h, at, egui::Modifiers::ALT);
+}
+
+/// A primary click at `position` with `modifiers` held
+fn click_with(h: &mut Harness<'_, TextureCraftApp>, position: egui::Pos2, modifiers: egui::Modifiers) {
+    h.event(egui::Event::ModifiersChanged(modifiers));
+    h.hover_at(position);
     for pressed in [true, false] {
-        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::ALT });
+        h.event(egui::Event::PointerButton { pos: position, button: egui::PointerButton::Primary, pressed, modifiers });
         h.run_steps(2);
     }
+
     h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
     h.run_steps(3);
 }
@@ -399,8 +487,158 @@ fn alt_click_on_a_mask_thumbnail_shows_that_mask_alone_without_changing_the_docu
 
 #[test]
 fn alt_click_on_the_content_thumbnail_leaves_the_view_alone() {
-    let (mut h, _) = harness();
-    let at = thumb(&h, "Masked fill", false);
-    alt_click(&mut h, at);
+    let (mut h, layer) = harness();
+    let content_thumbnail = thumb(&h, "Masked fill", false);
+    let mask_thumbnail = thumb(&h, "Masked fill", true);
+
+    alt_click(&mut h, content_thumbnail);
+
     assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Material);
+
+    alt_click(&mut h, mask_thumbnail);
+
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Mask(layer));
+    assert_eq!(h.state().session.target, StackTarget::Mask);
+
+    alt_click(&mut h, content_thumbnail);
+
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Mask(layer));
+    assert_eq!(h.state().session.target, StackTarget::Content);
+}
+
+/// Whether a bypassed mask's strike is painted across the thumbnail at `position`
+fn mask_strike_shown(h: &Harness<'_, TextureCraftApp>, position: egui::Pos2) -> bool {
+    let danger = texturecraft_ui_egui::theme::Tokens::get(&h.ctx).danger;
+    shapes(h).iter().any(|shape| matches!(shape, egui::Shape::LineSegment { points, stroke } if stroke.color == danger && egui::Rect::from_two_pos(points[0], points[1]).contains(position)))
+}
+
+#[test]
+fn shift_click_on_a_mask_thumbnail_switches_the_mask_off_and_on_in_one_undo_step_each() {
+    let (mut h, layer) = harness();
+    let at = thumb(&h, "Masked fill", true);
+    let target = h.state().session.target;
+    let history = h.state().session.history_labels().len();
+    let mask = h.state().session.doc.project.layers[&layer].mask.clone().unwrap();
+
+    assert!(!mask_strike_shown(&h, at));
+    assert_eq!(h.get_by_label(MASK_THUMBNAIL_NAME).accesskit_node().description().as_deref(), Some("Mask on"));
+
+    click_with(&mut h, at, egui::Modifiers::SHIFT);
+
+    let bypassed = h.state().session.doc.project.layers[&layer].mask.as_ref().unwrap();
+    assert!(!bypassed.enabled);
+    assert_eq!(bypassed.effects, mask.effects, "the mask keeps its effects while bypassed");
+    assert_eq!(h.state().session.history_labels().len(), history + 1);
+    assert_eq!(h.state().session.target, target, "Shift+click toggles instead of selecting the mask");
+    assert!(mask_strike_shown(&h, at), "the disabled indicator shows while the mask is bypassed");
+
+    let thumbnail = h.get_by_label(MASK_THUMBNAIL_NAME);
+    assert!(thumbnail.is_focused());
+    assert_eq!(thumbnail.accesskit_node().description().as_deref(), Some("Mask off"));
+
+    click_with(&mut h, at, egui::Modifiers::SHIFT);
+
+    assert_eq!(h.state().session.doc.project.layers[&layer].mask, Some(mask), "toggling back restores the mask as it was");
+    assert_eq!(h.state().session.history_labels().len(), history + 2);
+    assert!(!mask_strike_shown(&h, at));
+    assert_eq!(h.get_by_label(MASK_THUMBNAIL_NAME).accesskit_node().description().as_deref(), Some("Mask on"));
+
+    h.state_mut().session.undo().unwrap();
+
+    assert!(!h.state().session.doc.project.layers[&layer].mask.as_ref().unwrap().enabled, "one undo undoes one toggle");
+}
+
+#[test]
+fn shift_click_on_a_mask_thumbnail_works_with_no_layer_selected() {
+    let (mut harness, layer) = harness();
+    let row = harness.get_by_label("Masked fill").rect();
+    let mask_thumbnail = thumb(&harness, "Masked fill", true);
+    let history = harness.state().session.history_labels().len();
+
+    click_with(&mut harness, row.center(), egui::Modifiers::COMMAND);
+
+    assert!(harness.state().session.selected_layers().is_empty());
+    assert!(harness.state().session.doc.project.layers[&layer].mask.as_ref().unwrap().enabled);
+
+    click_with(&mut harness, mask_thumbnail, egui::Modifiers::SHIFT);
+
+    assert!(!harness.state().session.doc.project.layers[&layer].mask.as_ref().unwrap().enabled);
+    assert!(harness.state().session.selected_layers().is_empty());
+    assert_eq!(harness.state().session.history_labels().len(), history + 1);
+}
+
+#[test]
+fn the_mask_toggle_shortcut_requires_a_selected_layer() {
+    let (mut harness, layer) = harness();
+    let row = harness.get_by_label("Masked fill").rect();
+    harness.state_mut().ui.keymap.insert("mask.toggle".into(), "F7".into());
+
+    harness.key_press(egui::Key::F7);
+    harness.run_steps(3);
+
+    assert!(!harness.state().session.doc.project.layers[&layer].mask.as_ref().unwrap().enabled);
+
+    click_with(&mut harness, row.center(), egui::Modifiers::COMMAND);
+    assert!(harness.state().session.selected_layers().is_empty());
+    let toast_count = harness.state().toasts.len();
+
+    harness.key_press(egui::Key::F7);
+    harness.run_steps(3);
+
+    assert_eq!(harness.state().toasts.len(), toast_count, "the shortcut is inactive when it has no target");
+    assert!(!harness.state().session.doc.project.layers[&layer].mask.as_ref().unwrap().enabled);
+}
+
+#[test]
+fn clicking_the_material_thumbnail_leaves_the_mask_view() {
+    let (mut h, layer) = harness();
+    let mask_thumbnail = thumb(&h, "Masked fill", true);
+    let material_thumbnail = thumb(&h, "Masked fill", false);
+
+    alt_click(&mut h, mask_thumbnail);
+
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Mask(layer));
+
+    click(&mut h, material_thumbnail);
+
+    assert_eq!(h.state().session.view, texturecraft_engine::ViewMode::Material);
+    assert_eq!(h.state().session.target, StackTarget::Content, "the layer content is selected");
+}
+
+/// Pointer moves of the opacity cell drag, one per frame
+const OPACITY_DRAG_MOVES: usize = 4;
+
+/// How far left each move of the opacity cell drag goes, in points
+const OPACITY_DRAG_STEP: f32 = 10.0;
+
+/// A drag on a row's opacity cell is one undo step, however many frames it spans
+#[test]
+fn dragging_a_row_opacity_adds_one_undo_step() {
+    let (mut h, layer) = harness();
+    let row = h.get_by_label("Masked fill").rect();
+    let cell = h.get_all_by_role(egui::accesskit::Role::SpinButton).map(|node| node.rect()).find(|cell| row.contains(cell.center())).unwrap();
+    let opacity = |h: &Harness<'_, TextureCraftApp>| h.state().session.doc.project.layers[&layer].blend(Channel::BaseColor).unwrap().opacity;
+    let (before, steps) = (opacity(&h), h.state().session.history_labels().len());
+
+    // A leftward drag lowers it from 100 %, a frame per move as a real drag arrives
+    let from = cell.center();
+    h.hover_at(from);
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
+    let step_left = |step: usize| from - egui::vec2(OPACITY_DRAG_STEP * step as f32, 0.0);
+    for step in 1..=OPACITY_DRAG_MOVES {
+        h.hover_at(step_left(step));
+        h.run_steps(1);
+    }
+    h.event(egui::Event::PointerButton {
+        pos: step_left(OPACITY_DRAG_MOVES),
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(SETTLE_FRAMES);
+
+    assert!(opacity(&h) < before, "the drag lowers the opacity: {}", opacity(&h));
+    assert_eq!(h.state().session.history_labels().len(), steps + 1, "every frame of the drag merges into one step");
 }

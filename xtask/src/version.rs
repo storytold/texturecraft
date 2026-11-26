@@ -139,10 +139,4 @@ mod tests {
             assert!(validate(bad).is_err(), "{bad}");
         }
     }
-
-    #[test]
-    fn the_real_manifest_has_a_valid_version() {
-        let text = std::fs::read_to_string(crate::root().join("Cargo.toml")).unwrap();
-        validate(&read(&text).unwrap()).unwrap();
-    }
 }

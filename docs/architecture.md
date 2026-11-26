@@ -122,11 +122,7 @@ on the CPU by `render::displace` from the composited height.
 ## MaterialCraft materials
 
 A fill can carry a `MaterialLink` (`core::layer`): a MaterialCraft graph whose cooked maps are the
-fill's image sources. `engine::link_cmds` imports `.mcmat` files (`formats::mcmat`), keeps the
-`.mcraft` or `.sbs` source as a resource, and re-cooks its named graph by running `materialcraft-cli` with the link's
-values, the texture set's resolution and its baked mesh maps (`LinkJob::run`, on a worker thread
-in the UI). Every cook stores its maps under fresh resource names, so undo, redo and the decoded
-image cache never disagree. The apps share the `craft-mcmat` format library and the command line; neither depends on the other app.
+fill's image sources. `engine::link_cmds` imports a procedural MCMAT v3 by asking MaterialCraft to bake the entry graph. It keeps the archive and the interface reported by the CLI with the layer. Parameter edits can re-cook at the texture set's resolution. After a bake or a resize, run `material.link.cook` to use the new mesh maps or resolution. Each bake installs fresh map resources so duplicates, undo and redo preserve their own results. Both apps use the shared `craft-mcmat` library and communicate through the CLI.
 
 ## Commands and automation
 

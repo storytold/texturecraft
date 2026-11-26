@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{ViewportCommand, ViewportEvent, ViewportId};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_engine::Session;
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::file_dialogs::{Answer, Request};
@@ -13,7 +13,10 @@ use texturecraft_ui_egui::state::Unsaved;
 fn harness(modified: bool) -> Harness<'static, TextureCraftApp> {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     session.modified = modified;
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     h
 }
@@ -25,6 +28,16 @@ fn answer(h: &mut Harness<'_, TextureCraftApp>, answer_with: impl FnMut(&Request
 fn invoke(h: &mut Harness<'_, TextureCraftApp>, id: &str) {
     let ctx = h.ctx.clone();
     texturecraft_ui_egui::menus::invoke(h.state_mut(), &ctx, id);
+}
+
+/// The file dialog behind a menu item; Export Mesh's comes after its options prompt, whose Export asks for it this way
+fn ask_file_of(h: &mut Harness<'_, TextureCraftApp>, id: &str) {
+    if id == "file.exportMesh" {
+        let ctx = h.ctx.clone();
+        assert!(texturecraft_ui_egui::windows::file_action(h.state_mut(), &ctx, id));
+    } else {
+        invoke(h, id);
+    }
 }
 
 /// A path in a new temporary folder.
@@ -63,6 +76,30 @@ fn a_canceled_dialog_changes_nothing() {
     assert_eq!(h.state().session.doc.project.name, name);
     assert!(h.state().toasts.is_empty());
     assert_eq!(h.state().file_dialogs.pending(), 0);
+}
+
+#[test]
+fn the_sample_picker_asks_to_save_only_after_a_path_is_chosen() {
+    let samples = super::temp_dir::TempDir::new("sample-picker");
+    let mut h = harness(true);
+    let samples_folder = samples.join("Samples");
+    std::fs::create_dir(&samples_folder).unwrap();
+    std::fs::write(samples_folder.join("Material Ball.tcraft"), b"stand-in").unwrap();
+    h.state_mut().samples_folder = samples_folder;
+    answer(&mut h, |_| Answer::Cancelled);
+    invoke(&mut h, "project.sample");
+    assert_eq!(h.state().file_dialogs.pending(), 1);
+    h.run_steps(3);
+    assert!(h.state().ui.windows.unsaved.is_none());
+    assert!(h.state().session.modified);
+
+    let path = PathBuf::from("chosen.tcraft");
+    let selected = path.clone();
+    answer(&mut h, move |_| Answer::Paths(vec![selected.clone()]));
+    invoke(&mut h, "project.sample");
+    h.run_steps(3);
+    assert_eq!(h.state().ui.windows.unsaved, Some(Unsaved::Open(path.display().to_string())));
+    assert!(h.state().session.modified);
 }
 
 #[test]
@@ -146,8 +183,8 @@ fn answered_after_the_project_changed(ask: impl FnOnce(&mut Harness<'_, TextureC
 #[test]
 fn every_project_dialog_does_nothing_for_a_replaced_project() {
     let file = temp_file("replaced-actions", "chosen.obj");
-    for id in ["material.load", "resource.import", "file.importMaterialX", "file.exportMesh", "file.reimportMesh"] {
-        let h = answered_after_the_project_changed(|h| invoke(h, id), &file);
+    for id in ["material.load", "file.importMaterialX", "file.exportMesh", "file.reimportMesh"] {
+        let h = answered_after_the_project_changed(|h| ask_file_of(h, id), &file);
         assert!(h.state().toasts.iter().any(|t| t.error && t.text.starts_with(PROJECT_CHANGED)), "{id}");
         assert!(!file.exists(), "{id} wrote nothing");
     }
@@ -267,36 +304,62 @@ fn a_save_elsewhere_does_not_answer_the_prompt() {
 #[test]
 fn ui_export_mesh_preserves_selected_format_and_honors_explicit_extension() {
     let dir = temp_file("export-mesh-ui", "chosen").parent().unwrap().to_path_buf();
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
     let mut h = harness(false);
+    h.state_mut().ui.prefs.language = "en".into();
+    h.run_steps(3);
+    let press_export = |h: &Harness<'_, TextureCraftApp>| {
+        // The rail also has an Export button; the options prompt sits to its left
+        h.get_all_by_role(egui::Role::Button)
+            .filter(|button| button.accesskit_node().label().as_deref() == Some("Export"))
+            .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+            .expect("Export in the options prompt")
+            .click();
+    };
     let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
     let store = seen.clone();
     let extensionless = dir.join("mesh");
-    let reply_path = extensionless.clone();
     answer(&mut h, move |request| {
         *store.borrow_mut() = Some(request.clone());
-        Answer::Paths(vec![reply_path.clone()])
+        Answer::Paths(vec![extensionless.clone()])
     });
-    invoke(&mut h, "ui.exportMesh");
+
+    invoke(&mut h, "file.exportMesh");
     h.run_steps(2);
-    assert!(h.state().ui.windows.export_mesh);
+    assert_eq!(h.state().ui.windows.mesh_export_options, Some(h.state().session.project_id));
+    assert!(seen.borrow().is_none(), "the options prompt precedes the file chooser");
+    let file_type = h.get_by_role_and_label(egui::Role::ComboBox, "File type");
+    assert_eq!(file_type.value().as_deref(), Some("Wavefront OBJ (.obj)"));
+    file_type.click();
+    h.run_steps(2);
     h.get_by_label("glTF binary (.glb)").click();
+    h.run_steps(2);
+    assert!(seen.borrow().is_none(), "format choice alone does not open the native picker");
+    press_export(&h);
     h.run_steps(3);
+
     let Some(Request::File(dialog)) = seen.borrow().clone() else { panic!("no file dialog was asked for") };
     assert!(dialog.file_name.is_some_and(|name| name.ends_with(".glb")));
-    assert_eq!(dialog.filters.first().map(|f| f.extensions.clone()), Some(vec!["glb".to_string(), "gltf".to_string()]));
-    assert!(dir.join("mesh.glb").is_file(), "extensionless save must keep pre-selected GLB format");
-    assert!(!dir.join("mesh.obj").exists(), "extensionless GLB save must not write OBJ");
+    assert_eq!(dialog.filters.first().map(|filter| filter.extensions.clone()), Some(vec!["glb".to_string(), "gltf".to_string(), "glft".to_string()]));
+    assert!(std::fs::read(dir.join("mesh.glb")).unwrap().starts_with(b"glTF"));
+    assert!(!dir.join("mesh.obj").exists());
 
     let explicit_obj = dir.join("custom.obj");
     let reply_explicit = explicit_obj.clone();
     answer(&mut h, move |_| Answer::Paths(vec![reply_explicit.clone()]));
-    invoke(&mut h, "ui.exportMesh");
+    invoke(&mut h, "file.exportMesh");
+    h.run_steps(2);
+    let file_type = h.get_by_role_and_label(egui::Role::ComboBox, "File type");
+    assert_eq!(file_type.value().as_deref(), Some("Wavefront OBJ (.obj)"));
+    file_type.click();
     h.run_steps(2);
     h.get_by_label("glTF binary (.glb)").click();
+    h.run_steps(2);
+    press_export(&h);
     h.run_steps(3);
-    assert!(explicit_obj.is_file(), "explicit .obj extension must be honored over pre-selected GLB");
+
+    assert!(explicit_obj.is_file(), "explicit .obj extension takes precedence over pre-selected GLB");
     assert!(!dir.join("custom.glb").exists());
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

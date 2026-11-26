@@ -1,399 +1,222 @@
-//! A generator effect's properties, laid out like the reference app's: attributes, resolution, parameters, image inputs.
+//! A generator effect's properties, laid out like the reference app's: its slot, Parameters, Image inputs, Resolution, Attributes
 
-use egui::{RichText, Ui};
-use egui_phosphor::regular as ic;
-use serde_json::{Value, json};
+use egui::{CornerRadius, CursorIcon, Painter, Rect, Role, Sense, Stroke, StrokeKind, TextureHandle, WidgetInfo};
+use serde_json::json;
 use texturecraft_engine::core::{
-    BakedMap, CurvatureDetail, CurvatureMode, Generator, GeneratorKind, LayerId, MicroDetail, OutputResolution, ResolutionMode, Source,
+    CookResolution, Generator, GeneratorKind, KindControls, LayerId, LightParameters, ResolutionMode, SectionParameters, WearParameters,
 };
 
 use crate::TextureCraftApp;
-use crate::dock::{anchor_entries, anchor_label, anchors_below, effect_anchors_below, image_drop, image_menu, mesh_map_color};
-use crate::i18n::{baked_map_label, tr, trf};
-use crate::resource_panel::{ATTRIBUTE_KEY_WIDTH, NOTE_FONT_SIZE, factor_label, random_seed};
-use crate::theme::{Tokens, caption};
-use crate::widgets::{combo, section, slider_edit};
+use crate::fill_material_panel::{band_size, texture_set_size};
+use crate::generator_input_card::input_card;
+use crate::generator_input_slot::GeneratorInputSlot;
+use crate::generator_params::{defaults_of, differs_from_defaults};
+use crate::generator_section_rows::{global_rows, ramp_rows, section_rows, texture_card};
+use crate::generator_wear_rows::{light_rows, micro_switch_card, wear_rows};
+use crate::i18n::tr;
+use crate::property_sheet::PropertySheet;
+use crate::shelf_preview::ShelfPreview;
+use crate::theme::Tokens;
 
-/// Edge of the picture beside each image input, its corner rounding and the size of an icon drawn in it.
-const INPUT_TILE_SIZE: f32 = 32.0;
-const INPUT_TILE_ROUNDING: f32 = 2.0;
-const INPUT_TILE_ICON_SIZE: f32 = 16.0;
+/// The outline on the preview while it can open enlarged under the pointer, or is open, in points
+const ENLARGE_OUTLINE_WIDTH: f32 = 1.0;
 
-/// The settings of generator effect `id`.
-pub(crate) fn generator_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: LayerId, id: u64, generator: &Generator) {
-    let tokens = Tokens::get(ui.ctx());
-    ui.label(caption(tr("Generator")));
-    egui::ComboBox::from_id_salt("gen_kind").selected_text(tr(generator.kind.label())).show_ui(ui, |ui| {
-        for kind in GeneratorKind::ALL {
-            if ui.selectable_label(kind == generator.kind, tr(kind.label())).clicked() && kind != generator.kind {
-                app.run("effect.set", json!({"effect": id, "generator": format!("{kind:?}")}));
+/// The width the preview's orb is rendered at, in pixels: sharp at twice the preview's size
+const PREVIEW_ORB_PX: usize = 256;
+
+/// The texture set size a project without one is shown against
+const FALLBACK_TEXTURE_SET_SIZE: u32 = 2048;
+
+/// How soon a picture still rendering is looked for again
+const PICTURE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The settings of generator effect `id` on `layer`
+pub(crate) fn generator_properties(app: &mut TextureCraftApp, ui: &mut egui::Ui, layer: LayerId, id: u64, generator: &Generator) {
+    PropertySheet::show(ui, ("generator_sheet", id), |sheet| {
+        sheet.section(tr("Generator"), false);
+        slot_card(app, sheet, id, generator);
+
+        let band = sheet.band(tr("Parameters"), true, Some(differs_from_defaults(generator)), None);
+        if band.reset {
+            app.run("effect.set", defaults_of(id, generator));
+        }
+        if band.open {
+            parameters(app, sheet, (layer, id), generator);
+        }
+
+        // The kinds with only their own controls show the images the reference lets them take: Grayscale Conversion's own
+        let slots: Vec<GeneratorInputSlot> = match generator.kind_controls() {
+            Some(KindControls::Grayscale(_)) => vec![GeneratorInputSlot::Image],
+            Some(_) => Vec::new(),
+            None => generator.inputs_in_use().iter().map(|map| GeneratorInputSlot::Map(*map)).collect(),
+        };
+        if !slots.is_empty() && sheet.band(tr("Image inputs"), false, None, Some(&slots.len().to_string())).open {
+            for slot in slots {
+                input_card(app, sheet, (layer, id), slot, slot.source(generator), false);
             }
+        }
+
+        let texture_set = texture_set_size(app, FALLBACK_TEXTURE_SET_SIZE);
+        if let Some(picked) = crate::resolution_band::resolution_band(sheet, band_size(generator.resolution, texture_set), texture_set) {
+            let size = match picked {
+                CookResolution::Relative(factor) => json!({"resolution": format!("{:?}", ResolutionMode::Auto), "resolutionFactor": factor}),
+                CookResolution::Fixed(size) => json!({"resolution": format!("{:?}", ResolutionMode::Custom), "customResolution": size, "resolutionFactor": 0}),
+            };
+            app.run("effect.set", crate::generator_params::merged(json!({"effect": id}), size));
+        }
+
+        if sheet.band(tr("Attributes"), false, None, None).open {
+            attributes(sheet, generator.kind);
+        }
+        if !app.session.doc.baked.contains_key(&app.session.ts()) {
+            sheet.caption(tr("Bake mesh maps for curvature, AO and thickness based generators."));
         }
     });
-
-    section(ui, "generator_attributes", tr("Attributes"), false, |ui| attributes(ui, generator.kind));
-    section(ui, "generator_resolution", tr("Resolution"), false, |ui| resolution(app, ui, id, generator.resolution));
-    section(ui, "generator_parameters", tr("Parameters"), true, |ui| {
-        global_adjustments(app, ui, id, generator);
-        ramp_parameters(app, ui, id, generator);
-        if matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear) {
-            curvature_detail_properties(app, ui, id, generator.detail.as_ref());
-        }
-        if !matches!(generator.kind, GeneratorKind::ThinAreas | GeneratorKind::Position | GeneratorKind::Direction) {
-            micro_detail_properties(app, ui, id, generator.micro, layer);
-        }
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(tr("Restore defaults")).clicked() {
-                    app.run("effect.set", defaults_of(id, generator.kind));
-                }
-            });
-        });
-    });
-    if !generator.kind.inputs().is_empty() {
-        section(ui, "generator_inputs", tr("Image inputs"), true, |ui| {
-            for map in generator.kind.inputs() {
-                input_slot(app, ui, (layer, id), *map, generator.inputs.get(map), generator.detail.is_some());
-            }
-        });
-    }
-    if !app.session.doc.baked.contains_key(&app.session.ts()) {
-        ui.label(
-            RichText::new(format!("{} {}", ic::WARNING, tr("Bake mesh maps (F8) for curvature, AO and thickness based generators."))).color(tokens.warning),
-        );
-    }
 }
 
-/// The painted height anchor and its influence on this generator
-fn micro_detail_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, micro: Option<MicroDetail>, layer: LayerId) {
-    let tokens = Tokens::get(ui.ctx());
-    ui.label(caption(tr("Micro detail")))
-        .on_hover_text(tr("Painted height from an anchor point below: raised areas read as edges, recessed ones as cavities."));
-    let anchors = effect_anchors_below(app, layer, LayerId(id));
-    let current = match micro {
-        Some(detail) => anchors.iter().find(|(anchor, _)| *anchor == detail.anchor).map_or_else(|| tr("missing").to_string(), |(_, label)| label.clone()),
-        None => tr("None").to_string(),
-    };
-    combo(ui, tr("Anchor point"), current, |ui| {
-        if ui.selectable_label(micro.is_none(), tr("None")).clicked() {
-            app.run("effect.set", json!({"effect": id, "microAnchor": null}));
-        }
-        if let Some(anchor) = anchor_entries(ui, &anchors, micro.map(|detail| detail.anchor)) {
-            app.run("effect.set", json!({"effect": id, "microAnchor": anchor.0}));
-        }
-    });
-    if let Some(detail) = micro {
-        let mut amount = detail.amount;
-        if let Some(merge) = slider_edit(ui, tr("Amount"), &mut amount, 0.0..=1.0, 2) {
-            app.run("effect.set", json!({"effect": id, "microAmount": amount, "merge": merge}));
-        }
-    } else if anchors.is_empty() {
-        ui.label(RichText::new(tr("Add an anchor point to a layer below to use its height as micro detail.")).color(tokens.text_dim));
-    }
+/// The card naming the generator: its orb and name; a click opens the generator picker
+fn slot_card(app: &mut TextureCraftApp, sheet: &mut PropertySheet<'_>, id: u64, generator: &Generator) {
+    let ctx = sheet.ui.ctx().clone();
+    let thumbnail = app.thumbs.generator(&ctx, generator.kind);
+    let tokens = Tokens::get(&ctx);
+    let picture = |painter: &Painter, rect: Rect| orb(painter, rect, thumbnail.as_ref(), &tokens, &ctx);
+    let slot = sheet.slot(&picture, tr(generator.kind.label()), tr("Generator"), None, false, false);
+    sheet.close_card();
+    crate::generator_slot::picker(app, &slot.pick, id, generator.kind);
 }
 
-/// What a generator kind makes, its category and its tags (read only).
-fn attributes(ui: &mut Ui, kind: GeneratorKind) {
-    let tokens = Tokens::get(ui.ctx());
-    let (description, tags) = match kind {
-        GeneratorKind::EdgeWear => (
-            tr("Convex edges from the curvature map, broken up by noise: worn paint and polished edges."),
-            [tr("mask"), tr("generator"), tr("grayscale"), tr("curvature")],
-        ),
-        GeneratorKind::Dirt => (
-            tr("Crevices and occluded areas from the ambient occlusion map: dirt and grime."),
-            [tr("mask"), tr("generator"), tr("grayscale"), tr("ambient occlusion")],
-        ),
-        GeneratorKind::ThinAreas => (tr("Thin parts of the mesh from the thickness map."), [tr("mask"), tr("generator"), tr("grayscale"), tr("thickness")]),
-        GeneratorKind::Curvature => (
-            tr("Convex edges, cavities or both from the curvature map, at several detail sizes."),
-            [tr("mask"), tr("generator"), tr("grayscale"), tr("curvature")],
-        ),
-        GeneratorKind::AmbientOcclusion => {
-            (tr("Occluded areas from the ambient occlusion map."), [tr("mask"), tr("generator"), tr("grayscale"), tr("ambient occlusion")])
-        }
-        GeneratorKind::Position => (tr("A gradient along a world direction across the mesh."), [tr("mask"), tr("generator"), tr("grayscale"), tr("position")]),
-        GeneratorKind::Direction => (tr("Surfaces facing a direction, as if lit from it."), [tr("mask"), tr("generator"), tr("grayscale"), tr("normal")]),
-    };
-
-    // Wrapped rows: a long line must not widen the panel past its edge
-    let tags = tags.join(", ");
-    for (key, value) in [(tr("Description"), description), (tr("Category"), tr("Generators")), (tr("Tags"), tags.as_str())] {
-        ui.horizontal_top(|ui| {
-            ui.add_sized([ATTRIBUTE_KEY_WIDTH, 0.0], egui::Label::new(RichText::new(key).color(tokens.text_dim)));
-            ui.add(egui::Label::new(value).wrap());
-        });
-    }
-}
-
-/// What the generator's output resolution is based on, the factor applied to it, and the size it comes to.
-fn resolution(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, resolution: OutputResolution) {
-    let tokens = Tokens::get(ui.ctx());
-    combo(ui, tr("Resolution"), tr(resolution.mode.label()), |ui| {
-        for mode in ResolutionMode::ALL {
-            if ui.selectable_label(mode == resolution.mode, tr(mode.label())).clicked() {
-                app.run("effect.set", json!({"effect": id, "resolution": format!("{mode:?}")}));
-            }
-        }
-    })
-    .on_hover_text(tr("Auto and UV tile use the UV tile's resolution, Texture set the texture set's, Custom a size of its own."));
-    if resolution.mode == ResolutionMode::Custom {
-        combo(ui, tr("Size"), format!("{0} × {0}", resolution.custom), |ui| {
-            for size in OutputResolution::CUSTOM_SIZES {
-                if ui.selectable_label(size == resolution.custom, format!("{size} × {size}")).clicked() {
-                    app.run("effect.set", json!({"effect": id, "customResolution": size}));
-                }
-            }
-        });
-    }
-    combo(ui, tr("Factor"), factor_label(resolution.factor), |ui| {
-        for factor in OutputResolution::FACTORS {
-            if ui.selectable_label(factor == resolution.factor, factor_label(factor)).clicked() {
-                app.run("effect.set", json!({"effect": id, "resolutionFactor": factor}));
-            }
-        }
-    })
-    .on_hover_text(tr("Scales the base resolution: below 1 the generator is computed coarser and smoothed back up."));
-
-    let Ok(texture_set) = app.session.doc.project.texture_set(app.session.ts()) else { return };
-
-    let (smallest, largest) = texture_set
-        .uv_tiles
-        .iter()
-        .map(|&udim| resolution.output_size(texture_set.tile_resolution(udim), texture_set.resolution))
-        .fold((u32::MAX, 0), |(smallest, largest), size| (smallest.min(size), largest.max(size)));
-    let (smallest, largest) = if largest == 0 {
-        let size = resolution.output_size(texture_set.resolution, texture_set.resolution);
-        (size, size)
-    } else {
-        (smallest, largest)
-    };
-    let size_label = if smallest == largest { format!("{smallest} × {smallest}") } else { format!("{smallest}–{largest} × {smallest}–{largest}") };
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(tr("Output size")).color(tokens.text_dim));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(size_label));
-    })
-    .response
-    .on_hover_text(tr("An output finer than a UV tile gives the same result as that tile's resolution."));
-}
-
-/// Global invert, blur, balance and contrast: what every generator applies to its finished value.
-fn global_adjustments(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, generator: &Generator) {
-    let (mut invert, mut global) = (generator.invert, generator.global);
-    let invert_edit = ui.checkbox(&mut invert, tr("Global invert")).changed().then_some(false);
-    let blur_edit = slider_edit(ui, tr("Global blur"), &mut global.blur, 0.0..=1.0, 2);
-    let balance_edit = slider_edit(ui, tr("Global balance"), &mut global.balance, 0.0..=1.0, 2);
-    let contrast_edit = slider_edit(ui, tr("Global contrast"), &mut global.contrast, 0.0..=1.0, 2);
-    if let Some(merge) = invert_edit.or(blur_edit).or(balance_edit).or(contrast_edit) {
-        app.run(
-            "effect.set",
-            json!({"effect": id, "invert": invert, "blur": global.blur, "balance": global.balance, "contrast": global.contrast, "merge": merge}),
-        );
-    }
-}
-
-/// Where the generator's ramp starts, how soft it is, the noise breaking it up, its offset and its seed.
-fn ramp_parameters(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, generator: &Generator) {
-    let (mut level, mut softness, mut noise, mut noise_scale, mut offset) =
-        (generator.level, generator.softness, generator.noise_amount, generator.noise_scale, generator.offset);
-    let level_edit = slider_edit(ui, tr("Level"), &mut level, 0.0..=1.0, 2);
-    let softness_edit = slider_edit(ui, tr("Softness"), &mut softness, 0.0..=1.0, 2);
-    let noise_edit = slider_edit(ui, tr("Noise amount"), &mut noise, 0.0..=2.0, 2);
-    let noise_scale_edit = slider_edit(ui, tr("Noise scale"), &mut noise_scale, 0.1..=64.0, 1);
-    let offset_edit = slider_edit(ui, tr("Offset"), &mut offset, -1.0..=1.0, 2);
-    if let Some(merge) = level_edit.or(softness_edit).or(noise_edit).or(noise_scale_edit).or(offset_edit) {
-        app.run(
-            "effect.set",
-            json!({"effect": id, "level": level, "softness": softness, "noise": noise, "noiseScale": noise_scale, "offset": offset, "merge": merge}),
-        );
-    }
-    seed_row(app, ui, id, generator.seed);
-}
-
-/// The seed with a button that picks a new one and a pencil that opens a field to type it, as in the reference.
-fn seed_row(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, seed: u32) {
-    let typing_id = ui.make_persistent_id(("generator_seed_typing", id));
-    let mut typing = ui.data(|data| data.get_temp::<bool>(typing_id)).unwrap_or(false);
-    ui.horizontal(|ui| {
-        ui.label(tr("Seed"));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.selectable_label(typing, ic::PENCIL_SIMPLE).on_hover_text(tr("Type the seed")).clicked() {
-                typing = !typing;
-            }
-            if typing {
-                let mut typed = seed;
-                let field = ui.add(egui::DragValue::new(&mut typed).speed(1.0));
-                if field.changed() {
-                    // The later changes of one drag continue its first undo step
-                    let merge = field.dragged() && !field.drag_started();
-                    app.run("effect.set", json!({"effect": id, "seed": typed, "merge": merge}));
-                }
-            } else if ui.button(tr("Random")).on_hover_text(trf("Seed {seed}", &[("seed", &seed)])).clicked() {
-                app.run("effect.set", json!({"effect": id, "seed": random_seed(seed)}));
-            }
-        });
-    });
-    ui.data_mut(|data| data.insert_temp(typing_id, typing));
-}
-
-/// The `effect.set` params that put generator effect `id` back to the defaults of its kind.
-fn defaults_of(id: u64, kind: GeneratorKind) -> Value {
-    let defaults = Generator::new(kind);
-    let mut params = json!({
-        "effect": id,
-        "level": defaults.level,
-        "softness": defaults.softness,
-        "noise": defaults.noise_amount,
-        "noiseScale": defaults.noise_scale,
-        "offset": defaults.offset,
-        "seed": defaults.seed,
-        "direction": defaults.direction,
-        "invert": defaults.invert,
-        "blur": defaults.global.blur,
-        "balance": defaults.global.balance,
-        "contrast": defaults.global.contrast,
-        "resolution": format!("{:?}", defaults.resolution.mode),
-        "customResolution": defaults.resolution.custom,
-        "resolutionFactor": defaults.resolution.factor,
-        "microAnchor": null,
-    });
-    if let Some(detail) = defaults.detail {
-        params["mode"] = json!(format!("{:?}", detail.mode));
-        params["sizes"] = json!(detail.weights);
-    }
-    params
-}
-
-/// The curvature mode and detail size weights of generator effect `id` (`detail` None: saved before detail sizes).
-fn curvature_detail_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, detail: Option<&CurvatureDetail>) {
-    let tokens = Tokens::get(ui.ctx());
-    let shown = detail.cloned().unwrap_or_default();
-    combo(ui, tr("Mode"), curvature_mode_label(shown.mode), |ui| {
-        for mode in CurvatureMode::ALL {
-            if ui.selectable_label(mode == shown.mode, curvature_mode_label(mode)).clicked() {
-                app.run("effect.set", json!({"effect": id, "mode": format!("{mode:?}")}));
-            }
-        }
-    });
-
-    ui.label(caption(tr("Detail sizes")));
-    let mut weights = shown.weights;
-    let mut edit = None;
-    for (weight, size) in weights.iter_mut().zip(CurvatureDetail::SIZES) {
-        edit = edit.or(slider_edit(ui, &format!("{size} px"), weight, 0.0..=1.0, 2));
-    }
-    if let Some(merge) = edit {
-        app.run("effect.set", json!({"effect": id, "sizes": weights, "merge": merge}));
-    }
-    if detail.is_none() {
-        ui.label(RichText::new(tr("Reads the curvature map as baked: changing the mode or a size turns detail sizes on.")).color(tokens.text_dim));
-    }
-}
-
-/// The translated name of curvature mode `mode`.
-fn curvature_mode_label(mode: CurvatureMode) -> &'static str {
-    match mode {
-        CurvatureMode::Edges => tr("Edges"),
-        CurvatureMode::Cavities => tr("Cavities"),
-        CurvatureMode::Both => tr("Edges and cavities"),
-        CurvatureMode::Raw => tr("Raw curvature"),
-    }
-}
-
-/// One input of generator effect `id` on `layer`: what it reads (its mesh map unless `source` replaces it), a menu to replace it, and a button to read the mesh map again.
-fn input_slot(app: &mut TextureCraftApp, ui: &mut Ui, (layer, id): (LayerId, u64), map: BakedMap, source: Option<&Source>, detail_sizes: bool) {
-    let tokens = Tokens::get(ui.ctx());
-    let input = map.id();
-    let current = match source {
-        None => trf("Mesh map: {map}", &[("map", &tr(baked_map_label(map)))]),
-        Some(Source::Image { name, .. }) => trf("Image: {name}", &[("name", name)]),
-        Some(Source::Uniform(_)) => tr("Uniform value").to_string(),
-        Some(Source::Anchor { anchor, channel, .. }) => anchor_label(app, *anchor, *channel),
-        Some(Source::Procedural { .. }) => tr("Procedural").to_string(),
-    };
-    let group = ui.group(|ui| {
-        ui.horizontal(|ui| {
-            input_tile(app, ui, map, source);
-            ui.vertical(|ui| {
-                ui.label(RichText::new(tr(baked_map_label(map))).strong());
-                ui.label(RichText::new(&current).size(NOTE_FONT_SIZE).color(tokens.text_dim));
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if source.is_some() && ui.button(ic::X).on_hover_text(tr("Read the mesh map again")).clicked() {
-                    app.run("effect.set", json!({"effect": id, "input": input, "inputBaked": true}));
-                }
-            });
-        });
-        combo(ui, tr("Source"), current.clone(), |ui| {
-            let anchors = anchors_below(app, layer);
-            if ui.selectable_label(source.is_none(), tr("Mesh map")).clicked() {
-                app.run("effect.set", json!({"effect": id, "input": input, "inputBaked": true}));
-            }
-            if ui.selectable_label(matches!(source, Some(Source::Uniform(_))), tr("Uniform value")).clicked() {
-                app.run("effect.set", json!({"effect": id, "input": input, "inputValue": map.neutral()[0]}));
-            }
-            for (anchor, label) in &anchors {
-                if ui
-                    .selectable_label(
-                        matches!(source, Some(Source::Anchor { anchor: picked, .. }) if picked == anchor),
-                        trf("Anchor: {name}", &[("name", label)]),
-                    )
-                    .clicked()
-                {
-                    app.run("effect.set", json!({"effect": id, "input": input, "inputAnchor": anchor.0}));
-                }
-            }
-            if let Some(name) = image_menu(app, ui) {
-                app.run("effect.set", json!({"effect": id, "input": input, "inputImage": name}));
-            }
-        });
-        if let Some(Source::Uniform(value)) = source {
-            let mut value = value[0];
-            if let Some(merge) = slider_edit(ui, tr("Value"), &mut value, 0.0..=1.0, 2) {
-                app.run("effect.set", json!({"effect": id, "input": input, "inputValue": value, "merge": merge}));
-            }
-        }
-        if detail_sizes && map == BakedMap::Curvature && source.is_some_and(|source| !matches!(source, Source::Uniform(_))) {
-            ui.label(
-                RichText::new(tr("Detail sizes blur the mesh map, so a replaced curvature input is read at its own size only."))
-                    .size(NOTE_FONT_SIZE)
-                    .color(tokens.text_dim),
-            );
-        }
-    });
-    if let Some(name) = image_drop(ui, &group.response) {
-        app.run("effect.set", json!({"effect": id, "input": input, "inputImage": name}));
-    }
-}
-
-/// The picture of what an input reads: the image itself, the uniform value's gray, or the mesh map's swatch (as in the texture set's list).
-fn input_tile(app: &mut TextureCraftApp, ui: &mut Ui, map: BakedMap, source: Option<&Source>) {
-    let tokens = Tokens::get(ui.ctx());
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(INPUT_TILE_SIZE, INPUT_TILE_SIZE), egui::Sense::hover());
-    let painter = ui.painter();
-    let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-    match source {
-        Some(Source::Image { name, .. }) => match app.session.images.get(name) {
-            Some(image) => {
-                let texture = app.thumbs.image(ui.ctx(), name, image);
-                painter.image(texture.id(), rect, whole, egui::Color32::WHITE);
-            }
-            None => {
-                painter.rect_filled(rect, INPUT_TILE_ROUNDING, tokens.button);
-            }
-        },
-        Some(Source::Uniform(value)) => {
-            painter.rect_filled(rect, INPUT_TILE_ROUNDING, egui::Color32::from_gray((value[0].clamp(0.0, 1.0) * 255.0).round() as u8));
-        }
-        Some(Source::Anchor { .. } | Source::Procedural { .. }) => {
-            let glyph = if matches!(source, Some(Source::Anchor { .. })) { ic::ANCHOR } else { ic::MAGIC_WAND };
-            painter.rect_filled(rect, INPUT_TILE_ROUNDING, tokens.button);
-            painter.text(rect.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(INPUT_TILE_ICON_SIZE), tokens.text_dim);
+/// An orb picture in `rect`, a placeholder while it renders
+fn orb(painter: &Painter, rect: Rect, texture: Option<&TextureHandle>, tokens: &Tokens, ctx: &egui::Context) {
+    match texture {
+        Some(texture) => {
+            painter.image(texture.id(), rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
         }
         None => {
-            let baked = app.session.doc.baked.get(&app.session.ts()).is_some_and(|baked| baked.maps.contains_key(&map));
-            painter.rect_filled(rect, INPUT_TILE_ROUNDING, if baked { mesh_map_color(map) } else { tokens.button });
+            painter.rect_filled(rect, 0.0, tokens.button);
+            ctx.request_repaint_after(PICTURE_POLL);
         }
     }
-    painter.rect_stroke(rect, INPUT_TILE_ROUNDING, egui::Stroke::new(1.0, tokens.button_border), egui::StrokeKind::Outside);
+}
+
+/// The Parameters band's rows: the kind's own controls, else the global block and the earlier model's ramp
+fn parameters(app: &mut TextureCraftApp, sheet: &mut PropertySheet<'_>, (layer, id): (LayerId, u64), generator: &Generator) {
+    let ctx = sheet.ui.ctx().clone();
+    let tokens = Tokens::get(&ctx);
+    let kind = generator.kind;
+
+    // The Curvature size under the pointer shows alone in the preview: the columns are drawn after it, so it is kept from the frame before
+    let solo_id = sheet.ui.make_persistent_id(("generator_solo", id));
+    let solo: Option<usize> = sheet.ui.data(|data| data.get_temp(solo_id)).flatten();
+    let solo_texture = match (kind, generator.detail_in_use(), solo) {
+        (GeneratorKind::Curvature, Some(detail), Some(size)) => {
+            app.thumbs.generator_picture(&ctx, ShelfPreview::Curvature { mode: detail.mode, solo: Some(size) }, PREVIEW_ORB_PX)
+        }
+        _ => None,
+    };
+
+    // The preview shows the generator as set; a size shows the whole preview until its own render arrives, and the kind at its defaults shows until the first render
+    let set = ShelfPreview::generator_set(generator, &app.session.images);
+    let texture = solo_texture
+        .or_else(|| app.thumbs.generator_set_picture(&ctx, id, set, PREVIEW_ORB_PX))
+        .or_else(|| app.thumbs.generator_picture(&ctx, ShelfPreview::Generator(kind), PREVIEW_ORB_PX));
+    let drawn_at = std::cell::Cell::new(None);
+    let picture = |painter: &Painter, rect: Rect| {
+        drawn_at.set(Some(rect));
+        orb(painter, rect, texture.as_ref(), &tokens, &ctx);
+    };
+    rows(app, sheet, (layer, id), generator, &picture, solo_id);
+
+    if let Some(rect) = drawn_at.get() {
+        enlarge_on_click(app, sheet, id, rect);
+    }
+}
+
+/// The preview opens enlarged in its own window on a click: a grey outline shows it can while the pointer is on it, and that it is open
+fn enlarge_on_click(app: &mut TextureCraftApp, sheet: &mut PropertySheet<'_>, id: u64, rect: Rect) {
+    let response = sheet.ui.interact(rect, sheet.ui.make_persistent_id(("generator_preview_enlarge", id)), Sense::click()).on_hover_cursor(CursorIcon::ZoomIn);
+    let open = app.ui.windows.generator_preview == Some(id);
+    response.widget_info(|| WidgetInfo::selected(Role::Button, true, open, tr("Enlarge preview")));
+
+    if response.hovered() || response.has_focus() || open {
+        let tokens = Tokens::get(sheet.ui.ctx());
+        sheet.ui.painter().rect_stroke(rect, CornerRadius::ZERO, Stroke::new(ENLARGE_OUTLINE_WIDTH, tokens.text_dim), StrokeKind::Inside);
+    }
+
+    if response.clicked() {
+        let ctx = sheet.ui.ctx().clone();
+        crate::generator_preview_window::toggle(app, &ctx, id, rect);
+    }
+}
+
+/// The kind's rows, `picture` drawing the preview; `solo_id` keeps the Curvature size under the pointer for the next frame's preview
+fn rows(
+    app: &mut TextureCraftApp,
+    sheet: &mut PropertySheet<'_>,
+    (layer, id): (LayerId, u64),
+    generator: &Generator,
+    picture: &dyn Fn(&Painter, Rect),
+    solo_id: egui::Id,
+) {
+    let kind = generator.kind;
+    if let Some(controls) = generator.kind_controls() {
+        crate::generator_kind_rows::kind_rows(app, sheet, id, generator, controls, picture);
+        return;
+    }
+
+    if let Some(defaults) = WearParameters::defaults(kind) {
+        // A wear generator saved before its wear controls shows them at their defaults: editing one moves it onto them
+        wear_rows(app, sheet, (layer, id), generator, generator.wear.unwrap_or(defaults), picture);
+        return;
+    }
+
+    if let Some(light) = generator.light {
+        light_rows(app, sheet, id, Some(generator.invert), light, picture);
+        return;
+    }
+
+    global_rows(app, sheet, id, generator, picture);
+    if generator.on_earlier_model() {
+        ramp_rows(app, sheet, id, generator);
+    }
+
+    // Saved before the section or light controls, a generator shows them at their defaults: editing one moves it onto them
+    if let Some(defaults) = SectionParameters::defaults(kind) {
+        let mut solo = None;
+        section_rows(app, sheet, id, generator, generator.section_controls().unwrap_or(defaults), &mut solo);
+        texture_card(app, sheet, (layer, id), generator.texture.as_deref().cloned().unwrap_or_default());
+        micro_switch_card(app, sheet, (layer, id), generator);
+        sheet.ui.data_mut(|data| data.insert_temp(solo_id, solo));
+    }
+    if let Some(defaults) = LightParameters::defaults(kind) {
+        light_rows(app, sheet, id, None, defaults, picture);
+    }
+}
+
+/// What a generator kind makes, its category and its tags (read only)
+fn attributes(sheet: &mut PropertySheet<'_>, kind: GeneratorKind) {
+    let (description, tags) = match kind {
+        GeneratorKind::EdgeWear => (tr("Worn metal edges, scratched."), [tr("mask"), tr("generator"), tr("grayscale"), tr("curvature")]),
+        GeneratorKind::FiberGlassEdgeWear => (tr("Worn fibreglass edges."), [tr("mask"), tr("generator"), tr("grayscale"), tr("curvature")]),
+        GeneratorKind::Dirt => (tr("Grime in cavities."), [tr("mask"), tr("generator"), tr("grayscale"), tr("ambient occlusion")]),
+        GeneratorKind::ThinAreas => (tr("Thin parts of the mesh."), [tr("mask"), tr("generator"), tr("grayscale"), tr("thickness")]),
+        GeneratorKind::Curvature => (tr("Convex edges and cavities."), [tr("mask"), tr("generator"), tr("grayscale"), tr("curvature")]),
+        GeneratorKind::AmbientOcclusion => (tr("Occluded areas."), [tr("mask"), tr("generator"), tr("grayscale"), tr("ambient occlusion")]),
+        GeneratorKind::Position => (tr("A gradient across the mesh."), [tr("mask"), tr("generator"), tr("grayscale"), tr("position")]),
+        GeneratorKind::Direction => (tr("Surfaces facing a light."), [tr("mask"), tr("generator"), tr("grayscale"), tr("normal")]),
+        GeneratorKind::WorldSpaceNormals => (tr("Surfaces facing along the world's axes."), [tr("mask"), tr("generator"), tr("grayscale"), tr("normal")]),
+        GeneratorKind::ThreeDDistance => (tr("A gradient around a point on the mesh."), [tr("mask"), tr("generator"), tr("grayscale"), tr("position")]),
+        GeneratorKind::ThreeDLinearGradient => {
+            (tr("A gradient between two points on the mesh."), [tr("mask"), tr("generator"), tr("grayscale"), tr("position")])
+        }
+        GeneratorKind::UvBorderDistance => (tr("A gradient in from the UV islands' borders."), [tr("mask"), tr("generator"), tr("grayscale"), tr("uv")]),
+        GeneratorKind::GrayscaleConversion => (tr("An image turned gray."), [tr("mask"), tr("generator"), tr("grayscale"), tr("image")]),
+        GeneratorKind::DrippingRust => {
+            (tr("Rust in occluded areas, running down in drips."), [tr("mask"), tr("generator"), tr("grayscale"), tr("ambient occlusion")])
+        }
+        GeneratorKind::UvRandomColor => (tr("A random value per UV island."), [tr("mask"), tr("generator"), tr("grayscale"), tr("uv")]),
+        GeneratorKind::UvChecker => (tr("A checker over the UV layout."), [tr("mask"), tr("generator"), tr("grayscale"), tr("uv")]),
+    };
+    sheet.attribute_text(tr("Description"), description);
+    sheet.attribute(tr("Category"), tr("Generators"));
+    sheet.attribute(tr("Tags"), &tags.join(", "));
 }

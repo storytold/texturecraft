@@ -68,6 +68,22 @@ impl MeshMapSettings {
         *enabled = is_enabled;
     }
 
+    /// Take `map`'s parameters from `source`, keeping whether it is checked
+    pub fn copy_parameters(&mut self, map: BakedMap, source: &MeshMapSettings) {
+        match map {
+            BakedMap::Normal => self.normal.parameters = source.normal.parameters,
+            BakedMap::WorldNormal => self.world_normal.parameters = source.world_normal.parameters,
+            BakedMap::Id => self.id.parameters = source.id.parameters,
+            BakedMap::AmbientOcclusion => self.ao.parameters = source.ao.parameters,
+            BakedMap::Curvature => self.curvature.parameters = source.curvature.parameters,
+            BakedMap::Position => self.position.parameters = source.position.parameters,
+            BakedMap::Thickness => self.thickness.parameters = source.thickness.parameters,
+            BakedMap::Height => self.height.parameters = source.height.parameters,
+            BakedMap::BentNormal => self.bent_normal.parameters = source.bent_normal.parameters,
+            BakedMap::Opacity => self.opacity.parameters = source.opacity.parameters,
+        }
+    }
+
     pub fn enabled(&self) -> impl Iterator<Item = BakedMap> {
         BakedMap::ALL.into_iter().filter(|map| self.is_enabled(*map))
     }
