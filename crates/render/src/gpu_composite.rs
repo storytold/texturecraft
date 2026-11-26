@@ -68,6 +68,8 @@ const MASK_STAGE: u32 = 1 << 31;
 const GENERATOR_STAGE: u32 = 1 << 30;
 const MATERIAL_ANCHOR_STAGE: u32 = 1 << 29;
 const MASK_ANCHOR_STAGE: u32 = 1 << 28;
+/// P1: a generator's second stage, which adjusts its section between two blurs (`generator_second_stage` in WGSL)
+const SECOND_GENERATOR_STAGE: u32 = 1 << 27;
 const ANCHOR_SOURCE: u32 = 15;
 const ANCHOR_PUBLISH_MASK: u32 = 16;
 const ANCHOR_PUBLISH_LAYER: u32 = 17;
@@ -375,6 +377,9 @@ struct ProceduralInputs {
     levels: Vec<u32>,
     /// P8: each generator stage's (filter, cell) at those further scales, by generator stage
     generator_levels: Vec<Vec<(Option<NeighbourhoodFilter>, u32)>>,
+    /// P1: the second stage of a generator stage (by index), its blur at each UV tile scale: the
+    /// global blur after a section adjusted between the two
+    generator_second_stages: BTreeMap<usize, Vec<Option<NeighbourhoodFilter>>>,
     ramp_words: Vec<u32>,
     curvature_sizes: [bool; gpu_curvature::SIZES],
     filters: Vec<(Filter, f32)>,
@@ -438,6 +443,7 @@ impl ProceduralInputs {
             block: resolution,
             levels: Vec::new(),
             generator_levels: Vec::new(),
+            generator_second_stages: BTreeMap::new(),
             ramp_words: Vec::new(),
             curvature_sizes: [false; gpu_curvature::SIZES],
             filters: Vec::new(),
@@ -1182,6 +1188,28 @@ impl FilterPlan {
                         mask_view: [0; 4],
                         level: level as u32,
                     });
+                }
+                // P1: a section adjusted between two blurs runs a second stage, which the generator reads
+                if let Some(second) = inputs.generator_second_stages.get(&generator) {
+                    effect.spatial[1] = (self.stages.len() - first) as u32 + 1;
+                    reach = reach.saturating_add(second.first().copied().flatten().map_or(0, NeighbourhoodFilter::reach));
+                    for (level, &filter) in second.iter().enumerate() {
+                        self.stages.push(FilterStage {
+                            layer,
+                            preceding: preceding as u32 | MASK_STAGE | GENERATOR_STAGE | SECOND_GENERATOR_STAGE,
+                            filter,
+                            cell: 1,
+                            anchor: None,
+                            input: 0,
+                            input_kind: 0,
+                            input2: 0,
+                            wrap: false,
+                            whole: false,
+                            view: 0,
+                            mask_view: [0; 4],
+                            level: level as u32,
+                        });
+                    }
                 }
                 continue;
             }
@@ -4271,6 +4299,19 @@ mod procedural_tests {
         generator.inputs.insert(BakedMap::AmbientOcclusion, Source::Anchor { anchor: mask_anchor, channel: Channel::BaseColor, ramp: Vec::new() });
         generator.global.blur = 0.7;
         mask.effects.push(Effect::new(project.alloc_id(), EffectKind::Generator(generator)));
+
+        // P1: the section and light controls read anchors as their inputs too, as a gray and as a direction
+        let anchored = Source::Anchor { anchor: mask_anchor, channel: Channel::BaseColor, ramp: Vec::new() };
+        let mut section = Generator::new(GeneratorKind::AmbientOcclusion);
+        section.inputs.insert(BakedMap::AmbientOcclusion, anchored.clone());
+        section.section = section.section.map(|section| texturecraft_core::SectionParameters { balance: 0.3, ..section });
+        let mut light = Generator::new(GeneratorKind::Direction);
+        light.inputs.insert(BakedMap::WorldNormal, anchored);
+        for generator in [section, light] {
+            let mut controls = Effect::new(project.alloc_id(), EffectKind::Generator(generator));
+            controls.opacity = 0.4;
+            mask.effects.push(controls);
+        }
         let mut mix_height = Effect::new(
             project.alloc_id(),
             EffectKind::Fill {
@@ -4733,9 +4774,9 @@ mod procedural_tests {
         }
     }
 
-    /// A generator on the earlier model and new section and light generators compose on the GPU;
-    /// the wear's grunge, a section blur with a global blur around the adjustment, World Space
-    /// Normals, the kinds with only their own controls and Micro Details compose on the CPU
+    /// A generator on the earlier model and new section and light generators (also with a section
+    /// blur before a global blur) compose on the GPU; the wear's grunge, World Space Normals, the
+    /// kinds with only their own controls and Micro Details compose on the CPU
     #[test]
     fn generators_beyond_the_earlier_model_compose_on_the_cpu() {
         use texturecraft_core::{MicroDetails, SectionParameters, WearParameters};
@@ -4752,7 +4793,7 @@ mod procedural_tests {
         let section = SectionParameters { blur: 16.0, ..SectionParameters::defaults(GeneratorKind::AmbientOcclusion).unwrap() };
         let mut twice_blurred = Generator { section: Some(section), ..Generator::new(GeneratorKind::AmbientOcclusion) };
         twice_blurred.global.blur = 0.5;
-        assert!(!gpu(&twice_blurred), "a section blur before a global blur");
+        assert!(gpu(&twice_blurred), "a section blur before a global blur");
         assert!(!gpu(&Generator::new(GeneratorKind::WorldSpaceNormals)), "World Space Normals");
         assert!(!gpu(&oracle::earlier_generator(GeneratorKind::UvChecker)), "only its own controls");
         let micro = MicroDetails { enabled: true, ..MicroDetails::defaults(GeneratorKind::Curvature).unwrap() };

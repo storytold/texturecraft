@@ -19,6 +19,10 @@ const P1_PARAMETERS: u32 = 7u;
 // P1_FLAGS bits: the section adjusts after the generator's stage, the blurred curvature levels apply
 const P1_LATE_ADJUST: u32 = 1u;
 const P1_LEVELS: u32 = 2u;
+// The section adjusts between two stages; the bits from P1_STAGE_DISTANCE_SHIFT count the stages
+// from the first to the second (gpu_generator_p1.rs)
+const P1_TWO_STAGES: u32 = 4u;
+const P1_STAGE_DISTANCE_SHIFT: u32 = 8u;
 // The most sources an operation reads
 const P1_MAX_SOURCES: u32 = 2u;
 // The narrower curvature level when it is the map itself
@@ -85,8 +89,18 @@ fn p1_generator_ramp(op: Operation, texel: LayerTexel) -> f32 {
         case 1u: { value = p1_wear(op, texel, sources); }
         case 3u: { value = p1_light(op, texel, sources); }
         default: {
+            let flags = p1_word(op, P1_FLAGS);
+            if (flags & P1_TWO_STAGES) != 0u {
+                // The second stage adjusts the first's field before its global blur
+                if generator_second_stage {
+                    let second = mask_base(layers[params.filter_stage.z]) - 1u + op.spatial.y - 1u;
+                    // P2: the generator's texture blends over the adjusted signal here too
+                    return p1_adjusted(op, filter_value(second - (flags >> P1_STAGE_DISTANCE_SHIFT), texel.pixel).x);
+                }
+                return p1_section_signal(op, texel, sources);
+            }
             value = p1_section_signal(op, texel, sources);
-            if (p1_word(op, P1_FLAGS) & P1_LATE_ADJUST) == 0u {
+            if (flags & P1_LATE_ADJUST) == 0u {
                 value = p1_adjusted(op, value);
                 // P2: the generator's texture blends over the adjusted signal here
             }

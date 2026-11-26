@@ -5,8 +5,9 @@
 //! side-table words (`P1_*` in generator_p1.wgsl): a nonzero offset means the controls. Its
 //! sources (replaced inputs) follow each other in the generator sources, the first in
 //! `effects[2]`. A section adjusts its signal before the generator's stage, or after it when the
-//! stage averages cells or runs the section blur; a stage that would need both the section blur
-//! and the global blur, or cells and the global blur around the adjustment, stays on the CPU.
+//! stage averages cells or runs the section blur. Where a global blur follows those, the section
+//! adjusts between two stages: the first averages the cells and runs the section blur, the second
+//! reads its field, adjusts and runs the global blur (`generator_second_stages`).
 
 use bytemuck::Zeroable;
 use texturecraft_compose::generator_terms;
@@ -35,6 +36,9 @@ const PARAMETERS_WORD: usize = ROLES_WORD + ROLE_COUNT;
 
 const LATE_ADJUST: u32 = 1;
 const LEVELS: u32 = 2;
+const TWO_STAGES: u32 = 4;
+/// The flags' bits above this hold how many stages lie between a second stage and its first
+const STAGE_DISTANCE_SHIFT: u32 = 8;
 const NO_LEVEL: u32 = u32::MAX;
 
 /// The mesh's bounds the stand-in for P3a's mesh extent reads: low, high, centre and radius
@@ -96,47 +100,58 @@ pub(super) fn operation(generator: &Generator, inputs: &mut ProceduralInputs, pa
         SectionParameters::has_blur(generator.kind) && section.blur.clamp(*SectionParameters::BLUR_RANGE.start(), *SectionParameters::BLUR_RANGE.end()) > 0.0
     });
     op.spatial[2] = u32::from(global.blur > 0.0 || generator.resolution.can_reduce() || section_blur);
+
+    // Each UV tile scale's stage; the section adjusts between two stages where a global blur follows cells or the section blur
     let stages: Vec<_> =
         std::iter::once(inputs.resolution).chain(inputs.levels.iter().copied()).map(|resolution| stage(generator, resolution, inputs)).collect();
-    let stages = stages.into_iter().collect::<Option<Vec<_>>>()?;
-    let late = stages.iter().any(|(late, _, _)| *late);
-    if let [(_, blur, cell), levels @ ..] = stages.as_slice()
-        && (blur.is_some() || *cell >= 2)
+    let two_stages = stages.iter().any(|(late, _, global_blur, _)| *late && global_blur.is_some());
+    let late = stages.iter().any(|(late, ..)| *late);
+    let first: Vec<_> = if two_stages {
+        stages.iter().map(|&(_, section_blur, _, cell)| (section_blur, cell)).collect()
+    } else {
+        stages.iter().map(|&(_, section_blur, global_blur, cell)| (section_blur.or(global_blur), cell)).collect()
+    };
+    if let [(blur, cell), levels @ ..] = first.as_slice()
+        && (two_stages || blur.is_some() || *cell >= 2)
     {
         inputs.generator_stages.push((*blur, *cell));
         op.spatial[1] = inputs.generator_stages.len() as u32;
-        inputs.generator_levels.push(levels.iter().map(|&(_, blur, cell)| (blur, cell)).collect());
+        inputs.generator_levels.push(levels.to_vec());
+        if two_stages {
+            inputs.generator_second_stages.insert(inputs.generator_stages.len() - 1, stages.iter().map(|&(_, _, global_blur, _)| global_blur).collect());
+        }
     }
 
-    words[FLAGS_WORD] |= if late_adjust && late { LATE_ADJUST } else { 0 };
+    // The second stage reads the first's field, one stage per UV tile scale before it
+    words[FLAGS_WORD] |= match (two_stages, late_adjust && late) {
+        (true, _) => TWO_STAGES | ((first.len() as u32) << STAGE_DISTANCE_SHIFT),
+        (false, true) => LATE_ADJUST,
+        (false, false) => 0,
+    };
     op.ext[0] = inputs.pack_words(&words)?;
     op.projection.iter().all(|value| value.is_finite()).then_some(op)
 }
 
-/// The generator's stage at a UV tile of `resolution` texels: whether its section adjusts after the
-/// stage, the blur and the cell side. None where the adjustment would fall between two passes.
-fn stage(generator: &Generator, resolution: u32, inputs: &ProceduralInputs) -> Option<(bool, Option<NeighbourhoodFilter>, u32)> {
+/// A generator's stage at one UV tile scale: whether the section adjusts after the cells or the
+/// section blur, the section blur, the global blur and the cell side
+type Stage = (bool, Option<NeighbourhoodFilter>, Option<NeighbourhoodFilter>, u32);
+
+/// The generator's blurs and cell side at a UV tile of `resolution` texels
+fn stage(generator: &Generator, resolution: u32, inputs: &ProceduralInputs) -> Stage {
     let cell = generator.resolution.cell(resolution, inputs.texture_set);
     let global = generator.applied_global();
-    let global_blur = global.blur_radius_at(resolution).round() > 0.0;
     let section_radius = generator.section_controls().map_or(0, |section| generator_terms::section_blur_radius(generator.kind, &section, resolution));
-    let late = generator.section_controls().is_some() && (cell > 1 || section_radius > 0);
-    if late && global_blur {
-        return None;
-    }
 
-    let blur = if section_radius > 0 {
-        // The section blur's three box passes at the radius compose takes
-        let blur = Filter::Blur { radius: 1.0, wrap: false };
-        NeighbourhoodFilter::new(&blur, resolution, inputs.longest_side, 1.0, None)
-            .map(|filter| NeighbourhoodFilter { radius: section_radius as u32, ..filter })
-    } else if global_blur {
-        let blur = Filter::Blur { radius: global.blur_radius(), wrap: false };
-        NeighbourhoodFilter::new(&blur, resolution, inputs.longest_side, 1.0, None)
-    } else {
-        None
-    };
-    Some((late, blur, cell))
+    // The section blur's three box passes at the radius compose takes
+    let section_blur = (section_radius > 0)
+        .then(|| NeighbourhoodFilter::new(&Filter::Blur { radius: 1.0, wrap: false }, resolution, inputs.longest_side, 1.0, None))
+        .flatten()
+        .map(|filter| NeighbourhoodFilter { radius: section_radius as u32, ..filter });
+    let global_blur = (global.blur_radius_at(resolution).round() > 0.0)
+        .then(|| NeighbourhoodFilter::new(&Filter::Blur { radius: global.blur_radius(), wrap: false }, resolution, inputs.longest_side, 1.0, None))
+        .flatten();
+    let late = generator.section_controls().is_some() && (cell > 1 || section_radius > 0);
+    (late, section_blur, global_blur, cell)
 }
 
 /// A replaced input the generator reads: the source, how the CPU reads it (sampling and channel kind), and its role
@@ -338,16 +353,21 @@ mod tests {
     };
     use texturecraft_geom::{Mesh, primitives};
 
+    use crate::gpu_composite::CompositeRegion;
     use crate::gpu_composite::oracle::{OracleCase, Tolerance, assert_matches_cpu, headless};
 
     const SIZE: u32 = 64;
     const BAKE_SIZE: usize = 64;
+    /// A partial update inside the set, which blurs and cells reach past
+    const REGION: CompositeRegion = CompositeRegion { min: [21, 37], max: [35, 50] };
+    /// The bake side at which the widest curvature levels blur at their full radii, 64 and 128
+    const WIDE_BAKE_SIZE: usize = 2048;
 
     /// Smooth occlusion, curvature waves the blurred levels flatten differently, and a world
-    /// normal that is zero (the mesh's normal) along the left edge
-    fn bakes() -> BakedMaps {
-        let at = |index: usize| ((index % BAKE_SIZE) as f32 / BAKE_SIZE as f32, (index / BAKE_SIZE) as f32 / BAKE_SIZE as f32);
-        let texels = 0..BAKE_SIZE * BAKE_SIZE;
+    /// normal that is zero (the mesh's normal) along the left edge, `side` texels per side
+    fn bakes_of(side: usize) -> BakedMaps {
+        let at = |index: usize| ((index % side) as f32 / side as f32, (index / side) as f32 / side as f32);
+        let texels = 0..side * side;
         let occlusion = texels.clone().map(|index| 0.15 + 0.8 * at(index).0 * (1.0 - 0.5 * at(index).1)).collect::<Vec<_>>();
         let curvature = texels.clone().map(|index| 0.5 + 0.3 * (at(index).0 * TAU * 3.0).sin() * (at(index).1 * TAU * 2.0).cos()).collect::<Vec<_>>();
         let normal = |(u, v): (f32, f32)| if u < 0.1 { [0.5; 3] } else { [0.5 + 0.3 * (v * TAU).sin(), 0.8, 0.5 + 0.3 * (u * TAU).cos()] };
@@ -356,7 +376,11 @@ mod tests {
             (BakedMap::Curvature, Arc::new(curvature)),
             (BakedMap::WorldNormal, Arc::new(texels.flat_map(|index| normal(at(index))).collect::<Vec<_>>())),
         ]);
-        BakedMaps { resolution: BAKE_SIZE as u32, maps }
+        BakedMaps { resolution: side as u32, maps }
+    }
+
+    fn bakes() -> BakedMaps {
+        bakes_of(BAKE_SIZE)
     }
 
     /// An 8 × 8 image named `name` whose channels run across it
@@ -384,6 +408,7 @@ mod tests {
 
             let mut case = OracleCase::new(&project, &pixels, baked, &images, mesh);
             case.mask_owner = Some(owner);
+            case.region = Some(REGION);
             assert_matches_cpu(&mut gpu, &case, *tolerance, label);
         }
     }
@@ -442,6 +467,10 @@ mod tests {
         ];
 
         assert_generators_match(&mesh, &bakes(), &cases);
+
+        // The widest edges smoothness reads the two widest levels at their full radii
+        let widest = [("widest edges", wear(GeneratorKind::EdgeWear, |wear| (wear.edges_smoothness, wear.level) = (16.0, 0.9)), Tolerance::POINT)];
+        assert_generators_match(&mesh, &bakes_of(WIDE_BAKE_SIZE), &widest);
     }
 
     /// Curvature, Ambient Occlusion and Position on their section controls: each adjustment, the
@@ -461,6 +490,10 @@ mod tests {
         globally_blurred.global.blur = 0.2;
         let mut cells = section(GeneratorKind::AmbientOcclusion, |section| (section.balance, section.invert) = (0.4, true));
         cells.resolution.factor = -2;
+        let mut twice_blurred = section(GeneratorKind::AmbientOcclusion, |section| (section.blur, section.balance, section.contrast) = (16.0, 0.3, 0.3));
+        twice_blurred.global.blur = 0.3;
+        let mut cells_blurred = cells.clone();
+        cells_blurred.global.blur = 0.3;
         let mut replaced_position = section(GeneratorKind::Position, |section| section.axes = [axis(false, AxisBlend::Normal, 1.0); 3]);
         replaced_position.inputs.insert(BakedMap::Position, Source::image("Input"));
         let cases = [
@@ -474,6 +507,8 @@ mod tests {
                 Tolerance::NEIGHBOURHOOD,
             ),
             ("Ambient Occlusion cells", cells, Tolerance::NEIGHBOURHOOD),
+            ("Ambient Occlusion blurred twice", twice_blurred, Tolerance::NEIGHBOURHOOD),
+            ("Ambient Occlusion cells blurred", cells_blurred, Tolerance::NEIGHBOURHOOD),
             (
                 "Position axes",
                 section(GeneratorKind::Position, |section| {

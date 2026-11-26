@@ -201,9 +201,9 @@ mod tests {
         BakedMaps, Composite, DisplayKind, ImageRes, ImageStore, Inputs, MaskGray, PaintTarget, PixelStore, StrokePreview, composite_tiles, tile_bytes,
     };
     use texturecraft_core::{
-        BakedMap, Bevel, BlendMode, Channel, ColorSelection, Effect, EffectKind, Fill, Filter, GeneratorKind, GradientInput, HeightToNormal, Layer, LayerId,
-        LayerKind, Mask, MaskBackground, Mirror, Procedural, ProceduralKind, Project, Projection, Sampling, Source, SourceWarp, StylizedLighting, TextureSet,
-        TileTransform, WarpMode, WarpSource, WarpSourceMode,
+        BakedMap, Bevel, BlendMode, Channel, ColorSelection, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, GradientInput, HeightToNormal, Layer,
+        LayerId, LayerKind, Mask, MaskBackground, Mirror, Procedural, ProceduralKind, Project, Projection, Sampling, Source, SourceWarp, StylizedLighting,
+        TextureSet, TileTransform, WarpMode, WarpSource, WarpSourceMode,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::{Mesh, UvGBuffer, primitives};
@@ -553,7 +553,8 @@ mod tests {
         }
     }
 
-    /// A mask generator at a coarser resolution and blurred takes each tile's cells and blur.
+    /// A mask generator at a coarser resolution and blurred takes each tile's cells and blur, also
+    /// on its section controls, which adjust between the cells and the blur (P1's second stage).
     #[test]
     fn a_reduced_generator_takes_each_tiles_cells() {
         let Some(mut gpu) = headless() else { return };
@@ -561,20 +562,27 @@ mod tests {
         generator.global.blur = 0.4;
         generator.resolution.factor = -2;
         generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("Occlusion"));
+        let mut section = Generator::new(GeneratorKind::AmbientOcclusion);
+        section.section = section.section.map(|section| texturecraft_core::SectionParameters { balance: 0.35, contrast: 0.3, ..section });
+        section.global = generator.global;
+        section.resolution = generator.resolution;
+        section.inputs = generator.inputs.clone();
         let occlusion: Vec<[f32; 4]> = (0..64).map(|texel| [0.1 + 0.8 * ((texel % 8 + texel / 8 * 3) % 8) as f32 / 7.0; 4]).collect();
         let images = ImageStore::from([("Occlusion".into(), Arc::new(ImageRes::new(8, 8, occlusion, false)))]);
         let baked = BakedMaps::default();
 
-        for scaled in [false, true] {
-            let (mut project, mesh, pixels, owner, _) = painted(scaled, &[]);
-            let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(generator.clone()));
-            generated.blend = BlendMode::Multiply;
-            project.layers.get_mut(&owner).and_then(|layer| layer.mask.as_mut()).unwrap().effects.push(generated);
-            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
-            case.mask_owner = Some(owner);
-            case.region = Some(BLOCK_CORNER);
+        for (label, generator) in [("reduced generator", generator), ("reduced section", section)] {
+            for scaled in [false, true] {
+                let (mut project, mesh, pixels, owner, _) = painted(scaled, &[]);
+                let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(generator.clone()));
+                generated.blend = BlendMode::Multiply;
+                project.layers.get_mut(&owner).and_then(|layer| layer.mask.as_mut()).unwrap().effects.push(generated);
+                let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+                case.mask_owner = Some(owner);
+                case.region = Some(BLOCK_CORNER);
 
-            assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("reduced generator, scaled {scaled}"));
+                assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("{label}, scaled {scaled}"));
+            }
         }
     }
 

@@ -93,6 +93,11 @@ fn preceding_stage_word(pixel: vec2<u32>) -> f32 {
     return bitcast<f32>(output[start + 4u]);
 }
 
+// A generator's second stage (SECOND_GENERATOR_STAGE in Rust): P1's section adjusts the first
+// stage's field there before the global blur
+const SECOND_GENERATOR_STAGE: u32 = 0x08000000u;
+var<private> generator_second_stage: bool = false;
+
 // The most recent prepared field already contains all the effects below it.
 fn previous_field(start: u32, count: u32) -> u32 {
     for (var i = count; i > 0u; i--) {
@@ -148,7 +153,7 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         let texel = LayerTexel(pixel, uv, surface, baked, projected);
         let layer = layers[params.filter_stage.z];
-        let count = params.filter_stage.w & 0x0fffffffu;
+        let count = params.filter_stage.w & 0x07ffffffu;
         // Every mask and every content goes through one layer_mask and one layer_content call
         // below, which the driver inlines once each (the call sites, not the paths, set the size)
         let flags = params.filter_stage.w;
@@ -161,6 +166,7 @@ fn prepare_filter(@builtin(global_invocation_id) id: vec3<u32>) {
             triangle = textureLoad(surface_uv, vec2<i32>(pixel), 0).x;
         }
         if generator {
+            generator_second_stage = (flags & SECOND_GENERATOR_STAGE) != 0u;
             let source = layers[params.program.x + layer.effects.x + count];
             prepared = vec4(generator_ramp(source, texel), 0.0, 0.0, 1.0);
         }
