@@ -10,7 +10,7 @@ pub struct Headless {
 }
 
 /// The adapter for work without a window (renders, path tracing, GPU baking). Like the desktop app,
-/// it honours `WGPU_ADAPTER_NAME` (part of the adapter's name, any case) and `WGPU_POWER_PREF`
+/// it honours `WGPU_ADAPTER_NAME` (part of the adapter's name or backend, any case) and `WGPU_POWER_PREF`
 /// (`high`, the default, `low` or `none`); the instance reads wgpu's other variables
 /// (`WGPU_BACKEND`, `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER`, ...).
 pub fn adapter() -> Result<wgpu::Adapter, String> {
@@ -37,7 +37,7 @@ fn pick_adapter(infos: &[wgpu::AdapterInfo], name: &str, power: wgpu::PowerPrefe
     infos
         .iter()
         .enumerate()
-        .filter(|(_, info)| info.name.to_lowercase().contains(&wanted))
+        .filter(|(_, info)| info.name.to_lowercase().contains(&wanted) || format!("{:?}", info.backend).to_lowercase().contains(&wanted))
         .min_by_key(|(index, info)| {
             let lower = info.name.to_lowercase();
             let software = info.device_type == DeviceType::Cpu || ["llvmpipe", "lavapipe", "warp"].iter().any(|s| lower.contains(s));
@@ -126,6 +126,7 @@ mod tests {
         assert_eq!(pick_adapter(&gpus, "INTEL", P::None), Some(0));
         assert_eq!(pick_adapter(&gpus, "", P::HighPerformance), Some(1));
         assert_eq!(pick_adapter(&gpus, "llvm", P::HighPerformance), Some(2));
+        assert_eq!(pick_adapter(&gpus, "gl", P::HighPerformance), Some(2));
         assert_eq!(pick_adapter(&gpus, "nvidia", P::HighPerformance), None);
         // One GPU on two backends: the native one before OpenGL.
         let twice = [info("D3D12 (NVIDIA GeForce RTX 4050)", DiscreteGpu, Gl), info("Microsoft Direct3D12 (NVIDIA GeForce RTX 4050)", DiscreteGpu, Vulkan)];
