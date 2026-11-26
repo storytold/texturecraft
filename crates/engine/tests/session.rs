@@ -18,6 +18,26 @@ fn session_at(texture_size: u32) -> Session {
 }
 
 #[test]
+fn active_paint_color_survives_saving_and_reopening_a_project() {
+    let mut s = session();
+    let default_color = s.tool.values[&Channel::BaseColor];
+    let red = [1.0, 0.0, 0.0];
+    execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": red})).unwrap();
+    assert_eq!(s.tool.values[&Channel::BaseColor], red);
+
+    let bytes = s.to_project_bytes().unwrap();
+    let reopened = Session::from_project_bytes(&bytes).unwrap();
+    assert_eq!(reopened.tool.values[&Channel::BaseColor], red);
+    assert_eq!(reopened.doc.project, s.doc.project);
+
+    let mut older = s.project_file();
+    older.project.paint_color = None;
+    let bytes = texturecraft_formats::save_project_bytes(&older).unwrap();
+    let reopened = Session::from_project_bytes(&bytes).unwrap();
+    assert_eq!(reopened.tool.values[&Channel::BaseColor], default_color);
+}
+
+#[test]
 fn scripted_stroke_paints_and_undo_restores() {
     let mut s = session();
     execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [1.0, 0.0, 0.0]})).unwrap();

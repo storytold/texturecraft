@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use texturecraft_core::{Channel, Project, TextureSet};
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_core::{NormalFormat, PROJECT_EXT};
-use texturecraft_core::{Project, TextureSet};
 use texturecraft_formats::PlannedFile;
 use texturecraft_formats::mesh_import::{MeshUvSource, import_mesh_geometry};
 use texturecraft_formats::{ExportInput, ExportOptions, ExportedFile, FileFormat, MapOverride, Padding, ProjectFile};
@@ -210,7 +210,7 @@ impl Session {
         Session::from_project_file(pf)
     }
 
-    pub fn from_project_file(project_file: ProjectFile) -> Result<Session> {
+    pub fn from_project_file(mut project_file: ProjectFile) -> Result<Session> {
         project_file.validate_mesh_uvs().map_err(fe)?;
 
         let mesh = match (&project_file.mesh, project_file.project.mesh.strip_prefix("builtin:")) {
@@ -223,6 +223,7 @@ impl Session {
         drop(project_file.mesh_uvs);
         check_materials(&project_file.project, &mesh)?;
         let resources = project_file.resources.into_iter().map(|(name, bytes)| (name, Arc::new(bytes))).collect();
+        let paint_color = project_file.project.paint_color.take();
 
         let mut session = Session::new(
             Document {
@@ -236,6 +237,12 @@ impl Session {
             mesh,
             project_file.mesh,
         )?;
+
+        if let Some(color) = paint_color
+            && color.iter().all(|component| component.is_finite())
+        {
+            session.tool.values.insert(Channel::BaseColor, color.map(|component| component.clamp(0.0, 1.0)));
+        }
 
         session.sync_images();
         session.load_bake_meshes(project_file.high_poly, project_file.cage);
@@ -281,6 +288,7 @@ impl Session {
         let (high_poly, cage) = self.saved_bake_meshes();
         let mut project = self.doc.project.clone();
         project.format_version = project.save_format_version();
+        project.paint_color = self.tool.values.get(&Channel::BaseColor).copied().filter(|color| color.iter().all(|component| component.is_finite()));
 
         ProjectFile {
             project,

@@ -452,6 +452,9 @@ pub struct Project {
     /// The project's colour swatches (linear RGB), in the order they were added; projects without any save none
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub swatches: Vec<[f32; 3]>,
+    /// The active paint Base Color in linear RGB, saved for the tool state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paint_color: Option<[f32; 3]>,
 }
 
 impl Project {
@@ -470,6 +473,7 @@ impl Project {
             display: DisplaySettings::default(),
             cameras: Vec::new(),
             swatches: Vec::new(),
+            paint_color: None,
         }
     }
 
