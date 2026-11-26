@@ -1743,6 +1743,12 @@ impl Renderer {
             return Err("GPU composition is unavailable on this device or for this layout".into());
         }
 
+        // A composed map whose texture has another extent (a seeded overview, a placeholder) gets a
+        // new texture: a regional update would leave it neutral outside the region, so it
+        // composes the whole set
+        let resized =
+            DisplayKind::ALL.iter().zip(&set.tex).any(|(&kind, old)| program.writes_display(kind) && (old.texture.width(), old.texture.height()) != size);
+        let region = if resized { None } else { program.region };
         let mut submitted = None;
         let mut in_place = [false; DisplayKind::ALL.len()];
         let compile = (self.asynchronous_compile, self.shared_test_pipelines);
@@ -1759,7 +1765,7 @@ impl Renderer {
                     if extent == (old.texture.width(), old.texture.height()) && (composed || size != (1, 1)) {
                         in_place[kind as usize] = composed;
                         old.clone()
-                    } else if composed && program.region.is_none() {
+                    } else if composed && region.is_none() {
                         Tex::new(device, "tc_composite", extent.0, extent.1, display_format(kind), mip_count(extent.0.max(extent.1)))
                     } else {
                         neutral_tex(device, queue, extent, display_format(kind), mip_count(extent.0.max(extent.1)), neutral)
@@ -1770,7 +1776,7 @@ impl Renderer {
             compositor.compose(
                 (device, queue),
                 program,
-                (ts, set.size, set.shift, program.region),
+                (ts, set.size, set.shift, region),
                 &targets.each_ref().map(|target| &target.texture),
                 &mut submitted,
             )?;
@@ -1788,7 +1794,7 @@ impl Renderer {
         };
         self.compositor = Some(compositor);
         if let Some(set) = self.sets.get_mut(ts) {
-            let region = program.region.map(|r| r.viewport(set.shift, size));
+            let region = region.map(|r| r.viewport(set.shift, size));
             for ((mips, old), new) in set.mips_dirty.iter_mut().zip(&set.tex).zip(&textures).take(DisplayKind::ALL.len()) {
                 if let Some(region) = region
                     && old.texture == new.texture

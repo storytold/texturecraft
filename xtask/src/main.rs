@@ -173,10 +173,12 @@ fn render_ci_env() -> Result<Vec<(&'static str, String)>, String> {
     if !cfg!(target_os = "linux") || std::env::var_os("CI").is_none() {
         return Ok(Vec::new());
     }
+    // A driver file the caller named under either variable, else lavapipe's from the system
+    let given = std::env::var("VK_DRIVER_FILES").or_else(|_| std::env::var("VK_ICD_FILENAMES")).ok().filter(|files| !files.is_empty());
     let driver =
-        match std::env::var("VK_DRIVER_FILES") {
-            Ok(files) => files,
-            Err(_) => {
+        match given {
+            Some(files) => files,
+            None => {
                 let found =
                     std::fs::read_dir(VULKAN_DRIVER_DIR).into_iter().flatten().flatten().map(|entry| entry.path()).find(|path| {
                         path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("lvp_icd") && name.ends_with(".json"))
