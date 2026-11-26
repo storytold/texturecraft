@@ -10,10 +10,10 @@ use crate::field_cache::FieldCache;
 use crate::working_field::{REFERENCE_TILE_TEXELS, blur_blocks, box_radius};
 
 /// How far in the gradient reaches at Distance 1, in UV units (fitted: about half a UV tile)
-const REACH_PER_DISTANCE: f32 = 0.4936;
+pub const REACH_PER_DISTANCE: f32 = 0.4936;
 
 /// The blur at Smoothness 1, as a gaussian sigma in texels of a 2K UV tile (fitted)
-const SMOOTHNESS_SIGMA_2K: f32 = 45.0;
+pub const SMOOTHNESS_SIGMA_2K: f32 = 45.0;
 
 static CACHE: FieldCache = FieldCache::new();
 

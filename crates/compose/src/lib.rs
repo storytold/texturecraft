@@ -20,6 +20,7 @@ pub mod environment_sh;
 pub mod environment_sky;
 pub mod eval;
 mod fabric;
+pub mod field_recipe;
 mod field_cache;
 mod field_cache_key;
 pub mod fill_copies;

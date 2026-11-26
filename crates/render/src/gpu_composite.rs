@@ -50,6 +50,9 @@ mod point;
 mod stack;
 #[path = "gpu_composite_udim.rs"]
 mod udim;
+// P3b: the whole-map generator kinds (UV Border Distance, Dripping Rust, UV Random Color, UV Checker)
+#[path = "gpu_generator_p3b.rs"]
+mod p3b;
 use groups::{BEGIN_GROUP, END_GROUP, GroupPlan, StackWork};
 use pipelines::CompositePipelines;
 
@@ -396,6 +399,8 @@ struct ProceduralInputs {
     bake_rows: bool,
     /// The image inputs (`register_input` references) read as colour (`register_color_input`).
     color_inputs: BTreeSet<u32>,
+    /// P3b: the whole-map generator fields, one array layer each (`p3b::operation`)
+    p3b_fields: Vec<p3b::field_request::FieldRequest>,
 }
 
 #[derive(Default)]
@@ -449,6 +454,7 @@ impl ProceduralInputs {
             environment_word: None,
             bake_rows: false,
             color_inputs: BTreeSet::new(),
+            p3b_fields: Vec::new(),
         }
     }
 
@@ -1477,6 +1483,8 @@ pub struct CompositeProgram {
     udim: u32,
     /// P8: the UV tile atlas's blocks, which say where a level stage has texels to filter
     udim_layout: Option<udim::UdimLayout>,
+    /// P3b: the whole-map generator fields the program reads
+    p3b_fields: p3b::FieldPlan,
 }
 
 /// A program's late-bound environment words: where they start in the side table, the display
@@ -1644,6 +1652,8 @@ impl CompositeProgram {
             self.surface = Some((mesh.clone(), gbuf.clone()));
         }
         self.geometry.resolve(mesh);
+        // P3b: what the whole-map generator fields read
+        self.p3b_fields.set_inputs(mesh, gbuf, baked);
         // Texels no triangle covers keep the channels' defaults, as the CPU leaves them
         let partly_covered = gbuf.tri.contains(&NO_TRI);
         if self.mask_preview || ((partly_covered || !self.filters.stages.is_empty() || !self.geometry.parts.is_empty()) && self.coverage.is_none()) {
@@ -2040,6 +2050,7 @@ impl CompositeProgram {
             bake_rows: procedural.bake_rows,
             udim,
             udim_layout: layout,
+            p3b_fields: p3b::FieldPlan::new(procedural.p3b_fields, set.material),
         })
     }
 
@@ -2125,6 +2136,7 @@ impl CompositeProgram {
             bake_rows: procedural.bake_rows,
             udim,
             udim_layout: layout,
+            p3b_fields: p3b::FieldPlan::new(procedural.p3b_fields, set.material),
         })
     }
 }
@@ -2543,6 +2555,10 @@ fn source_operation(
 }
 
 fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
+    // P3b: the whole-map kinds read a field built before the composite
+    if p3b::is_field_kind(generator.kind) {
+        return p3b::operation(generator, inputs);
+    }
     // The GPU has the earlier model alone: the wear, section, light and kind controls, a texture,
     // a grunge, Micro Details and the kinds without an earlier model compose on the CPU
     if !generator.on_earlier_model()
@@ -2784,6 +2800,8 @@ pub(crate) struct GpuCompositor {
     baked: BTreeMap<usize, BakeCache>,
     id_bakes: BTreeMap<usize, IdBakeCache>,
     curvature: Option<CurvatureResources>,
+    /// P3b: the whole-map generator fields at binding 16, when the adapter has room for them
+    generator_fields: Option<p3b::GeneratorFieldsGpu>,
     default_surface: wgpu::TextureView,
     default_vertices: wgpu::Buffer,
     default_baked: wgpu::TextureView,
@@ -2856,6 +2874,15 @@ impl GpuCompositor {
         if supports_id {
             entries.push(binding(15, uint));
         }
+        // P3b: the whole-map generator fields, built with storage textures like the curvature levels
+        let supports_fields = supports_curvature
+            && supports_id
+            && limits.max_sampled_textures_per_shader_stage >= 8
+            && limits.max_bindings_per_bind_group >= 17
+            && limits.max_storage_buffers_per_shader_stage >= 2;
+        if supports_fields {
+            entries.push(binding(16, texture(wgpu::TextureSampleType::Float { filterable: false }, wgpu::TextureViewDimension::D2Array)));
+        }
         let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("tc_gpu_composite_bindings"), entries: &entries });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tc_gpu_composite_layout"),
@@ -2883,7 +2910,7 @@ impl GpuCompositor {
         let default_brush_alpha =
             input_texture(device, "tc_composite_empty_brush_alpha", (1, 1), 1, wgpu::TextureFormat::R16Uint).create_view(&Default::default());
         Self {
-            pipelines: pipelines::shared(shared, supports_curvature, supports_id),
+            pipelines: pipelines::shared(shared, supports_curvature, supports_id, supports_fields),
             shared_test_kernels: shared,
             asynchronous: false,
             bindings,
@@ -2896,6 +2923,7 @@ impl GpuCompositor {
             baked: BTreeMap::new(),
             id_bakes: BTreeMap::new(),
             curvature: supports_curvature.then(|| CurvatureResources { gpu: None, empty: CurvatureLevels::empty(device), cache: BTreeMap::new() }),
+            generator_fields: supports_fields.then(|| p3b::GeneratorFieldsGpu::new(device)),
             default_surface,
             default_vertices,
             default_baked,
@@ -3326,6 +3354,12 @@ impl GpuCompositor {
         let baked = self.baked_input(device, queue, ts, program.baked.as_ref())?;
         let curvature = self.curvature_inputs(device, queue, ts, program, &baked)?;
         let id_bake = self.id_bake_input(device, queue, ts, program.id_bake.as_ref())?;
+        // P3b: the whole-map generator fields, one array layer each
+        let generator_fields = match &mut self.generator_fields {
+            Some(fields) => Some(fields.fields(device, queue, &program.p3b_fields, program.udim_layout.as_ref().map(|layout| layout.grid), &surface)?),
+            None if !program.p3b_fields.requests.is_empty() => return Err("The GPU adapter cannot bind the whole-map generator fields.".into()),
+            None => None,
+        };
         let [id_width, id_height] = program.id_bake.as_ref().map_or([0; 2], |id| id.size);
         let bake_words = program.baked.as_ref().map_or([0; 2], BakedInputs::uniform_words);
         let mut words_per_pixel = 0;
@@ -3574,7 +3608,11 @@ impl GpuCompositor {
                 entries.swap(count, 15);
                 count += 1;
             }
-            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("tc_composite_band"), layout: &self.bindings, entries: &entries[..count] })
+            let mut entries = entries[..count].to_vec();
+            if let Some(fields) = &generator_fields {
+                entries.push(wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(fields) });
+            }
+            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("tc_composite_band"), layout: &self.bindings, entries: &entries })
         };
         let mut packed = Vec::new();
         let mut pending_bytes = 0;
@@ -4741,7 +4779,7 @@ mod procedural_tests {
         let earlier = oracle::earlier_generator(GeneratorKind::Dirt);
         assert!(gpu(&earlier));
         assert!(!gpu(&Generator::new(GeneratorKind::Dirt)), "the reference app's controls");
-        assert!(!gpu(&oracle::earlier_generator(GeneratorKind::UvChecker)), "no earlier model");
+        assert!(!gpu(&oracle::earlier_generator(GeneratorKind::ThreeDDistance)), "no earlier model");
         let micro = MicroDetails { enabled: true, ..MicroDetails::defaults(GeneratorKind::Curvature).unwrap() };
         let curvature = Generator { micro: Some(Box::new(micro)), ..oracle::earlier_generator(GeneratorKind::Curvature) };
         assert!(!gpu(&curvature), "Micro Details");
@@ -5963,6 +6001,7 @@ mod paint_window_tests {
             bake_rows: false,
             udim: 0,
             udim_layout: None,
+            p3b_fields: p3b::FieldPlan::default(),
         };
         let region = CompositeRegion { min: [0, 0], max: [128, 128] };
         let limit = 6 * 64 * 64 * 2 + 32;

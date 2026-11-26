@@ -1,4 +1,8 @@
 fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
+    // P3b: UV Border Distance, Dripping Rust, UV Random Color and UV Checker read their whole-map field
+    if effect.ids.y == 47u && effect.procedural.x >= 5u {
+        return p3b_field_ramp(effect, texel.pixel);
+    }
     let surface = texel.surface;
     var baked = texel.baked;
     if effect.effects.w != 0u {

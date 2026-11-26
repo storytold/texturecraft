@@ -22,6 +22,8 @@ struct Features {
     anchors: bool,
     material_anchors: bool,
     color_selection: bool,
+    // P3b: a generator reads a whole-map field (gpu_generator_p3b.rs)
+    p3b_fields: bool,
     // The GPU port packages' WGSL files compiled in full (gpu_composite_packages.rs)
     packages: ShaderFlags,
 }
@@ -50,6 +52,7 @@ impl Features {
             features.extended_blend_modes |= op.balance[2] > 8.0;
             features.anchors |= kind == ANCHOR_SOURCE;
             features.color_selection |= kind == COLOR_SELECTION_OPCODE;
+            features.p3b_fields |= super::p3b::reads_field(op);
             features.patterns |= matches!(kind, 1..=9 | 11..=13 | FIRST_EXTENDED_PATTERN..=TILE_GENERATOR_OPCODE);
             features.extended_patterns |= (FIRST_EXTENDED_PATTERN..TILE_GENERATOR_OPCODE).contains(&kind);
             features.tile_generator |= kind == TILE_GENERATOR_OPCODE;
@@ -64,7 +67,7 @@ impl Features {
         features
     }
 
-    fn source(self, supports_curvature: bool, supports_id: bool) -> String {
+    fn source(self, supports_curvature: bool, supports_id: bool, supports_fields: bool) -> String {
         fn include(enabled: bool, full: &'static str, stub: &'static str) -> &'static str {
             if enabled { full } else { stub }
         }
@@ -111,6 +114,11 @@ impl Features {
                 self.sampled_generator_inputs,
                 "fn generator_source_value(index: u32, texel: LayerTexel) -> f32 {\n                     return fill_value(layers[index], texel.uv, texel.surface).x;\n                 }",
                 "fn generator_source_value(index: u32, texel: LayerTexel) -> f32 { return layers[index].low.x; }",
+            ),
+            include(
+                self.p3b_fields && supports_fields,
+                include_str!("shaders/generator_p3b_sample.wgsl"),
+                "fn p3b_field_ramp(effect: Operation, pixel: vec2<u32>) -> f32 { return 0.0; }",
             ),
             include(
                 self.generators,
@@ -210,6 +218,7 @@ struct Variants {
 pub(super) struct CompositePipelines {
     supports_curvature: bool,
     supports_id: bool,
+    supports_fields: bool,
     variants: BTreeMap<Features, Variants>,
 }
 
@@ -217,20 +226,20 @@ pub(super) struct CompositePipelines {
 /// share, [`crate::headless::Headless::for_tests`]) one set for every such compositor, so a test
 /// does not compile the variants an earlier one compiled (llvmpipe keeps what it compiled until
 /// the process ends, and compiling dominates its tests' time).
-pub(super) fn shared(shared: bool, supports_curvature: bool, supports_id: bool) -> Arc<Mutex<CompositePipelines>> {
+pub(super) fn shared(shared: bool, supports_curvature: bool, supports_id: bool, supports_fields: bool) -> Arc<Mutex<CompositePipelines>> {
     #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
     if shared {
         static SHARED: std::sync::OnceLock<Arc<Mutex<CompositePipelines>>> = std::sync::OnceLock::new();
-        return SHARED.get_or_init(|| Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)))).clone();
+        return SHARED.get_or_init(|| Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id, supports_fields)))).clone();
     }
     #[cfg(not(all(any(test, feature = "test-support"), not(target_arch = "wasm32"))))]
     let _ = shared;
-    Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)))
+    Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id, supports_fields)))
 }
 
 impl CompositePipelines {
-    pub(super) fn new(supports_curvature: bool, supports_id: bool) -> Self {
-        Self { supports_curvature, supports_id, variants: BTreeMap::new() }
+    pub(super) fn new(supports_curvature: bool, supports_id: bool, supports_fields: bool) -> Self {
+        Self { supports_curvature, supports_id, supports_fields, variants: BTreeMap::new() }
     }
 
     /// Start compiling `program`'s pipelines without waiting (`get` returns them once ready).
@@ -250,10 +259,11 @@ impl CompositePipelines {
         let features = Features::of(program);
         let supports_curvature = self.supports_curvature;
         let supports_id = self.supports_id;
+        let supports_fields = self.supports_fields;
         let variants = self.variants.entry(features).or_insert_with(|| Variants {
             module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tc_gpu_composite"),
-                source: wgpu::ShaderSource::Wgsl(features.source(supports_curvature, supports_id).into()),
+                source: wgpu::ShaderSource::Wgsl(features.source(supports_curvature, supports_id, supports_fields).into()),
             }),
             render: [None, None],
             prepare: [None, None],
@@ -339,6 +349,7 @@ mod tests {
             anchors: true,
             material_anchors: true,
             color_selection: true,
+            p3b_fields: true,
             packages: ShaderFlags::ALL,
         });
         variants
@@ -385,7 +396,8 @@ mod tests {
         for features in variants() {
             for (curvature, id) in [(false, false), (true, true)] {
                 let constants = [false, true].map(|grouped| features.constants(grouped).to_vec());
-                naga_check(&format!("{features:?} curvature {curvature} id {id}"), &features.source(curvature, id), &entry_points(features), &constants);
+                let source = features.source(curvature, id, curvature && id);
+                naga_check(&format!("{features:?} curvature {curvature} id {id}"), &source, &entry_points(features), &constants);
             }
         }
         naga_check("neighbourhood", &NeighbourhoodGpu::source(), &NeighbourhoodGpu::ENTRY_POINTS, &[Vec::new()]);
@@ -540,9 +552,9 @@ mod tests {
             ("UV tile atlas: plain fill", uv_tiles(project(Vec::new(), Vec::new()))),
         ];
         let compositor = GpuCompositor::new(&gpu.device);
-        let (curvature, id) = {
+        let (curvature, id, fields) = {
             let pipelines = compositor.pipelines();
-            (pipelines.supports_curvature, pipelines.supports_id)
+            (pipelines.supports_curvature, pipelines.supports_id, pipelines.supports_fields)
         };
         let programs =
             cases.map(|(label, project)| (label, Features::of(&CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).unwrap())));
@@ -551,7 +563,7 @@ mod tests {
         for (label, features) in programs.into_iter().chain(everything) {
             let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tc_bench"),
-                source: wgpu::ShaderSource::Wgsl(features.source(curvature, id).into()),
+                source: wgpu::ShaderSource::Wgsl(features.source(curvature, id, fields).into()),
             });
             for entry in entry_points(features) {
                 let started = std::time::Instant::now();
@@ -578,9 +590,9 @@ mod tests {
     fn package_shaders_build_compute_pipelines_in_full_and_as_stubs() {
         let Some(gpu) = oracle::headless() else { return };
         let compositor = GpuCompositor::new(&gpu.device);
-        let (curvature, id) = {
+        let (curvature, id, fields) = {
             let pipelines = compositor.pipelines();
-            (pipelines.supports_curvature, pipelines.supports_id)
+            (pipelines.supports_curvature, pipelines.supports_id, pipelines.supports_fields)
         };
         // Every package variant; the program with every other feature too is left to the naga
         // check above: Mesa's GL compiler needs over 28 GB for it (llvmpipe, measured)
@@ -592,7 +604,7 @@ mod tests {
             let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
             let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tc_gpu_composite_packages"),
-                source: wgpu::ShaderSource::Wgsl(features.source(curvature, id).into()),
+                source: wgpu::ShaderSource::Wgsl(features.source(curvature, id, fields).into()),
             });
             for grouped in [false, true] {
                 for entry in entry_points(features) {

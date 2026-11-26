@@ -3,7 +3,7 @@
 use crate::eval::{Inputs, blur};
 
 /// The resolution of a UV tile the generators' fitted sizes are measured at
-pub(crate) const REFERENCE_TILE_TEXELS: f32 = 2048.0;
+pub const REFERENCE_TILE_TEXELS: f32 = 2048.0;
 
 /// The size of one UV tile's block in `inp`'s working atlas
 pub(crate) fn working_block(inp: &Inputs) -> (u32, u32) {
@@ -14,7 +14,7 @@ pub(crate) fn working_block(inp: &Inputs) -> (u32, u32) {
 }
 
 /// The radius of three box passes that blur like a gaussian of `sigma`: three boxes of radius r spread a texel with variance r (r + 1)
-pub(crate) fn box_radius(sigma: f32) -> usize {
+pub fn box_radius(sigma: f32) -> usize {
     (((1.0 + 4.0 * sigma * sigma).sqrt() - 1.0) * 0.5).round() as usize
 }
 
