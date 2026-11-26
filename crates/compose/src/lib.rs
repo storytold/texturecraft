@@ -29,6 +29,7 @@ mod fill_place;
 pub mod frame_placement;
 mod fur_lock;
 mod generator_maps;
+pub mod generator_terms;
 mod grunge_pattern;
 mod held_fields;
 mod histogram_scan;

@@ -4,12 +4,13 @@
 //! the block. A UV tile smaller than its block covers the bake through its block scale.
 
 use bytemuck::{Pod, Zeroable};
-use texturecraft_core::CurvatureDetail;
+use texturecraft_compose::curvature_sizes::LEVEL_RADII;
 use wgpu::util::DeviceExt;
 
 use crate::gpu_trace::{entry, storage};
 
-const SIZES: usize = CurvatureDetail::BLURRED_SIZES;
+/// The blurred levels: the curvature detail sizes, then the wider ones the wear generators' edges smoothness reaches
+pub(crate) const SIZES: usize = LEVEL_RADII.len();
 const LINE_WORKGROUP: u32 = 64;
 const TILE_WORKGROUP: u32 = 8;
 const BOX_PASSES: usize = 3;
@@ -255,12 +256,8 @@ struct Level {
 /// The levels' places in one atlas: each size's radius (texels at 2K, scaled to the block's
 /// width) and coarsening step (dividing the block, so no cell spans two UV tiles).
 fn plan_atlas(size: [u32; 2], block: [u32; 2], needed: [bool; SIZES], limit: u32) -> Option<([u32; 2], Layout, Vec<Level>)> {
-    let radii: Vec<_> = CurvatureDetail::SIZES
-        .iter()
-        .skip(1)
-        .zip(needed)
-        .map(|(&radius, needed)| needed.then_some((radius * block[0] as f32 / 2048.0).round().max(1.0) as u32))
-        .collect();
+    let radii: Vec<_> =
+        LEVEL_RADII.iter().zip(needed).map(|(&radius, needed)| needed.then_some((radius * block[0] as f32 / 2048.0).round().max(1.0) as u32)).collect();
     let initial_width = radii.iter().flatten().map(|&radius| size[0].div_ceil(level_step(block, radius))).max()?;
     if initial_width > limit {
         return None;

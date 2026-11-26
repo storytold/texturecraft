@@ -1,4 +1,8 @@
 fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
+    // P1: the wear, section and light controls (generator_p1.wgsl)
+    if effect.ids.y <= 46u && effect.ext.x != 0u {
+        return p1_generator_ramp(effect, texel);
+    }
     let surface = texel.surface;
     var baked = texel.baked;
     if effect.effects.w != 0u {
@@ -50,7 +54,7 @@ fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 {
 }
 
 fn finish_generator(effect: Operation, ramp: f32) -> f32 {
-    var value = ramp;
+    var value = p1_finish_signal(effect, ramp);
     if effect.projection.z != 0.5 || effect.projection.w != 0.0 {
         let balance = clamp(effect.projection.z, 0.0, 1.0);
         let low = max(1.0 - 2.0 * balance, 0.0);

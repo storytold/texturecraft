@@ -19,7 +19,7 @@ use texturecraft_core::{
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer, glam::Vec3};
 use texturecraft_texel::{TILE, TileImage};
 
-use crate::gpu_curvature::{CurvatureGpu, CurvatureInput, CurvatureLevels};
+use crate::gpu_curvature::{self, CurvatureGpu, CurvatureInput, CurvatureLevels};
 use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, ImageUse, MaterialImages};
 use crate::gpu_neighbourhood::{self, FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
 use crate::gpu_stencil::GpuStencil;
@@ -27,6 +27,8 @@ use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePattern
 use crate::paint_window::CompositePaintWindow;
 use wgpu::util::DeviceExt;
 
+#[path = "gpu_generator_p1.rs"]
+mod generator_p1;
 #[path = "gpu_composite_groups.rs"]
 mod groups;
 #[path = "gpu_composite_pipelines.rs"]
@@ -374,7 +376,7 @@ struct ProceduralInputs {
     /// P8: each generator stage's (filter, cell) at those further scales, by generator stage
     generator_levels: Vec<Vec<(Option<NeighbourhoodFilter>, u32)>>,
     ramp_words: Vec<u32>,
-    curvature_sizes: [bool; CurvatureDetail::BLURRED_SIZES],
+    curvature_sizes: [bool; gpu_curvature::SIZES],
     filters: Vec<(Filter, f32)>,
     materials: MaterialImages,
     generator_stages: Vec<(Option<NeighbourhoodFilter>, u32)>,
@@ -437,7 +439,7 @@ impl ProceduralInputs {
             levels: Vec::new(),
             generator_levels: Vec::new(),
             ramp_words: Vec::new(),
-            curvature_sizes: [false; CurvatureDetail::BLURRED_SIZES],
+            curvature_sizes: [false; gpu_curvature::SIZES],
             filters: Vec::new(),
             materials: MaterialImages::default(),
             generator_stages: Vec::new(),
@@ -1450,7 +1452,7 @@ pub struct CompositeProgram {
     geometry: GeometryMasks,
     paint: Vec<TileImage>,
     ramp_words: Vec<u32>,
-    curvature_sizes: [bool; CurvatureDetail::BLURRED_SIZES],
+    curvature_sizes: [bool; gpu_curvature::SIZES],
     tile_patterns: TilePatterns,
     material_images: MaterialImages,
     brush_alpha: Option<wgpu::TextureView>,
@@ -1640,6 +1642,8 @@ impl CompositeProgram {
     pub fn set_surface_inputs(&mut self, mesh: &Arc<Mesh>, gbuf: &Arc<UvGBuffer>, baked: Option<&BakedMaps>) -> Result<(), &'static str> {
         // P1's projector depth grids, before the atlas reads them
         self.material_images.set_surface(mesh);
+        // P1 stand-in for P3a's mesh extent: the bounds the generator controls read
+        generator_p1::set_bounds(&self.operations, &mut self.ramp_words, mesh);
         if self.needs_surface || !self.geometry.parts.is_empty() {
             self.surface = Some((mesh.clone(), gbuf.clone()));
         }
@@ -2543,15 +2547,14 @@ fn source_operation(
 }
 
 fn generator_operation(generator: &Generator, inputs: &mut ProceduralInputs, patterns: &mut TilePatterns) -> Option<Operation> {
-    // The GPU has the earlier model alone: the wear, section, light and kind controls, a texture,
-    // a grunge, Micro Details and the kinds without an earlier model compose on the CPU
-    if !generator.on_earlier_model()
-        || generator.controls.is_some()
-        || generator.texture.is_some()
-        || generator.grunge.is_some()
-        || generator.micro_in_use().is_some()
-    {
+    // A texture, a grunge, Micro Details and the kinds with only their own controls compose on the CPU
+    if generator.kind_controls().is_some() || generator.texture.is_some() || generator.grunge.is_some() || generator.micro_in_use().is_some() {
         return None;
+    }
+
+    // P1: the wear, section and light controls
+    if !generator.on_earlier_model() {
+        return generator_p1::operation(generator, inputs, patterns);
     }
     let kind = match generator.kind {
         GeneratorKind::EdgeWear => 40,
@@ -2758,7 +2761,7 @@ struct CurvatureCache {
     gbuf: Weak<UvGBuffer>,
     map: Weak<Vec<f32>>,
     size: [u32; 2],
-    needed: [bool; CurvatureDetail::BLURRED_SIZES],
+    needed: [bool; gpu_curvature::SIZES],
     levels: CurvatureLevels,
 }
 
@@ -4730,18 +4733,28 @@ mod procedural_tests {
         }
     }
 
-    /// A generator on the earlier model composes on the GPU; one with the reference app's controls
-    /// (a new generator's), a kind without an earlier model or Micro Details composes on the CPU
+    /// A generator on the earlier model and new section and light generators compose on the GPU;
+    /// the wear's grunge, a section blur with a global blur around the adjustment, World Space
+    /// Normals, the kinds with only their own controls and Micro Details compose on the CPU
     #[test]
     fn generators_beyond_the_earlier_model_compose_on_the_cpu() {
-        use texturecraft_core::MicroDetails;
+        use texturecraft_core::{MicroDetails, SectionParameters, WearParameters};
 
         let (mut inputs, mut patterns) = (ProceduralInputs::new(64), TilePatterns::default());
         let mut gpu = |generator: &Generator| generator_operation(generator, &mut inputs, &mut patterns).is_some();
-        let earlier = oracle::earlier_generator(GeneratorKind::Dirt);
-        assert!(gpu(&earlier));
-        assert!(!gpu(&Generator::new(GeneratorKind::Dirt)), "the reference app's controls");
-        assert!(!gpu(&oracle::earlier_generator(GeneratorKind::UvChecker)), "no earlier model");
+        assert!(gpu(&oracle::earlier_generator(GeneratorKind::Dirt)));
+        for kind in [GeneratorKind::Curvature, GeneratorKind::AmbientOcclusion, GeneratorKind::Position, GeneratorKind::Direction] {
+            assert!(gpu(&Generator::new(kind)), "{kind:?}: the section and light controls");
+        }
+        let without_grunge = WearParameters { grunge_amount: 0.0, ..WearParameters::defaults(GeneratorKind::Dirt).unwrap() };
+        assert!(gpu(&Generator { wear: Some(without_grunge), ..Generator::new(GeneratorKind::Dirt) }));
+        assert!(!gpu(&Generator::new(GeneratorKind::Dirt)), "the wear's grunge");
+        let section = SectionParameters { blur: 16.0, ..SectionParameters::defaults(GeneratorKind::AmbientOcclusion).unwrap() };
+        let mut twice_blurred = Generator { section: Some(section), ..Generator::new(GeneratorKind::AmbientOcclusion) };
+        twice_blurred.global.blur = 0.5;
+        assert!(!gpu(&twice_blurred), "a section blur before a global blur");
+        assert!(!gpu(&Generator::new(GeneratorKind::WorldSpaceNormals)), "World Space Normals");
+        assert!(!gpu(&oracle::earlier_generator(GeneratorKind::UvChecker)), "only its own controls");
         let micro = MicroDetails { enabled: true, ..MicroDetails::defaults(GeneratorKind::Curvature).unwrap() };
         let curvature = Generator { micro: Some(Box::new(micro)), ..oracle::earlier_generator(GeneratorKind::Curvature) };
         assert!(!gpu(&curvature), "Micro Details");
@@ -5942,7 +5955,7 @@ mod paint_window_tests {
             layer_count: 0,
             paint: vec![paint],
             ramp_words: Vec::new(),
-            curvature_sizes: [false; CurvatureDetail::BLURRED_SIZES],
+            curvature_sizes: [false; gpu_curvature::SIZES],
             tile_patterns: TilePatterns::default(),
             material_images: MaterialImages::default(),
             brush_alpha: None,

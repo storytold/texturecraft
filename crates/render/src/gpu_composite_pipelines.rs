@@ -13,6 +13,8 @@ struct Features {
     mask_preview: bool,
     extended_blend_modes: bool,
     generators: bool,
+    // P1: an operation on the wear, section or light controls
+    generator_controls: bool,
     curvature: bool,
     sampled_generator_inputs: bool,
     spatial: bool,
@@ -56,6 +58,11 @@ impl Features {
             if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&kind) {
                 features.generators = true;
                 features.curvature |= op.uv[1] != 0.0;
+                // P1: the controls read the curvature levels and their detail sizes
+                if kind < 47 && op.ext[0] != 0 {
+                    features.generator_controls = true;
+                    features.curvature = true;
+                }
                 if let Some(source) = op.effects[3].checked_sub(1).and_then(|index| program.operations.get(index as usize)) {
                     features.sampled_generator_inputs |= source.ids[1] != 0;
                 }
@@ -100,7 +107,7 @@ impl Features {
             include(
                 self.curvature && supports_curvature,
                 include_str!("shaders/curvature_sample.wgsl"),
-                "fn curvature_level_at(pixel: vec2<u32>, level: u32) -> f32 { return 0.0; }",
+                "fn curvature_level_at(pixel: vec2<u32>, level: u32) -> f32 { return 0.0; }\n                 fn curvature_level_present(level: u32) -> bool { return false; }",
             ),
             include(
                 self.curvature,
@@ -111,6 +118,11 @@ impl Features {
                 self.sampled_generator_inputs,
                 "fn generator_source_value(index: u32, texel: LayerTexel) -> f32 {\n                     return fill_value(layers[index], texel.uv, texel.surface).x;\n                 }",
                 "fn generator_source_value(index: u32, texel: LayerTexel) -> f32 { return layers[index].low.x; }",
+            ),
+            include(
+                self.generator_controls,
+                include_str!("shaders/generator_p1.wgsl"),
+                "fn p1_generator_ramp(effect: Operation, texel: LayerTexel) -> f32 { return 0.0; }\n                 fn p1_finish_signal(effect: Operation, ramp: f32) -> f32 { return ramp; }",
             ),
             include(
                 self.generators,
@@ -330,6 +342,7 @@ mod tests {
             mask_preview: false,
             extended_blend_modes: true,
             generators: true,
+            generator_controls: true,
             curvature: true,
             sampled_generator_inputs: true,
             spatial: true,
