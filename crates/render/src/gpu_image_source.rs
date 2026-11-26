@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use texturecraft_compose::{
     ImageRes, ImageStore,
+    graphs::{Cooked, Mip},
     pattern::{decal_axes, mesh_frame},
     placed::{
         rotation_xyz,
@@ -69,7 +70,7 @@ pub(crate) struct MaterialImages {
 #[derive(Debug)]
 enum MaterialSource {
     Named(String, ImageUse),
-    Graph { key: Arc<str>, name: String, image: TileImage, srgb: bool },
+    Graph { key: Arc<str>, name: String, image: TileImage, srgb: bool, levels: Option<Arc<Vec<Mip>>> },
 }
 
 #[derive(Debug, PartialEq)]
@@ -101,17 +102,23 @@ impl MaterialImages {
         index
     }
 
-    pub(crate) fn register_graph(&mut self, key: &Arc<str>, name: &str, image: &TileImage, srgb: bool) -> u32 {
-        if let Some(index) = self
-            .sources
-            .iter()
-            .position(|source| matches!(source, MaterialSource::Graph { key: k, name: n, srgb: color, .. } if k == key && n == name && *color == srgb))
-        {
-            return index as u32;
+    pub(crate) fn register_graph(&mut self, key: &Arc<str>, (name, image): (&str, &TileImage), cooked: &Cooked, mipmapped: bool) -> u32 {
+        for (index, source) in self.sources.iter_mut().enumerate() {
+            if let MaterialSource::Graph { key: existing_key, name: existing_name, levels, .. } = source
+                && existing_key == key
+                && existing_name == name
+            {
+                if mipmapped && levels.is_none() {
+                    *levels = cooked.output_mips(name);
+                }
+                return index as u32;
+            }
         }
 
         let index = self.sources.len() as u32;
-        self.sources.push(MaterialSource::Graph { key: key.clone(), name: name.to_owned(), image: image.clone(), srgb });
+        let srgb = !cooked.is_linear(Some(name));
+        let levels = mipmapped.then(|| cooked.output_mips(name)).flatten();
+        self.sources.push(MaterialSource::Graph { key: key.clone(), name: name.to_owned(), image: image.clone(), srgb, levels });
         index
     }
 
@@ -222,7 +229,11 @@ impl MaterialImages {
     pub(crate) fn atlas_images(&self) -> impl Iterator<Item = (ColorImage<'_>, AtlasMips)> {
         let authored = self.atlas.iter().map(|(image, mips)| (ColorImage::Authored(image), *mips));
         authored.chain(self.sources.iter().filter_map(|source| match source {
-            MaterialSource::Graph { key, name, image, srgb } => Some((ColorImage::Cooked { key, name, image, srgb: *srgb }, AtlasMips::None)),
+            MaterialSource::Graph { key, name, image, srgb, levels } => {
+                let levels = levels.as_deref().map_or(&[][..], Vec::as_slice);
+                let mips = if levels.is_empty() { AtlasMips::None } else { AtlasMips::Stored };
+                Some((ColorImage::Cooked { key, name, image, srgb: *srgb, levels }, mips))
+            }
             MaterialSource::Named(..) => None,
         }))
     }

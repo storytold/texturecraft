@@ -159,6 +159,15 @@ impl Cooked {
         }
     }
 
+    /// Cached mip levels below the base image, in the graph's stored colour space.
+    pub fn output_mips(&self, name: &str) -> Option<Arc<Vec<Mip>>> {
+        let image = self.outputs.get(name)?;
+        Some(match self.mips.0.get(name) {
+            Some(slot) => Arc::clone(slot.get_or_init(|| Arc::new(mip_levels(image)))),
+            None => Arc::new(mip_levels(image)),
+        })
+    }
+
     /// Whether output `name` holds linear colour.
     pub fn is_linear(&self, name: Option<&str>) -> bool {
         let first = || self.outputs.keys().next().map(String::as_str);
@@ -204,17 +213,27 @@ impl PartialEq for Mips {
 
 /// One mip level, row by row.
 #[derive(Debug)]
-struct Mip {
+pub struct Mip {
     w: usize,
     h: usize,
     px: MipPixels,
+}
+
+impl Mip {
+    pub fn size(&self) -> [u32; 2] {
+        [self.w as u32, self.h as u32]
+    }
+
+    pub fn pixels(&self) -> &MipPixels {
+        &self.px
+    }
 }
 
 /// A level's pixels: RGBA, or one value for a grey opaque output (read as that value three times and alpha 1, which is
 /// what the RGBA form of such an output holds bit for bit: the mean of four equal channels is the same in each, and
 /// the mean of four ones is one).
 #[derive(Debug)]
-enum MipPixels {
+pub enum MipPixels {
     Rgba(Vec<[f32; 4]>),
     Grey(Vec<f32>),
 }

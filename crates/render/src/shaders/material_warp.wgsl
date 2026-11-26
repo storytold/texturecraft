@@ -61,7 +61,7 @@ fn warp_uv_at(grid: WarpGrid, pos: vec2u) -> vec2f {
     return bitcast<vec2f>(vec2u(srgb[i], srgb[i + 1u]));
 }
 
-fn warp_refine(grid: WarpGrid, position: vec2f, seed: vec2f) -> vec4f {
+fn warp_refine(grid: WarpGrid, position: vec2f, seed: vec2f, prefilter: bool) -> WarpHit {
     var st = seed;
     for (var it = 0u; it < 10u; it++) {
         let sample = warp_sample(grid, st);
@@ -76,17 +76,30 @@ fn warp_refine(grid: WarpGrid, position: vec2f, seed: vec2f) -> vec4f {
     }
     let sample = warp_sample(grid, st);
     let miss = position - sample.point.xy;
-    if !(dot(miss, miss) <= 1e-12) { return vec4f(0.0); }
+    if !(dot(miss, miss) <= 1e-12) { return WarpHit(vec2f(0.0), 0.0, 0.0, false); }
     let span = warp_patch(grid, st);
     let a = warp_uv_at(grid, span.cell);
     let b = warp_uv_at(grid, span.cell + vec2u(1u, 0u));
     let c = warp_uv_at(grid, span.cell + vec2u(0u, 1u));
     let d = warp_uv_at(grid, span.cell + 1u);
     let uv = mix(mix(a, b, span.within.x), mix(c, d, span.within.x), span.within.y);
-    return vec4f(uv, sample.point.z, 1.0);
+    var image_per_grid = 1.0;
+    if prefilter {
+        // Chain the image-space derivatives with the inverse of the grid's surface Jacobian
+        let det = sample.ds.x * sample.dt.y - sample.dt.x * sample.ds.y;
+        if abs(det) > 1e-14 {
+            let uv_s = mix(b - a, d - c, span.within.y) * f32(grid.cells.x);
+            let uv_t = mix(c - a, d - b, span.within.x) * f32(grid.cells.y);
+            let along_x = (uv_s * sample.dt.y - uv_t * sample.ds.y) / det;
+            let along_y = (uv_t * sample.ds.x - uv_s * sample.dt.x) / det;
+            image_per_grid = max(length(along_x), length(along_y));
+        }
+    }
+    return WarpHit(uv, sample.point.z, image_per_grid, true);
 }
 
-fn warp_inverse(data: u32, position: vec2f) -> vec4f {
+fn warp_inverse(data: u32, position: vec2f, prefilter: bool) -> WarpHit {
+    let miss = WarpHit(vec2f(0.0), 0.0, 0.0, false);
     let rows = srgb[data];
     let columns = srgb[data + 1u];
     let extent = vec2u(srgb[data + 2u], srgb[data + 3u]);
@@ -94,7 +107,7 @@ fn warp_inverse(data: u32, position: vec2f) -> vec4f {
     let cell_size = bitcast<f32>(srgb[data + 6u]);
     let f = (position - origin) / cell_size;
     if any(extent == vec2u(0u)) || !all(f >= vec2f(-1.0)) || !all(f <= vec2f(extent) + 1.0) {
-        return vec4f(0.0);
+        return miss;
     }
     let controls = data + 7u;
     let stride = 3u * (columns - 1u) + 1u;
@@ -112,8 +125,8 @@ fn warp_inverse(data: u32, position: vec2f) -> vec4f {
         let seed = seeds + 2u * (u32(cell.y) * extent.x + u32(cell.x));
         let st = bitcast<vec2f>(vec2u(srgb[seed], srgb[seed + 1u]));
         if st.x < 0.0 { continue; }
-        let hit = warp_refine(grid, position, st);
-        if hit.w != 0.0 { return hit; }
+        let hit = warp_refine(grid, position, st, prefilter);
+        if hit.valid { return hit; }
     }
-    return vec4f(0.0);
+    return miss;
 }

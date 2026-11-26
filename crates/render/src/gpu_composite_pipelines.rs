@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use super::packages::{self, ShaderFlags};
 use super::{
-    ANCHOR_PUBLISH_LAYER, ANCHOR_SOURCE, COLOR_SELECTION_OPCODE, CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, PLACED_UV_PROJECTION,
-    TILE_GENERATOR_OPCODE,
+    ANCHOR_PUBLISH_LAYER, ANCHOR_SOURCE, COLOR_SELECTION_OPCODE, CompositeProgram, FIRST_EXTENDED_PATTERN, FIRST_GENERATOR, GRAPH_IMAGE_COLOR,
+    GRAPH_IMAGE_DATA, IMAGE_SOURCE_OPCODE, PLACED_UV_PROJECTION, TILE_GENERATOR_OPCODE,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -14,6 +14,7 @@ struct Features {
     tile_generator: bool,
     authored_images: bool,
     placed_uv: bool,
+    graph_prefilter: bool,
     curved_warp: bool,
     mask_preview: bool,
     extended_blend_modes: bool,
@@ -58,6 +59,7 @@ impl Features {
             let kind = op.ids[1];
             features.extended_blend_modes |= op.balance[2] > 8.0;
             features.placed_uv |= op.procedural[3] == PLACED_UV_PROJECTION;
+            features.graph_prefilter |= kind == IMAGE_SOURCE_OPCODE && (GRAPH_IMAGE_COLOR..=GRAPH_IMAGE_DATA).contains(&op.ids[3]) && op.ext[0] != 0;
             features.anchors |= kind == ANCHOR_SOURCE;
             features.color_selection |= kind == COLOR_SELECTION_OPCODE;
             features.patterns |= matches!(kind, 1..=9 | 11..=13 | FIRST_EXTENDED_PATTERN..=TILE_GENERATOR_OPCODE);
@@ -106,14 +108,26 @@ impl Features {
                 include_str!("shaders/material_image.wgsl"),
                 "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }\n                 fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> { return vec4(0.0); }\n                 const MISSING_IMAGE: u32 = 0xffffffffu;\n                 fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> { return rgb; }
                  fn authored_image_content(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }
-                 fn authored_image_placed(layer: Operation, uv: vec2<f32>, repeat: vec2<bool>) -> vec4<f32> { return vec4(0.5, 0.5, 0.5, 1.0); }
+                 fn authored_image_placed(layer: Operation, uv: vec2<f32>, repeat: vec2<bool>, footprint: f32) -> vec4<f32> { return vec4(0.5, 0.5, 0.5, 1.0); }
                  fn authored_image_triplanar(layer: Operation, surface: Surface, with_alpha: bool) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }
-                 fn authored_image_warp(layer: Operation, surface: Surface, with_alpha: bool) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }",
+                 fn authored_image_warp(layer: Operation, surface: Surface, with_alpha: bool) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }
+                 fn material_image_at_with_repeat(image: u32, uv: vec2<f32>, repeat: vec2<bool>) -> vec4<f32> { return vec4(0.0); }",
+            ),
+            include(
+                self.graph_prefilter,
+                include_str!("shaders/graph_prefilter.wgsl"),
+                "fn graph_prefilters(layer: Operation) -> bool { return false; }
+                 fn graph_uv_footprint(layer: Operation) -> f32 { return 0.0; }
+                 fn graph_projection_footprint(layer: Operation, surface: Surface) -> f32 { return 0.0; }
+                 fn graph_warp_footprint(frame: u32, surface: Surface, image_per_grid: f32) -> f32 { return 0.0; }
+                 fn graph_triplanar_axes(frame: u32, surface: Surface) -> GraphSurfaceAxes { return GraphSurfaceAxes(vec3(0.0), vec3(0.0), 0.0); }
+                 fn graph_plane_tap(frame: u32, plane: u32, side: vec3<f32>, axes: GraphSurfaceAxes, point: vec2<f32>) -> GraphTap { return GraphTap(point, 0.0, vec2(0.0), 1u); }
+                 fn graph_image_sample(image: u32, tap: GraphTap, repeat: vec2<bool>) -> vec4<f32> { return material_image_at_with_repeat(image, tap.uv, repeat); }",
             ),
             include(
                 self.curved_warp,
                 include_str!("shaders/material_warp.wgsl"),
-                "fn warp_inverse(data: u32, position: vec2f) -> vec4f { return vec4f(0.0); }",
+                "fn warp_inverse(data: u32, position: vec2f, prefilter: bool) -> WarpHit { return WarpHit(vec2f(0.0), 0.0, 0.0, false); }",
             ),
             include_str!("shaders/stencil_projection.wgsl"),
             include(
@@ -376,6 +390,7 @@ mod tests {
             tile_generator: true,
             authored_images: true,
             placed_uv: true,
+            graph_prefilter: true,
             curved_warp: true,
             mask_preview: false,
             extended_blend_modes: true,

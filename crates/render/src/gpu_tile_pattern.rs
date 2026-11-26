@@ -5,7 +5,11 @@ use crate::gpu_composite::{CompositeTiming, time_composite};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
-use texturecraft_compose::{ImageRes, ImageStore, TileLayout, prepare_tile_layout};
+use texturecraft_compose::{
+    ImageRes, ImageStore, TileLayout,
+    graphs::{Mip, MipPixels},
+    prepare_tile_layout,
+};
 use texturecraft_core::{TileBlending, TileGenerator, TileShape};
 use texturecraft_texel::{TILE, TileImage};
 
@@ -178,6 +182,7 @@ enum RgbaEncoding {
     Shorts = 2,
     Floats = 4,
     Gray16 = 5,
+    GrayFloat = 6,
 }
 
 impl RgbaEncoding {
@@ -196,7 +201,7 @@ impl RgbaEncoding {
     }
 
     fn planes(self) -> usize {
-        if matches!(self, Self::Gray16) { 1 } else { self as usize }
+        if matches!(self, Self::Gray16 | Self::GrayFloat) { 1 } else { self as usize }
     }
 
     fn word(self, [r, g, b, a]: [f32; 4], lane: usize) -> u32 {
@@ -212,6 +217,7 @@ impl RgbaEncoding {
             }
             Self::Floats => [r, g, b, a][lane].to_bits(),
             Self::Gray16 => (r * 65535.0).round() as u32,
+            Self::GrayFloat => r.to_bits(),
         }
     }
 }
@@ -253,7 +259,7 @@ pub(crate) struct RawPlane {
 #[derive(Clone, Copy)]
 pub(crate) enum ColorImage<'a> {
     Authored(&'a Arc<ImageRes>),
-    Cooked { key: &'a Arc<str>, name: &'a str, image: &'a TileImage, srgb: bool },
+    Cooked { key: &'a Arc<str>, name: &'a str, image: &'a TileImage, srgb: bool, levels: &'a [Mip] },
 }
 
 impl<'a> ColorImage<'a> {
@@ -272,16 +278,26 @@ impl<'a> ColorImage<'a> {
         }
     }
 
-    /// The image, then the halved levels `mips` asks for (a cooked output has none), each with its encoding
+    /// The image and the requested halved levels, each with its own encoding
     fn parts(self, mips: AtlasMips) -> Vec<ColorPart<'a>> {
         match self {
             Self::Authored(image) => std::iter::once((image.rgba.as_slice(), self.size()))
                 .chain(levels_of(image, mips))
                 .map(|(texels, size)| (PartTexels::Rgba(texels), size, RgbaEncoding::for_texels(texels)))
                 .collect(),
-            Self::Cooked { image, .. } => {
+            Self::Cooked { image, levels, .. } => {
                 let encoding = if image.comps() == 1 { RgbaEncoding::Gray16 } else { RgbaEncoding::Shorts };
-                vec![(PartTexels::Cooked(image), self.size(), encoding)]
+                let base = (PartTexels::Cooked(image), self.size(), encoding);
+
+                std::iter::once(base)
+                    .chain(levels.iter().map(|level| {
+                        let (texels, encoding) = match level.pixels() {
+                            MipPixels::Grey(texels) => (PartTexels::Gray(texels), RgbaEncoding::GrayFloat),
+                            MipPixels::Rgba(texels) => (PartTexels::Rgba(texels), RgbaEncoding::Floats),
+                        };
+                        (texels, level.size(), encoding)
+                    }))
+                    .collect()
             }
         }
     }
@@ -493,6 +509,7 @@ type ColorPart<'a> = (PartTexels<'a>, [u32; 2], RgbaEncoding);
 #[derive(Clone, Copy)]
 enum PartTexels<'a> {
     Rgba(&'a [[f32; 4]]),
+    Gray(&'a [f32]),
     Cooked(&'a TileImage),
 }
 
@@ -504,6 +521,11 @@ impl PartTexels<'_> {
                 let first = top as usize * width;
                 let end = first + rows as usize * width;
                 words.extend((first..end).map(|index| encoding.word(texels.get(index).copied().unwrap_or_default(), lane)));
+            }
+            Self::Gray(texels) => {
+                let first = top as usize * width;
+                let end = first + rows as usize * width;
+                words.extend(texels[first..end].iter().map(|value| value.to_bits()));
             }
             Self::Cooked(image) => {
                 let side = TILE as usize;

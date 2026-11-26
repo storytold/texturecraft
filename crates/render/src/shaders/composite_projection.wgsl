@@ -1006,7 +1006,7 @@ fn p1_copied(surface: Surface, copy: P1Copy) -> Surface {
     }
 
     // The CPU's copy turns the point and the normals, not the tangent (Texel::surface)
-    return Surface(copy.pivot + copy.turn * (surface.position - copy.pivot), copy.turn * surface.normal, true, surface.tangent);
+    return Surface(copy.pivot + copy.turn * (surface.position - copy.pivot), copy.turn * surface.normal, true, surface.tangent, surface.triangle);
 }
 
 // The fill sampled once through `copy`: its value and its coverage (compose Texel::fill_texel)

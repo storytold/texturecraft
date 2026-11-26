@@ -37,6 +37,7 @@ pub(super) const WGSL: &str = include_str!("shaders/composite_udim.wgsl");
 /// A classic set's coordinates, bakes and stage slots, for programs without a UV tile atlas or
 /// baked maps of different heights.
 pub(super) const WGSL_STUB: &str = "
+fn udim_block_resolution() -> u32 { return params.source.x; }
 fn udim_mesh_uv(uv: vec2<f32>) -> vec2<f32> { return uv; }
 fn udim_value_uv(layer: Operation, uv: vec2<f32>) -> vec2<f32> { return uv; }
 fn udim_mesh_uv_step(pixel: vec2<u32>) -> vec2<f32> { return 1.0 / vec2<f32>(params.source.xy); }

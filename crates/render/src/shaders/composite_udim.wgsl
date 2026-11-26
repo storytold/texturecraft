@@ -32,6 +32,12 @@ fn udim_round(value: f32) -> f32 {
     return whole + select(0.0, 1.0, value - whole >= 0.5);
 }
 
+// The working width of one UV tile's block, or of a classic texture set
+fn udim_block_resolution() -> u32 {
+    let record = udim_record();
+    return select(params.source.x, srgb[record + UDIM_BLOCK], record != 0u);
+}
+
 // The atlas block holding `pixel`, row by row, or UDIM_NONE past the grid (BlockScales::at)
 fn udim_block_index(pixel: vec2<u32>) -> u32 {
     let record = udim_record();

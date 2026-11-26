@@ -97,6 +97,26 @@ override enable_placed_uv: bool = false;
 const SPATIAL_FILTER_OPCODE: u32 = 36u;
 const COLOR_SELECTION_OPCODE: u32 = 38u;
 
+struct GraphSurfaceAxes {
+    across: vec3<f32>,
+    down: vec3<f32>,
+    length: f32,
+}
+
+struct GraphTap {
+    uv: vec2<f32>,
+    footprint: f32,
+    span: vec2<f32>,
+    probes: u32,
+}
+
+struct WarpHit {
+    uv: vec2<f32>,
+    depth: f32,
+    image_per_grid: f32,
+    valid: bool,
+}
+
 struct Surface {
     position: vec3<f32>,
     normal: vec3<f32>,
@@ -104,9 +124,10 @@ struct Surface {
     // The MikkTSpace tangent (unit xyz) and the bitangent sign in w, as the CPU g-buffer's
     // surface_at gives them: xyz interpolated and normalised, the sign of the triangle's first vertex.
     tangent: vec4<f32>,
+    triangle: u32,
 }
 
-const NO_SURFACE = Surface(vec3(0.0), vec3(0.0, 1.0, 0.0), false, vec4(1.0, 0.0, 0.0, 1.0));
+const NO_SURFACE = Surface(vec3(0.0), vec3(0.0, 1.0, 0.0), false, vec4(1.0, 0.0, 0.0, 1.0), 0xffffffffu);
 
 // The tangent of vertex `vertex` from the block after the vertices.
 fn surface_tangent(vertex: u32) -> vec4<f32> {
@@ -160,7 +181,7 @@ fn surface_at(pixel: vec2<u32>) -> Surface {
     let tangent = ta.xyz * w + surface_tangent(hit.x * 3u + 1u).xyz * weight.x + surface_tangent(hit.x * 3u + 2u).xyz * weight.y;
     let length_squared = dot(tangent, tangent);
     let direction = select(any_orthonormal(unit), tangent * inverseSqrt(length_squared), length_squared > 0.0 && length_squared < 3.4e38);
-    return Surface(position, unit, true, vec4(direction, select(1.0, -1.0, ta.w < 0.0)));
+    return Surface(position, unit, true, vec4(direction, select(1.0, -1.0, ta.w < 0.0)), hit.x);
 }
 
 // One row block of the bake texture: the whole texture, or params.id_bake.z rows when the
@@ -303,13 +324,18 @@ fn placed_uv_covered(uv: vec2<f32>, repeat: vec2<bool>) -> bool {
 }
 
 fn placed_uv_value(layer: Operation, uv: vec2<f32>, with_alpha: bool) -> vec4<f32> {
-    let point = transformed_uv(layer, uv);
+    var projected_uv = uv;
+    if layer.ids.y == IMAGE_SOURCE_OPCODE && is_graph_image(layer.ids.w) {
+        projected_uv = udim_mesh_uv(uv);
+    }
+    let point = transformed_uv(layer, projected_uv);
     let repeat = (vec2(layer.procedural.z) & vec2(1u, 2u)) != vec2(0u);
     if !placed_uv_covered(point, repeat) {
         return vec4(0.0);
     }
     if enable_authored_images && layer.ids.y == IMAGE_SOURCE_OPCODE {
-        let sample = authored_image_placed(layer, point, repeat);
+        let footprint = graph_uv_footprint(layer);
+        let sample = authored_image_placed(layer, point, repeat, footprint);
         return vec4(sample.rgb, select(1.0, sample.a, with_alpha));
     }
     return vec4(layer.low.rgb, 1.0);
@@ -348,7 +374,13 @@ fn fill_sample(layer: Operation, uv: vec2<f32>, surface: Surface, content: bool)
         return projection_fill_value(placed, uv, surface);
     }
     if content && enable_authored_images && placed.ids.y == IMAGE_SOURCE_OPCODE && imported && placed.procedural.w != DECAL_PROJECTION {
-        return authored_image_content(placed, uv, surface);
+        // A 1:1 graph cook already spans the working atlas
+        var projected_uv = uv;
+        if is_graph_image(placed.ids.w) && placed.procedural.w == 0u
+            && (any(placed.projection != vec4(1.0, 0.0, 1.0, 1.0)) || any(placed.uv.xy != vec2(0.0))) {
+            projected_uv = udim_mesh_uv(uv);
+        }
+        return authored_image_content(placed, projected_uv, surface);
     }
     if !enable_authored_images || placed.procedural.w != DECAL_PROJECTION {
         // P8: the mesh's own UV on a UV tile atlas, so projections repeat per tile

@@ -323,6 +323,7 @@ struct Operation {
     constraints: [u32; 4],
     // The GPU port packages' word, zero everywhere else (layout in gpu_composite_packages.rs):
     // side-table offset (0: none), P1 projection flags, P2/P3/P6/P7 flag bytes, P8 word.
+    // A graph image uses x as its prefilter flag instead of an offset.
     ext: [u32; 4],
 }
 
@@ -558,6 +559,7 @@ impl<'a> ProceduralInputs<'a> {
         alpha: Option<&str>,
         owner: (LayerId, Option<Channel>),
         dynamic: bool,
+        prefilter: bool,
     ) -> Result<Option<(u32, u32)>, &'static str> {
         let inputs = self.graphs.ok_or(GRAPH_OUTPUT_PENDING)?;
         let use_ = GraphUse { set: self.set, id: owner.0, channel: owner.1 };
@@ -584,9 +586,9 @@ impl<'a> ProceduralInputs<'a> {
         let (key, cooked) = self.cooked.get(&key).ok_or(GRAPH_OUTPUT_PENDING)?;
         let output = output.or_else(|| cooked.outputs.keys().next().map(String::as_str));
         let Some((name, image)) = output.and_then(|name| cooked.outputs.get_key_value(name)) else { return Ok(None) };
-        let slot = self.materials.register_graph(key, name, image, !cooked.is_linear(output));
+        let slot = self.materials.register_graph(key, (name, image), cooked, prefilter);
         let alpha = alpha.and_then(|name| cooked.outputs.get_key_value(name));
-        let alpha = alpha.map_or(0, |(name, image)| self.materials.register_graph(key, name, image, !cooked.is_linear(Some(name))) + 1);
+        let alpha = alpha.map_or(0, |(name, image)| self.materials.register_graph(key, (name, image), cooked, prefilter) + 1);
         Ok(Some((slot, alpha)))
     }
 
@@ -2793,9 +2795,17 @@ fn graph_operation(
     if dynamic && !effect {
         return Err("An imported fill graph uses the layer stack or an anchor as a source.");
     }
-    let Some((binding, alpha_slot)) = inputs.graph_image(graph, output, alpha, owner, dynamic)? else { return Ok(None) };
+    let prefilter = !dynamic
+        && !graph.unfiltered
+        && match projection {
+            Projection::Uv { scale, rotation, offset } => *scale != [1.0, 1.0] || *rotation != 0.0 || *offset != [0.0, 0.0],
+            Projection::Triplanar { .. } | Projection::Planar { .. } | Projection::Placed(_) => true,
+            _ => false,
+        };
+    let Some((binding, alpha_slot)) = inputs.graph_image(graph, output, alpha, owner, dynamic, prefilter)? else { return Ok(None) };
     let mut op = Operation { ids: [0, IMAGE_SOURCE_OPCODE, binding, kind], ..Operation::zeroed() };
     op.procedural[1] = alpha_slot;
+    op.ext[0] = u32::from(prefilter);
     let unsupported = "An imported graph uses a projection that uses CPU compositing.";
     if dynamic {
         // A graph that reads the stack lies on the texture as the stack does
@@ -6364,7 +6374,7 @@ mod procedural_tests {
         use texturecraft_compose::{Composite, composite_tiles, eval::prepare_texture_set_graphs, tile_bytes};
         use texturecraft_core::{CompositeRules, GraphInput, HeightNormal, ImagePlacement, PlacedProjection, Volume};
 
-        let Ok(mut gpu) = Headless::new() else { return };
+        let Some(mut gpu) = Headless::for_required_tests() else { return };
         let mesh = Arc::new(primitives::plane(1.0, 1));
         let gbuf = Arc::new(UvGBuffer::new(&mesh, 0, TILE, TILE));
         let mut project = Project::new("Imported graph stages", "builtin:plane");
@@ -6407,6 +6417,11 @@ mod procedural_tests {
         layer.mask = Some(mask);
         project.insert_layer(0, layer, None, true).unwrap();
 
+        let halves = graphs.add_text(concat!(
+            "format 3\nsize 16\nsubgraph c\nmeta kind \"function\"\n",
+            "node 2 f_pos\nnode 3 f_swizzle a=@2 mask=\"x\"\nnode 4 f_float v=0.5\n",
+            "node 5 f_lt a=@3 b=@4\nnode 1 f_out in=@5\nend\nnode 1 pixel_processor fn=\"c\"\noutput out 1\n"
+        ));
         let pixels = PixelStore::default();
         let baked = BakedMaps::default();
         let images = ImageStore::default();
@@ -6436,6 +6451,49 @@ mod procedural_tests {
         assert_eq!(actual.len(), expected.len());
         for (index, (gpu, cpu)) in actual.iter().zip(expected).enumerate() {
             assert!(gpu.abs_diff(cpu) <= 2, "sample {index}: GPU {gpu}, CPU {cpu}");
+        }
+        let scale = TILE as f32;
+        let projections = [
+            Projection::Uv { scale: [scale; 2], rotation: 0.0, offset: [0.25, 0.0] },
+            Projection::Placed(Box::new(PlacedProjection {
+                mode: PlacedMode::TriPlanar { hardness: 0.5 },
+                volume: Volume::default(),
+                image: ImagePlacement { tiling: [scale; 2], offset: [-0.25 / scale, 0.0], ..Default::default() },
+                repeat: Default::default(),
+            })),
+        ];
+        let channels = [Channel::Roughness, Channel::Metallic];
+        let mut scaled = Project::new("Scaled graph fill", "builtin:plane");
+        scaled.texture_sets.push(TextureSet::new("Plane", 0, TILE));
+        let mut sharp = GraphRef::new(halves, "Halves");
+        let filtered = sharp.clone();
+        sharp.unfiltered = true;
+        let id = scaled.alloc_id();
+        let fill = Fill {
+            sources: BTreeMap::from([(Channel::Roughness, Source::Graph(Box::new(filtered))), (Channel::Metallic, Source::Graph(Box::new(sharp)))]),
+            projection: projections[0].clone(),
+            ..Default::default()
+        };
+        scaled.insert_layer(0, Layer::new(id, "Scale", LayerKind::Fill(fill), &channels), None, true).unwrap();
+        for projection in projections {
+            let LayerKind::Fill(fill) = &mut scaled.layers.get_mut(&id).unwrap().kind else { panic!("expected the graph fill") };
+            fill.projection = projection;
+            let inputs = Inputs { project: &scaled, block_scales: scaled.texture_sets[0].block_scales(), ..inputs };
+            prepare_texture_set_graphs(&inputs);
+            let mut program = CompositeProgram::try_compile_inputs(&inputs, None).unwrap();
+            program.set_surface_inputs(&mesh, &gbuf, Some(&baked)).unwrap();
+            gpu.renderer.composite_on_gpu(&gpu.device, &gpu.queue, 0, &program).unwrap();
+
+            let mut cpu = Composite::new(&channels, TILE);
+            composite_tiles(&inputs, &mut cpu, &[(0, 0)]);
+            let expected = tile_bytes(&cpu, &baked, DisplayKind::Orm, 0, 0);
+            let (_, _, actual) = Readback::blocking(&gpu.device, &gpu.queue, gpu.renderer.display_textures()[0][1]).unwrap();
+            let sample = ((10 * TILE + 10) * 4) as usize;
+            assert!(expected[sample + 1].abs_diff(128) <= 2, "the filtered graph should average to gray");
+            assert!(expected[sample + 1].abs_diff(expected[sample + 2]) > 100, "the unfiltered graph should keep its contrast");
+            for (index, (gpu, cpu)) in actual.iter().zip(expected).enumerate() {
+                assert!(gpu.abs_diff(cpu) <= 2, "scaled graph sample {index}: GPU {gpu}, CPU {cpu}");
+            }
         }
     }
 

@@ -21,6 +21,7 @@ fn material_image_texel_with_repeat(image: u32, pixel: vec2<i32>, size: vec2<i32
         case 1u: { return unpack4x8unorm(first); }
         case 2u: { return vec4(unpack2x16unorm(first), unpack2x16unorm(image_plane_at(planes + 3u, at))); }
         case 5u: { return vec4(vec3(f32(first) / 65535.0), 1.0); }
+        case 6u: { return vec4(vec3(bitcast<f32>(first)), 1.0); }
         default: {
             return bitcast<vec4<f32>>(vec4(first, image_plane_at(planes + 3u, at), image_plane_at(planes + 6u, at), image_plane_at(planes + 9u, at)));
         }
@@ -83,6 +84,7 @@ fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f
         return p1_image_at(image, uv, layer);
     }
 
+    let footprint = graph_projection_footprint(layer, surface);
     let p = surface.position * layer.projection.w + layer.projection.xyz;
     if mode == 1u {
         // The three planes through one material_image_at call (the driver inlines each call site)
@@ -101,7 +103,10 @@ fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f
         }
         var sampled = vec4(0.0);
         for (var plane = 0u; plane < 3u; plane++) {
-            if w[plane] > 0.0 { sampled += w[plane] * material_image_at(image, points[plane]); }
+            if w[plane] > 0.0 {
+                let tap = GraphTap(points[plane], footprint, vec2(0.0), 1u);
+                sampled += w[plane] * graph_image_sample(image, tap, vec2(true));
+            }
         }
         return sampled;
     }
@@ -125,7 +130,7 @@ fn image_projection(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f
         case UV_TILE_PROJECTION: { point = fract(uv); }
         default: { point = transformed_uv(layer, uv); }
     }
-    return material_image_at(image, point);
+    return graph_image_sample(image, GraphTap(point, footprint, vec2(0.0), 1u), vec2(true));
 }
 
 fn placed_image_coord(frame: u32, p: vec2<f32>) -> vec2<f32> {
@@ -135,13 +140,20 @@ fn placed_image_coord(frame: u32, p: vec2<f32>) -> vec2<f32> {
     return vec2(dot(centered, image_x), dot(centered, image_y)) + 0.5;
 }
 
-fn triplanar_sample(image: u32, frame: u32, p: vec3<f32>, n: vec3<f32>, weights: vec3<f32>) -> vec4<f32> {
+fn triplanar_sample(image: u32, frame: u32, p: vec3<f32>, n: vec3<f32>, weights: vec3<f32>, axes: GraphSurfaceAxes, prefilter: bool) -> vec4<f32> {
     let side = select(vec3(1.0), vec3(-1.0), n < vec3(0.0));
     // The three planes through one material_image_at call (the driver inlines each call site)
     let points = array<vec2<f32>, 3>(vec2(-p.z * side.x, -p.y), vec2(p.x, p.z * side.y), vec2(p.x * side.z, -p.y));
     var result = vec4(0.0);
     for (var plane = 0u; plane < 3u; plane++) {
-        if weights[plane] > 0.0 { result += weights[plane] * material_image_at(image, placed_image_coord(frame, points[plane])); }
+        if weights[plane] > 0.0 {
+            let point = placed_image_coord(frame, points[plane]);
+            var tap = GraphTap(point, 0.0, vec2(0.0), 1u);
+            if prefilter {
+                tap = graph_plane_tap(frame, plane, side, axes, point);
+            }
+            result += weights[plane] * graph_image_sample(image, tap, vec2(true));
+        }
     }
     return result;
 }
@@ -161,13 +173,15 @@ fn authored_image_warp(layer: Operation, surface: Surface, with_alpha: bool) -> 
     }
     var image_coord = clamp(vec2(p.x, -p.y), vec2(-0.5), vec2(0.5));
     var depth = 0.0;
+    var image_per_grid = 0.5;
     if data == 0u {
         if any(abs(p.xy) > vec2(0.5000005)) { return vec4(0.0); }
     } else {
-        let hit = warp_inverse(data, 2.0 * p.xy);
-        if hit.w == 0.0 { return vec4(0.0); }
-        image_coord = hit.xy - 0.5;
-        depth = hit.z;
+        let hit = warp_inverse(data, 2.0 * p.xy, graph_prefilters(layer));
+        if !hit.valid { return vec4(0.0); }
+        image_coord = hit.uv - 0.5;
+        depth = hit.depth;
+        image_per_grid = hit.image_per_grid;
     }
     let z = abs(2.0 * p.z - depth);
     let reach = bitcast<f32>(srgb[frame + 18u]);
@@ -183,7 +197,11 @@ fn authored_image_warp(layer: Operation, surface: Surface, with_alpha: bool) -> 
     let repeat = (vec2(layer.procedural.z) & vec2(1u, 2u)) != vec2(0u);
     if !placed_uv_covered(point, repeat) { return vec4(0.0); }
     if layer.ids.y != IMAGE_SOURCE_OPCODE { return vec4(layer.low.rgb, coverage); }
-    let sample = authored_image_placed(layer, point, repeat);
+    var footprint = 0.0;
+    if graph_prefilters(layer) {
+        footprint = graph_warp_footprint(frame, surface, image_per_grid);
+    }
+    let sample = authored_image_placed(layer, point, repeat, footprint);
     return vec4(sample.rgb, coverage * select(1.0, sample.a, with_alpha));
 }
 
@@ -213,8 +231,13 @@ fn authored_image_triplanar(layer: Operation, surface: Surface, with_alpha: bool
     let matte = with_alpha && is_graph_image(layer.ids.w) && layer.procedural.y > 0u;
     var sample = vec4(0.0);
     var alpha = 1.0;
+    let prefilter = graph_prefilters(layer);
+    var axes = GraphSurfaceAxes(vec3(0.0), vec3(0.0), 0.0);
+    if prefilter {
+        axes = graph_triplanar_axes(frame, surface);
+    }
     for (var read = 0u; read < select(1u, 2u, matte); read++) {
-        let sampled = triplanar_sample(select(image, layer.procedural.y - 1u, read == 1u), frame, p, n, weights);
+        let sampled = triplanar_sample(select(image, layer.procedural.y - 1u, read == 1u), frame, p, n, weights, axes, prefilter);
         if read == 0u {
             sample = sampled;
             if with_alpha && !is_graph_image(layer.ids.w) { alpha = sampled.a; }
@@ -304,7 +327,7 @@ fn authored_image_content(layer: Operation, uv: vec2<f32>, surface: Surface) -> 
     return vec4(decode_image_sample(layer, sampled.rgb), alpha);
 }
 
-fn authored_image_placed(layer: Operation, uv: vec2<f32>, repeat: vec2<bool>) -> vec4<f32> {
+fn authored_image_placed(layer: Operation, uv: vec2<f32>, repeat: vec2<bool>, footprint: f32) -> vec4<f32> {
     if layer.ids.z == MISSING_IMAGE {
         return vec4(vec3(0.5), 1.0);
     }
@@ -314,7 +337,7 @@ fn authored_image_placed(layer: Operation, uv: vec2<f32>, repeat: vec2<bool>) ->
     var alpha = 1.0;
     for (var read = 0u; read < select(1u, 2u, matte); read++) {
         let image = select(layer.ids.z, layer.procedural.y - 1u, read == 1u);
-        let read_sample = material_image_at_with_repeat(image, uv, repeat);
+        let read_sample = graph_image_sample(image, GraphTap(uv, footprint, vec2(0.0), 1u), repeat);
         if read == 0u {
             sampled = read_sample;
             alpha = select(read_sample.a, 1.0, is_graph_image(layer.ids.w));
