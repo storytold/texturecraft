@@ -1698,6 +1698,8 @@ impl CompositeProgram {
         generator_p3a::bind_bounds(&mut self.operations, mesh);
         // P3b: what the whole-map generator fields read
         self.p3b_fields.set_inputs(mesh, gbuf, baked);
+        // P2: what the micro details read
+        self.micro.set_surface_inputs(mesh, gbuf, baked)?;
         // Texels no triangle covers keep the channels' defaults, as the CPU leaves them
         let partly_covered = gbuf.tri.contains(&NO_TRI);
         if self.mask_preview || ((partly_covered || !self.filters.stages.is_empty() || !self.geometry.parts.is_empty()) && self.coverage.is_none()) {
@@ -2066,6 +2068,8 @@ impl CompositeProgram {
         let region = filters.expand(region);
         let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
         let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
+        // P2: the programs that composite the anchor heights micro details read
+        generator_p2::compile_captures(&mut procedural.micro, project, pixels, ts)?;
         Ok(Self {
             operations,
             layer_count,
@@ -2153,6 +2157,8 @@ impl CompositeProgram {
         let region = filters.expand(region);
         let (brush_alpha, brush_stencil) = brush.map_or((None, None), |brush| (Some(brush.alpha), brush.stencil));
         let needs_surface = brush_stencil.is_some() || needs_surface(&operations);
+        // P2: the programs that composite the anchor heights micro details read
+        generator_p2::compile_captures(&mut procedural.micro, project, pixels, ts)?;
         Ok(Self {
             operations,
             layer_count: 1,
@@ -3407,6 +3413,8 @@ impl GpuCompositor {
     ) -> Result<(), String> {
         let (device, queue) = gpu;
         let (ts, source_size, shift, region) = target;
+        // P2: the anchor heights micro details read, composited by their capture programs first
+        let captures = if program.micro.captures_anchors() { generator_p2::compose_captures(self, gpu, (ts, source_size), program)? } else { Vec::new() };
         let base = textures.first().ok_or("The GPU output textures are missing.")?;
         let extent = (base.width(), base.height());
         let region = region.map(|r| r.viewport(shift, extent)).unwrap_or(CompositeRegion { min: [0; 2], max: [extent.0, extent.1] });
@@ -3457,7 +3465,7 @@ impl GpuCompositor {
             return Err("A generator's texture, grunge or Micro Details exceed the GPU adapter's binding limits.".into());
         }
         // P2: the micro detail maps, and the detail sizes of each micro curvature
-        let micro = generator_p2::MicroGpu::maps(&mut self.micro, device, queue, (ts, self.default_micro_maps.is_some()), program, &baked)?;
+        let micro = generator_p2::MicroGpu::maps(&mut self.micro, (device, queue), (ts, self.default_micro_maps.is_some()), program, (&baked, &captures))?;
         if let Some(bakes) = micro.as_ref().and_then(|maps| maps.level_bakes()) {
             let sets = bakes.map(|bake| self.curvature_levels(device, queue, program, bake)).collect::<Result<Vec<_>, _>>()?;
             if let (Some(gpu), Some(maps)) = (&self.micro, &micro) {
@@ -4904,10 +4912,10 @@ mod procedural_tests {
         }
     }
 
-    /// A generator on the earlier model (with Micro Details too, beside the bake's own detail
-    /// sizes), new wear, section and light generators (also with a section blur before a global
-    /// blur) and the kinds P3a and P3b port compose on the GPU; a micro height read from an anchor
-    /// point composes on the CPU
+    /// A generator on the earlier model (with Micro Details too, a micro height read from an anchor
+    /// point among them, beside the bake's own detail sizes), new wear, section and light generators
+    /// (also with a section blur before a global blur) and the kinds P3a and P3b port compose on
+    /// the GPU
     #[test]
     fn generators_beyond_the_earlier_model_compose_on_the_cpu() {
         use texturecraft_core::{MicroDetails, SectionParameters};
@@ -4941,7 +4949,7 @@ mod procedural_tests {
         let curvature = Generator { micro: Some(Box::new(micro.clone())), ..oracle::earlier_generator(GeneratorKind::Curvature) };
         assert!(gpu(&curvature), "Micro Details");
         let anchored = MicroDetails { height_source: Some(Source::Anchor { anchor: LayerId(7), channel: Channel::Height, ramp: Vec::new() }), ..micro };
-        assert!(!gpu(&Generator { micro: Some(Box::new(anchored)), ..curvature.clone() }), "a micro height from an anchor point");
+        assert!(gpu(&Generator { micro: Some(Box::new(anchored)), ..curvature.clone() }), "a micro height from an anchor point");
         assert!(gpu(&oracle::earlier_generator(GeneratorKind::Curvature)), "the bake's own detail sizes after micro curvature's");
     }
 

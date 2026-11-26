@@ -2,18 +2,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
 use bytemuck::Zeroable;
+use texturecraft_core::LayerId;
 use wgpu::util::DeviceExt;
 
 use super::super::CompositeProgram;
+use super::capture_layout::CaptureLayout;
 use super::dummies::Dummies;
 use super::field_buffers::FieldBuffers;
 use super::micro_cache::MicroCache;
 use super::micro_key::MicroKey;
 use super::micro_maps::MicroMaps;
+use super::micro_slot::MicroSlot;
 use super::params::Params;
 use super::run::Run;
 use super::slot_data::SlotData;
-use super::{LINE_WORKGROUP, WORKGROUP, block_groups, dispatch, texture};
+use super::{LINE_WORKGROUP, WORKGROUP, block_groups, dispatch, single_blocks, texture};
 use crate::gpu_curvature::CurvatureLevels;
 use crate::gpu_trace::{entry, storage};
 
@@ -73,6 +76,14 @@ impl MicroGpu {
                         view_dimension: wgpu::TextureViewDimension::D2,
                     },
                 ),
+                entry(
+                    12,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -106,14 +117,14 @@ impl MicroGpu {
 
     /// The micro maps `program` reads on texture set `ts`, built on first use and kept while its
     /// requests, images and bake stay the same (None without micro details). `baked` is the
-    /// program's bake texture, `supported` whether the composite binds micro maps.
+    /// program's bake texture, `supported` whether the composite binds micro maps, `captures`
+    /// the anchor heights its capture programs composited (maps reading them are built anew).
     pub(crate) fn maps(
         slot: &mut Option<MicroGpu>,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        (device, queue): (&wgpu::Device, &wgpu::Queue),
         (ts, supported): (usize, bool),
         program: &CompositeProgram,
-        baked: &wgpu::TextureView,
+        (baked, captures): (&wgpu::TextureView, &[(LayerId, wgpu::TextureView)]),
     ) -> Result<Option<Arc<MicroMaps>>, String> {
         let plan = &program.micro;
         if plan.is_empty() {
@@ -144,22 +155,25 @@ impl MicroGpu {
             needed: program.curvature_sizes,
         };
         let gpu = slot.get_or_insert_with(|| MicroGpu::new(device));
-        if let Some(cache) = gpu.cache.get(&ts).filter(|cache| cache.key.matches(&key)) {
+        if let Some(cache) = gpu.cache.get(&ts).filter(|cache| captures.is_empty() && cache.key.matches(&key)) {
             return Ok(Some(cache.maps.clone()));
         }
 
         gpu.cache.remove(&ts);
-        let maps = Arc::new(gpu.build(device, queue, program, baked, (width, occlusion_rows, curvature_rows), grid)?);
-        gpu.cache.insert(ts, MicroCache { key, maps: maps.clone() });
+        let maps = Arc::new(gpu.build((device, queue), program, (baked, captures), (width, occlusion_rows, curvature_rows), grid)?);
+
+        // Anchor heights change with the stack below them, which the key does not see
+        if captures.is_empty() {
+            gpu.cache.insert(ts, MicroCache { key, maps: maps.clone() });
+        }
         Ok(Some(maps))
     }
 
     pub(super) fn build(
         &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        (device, queue): (&wgpu::Device, &wgpu::Queue),
         program: &CompositeProgram,
-        baked: &wgpu::TextureView,
+        (baked, captures): (&wgpu::TextureView, &[(LayerId, wgpu::TextureView)]),
         (width, occlusion_rows, curvature_rows): (u32, u32, u32),
         grid: [u32; 2],
     ) -> Result<MicroMaps, String> {
@@ -176,6 +190,7 @@ impl MicroGpu {
         let maps = texture(device, "tc_micro_maps", [width, tallest + 1, layers], wgpu::TextureFormat::R32Float, usage);
         let maps_view = maps.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
         let dummy = Dummies::new(device);
+        let capture_layout = capture_layout(program, captures);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_micro") });
 
         for (index, request) in plan.requests.iter().enumerate() {
@@ -219,8 +234,16 @@ impl MicroGpu {
                     }
                     continue;
                 }
-                for group in block_groups([width, rows], grid) {
-                    let run = Run { gpu: self, device, slots: &slots, dummy: &dummy, target: &maps_view, group: &group, layer };
+                // An anchor's heights differ in every block: each is computed alone
+                let capture = match request.height {
+                    Some(MicroSlot::Anchor(anchor)) => captures.iter().find(|(captured, _)| *captured == anchor).map(|(_, heights)| heights),
+                    _ => None,
+                };
+                let groups = block_groups([width, rows], grid);
+                let groups = if capture.is_some() { single_blocks(groups) } else { groups };
+                for group in groups {
+                    let capture = capture.map(|heights| (heights, &capture_layout, [width, rows]));
+                    let run = Run { gpu: self, device, slots: &slots, dummy: &dummy, target: &maps_view, group: &group, layer, capture };
                     run.fits(limits.max_storage_buffer_binding_size.min(limits.max_buffer_size))?;
                     if offset == 0 {
                         run.curvature(&mut encoder, request);
@@ -244,7 +267,7 @@ impl MicroGpu {
             );
             let view = bake.create_view(&Default::default());
             let params = Params { place: [0, 0, index as u32 * 2, 0], ..Params::zeroed() };
-            let bindings = self.bindings(device, &params, &dummy, (&dummy.maps_out, baked, &maps_view, &view));
+            let bindings = self.bindings(device, &params, &dummy, (&dummy.maps_out, baked, &maps_view, &view, &dummy.capture));
             dispatch(&mut encoder, &self.adjust, &bindings, [width.div_ceil(WORKGROUP), curvature_rows.div_ceil(WORKGROUP)]);
             bakes.push((index, view));
         }
@@ -316,7 +339,7 @@ impl MicroGpu {
         device: &wgpu::Device,
         params: &Params,
         fields: &dyn FieldBuffers,
-        (maps_out, bake, maps_in, bake_out): (&wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView),
+        (maps_out, bake, maps_in, bake_out, capture): (&wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView),
     ) -> wgpu::BindGroup {
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tc_micro_params"),
@@ -332,6 +355,7 @@ impl MicroGpu {
             wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(bake) },
             wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(maps_in) },
             wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(bake_out) },
+            wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(capture) },
         ]);
         device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("tc_micro_pass"), layout: &self.layout, entries: &entries })
     }
@@ -379,4 +403,16 @@ fn levels_pipelines(device: &wgpu::Device, vec4s: u32) -> (wgpu::BindGroupLayout
     };
     let (copy, header) = (pipeline("copy_levels"), pipeline("write_header"));
     (layout, copy, header)
+}
+
+/// Where `captures`' anchor heights lie in `program`'s working atlas
+fn capture_layout(program: &CompositeProgram, captures: &[(LayerId, wgpu::TextureView)]) -> CaptureLayout {
+    let working = captures.first().map_or([1, 1], |(_, heights)| {
+        let size = heights.texture().size();
+        [size.width, size.height]
+    });
+    match program.udim_layout.as_ref().filter(|layout| layout.scaled) {
+        Some(layout) => CaptureLayout { working, block: layout.block, scales: layout.scales.clone(), columns: layout.grid.cols },
+        None => CaptureLayout { working, block: 1, scales: Vec::new(), columns: 1 },
+    }
 }

@@ -26,6 +26,10 @@ struct Params {
     scales: vec4<f32>,
     // The height intensity Smooth's detail is scaled by
     intensity: vec4<f32>,
+    // An anchor height slot: the map's width and rows (0: no anchor), the working atlas's size
+    anchor: vec4<u32>,
+    // The working atlas's block side, and the block's tile scale (0: the working UV is the bake's)
+    anchor_block: vec4<f32>,
     kernel: array<vec4<f32>, 4>,
     directions: array<vec4<f32>, 16>,
     // Each direction's steps: texel offset x and y, distance
@@ -44,6 +48,7 @@ struct Params {
 @group(0) @binding(9) var bake: texture_2d<u32>;
 @group(0) @binding(10) var maps_in: texture_2d_array<f32>;
 @group(0) @binding(11) var bake_out: texture_storage_2d<rgba32uint, write>;
+@group(0) @binding(12) var capture: texture_2d<f32>;
 
 const OCCLUSION_DIRECTIONS: u32 = 16u;
 const OCCLUSION_STRENGTH: f32 = 0.3232;
@@ -82,6 +87,26 @@ fn slot_sample(start: u32, size: vec2<u32>, channels: u32, channel: u32, uv: vec
     return upper + (lower - upper) * weight.y;
 }
 
+// An anchor point's height under bake texel `texel` (AnchorHeights::at): the capture program's
+// texel at the working UV of the texel's bake UV, 0 outside the atlas
+fn anchor_height(texel: vec2<u32>) -> f32 {
+    let uv = (vec2<f32>(texel) + 0.5) / vec2<f32>(params.anchor.xy);
+    if any(uv < vec2(0.0)) || any(uv >= vec2(1.0)) {
+        return 0.0;
+    }
+    let working = vec2<f32>(params.anchor.zw);
+    var at = uv;
+    let scale = params.anchor_block.y;
+    if scale != 0.0 {
+        let block = params.anchor_block.x;
+        let position = uv * working / block;
+        let origin = floor(position);
+        at = (origin + (position - origin) * scale) * block / working;
+    }
+    let pixel = min(vec2<u32>(at * working), params.anchor.zw - 1u);
+    return textureLoad(capture, vec2<i32>(pixel), 0).x;
+}
+
 // The micro height and normal at each texel of the block; the detail starts at zero
 @compute @workgroup_size(8, 8)
 fn sample_slots(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -93,6 +118,10 @@ fn sample_slots(@builtin(global_invocation_id) id: vec3<u32>) {
     var height = params.uniforms.x;
     if params.slots.x != 0u {
         height = slot_sample(0u, params.slots.xy, 1u, 0u, uv);
+    }
+    // An anchor's height, its block computed alone
+    if params.anchor.x != 0u {
+        height = anchor_height(params.origins.xy + id.xy);
     }
     var normal = params.uniforms.yz;
     if params.slots.z != 0u {

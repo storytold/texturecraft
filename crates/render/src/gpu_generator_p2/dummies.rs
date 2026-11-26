@@ -8,6 +8,7 @@ pub(super) struct Dummies {
     pub(super) maps_in: wgpu::TextureView,
     pub(super) bake: wgpu::TextureView,
     pub(super) bake_out: wgpu::TextureView,
+    pub(super) capture: wgpu::TextureView,
 }
 
 impl Dummies {
@@ -29,6 +30,7 @@ impl Dummies {
             maps_in: texture(device, "tc_micro_unused_in", [1, 1, 1], wgpu::TextureFormat::R32Float, sampled).create_view(&array),
             bake: texture(device, "tc_micro_unused_bake", [1, 1, 1], wgpu::TextureFormat::Rgba32Uint, sampled).create_view(&Default::default()),
             bake_out: texture(device, "tc_micro_unused_bake_out", [1, 1, 1], wgpu::TextureFormat::Rgba32Uint, storage).create_view(&Default::default()),
+            capture: texture(device, "tc_micro_unused_capture", [1, 1, 1], wgpu::TextureFormat::Rg32Float, sampled).create_view(&Default::default()),
         }
     }
 }
