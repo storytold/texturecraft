@@ -722,15 +722,15 @@ set.
 ## CLI
 
 ```sh
-texturecraft-cli --version                                   # TextureCraft 0.1.0 (abc1234 2026-10-14)
+texturecraft-cli --version                                   # texturecraft-cli 0.1.0 (abc1234 2026-10-14)
 texturecraft-cli info model.glb                              # triangles, materials, UV report
 texturecraft-cli info project.tcraft                         # texture sets, layers, baked maps
-texturecraft-cli commands --filter mask
+texturecraft-cli commands --filter mask --json
 texturecraft-cli new builtin:material_ball ball.tcraft --resolution 1024 --sample   # mesh maps baked at ≤ 1024 px
 texturecraft-cli new model.glb model.tcraft --resolution 2048
-texturecraft-cli run ball.tcraft layer.add.fill '{"color":"#c08040","metallic":1}' -o ball.tcraft
+texturecraft-cli run ball.tcraft layer.add.fill '{"color":"#c08040","metallic":1}' -o ball.tcraft --in-place
 texturecraft-cli batch script.json
-texturecraft-cli bake model.tcraft --resolution 2048 --maps ambientOcclusion,curvature,thickness
+texturecraft-cli bake model.tcraft --resolution 2048 --maps ambientOcclusion,curvature,thickness --in-place
 texturecraft-cli export model.tcraft out/ --preset "Unreal Engine (Packed)" --format png --size 2048
 texturecraft-cli render ball.tcraft ball.png --size 1280x800 --view 3d --yaw 30 --pitch 15
 texturecraft-cli render scene.tcraft hero.png --size 1200x900 --camera Hero --samples 2048   # a saved camera (camera.add), path traced
@@ -751,5 +751,24 @@ steps or an object with an optional input and output (paths relative to the curr
 }
 ```
 
-Errors print `texturecraft-cli <command>: error: …` and exit 1; usage errors exit 2. The CLI is a
-console program and never opens a window; `render` needs a GPU or software adapter.
+The CLI is a console program and never opens a window; `render` needs a GPU or software adapter.
+
+`texturecraft-cli` follows [RFC-0018](https://github.com/storytold/craft-contrib/blob/main/rfcs/0018-cli-conventions.md)
+(command-line conventions); `texturecraft-cli --help` and `<subcommand> --help` are the reference for every flag.
+Exit status: 0 success, 1 a command failed, 2 a usage error (an unknown or repeated flag, a bad value, flags that
+conflict or that the subcommand doesn't use, all checked before any file is touched), and 128 plus the signal number
+when a signal ends the process. Errors are `error: <message>` on stderr. `--version`/`-V` work on every subcommand
+(`texturecraft-cli 0.6.1 (<commit> <date>)`, with no `version` subcommand), and no arguments print the help on
+stderr and exit 2. `info`, `run`, `batch` and `bake` print JSON because agents read it; `commands --json` prints the
+list as JSON where it prints a table without it.
+
+- **Environment.** `TEXTURECRAFT_CONTROL_TOKEN` is the one variable the CLI reads for a flag (`mcp --bridge`'s
+  `--token`; `serve --port` reads it for its own token). The flag wins, an empty or blank variable counts as unset,
+  and `--help` never shows its value. No variable grants file access (roots come from `--read-root`/`--write-root`)
+  or replaces a file. The app's own `TEXTURECRAFT_NO_PREFS` is a setting of the app, not a flag fallback.
+- **Replacing files.** `run -o` and `bake -o` onto the project they opened, and `bake` of a project without `-o`,
+  need `--in-place`; `render` and `new` never replace their input, and `bake` of a mesh needs `-o`.
+- **Packages.** The Linux packages (deb, rpm, tar.gz) and the FreeBSD package install `texturecraft-cli`'s man pages
+  and its bash, zsh and fish completions. Nightly packages ship no CLI, so none; macOS and Windows are outside
+  RFC-0018's scope.
+- **Not yet.** The ast-grep scan of RFC-0018 section 3 is not switched on.

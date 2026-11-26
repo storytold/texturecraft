@@ -6,6 +6,14 @@ edition.workspace = true
 license.workspace = true
 build = "build.rs"
 
+[lib]
+name = "texturecraft_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "texturecraft-cli"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
@@ -14,9 +22,13 @@ texturecraft-automation = { workspace = true }
 texturecraft-engine = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true }
+clap_complete = { workspace = true }
+clap_mangen = { workspace = true }
 
 [build-dependencies]
 winresource = "0.1"
