@@ -6015,6 +6015,9 @@ dependencies = [
 [[package]]
 name = "texturecraft-texel"
 version = "0.6.1"
+dependencies = [
+ "rayon",
+]
 
 [[package]]
 name = "texturecraft-ui-egui"

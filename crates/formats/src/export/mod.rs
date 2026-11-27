@@ -18,7 +18,7 @@ use std::io::Cursor;
 use craft_image_codecs::{ChannelLayout, EncodeOptions, Format as CodecFormat, Image as CodecImage, SampleType};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use texturecraft_compose::{BakedMaps, Composite};
+use texturecraft_compose::{BakedMaps, BakedView, Composite};
 use texturecraft_core::{AoMixing, BakedMap, BlockScales, Channel, ChannelKind, NormalFormat, NormalMixing, Project, TextureSet};
 use texturecraft_geom::glam::Vec3;
 use texturecraft_texel::{ColorSpace, DilationMap, linear_to_srgb};
@@ -758,7 +758,8 @@ enum At {
 struct Sampler<'a> {
     set: &'a TextureSet,
     comp: &'a Composite,
-    baked: &'a BakedMaps,
+    /// The set's bakes at the composite's size (area-averaged where baked larger).
+    baked: BakedView<'a>,
     coverage: &'a [bool],
     /// Composite width.
     res: u32,
@@ -766,7 +767,7 @@ struct Sampler<'a> {
     /// follow the block.
     tile_res: u32,
     /// The share of its block each tile fills: a smaller tile's height slope shrinks with it.
-    scales: BlockScales,
+    scales: &'a BlockScales,
     /// Normal convention overriding every normal output.
     normal_override: Option<NormalFormat>,
     project_normal: NormalFormat,
@@ -794,9 +795,7 @@ impl Sampler<'_> {
 
     fn baked(&self, m: BakedMap, at: At) -> [f32; 3] {
         match at {
-            At::Texel(x, y) if self.set.baked.contains(&m) => {
-                self.baked.sample_working(m, x, y, (self.res, self.comp.height), &self.scales).unwrap_or(m.neutral())
-            }
+            At::Texel(x, y) if self.set.baked.contains(&m) => self.baked.sample(m, x, y).unwrap_or(m.neutral()),
             _ => m.neutral(),
         }
     }
@@ -924,14 +923,15 @@ pub fn render_planned_maps(input: &ExportInput, options: &ExportOptions, planned
     };
     let beyond_default = matches!(options.padding, Padding::DilationDefault(_) | Padding::Infinite);
     let diffuse = matches!(options.padding, Padding::DilationDiffusion(_));
+    let scales = set.block_scales();
     let sampler = Sampler {
         set,
         comp: input.composite,
-        baked: input.baked,
+        baked: input.baked.view((width, height), (width, height), &scales, &baked_reads(set, &planned, options)),
         coverage: input.coverage,
         res: width,
         tile_res,
-        scales: set.block_scales(),
+        scales: &scales,
         normal_override: options.normal_format,
         project_normal: input.project.normal_format,
         dielectric_f0_scale: input.project.display.dielectric_f0_scale(),
@@ -1032,6 +1032,26 @@ pub fn render_planned_maps(input: &ExportInput, options: &ExportOptions, planned
             Ok(ExportedFile { name: planned_file.name, bytes, width: size.0, height: size.1, warnings })
         })
         .collect()
+}
+
+/// The baked maps the planned files read (what [`Sampler::baked`] is asked for).
+fn baked_reads(set: &TextureSet, planned: &[PlannedFile], options: &ExportOptions) -> Vec<BakedMap> {
+    let mut maps: Vec<BakedMap> = planned
+        .iter()
+        .filter_map(|p| options.preset.maps.get(p.map))
+        .flat_map(|map| layout(set, map))
+        .flat_map(|(_, src)| match src {
+            SourceRef::Baked { map, .. } => vec![*map],
+            SourceRef::Virtual { map: VirtualMap::AoMixed, .. } => vec![BakedMap::AmbientOcclusion],
+            SourceRef::Channel { channel: Channel::Normal, .. } | SourceRef::Virtual { map: VirtualMap::NormalOpenGl | VirtualMap::NormalDirectX, .. } => {
+                vec![BakedMap::Normal]
+            }
+            _ => Vec::new(),
+        })
+        .collect();
+    maps.sort_unstable();
+    maps.dedup();
+    maps
 }
 
 fn tile_side(set: &TextureSet, tile: u32, block_resolution: u32) -> u32 {

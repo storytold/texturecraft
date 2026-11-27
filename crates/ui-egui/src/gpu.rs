@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use rayon::prelude::*;
 use texturecraft_engine::Session;
-use texturecraft_engine::compose::{DisplayKind, ImageRes, kinds_for, tile_bytes};
+use texturecraft_engine::compose::{DisplayKind, ImageRes, display_view, kinds_for, tile_bytes};
 use texturecraft_engine::core::{BakedMap, Channel, LayerId};
 use texturecraft_engine::geom::Mesh;
 use texturecraft_render::{BakeVisualization, CageGeometry, Frame, Renderer, wgpu};
@@ -258,8 +258,8 @@ impl GpuLink {
             let mut done = 0;
             if let Some(cache) = session.caches.get(texture_set) {
                 let empty = Default::default();
-                let baked = session.doc.baked.get(&texture_set).unwrap_or(&empty);
                 let composite = &cache.composite;
+                let baked = display_view(session.doc.baked.get(&texture_set).unwrap_or(&empty), composite);
                 let channels: Vec<Channel> = composite.channels.keys().copied().collect();
                 let sent = self.sent.entry(texture_set).or_default();
                 let kinds: Vec<DisplayKind> =
@@ -271,7 +271,7 @@ impl GpuLink {
                     let bytes: Vec<_> = chunk
                         .par_iter()
                         .flat_map_iter(|&(tile_x, tile_y)| kinds.iter().map(move |&kind| (kind, tile_x, tile_y)))
-                        .map(|(kind, tile_x, tile_y)| (texture_set, kind, tile_x, tile_y, tile_bytes(composite, baked, kind, tile_x, tile_y)))
+                        .map(|(kind, tile_x, tile_y)| (texture_set, kind, tile_x, tile_y, tile_bytes(composite, &baked, kind, tile_x, tile_y)))
                         .collect();
                     queued += bytes.len();
                     out.tiles.extend(bytes);

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use serde_json::{Value, json};
-use texturecraft_engine::compose::{DisplayKind, kinds_for, tile_bytes};
+use texturecraft_engine::compose::{DisplayKind, display_view, kinds_for, tile_bytes};
 use texturecraft_engine::core::Channel;
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_engine::geom::primitives;
@@ -59,12 +59,13 @@ fn upload_bytes(session: &mut Session) -> (usize, usize) {
     let empty = Default::default();
     let baked = session.doc.baked.get(&0).unwrap_or(&empty);
     let composite = &session.caches[0].composite;
+    let view = display_view(baked, composite);
     let channels: Vec<Channel> = composite.channels.keys().copied().collect();
     let kinds: Vec<DisplayKind> = kinds_for(&channels).collect();
     let selected_bytes = tiles
         .par_iter()
         .flat_map_iter(|&(tile_x, tile_y)| kinds.iter().map(move |&kind| (kind, tile_x, tile_y)))
-        .map(|(kind, tile_x, tile_y)| tile_bytes(composite, baked, kind, tile_x, tile_y).len())
+        .map(|(kind, tile_x, tile_y)| tile_bytes(composite, &view, kind, tile_x, tile_y).len())
         .sum();
     let all_bytes_per_tile: usize = DisplayKind::ALL.iter().map(|kind| kind.bytes_per_texel() * (TILE * TILE) as usize).sum();
 

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
 use rayon::prelude::*;
-use texturecraft_engine::compose::{DisplayKind, ImageRes, all_tiles, tile_bytes};
+use texturecraft_engine::compose::{DisplayKind, ImageRes, all_tiles, display_view, tile_bytes};
 use texturecraft_engine::{Session, ViewMode};
 use texturecraft_render::displace::trace_geometry;
 use texturecraft_render::gpu_trace::GpuTracer;
@@ -65,8 +65,8 @@ impl Gpu {
                 tiles = all_tiles(cache.size.0, cache.size.1);
             }
             let empty = Default::default();
-            let baked = session.doc.baked.get(&set_index).unwrap_or(&empty);
             let composite = &cache.composite;
+            let baked = display_view(session.doc.baked.get(&set_index).unwrap_or(&empty), composite);
 
             // Limit live converted pixels while retaining parallel conversion within each batch
             const UPLOAD_TILES_PER_BATCH: usize = 64;
@@ -74,7 +74,7 @@ impl Gpu {
                 let bytes: Vec<_> = batch
                     .par_iter()
                     .flat_map_iter(|&(tile_x, tile_y)| DisplayKind::ALL.into_iter().map(move |kind| (kind, tile_x, tile_y)))
-                    .map(|(kind, tile_x, tile_y)| (kind, tile_x, tile_y, tile_bytes(composite, baked, kind, tile_x, tile_y)))
+                    .map(|(kind, tile_x, tile_y)| (kind, tile_x, tile_y, tile_bytes(composite, &baked, kind, tile_x, tile_y)))
                     .collect();
                 for (kind, tile_x, tile_y, pixels) in bytes {
                     headless.renderer.upload_tile(&headless.device, &headless.queue, set_index, kind, tile_x, tile_y, &pixels);

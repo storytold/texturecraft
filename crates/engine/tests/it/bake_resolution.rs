@@ -85,7 +85,7 @@ fn rectangular_bakes_and_excluded_vertical_tiles_ignore_working_resolution() {
 
 #[test]
 fn imported_mesh_maps_display_and_export_the_entire_overridden_tile() {
-    use texturecraft_engine::compose::{DisplayKind, tile_bytes};
+    use texturecraft_engine::compose::{DisplayKind, display_view, tile_bytes};
     use texturecraft_engine::formats::export::{Dest, ExportOptions, ExportPreset, FileFormat, MapSpec, SourceRef};
 
     let mut session = session();
@@ -103,7 +103,7 @@ fn imported_mesh_maps_display_and_export_the_entire_overridden_tile() {
     let map = BakedMap::AmbientOcclusion;
     assert!((baked.scalar(map, 248, 120, (256, 128)).unwrap() - 240.0 / 255.0).abs() < 0.001);
     let composite = &session.caches[0].composite;
-    let display = tile_bytes(composite, baked, DisplayKind::Orm, 5, 1);
+    let display = tile_bytes(composite, &display_view(baked, composite), DisplayKind::Orm, 5, 1);
     assert_eq!(display[((56 * 64 + 56) * 4) as usize], 240, "the viewport samples the far corner of the smaller working tile");
 
     let options = ExportOptions::new(ExportPreset {

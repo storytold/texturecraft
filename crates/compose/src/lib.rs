@@ -69,7 +69,7 @@ mod wear_scan;
 mod working_field;
 
 pub use below::{BelowCache, StackKey};
-pub use display::{DisplayKind, kinds_for, tile_bytes};
+pub use display::{DisplayKind, display_view, kinds_for, tile_bytes};
 pub use effect_histogram::EffectHistogram;
 pub use eval::{
     BLOCK, Composite, Inputs, MASK_CHANNEL, PaintTarget, Stencil, StrokePreview, all_tiles, compare_histograms, composite_tiles, composite_tiles_cached,
@@ -80,5 +80,5 @@ pub use mask_gray::MaskGray;
 pub use pattern_context::PatternContext;
 pub use projector_depth_cache::ProjectorDepthCache;
 pub use solo::solo_project;
-pub use store::{BakedMaps, ImageRes, ImageStore, PixelStore};
+pub use store::{BakedMaps, BakedView, ImageRes, ImageStore, PixelStore};
 pub use thumb::{THUMB_TEXELS, ThumbImage, ThumbTarget};

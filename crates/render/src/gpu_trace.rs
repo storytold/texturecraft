@@ -798,7 +798,7 @@ mod tests {
     use super::*;
     use crate::headless::Headless;
     use crate::trace::{TraceSet, Tracer};
-    use texturecraft_compose::{BakedMaps, Composite, all_tiles, tile_bytes};
+    use texturecraft_compose::{BakedMaps, Composite, all_tiles, display_view, tile_bytes};
     use texturecraft_core::Channel;
     use texturecraft_geom::{Bvh, primitives};
 
@@ -825,7 +825,7 @@ mod tests {
         h.renderer.set_texture_sets(&h.device, &h.queue, &[((64, 64), 0)], 1);
         for (tx, ty) in all_tiles(64, 64) {
             for k in DisplayKind::ALL {
-                h.renderer.upload_tile(&h.device, &h.queue, 0, k, tx, ty, &tile_bytes(&composite, &BakedMaps::default(), k, tx, ty));
+                h.renderer.upload_tile(&h.device, &h.queue, 0, k, tx, ty, &tile_bytes(&composite, &display_view(&BakedMaps::default(), &composite), k, tx, ty));
             }
         }
         let mesh = Arc::new(primitives::sphere(1.0, 32, 16));
@@ -1001,7 +1001,7 @@ mod tests {
         h.renderer.set_texture_sets(&h.device, &h.queue, &[((64, 64), 0)], 1);
         for (tx, ty) in all_tiles(64, 64) {
             for k in DisplayKind::ALL {
-                h.renderer.upload_tile(&h.device, &h.queue, 0, k, tx, ty, &tile_bytes(&composite, &BakedMaps::default(), k, tx, ty));
+                h.renderer.upload_tile(&h.device, &h.queue, 0, k, tx, ty, &tile_bytes(&composite, &display_view(&BakedMaps::default(), &composite), k, tx, ty));
             }
         }
         let sizes: Vec<u32> = h.renderer.display_textures()[0].iter().map(|t| t.width()).collect();

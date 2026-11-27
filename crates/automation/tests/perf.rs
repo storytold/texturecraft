@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use texturecraft_automation::headless::{Filesystem, Headless};
 use texturecraft_engine::Session;
 use texturecraft_engine::bake::Progress;
-use texturecraft_engine::compose::{DisplayKind, tile_bytes};
+use texturecraft_engine::compose::{DisplayKind, display_view, tile_bytes};
 use texturecraft_engine::core::{BakeResolution, BakedMap};
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_engine::project_cmds::sample_session;
@@ -57,6 +57,7 @@ fn display_all(session: &mut Session) -> usize {
         let tiles = session.take_uploads(texture_set);
         let baked = session.baked(texture_set).cloned().unwrap_or_default();
         let composite = &session.caches[texture_set].composite;
+        let baked = display_view(&baked, composite);
         bytes += tiles
             .par_iter()
             .flat_map_iter(|&(tile_x, tile_y)| DisplayKind::ALL.map(|kind| tile_bytes(composite, &baked, kind, tile_x, tile_y).len()))
