@@ -1,12 +1,12 @@
 use super::{MergedHigh, StreamedBake, StreamedMap};
 use crate::{EngineError, Result};
 use std::sync::Arc;
-use texturecraft_bake::{BakeOutput, BakePaintMap, BakePasses, BakeRequest, HighPoly, Progress, bake_tiles, tracing::Tracer};
+use texturecraft_bake::{BakeOutput, BakePaintMap, BakePasses, BakeRequest, HighPoly, Progress, RegionBake, TexelBox, bake_tiles_in, tracing::Tracer};
 use texturecraft_compose::BakedMaps;
 use texturecraft_core::{BakeSettings, BakedMap};
 use texturecraft_geom::{Bvh, Mesh};
 
-/// A self-contained bake task that can run on another thread.
+/// A self-contained bake task that can run on another thread
 pub struct BakeTask {
     pub low_base_color: super::MaterialColors,
     pub ts: usize,
@@ -14,18 +14,24 @@ pub struct BakeTask {
     pub bvh: Arc<Bvh>,
     pub material: usize,
     pub settings: BakeSettings,
-    /// The merged high polys, unless the set bakes from the low poly.
+    /// The merged high polys, unless the set bakes from the low poly
     pub high: Option<MergedHigh>,
     pub cage: Option<Arc<Mesh>>,
     pub skew: Option<Arc<BakePaintMap>>,
     pub cage_paint: Option<Arc<BakePaintMap>>,
-    /// UV tile grid (columns, rows) of the set; (1, 1) without UV tiles.
+    /// UV tile grid (columns, rows) of the set; (1, 1) without UV tiles
     pub tiles: (u32, u32),
     /// Snapshot of tile selection and pixels to retain while the worker runs
     pub excluded_tiles: Vec<(u32, u32)>,
     pub previous_maps: BakedMaps,
-    /// The GPU ray tracer, if installed and not turned off (`bake.run {cpu: true}`).
+    /// The GPU ray tracer, if installed and not turned off (`bake.run {cpu: true}`)
     pub tracer: Option<Arc<dyn Tracer>>,
+    /// What each map this task makes is baked from, taken when the task was made
+    pub sources: std::collections::BTreeMap<BakedMap, texturecraft_core::BakeSource>,
+    /// The newest skew or cage stroke when the task was made; a later stroke still needs a rebake
+    pub painted_stroke: u64,
+    /// Sample only these texels and take the rest from `previous_maps` (the same size); `None` samples every texel
+    pub region: Option<TexelBox>,
 }
 
 impl BakeTask {
@@ -34,13 +40,7 @@ impl BakeTask {
         self.settings.maps.enabled().collect()
     }
 
-    /// Bake the maps one after another, handing each one to `on_map` as soon as it is padded,
-    /// and return all of them together. Each map is a bake of its own, so with a high poly
-    /// the transfer rays are cast once per map: slower than [`BakeTask::run`] with several
-    /// maps, in exchange for showing them as they land. The pixels are the same as `run`'s.
-    /// The handed-over buffers are the returned ones too (no copy is made), so a preview that
-    /// keeps them costs no second set of maps. A cancel or an error leaves the maps already
-    /// handed over whole.
+    /// Bake the maps one by one (same pixels as [`BakeTask::run`], rays cast per map), handing each padded map's shared buffer to `on_map`, then return them all
     pub fn run_streaming(&self, progress: &Progress, on_map: &mut dyn FnMut(StreamedMap)) -> Result<StreamedBake> {
         let maps = self.maps();
         let total = maps.len();
@@ -48,7 +48,7 @@ impl BakeTask {
 
         let mut passes = BakePasses::new(self.request());
         for (index, map) in maps.iter().copied().enumerate() {
-            let mut output = passes.bake_map(map, progress, &self.excluded_tiles, self.tracer.as_deref()).map_err(bake_error)?;
+            let mut output = passes.bake_map_in(map, progress, &self.excluded_tiles, self.region(), self.tracer.as_deref()).map_err(bake_error)?;
             super::preserve_tiles::restore(&mut output, &self.previous_maps, &self.excluded_tiles, self.tiles)?;
             let Some(data) = output.maps.remove(&map) else { continue };
             if combined.is_none() {
@@ -66,7 +66,14 @@ impl BakeTask {
                     // A resized partial bake also returns unchecked maps that must survive application
                     let mut retained: std::collections::BTreeMap<_, _> = output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(pixels))).collect();
                     retained.insert(map, data);
-                    combined = Some(StreamedBake { resolution: output.resolution, height: output.height, maps: retained, tracer: output.tracer });
+                    combined = Some(StreamedBake {
+                        resolution: output.resolution,
+                        height: output.height,
+                        maps: retained,
+                        tracer: output.tracer,
+                        sources: self.sources.clone(),
+                        painted_stroke: self.painted_stroke,
+                    });
                 }
             }
         }
@@ -80,16 +87,23 @@ impl BakeTask {
                     height: output.height,
                     maps: output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(pixels))).collect(),
                     tracer: output.tracer,
+                    sources: self.sources.clone(),
+                    painted_stroke: self.painted_stroke,
                 })
             }
         }
     }
 
     pub fn run(&self, progress: &Progress) -> Result<BakeOutput> {
-        let mut output = bake_tiles(&self.request(), progress, &self.excluded_tiles, self.tracer.as_deref()).map_err(bake_error)?;
+        let mut output = bake_tiles_in(&self.request(), progress, &self.excluded_tiles, self.region(), self.tracer.as_deref()).map_err(bake_error)?;
         super::preserve_tiles::restore(&mut output, &self.previous_maps, &self.excluded_tiles, self.tiles)?;
         super::preserve_tiles::restore_unchecked(&mut output, &self.previous_maps, &self.excluded_tiles, &[])?;
         Ok(output)
+    }
+
+    /// The texels to sample, with the stored maps to take the rest from; `None` samples every texel
+    fn region(&self) -> Option<RegionBake<'_>> {
+        self.region.map(|texels| RegionBake { texels, previous: &self.previous_maps.maps })
     }
 
     fn request(&self) -> BakeRequest<'_> {
@@ -111,7 +125,10 @@ impl BakeTask {
 }
 
 fn bake_error(error: texturecraft_bake::BakeError) -> EngineError {
-    EngineError::Other(format!("bake failed: {error}"))
+    match error {
+        texturecraft_bake::BakeError::Cancelled => EngineError::BakeCancelled,
+        error => EngineError::Other(format!("bake failed: {error}")),
+    }
 }
 
 #[cfg(test)]

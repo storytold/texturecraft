@@ -1268,6 +1268,14 @@ impl Generator {
         if reads_geometry { &[] } else { self.kind.inputs() }
     }
 
+    /// The mesh maps the generator reads that a bake makes: its inputs in use, and the occlusion Dripping Rust reads whole, which no input replaces
+    pub fn baked_maps_read(&self) -> &'static [BakedMap] {
+        match self.kind {
+            GeneratorKind::DrippingRust => &[BakedMap::AmbientOcclusion],
+            _ => self.inputs_in_use(),
+        }
+    }
+
     /// The texture the generator blends over its signal: only on the section controls, turned on with some opacity
     pub fn texture_in_use(&self) -> Option<&TextureLayer> {
         self.texture.as_deref().filter(|texture| texture.in_use() && self.section_controls().is_some())

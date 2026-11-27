@@ -18,6 +18,8 @@ use crate::property_sheet::PropertySheet;
 use crate::shelf_preview::ShelfPreview;
 use crate::theme::Tokens;
 
+mod bake_note;
+
 /// The outline on the preview while it can open enlarged under the pointer, or is open, in points
 const ENLARGE_OUTLINE_WIDTH: f32 = 1.0;
 
@@ -35,6 +37,7 @@ pub(crate) fn generator_properties(app: &mut TextureCraftApp, ui: &mut egui::Ui,
     PropertySheet::show(ui, ("generator_sheet", id), |sheet| {
         sheet.section(tr("Generator"), false);
         slot_card(app, sheet, id, generator);
+        bake_note::bake_notes(app, sheet, generator);
 
         let band = sheet.band(tr("Parameters"), true, Some(differs_from_defaults(generator)), None);
         if band.reset {
@@ -67,9 +70,6 @@ pub(crate) fn generator_properties(app: &mut TextureCraftApp, ui: &mut egui::Ui,
 
         if sheet.band(tr("Attributes"), false, None, None).open {
             attributes(sheet, generator.kind);
-        }
-        if !app.session.doc.baked.contains_key(&app.session.ts()) {
-            sheet.caption(tr("Bake mesh maps for curvature, AO and thickness based generators."));
         }
     });
 }

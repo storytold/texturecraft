@@ -369,6 +369,31 @@ fn an_explicit_mesh_map_replacement_breaks_the_import_link_even_when_pixels_matc
 }
 
 #[test]
+fn a_file_import_replaces_bake_provenance_and_clear_detaches_the_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("Ball_position.png");
+    write_png(&file, 4, RED);
+    let mut session = ball();
+    execute(&mut session, "bake.run", &json!({"ts": 0, "resolution": 32, "maps": ["position"], "dilation": 0})).unwrap();
+    execute(&mut session, "bake.settings", &json!({"ts": 0, "positionMode": "boundingBox"})).unwrap();
+    assert!(!session.bake_changes(0, BakedMap::Position).is_empty(), "the previous bake is stale");
+
+    execute(&mut session, "textureSet.meshMap.import", &json!({"files": [{"path": text(&file)}]})).unwrap();
+    write_png(&file, 8, [0, 0, 255, 255]);
+    let imported = session.baked(0).unwrap().maps[&BakedMap::Position].clone();
+    execute(&mut session, "resource.update", &Value::Null).unwrap();
+
+    assert_ne!(*imported, *session.baked(0).unwrap().maps[&BakedMap::Position], "the replacement follows its file");
+    assert!(session.bake_changes(0, BakedMap::Position).is_empty(), "the imported map has no bake provenance");
+
+    execute(&mut session, "textureSet.meshMap.clear", &json!({"ts": 0, "map": "position"})).unwrap();
+    assert!(session.doc.project.resource_sources["Ball_position.png"].mesh_map.is_none(), "clearing releases the file link");
+    write_png(&file, 16, RED);
+    execute(&mut session, "resource.update", &Value::Null).unwrap();
+    assert!(!session.baked(0).unwrap().maps.contains_key(&BakedMap::Position), "updating the old source leaves the slot empty");
+}
+
+#[test]
 fn removing_unused_resources_keeps_the_file_that_feeds_an_imported_mesh_map() {
     let dir = tempfile::tempdir().unwrap();
     let map_file = dir.path().join("Ball_ao.png");

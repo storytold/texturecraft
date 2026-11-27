@@ -12,4 +12,9 @@ pub struct RunningBake {
     /// Maps finished so far, and how many the set makes.
     pub maps_done: Arc<std::sync::atomic::AtomicUsize>,
     pub maps_total: usize,
+    /// The maps received so far, kept when the bake is canceled even if the preview has closed
+    pub finished: texturecraft_engine::compose::BakedMaps,
+    /// What the task bakes from and the newest stroke it saw, recorded with the finished maps a cancel keeps
+    pub sources: std::collections::BTreeMap<texturecraft_engine::core::BakedMap, texturecraft_engine::core::BakeSource>,
+    pub painted_stroke: u64,
 }

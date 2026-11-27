@@ -11,4 +11,6 @@ pub struct BakeMesh {
     pub bytes: Arc<Vec<u8>>,
     pub mesh: Arc<Mesh>,
     pub base_color: Vec<Option<Arc<BaseColor>>>,
+    /// [`texturecraft_core::fingerprint`] of `bytes`: what bakes from this file record
+    pub fingerprint: u64,
 }

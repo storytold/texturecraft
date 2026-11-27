@@ -243,6 +243,7 @@ impl Session {
             pixels: pf.pixels,
             baked: BTreeMap::new(),
             resources: BTreeMap::new(),
+            painted_regions: Default::default(),
         };
 
         let label = src.project.texture_sets.first().map(|t| t.name.clone()).unwrap_or_default();

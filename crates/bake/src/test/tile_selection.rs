@@ -28,11 +28,13 @@ fn excluded_tiles_match_across_strips_antialiasing_and_cpu_fallback() {
         cage_paint: None,
         tiles: (2, 1),
     };
+
     let full = bake(&request, &Progress::new()).unwrap();
     for excluded in [[(0, 0)], [(1, 0)]] {
         let partial = bake_tiles(&request, &Progress::new(), &excluded, None).unwrap();
-        let strips = bake_in_strips(&request, &Progress::new(), 512, &CpuTracer, &excluded).unwrap();
+        let strips = bake_in_strips(&request, &Progress::new(), 512, &CpuTracer, &excluded, None).unwrap();
         let fallback = bake_tiles(&request, &Progress::new(), &excluded, Some(&Broken)).unwrap();
+
         assert_eq!(strips.maps, partial.maps);
         assert_eq!(fallback.maps, partial.maps);
         assert!(fallback.tracer.contains("Broken unavailable"));

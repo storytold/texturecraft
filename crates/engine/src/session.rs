@@ -33,6 +33,9 @@ pub struct Document {
     pub resources: BTreeMap<String, Arc<Vec<u8>>>,
     /// High-definition meshes and cage for baking (saved inside the project)
     pub bake_meshes: crate::BakeMeshes,
+    /// Skew and cage paint bounds since each set's last Auto-rebake. Undo restores the bounds
+    /// with their maps. The project file omits these bounds.
+    pub(crate) painted_regions: BTreeMap<usize, crate::bake::PaintedRegion>,
 }
 
 /// Derived per-texture-set data (rebuilt when the mesh or resolution changes).
@@ -425,6 +428,12 @@ pub struct Session {
     pub project_id: u64,
     /// The mesh with its own UVs (`mesh` maps UV-tiled sets into their atlas).
     pub(crate) source: Arc<Mesh>,
+    /// Fingerprint of the bake inputs in `source`, computed on first use
+    pub(crate) low_poly_fingerprint: std::sync::OnceLock<u64>,
+    /// Fingerprint of the packed mesh file, computed only for bakes that read its material colors.
+    pub(crate) low_material_file_fingerprint: std::sync::OnceLock<u64>,
+    /// Skew and cage strokes so far
+    pub(crate) painted_strokes: u64,
     pub bvh: Arc<Bvh>,
     /// Original mesh file (saved inside the project); None for built-in meshes.
     pub mesh_source: Option<(String, Arc<Vec<u8>>)>,
@@ -451,6 +460,8 @@ pub struct Session {
     pub solo: Option<crate::Solo>,
     /// The live bake preview while the app bakes (see [`crate::bake_preview`]).
     pub bake_preview: Option<crate::bake_preview::BakePreview>,
+    /// The latest bake, map by map (the Baking Log)
+    pub bake_log: crate::bake::BakeLog,
     /// Viewport size (pixels) used by scripted strokes.
     pub viewport: Vec2,
     pub(crate) stroke: Option<ActiveStroke>,
@@ -528,6 +539,9 @@ impl Session {
             mesh_id: next_mesh_id(),
             project_id: next_mesh_id(),
             source,
+            low_poly_fingerprint: Default::default(),
+            low_material_file_fingerprint: Default::default(),
+            painted_strokes: 0,
             mesh,
             bvh: Arc::new(bvh),
             mesh_source: mesh_source.map(|(extension, bytes)| (extension, Arc::new(bytes))),
@@ -546,6 +560,7 @@ impl Session {
             view_image: None,
             solo: None,
             bake_preview: None,
+            bake_log: Default::default(),
             viewport: Vec2::new(1280.0, 800.0),
             stroke: None,
             clipboard: None,
@@ -649,6 +664,7 @@ impl Session {
                 pixels: PixelStore::default(),
                 baked: BTreeMap::new(),
                 resources: BTreeMap::new(),
+                painted_regions: Default::default(),
             },
             mesh,
             mesh_source,

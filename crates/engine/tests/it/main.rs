@@ -2,8 +2,11 @@
 //! Keep feature tests in their own modules; the standalone session.rs target remains available.
 
 mod add_mask_items;
+mod auto_rebake;
 mod bake;
 mod bake_checks;
+mod bake_log;
+mod bake_out_of_date;
 mod bake_resolution;
 mod bake_settings;
 mod bake_tiles;

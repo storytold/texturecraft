@@ -293,6 +293,7 @@ impl Session {
                 pixels: project_file.pixels,
                 baked: project_file.baked,
                 resources,
+                painted_regions: Default::default(),
             },
             mesh,
             project_file.mesh,
@@ -744,6 +745,10 @@ impl Session {
 
         next.modified = true;
         next.project_id = self.project_id;
+
+        // Keep the stroke counter aligned with the painted regions in the cloned document
+        next.painted_strokes = self.painted_strokes;
+
         let preserved = preserve_strokes.then(|| crate::preserve::preserve_strokes(self, &mut next));
 
         // Keep the stored source in the current session until reimport succeeds
@@ -752,6 +757,7 @@ impl Session {
         }
 
         self.switch_to(next);
+
         Ok(preserved.map_or(Value::Null, |n| json!({ "preserved": n })))
     }
 }
@@ -1663,11 +1669,18 @@ f 1/1 2/2 3/3
         let a = dir.join("a.obj");
         std::fs::write(&a, "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n").unwrap();
 
-        // Same triangle count, other vertices
+        // Keep the triangle count fixed while changing the geometry
         let b = dir.join("b.obj");
         std::fs::write(&b, "v 0 0 0\nv 2 0 0\nv 0 2 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n").unwrap();
         let mut s = Session::from_mesh_bytes("a.obj", &std::fs::read(&a).unwrap(), 128, "a").unwrap();
-        let cage = crate::bake::BakeMesh { name: "cage".into(), folder: None, bytes: Default::default(), mesh: s.mesh.clone(), base_color: Vec::new() };
+        let cage = crate::bake::BakeMesh {
+            name: "cage".into(),
+            folder: None,
+            bytes: Default::default(),
+            mesh: s.mesh.clone(),
+            base_color: Vec::new(),
+            fingerprint: 0,
+        };
         s.doc.bake_meshes.cage = Some(cage);
         let _ = s.doc.bake_meshes.low_base_color.set(Err("old".into()));
 

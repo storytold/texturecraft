@@ -31,7 +31,7 @@ impl CommandSpec {
     /// that only return data or do nothing without parameters, and the ones that replace the
     /// open project (the menu asks to save first).
     pub fn bindable(&self) -> bool {
-        const NOT_FROM_A_KEY: [&str; 14] = [
+        const NOT_FROM_A_KEY: &[&str] = &[
             "project.inspect",
             "project.templates",
             "project.new",
@@ -43,6 +43,7 @@ impl CommandSpec {
             "textureSet.parts",
             "bake.settings",
             "bake.preview",
+            "bake.log",
             "camera.set",
             "textureSet.settings",
             "resource.status",
@@ -140,6 +141,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::project_cmds::specs());
         v.extend(crate::bake::specs());
         v.extend(crate::bake_preview::specs());
+        v.extend(crate::bake_log_cmds::specs());
         v.extend(crate::materialx_cmds::specs());
         v.extend(crate::pbr_cmds::specs());
         v.extend(crate::file_cmds::specs());
@@ -373,7 +375,18 @@ mod tests {
         ] {
             assert!(!bindable(id), "{id} needs a parameter");
         }
-        for id in ["layer.move", "layer.list", "project.inspect", "edit.history", "export.presets", "tool.state", "project.new", "camera.set", "layer.blend"] {
+        for id in [
+            "layer.move",
+            "layer.list",
+            "project.inspect",
+            "edit.history",
+            "export.presets",
+            "tool.state",
+            "project.new",
+            "camera.set",
+            "layer.blend",
+            "bake.log",
+        ] {
             assert!(!bindable(id), "{id} is a query or has several forms");
         }
     }
