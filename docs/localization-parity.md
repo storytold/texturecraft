@@ -26,6 +26,7 @@ generator, filter and brush alpha names (**KEYS** strings, counted by the
 | Simplified Chinese | `zh-Hans` | KEYS (100%) | yes | CJK glyphs: craft-fonts (Noto Sans CJK SC) or system fonts on desktop; see below | no | full | 2 h (review) |
 | Spanish | `es` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
 | Hindi | `hi` | 0 | no | Devanagari shaping: not yet (egui has no complex shaping) | no | none | 12 h |
+| Georgian | `ka` | KEYS (100%) | yes | Georgian glyphs: craft-fonts (Noto Sans Georgian) or system fonts on desktop | no | full | 1 h (review) |
 | Arabic | `ar` | KEYS (100%) | yes | Arabic glyphs: craft-fonts (Noto Sans Arabic) or system fonts on desktop; egui shapes the text and orders it right to left (panels keep the left-to-right layout) | yes | full | 0 h |
 | French | `fr` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
 | Portuguese (Brazil) | `pt-BR` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
@@ -41,9 +42,9 @@ user content (layer, texture set, project names), file format and technical name
 RGB, OpenGL, DirectX), and error details that come from the engine (shown after a translated
 "Couldn't …:" prefix).
 
-## Fonts for Chinese, Japanese, Korean and Arabic
+## Fonts for Chinese, Japanese, Korean, Arabic and Georgian
 
-egui's built-in fonts have no CJK or Arabic glyphs. `crates/ui-egui/src/fonts.rs` adds fallbacks after the
+egui's built-in fonts have no CJK, Arabic or Georgian glyphs. `crates/ui-egui/src/fonts.rs` adds fallbacks after the
 app's own fonts (Latin text and row heights keep the default font), loading them only when the
 UI language needs them or the language picker shows every language's own name:
 
@@ -51,14 +52,15 @@ UI language needs them or the language picker shows every language's own name:
    build time when `CRAFT_FONTS_DIR` points at a checkout (`crates/ui-egui/build.rs`, the recipe in
    craft-fonts' `docs/integration.md`; `CRAFT_FONTS_REQUIRED=1` makes it mandatory for releases).
    Desktop builds embed BIZ UDPGothic Regular (Japanese), Noto Sans CJK SC Regular (Simplified
-   Chinese) and Noto Sans Arabic Regular; the web build embeds BIZ UDPGothic (about 4.5 MB of the
-   download) and Noto Sans Arabic (0.8 MB).
+   Chinese), Noto Sans Arabic Regular and Noto Sans Georgian Regular; the web build embeds BIZ UDPGothic
+   (about 4.5 MB of the download), Noto Sans Arabic (0.8 MB) and Noto Sans Georgian (0.23 MB).
 2. **System fonts** on desktop: Yu Gothic / Meiryo, Microsoft YaHei / SimSun and Malgun Gothic on
    Windows; Hiragino, PingFang / STHeiti and Apple SD Gothic Neo on macOS; Noto Sans CJK, WenQuanYi,
    Droid Sans Fallback and Nanum Gothic on Linux and FreeBSD. Arabic: Segoe UI / Tahoma / Arial on
    Windows, SF Arabic / Geeza Pro on macOS, Noto Sans Arabic or DejaVu Sans on Linux and FreeBSD.
+   Georgian: Sylfaen / Segoe UI on Windows, SF Georgian on macOS, Noto Sans Georgian or DejaVu Sans on Linux and FreeBSD.
 
 **Web limitation:** a browser page can't read system fonts, so the web build shows CJK text only
-with the fonts it embeds: Japanese (and most shared Han characters) and Arabic when built with
+with the fonts it embeds: Japanese (and most shared Han characters), Arabic and Georgian when built with
 craft-fonts, none without it. A language no available font can draw appears in the picker under its English
 name and can't be selected.

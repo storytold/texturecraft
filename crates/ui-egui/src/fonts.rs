@@ -1,5 +1,5 @@
-//! CJK and Arabic fallback fonts for the UI. egui's default fonts have no Japanese, Chinese,
-//! Korean or Arabic glyphs, so translated UIs (and such layer or file names) need more fonts.
+//! CJK, Arabic and Georgian fallback fonts for the UI. egui's default fonts have no Japanese, Chinese,
+//! Korean, Arabic or Georgian glyphs, so translated UIs (and such layer or file names) need more fonts.
 //! They come from:
 //!
 //! 1. craft-fonts, embedded at build time when `CRAFT_FONTS_DIR` points at a checkout (optional;
@@ -38,10 +38,11 @@ pub enum Script {
     Chinese,
     Korean,
     Arabic,
+    Georgian,
 }
 
 impl Script {
-    pub const ALL: [Script; 4] = [Script::Japanese, Script::Chinese, Script::Korean, Script::Arabic];
+    pub const ALL: [Script; 5] = [Script::Japanese, Script::Chinese, Script::Korean, Script::Arabic, Script::Georgian];
 
     /// The script a UI language needs beyond Latin.
     pub fn of_language(code: &str) -> Option<Script> {
@@ -50,6 +51,7 @@ impl Script {
             "zh-Hans" => Some(Script::Chinese),
             "ko" => Some(Script::Korean),
             "ar" => Some(Script::Arabic),
+            "ka" => Some(Script::Georgian),
             _ => None,
         }
     }
@@ -61,6 +63,7 @@ impl Script {
             Script::Chinese => "Hans",
             Script::Korean => "Kore",
             Script::Arabic => "Arab",
+            Script::Georgian => "Geor",
         }
     }
 
@@ -76,6 +79,7 @@ impl Script {
                 Script::Chinese => &["msyh.ttc", "simsun.ttc", "simhei.ttf"],
                 Script::Korean => &["malgun.ttf", "gulim.ttc"],
                 Script::Arabic => &["segoeui.ttf", "tahoma.ttf", "arial.ttf"],
+                Script::Georgian => &["sylfaen.ttf", "segoeui.ttf"],
             };
             v.extend(files.iter().map(|f| (fonts.join(f), 0)));
         } else if cfg!(target_os = "macos") {
@@ -86,25 +90,24 @@ impl Script {
                 }
                 Script::Korean => &["/System/Library/Fonts/AppleSDGothicNeo.ttc"],
                 Script::Arabic => &["/System/Library/Fonts/SFArabic.ttf", "/System/Library/Fonts/Supplemental/GeezaPro.ttc"],
+                Script::Georgian => &["/System/Library/Fonts/SFGeorgian.ttf", "/Library/Fonts/NotoSansGeorgian-Regular.ttf"],
             };
             v.extend(files.iter().map(|f| (PathBuf::from(f), 0)));
             v.push((PathBuf::from("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"), 0));
-        } else if self == Script::Arabic {
-            for f in [
-                "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
-                "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
-                "/usr/share/fonts/google-noto/NotoSansArabic-Regular.ttf",
-                "/usr/local/share/fonts/noto/NotoSansArabic-Regular.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-                "/usr/local/share/fonts/dejavu/DejaVuSans.ttf",
-            ] {
+        } else if matches!(self, Script::Arabic | Script::Georgian) {
+            let noto = if self == Script::Arabic { "NotoSansArabic-Regular.ttf" } else { "NotoSansGeorgian-Regular.ttf" };
+            for dir in ["/usr/share/fonts/truetype/noto", "/usr/share/fonts/noto", "/usr/share/fonts/google-noto", "/usr/local/share/fonts/noto"] {
+                v.push((PathBuf::from(dir).join(noto), 0));
+            }
+            for f in
+                ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/dejavu/DejaVuSans.ttf", "/usr/local/share/fonts/dejavu/DejaVuSans.ttf"]
+            {
                 v.push((PathBuf::from(f), 0));
             }
         } else {
             // Noto Sans CJK collections hold JP, KR, SC, TC and HK faces, in that order.
             let face = match self {
-                Script::Japanese | Script::Arabic => 0,
+                Script::Japanese | Script::Arabic | Script::Georgian => 0,
                 Script::Korean => 1,
                 Script::Chinese => 2,
             };
@@ -277,6 +280,7 @@ mod tests {
         assert_eq!(Script::of_language("zh-Hans"), Some(Script::Chinese));
         assert_eq!(Script::of_language("ko"), Some(Script::Korean));
         assert_eq!(Script::of_language("ar"), Some(Script::Arabic));
+        assert_eq!(Script::of_language("ka"), Some(Script::Georgian));
         assert_eq!(Script::of_language("de"), None);
         for l in &crate::i18n::LANGUAGES {
             // Past the Latin blocks and their diacritics.
@@ -293,6 +297,12 @@ mod tests {
         assert!(f.installed.is_empty() && f.loaded.is_empty(), "English loads nothing");
         f.update(&ctx, "ko", false);
         assert_eq!(f.installed, [Script::Korean]);
+        f.update(&ctx, "ka", false);
+        assert_eq!(f.installed, [Script::Georgian, Script::Korean]);
+        // An embedded Georgian face (builds with craft-fonts) is what draws it.
+        if CRAFT_FONTS.iter().any(|c| c.scripts.contains(&"Geor") && !c.bytes.is_empty()) {
+            assert!(f.covers(Script::Georgian));
+        }
         f.update(&ctx, "ja", true);
         assert_eq!(f.installed, Script::ALL);
         // Closing the picker keeps what is loaded; each script was read at most once.
