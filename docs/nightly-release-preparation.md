@@ -15,8 +15,8 @@ gh api repos/storytold/texturecraft/actions/workflows/nightly.yml --jq .id
 The callers pass no platform secrets. The unsigned reusable caller's maximum OIDC/attestation
 permissions are for its isolated attester; its compiler narrows to contents and Actions read
 only, with no OIDC, attestation write, release environment or platform signing secrets.
-Shared tooling is pinned to `be00e5ccd18b68e950c8a08532f2230e7c3d0cba`, the craft-common-actions
-main commit that merged [#371](https://github.com/storytold/craft-common-actions/pull/371) (the
+Shared tooling is pinned to `f94a43818dabb2e85f2f4d5cd768bb8e5662600a`, the craft-common-actions
+main commit that merged [#382](https://github.com/storytold/craft-common-actions/pull/382) (first-signer-attempt creation time is reconciled on re-read) after [#371](https://github.com/storytold/craft-common-actions/pull/371) (the
 candidate is admitted on the built commit's own Sonar analysis, not main's latest) after
 [#370](https://github.com/storytold/craft-common-actions/pull/370) (the Windows and macOS nightly
 registry rows for the 14 apps) and
@@ -80,7 +80,7 @@ Read on 2026-11-24; re-read anything that may have moved before `nightly-signer`
 |---|---|---|
 | `repository_id` | `1419654881` | `gh api repos/storytold/texturecraft --jq .id` |
 | `producer_workflow_id` | `429738073` | `gh api repos/storytold/texturecraft/actions/workflows/nightly.yml --jq .id` |
-| `producer_tooling_revision`, `signer_tooling_revision`, `producer_workflow_ref` | `be00e5cc…` (craft-common-actions #371 after #370, #369 and #364) | The callers' pin |
+| `producer_tooling_revision`, `signer_tooling_revision`, `producer_workflow_ref` | `f94a4381…` (craft-common-actions #382 after #379, #376, #371, #370, #369 and #364) | The callers' pin |
 | `manual_actors` / `automatic_signer_actors` | the five release managers / `[]` | release-managers team (id 19837241) members who can push; equals the producer caller's `manual-actors` |
 | `max_age_seconds`, `max_artifact_bytes` | `86400`, `2147483648` | Go-live checklist |
 | `platforms` | three rows (`windows-x86_64`, `linux-x86_64`, `macos-aarch64`) | Stable suite signing identities (`Learning Machines Inc` Authenticode subject, Linux OpenPGP fingerprint `2B76741B414AAD6CD33E631213A005C0B9D7C3ED`, Apple Team ID `DJ6XS33FX8`) |
