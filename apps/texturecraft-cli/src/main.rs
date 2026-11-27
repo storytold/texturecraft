@@ -38,10 +38,12 @@ USAGE:
       New project; --sample bakes and applies a smart material to every texture set. The
       sample's mesh maps are baked at the resolution up to 1024 px (most of the file's size),
       so a 2048 sample project is as large as a 1024 one.
-  texturecraft-cli mcp [--bridge <port>] [--token <token>] [--read-root <dir>] [--write-root <dir>]
-      MCP server on stdio: headless (file access only below the roots), or bridged to
-      `texturecraft --control <port>`. --automation-read-root / --automation-write-root are
-      the same as --read-root / --write-root (mcp and serve).
+  texturecraft-cli mcp [--read-root <dir>] [--write-root <dir>]
+      Headless MCP server on stdio, with file access only below the supplied roots.
+      --automation-read-root / --automation-write-root are aliases for --read-root /
+      --write-root (mcp and serve).
+  texturecraft-cli mcp --bridge <port> [--token <token>]
+      Relay MCP to `texturecraft --control <port>`. File-root options only apply in headless mode.
   texturecraft-cli serve [--port <port>] [--read-root <dir>] [--write-root <dir>]
       JSON lines ({\"id\",\"method\",\"params\"}) on stdio, or on 127.0.0.1:<port> with a token.
 
@@ -420,12 +422,17 @@ fn port_of(v: &str) -> Result<u16, String> {
     p.parse::<u16>().ok().filter(|p| *p != 0).ok_or_else(|| format!("`{v}` is not a loopback port (1-65535)"))
 }
 
+fn mcp_bridge_port(a: &Args) -> Result<Option<u16>, String> {
+    let Some(value) = a.get("--bridge") else { return Ok(None) };
+    if ["--read-root", "--write-root", "--automation-read-root", "--automation-write-root"].iter().any(|flag| a.has(flag)) {
+        return Err("file-root options apply to headless MCP and cannot be used with --bridge".into());
+    }
+    port_of(value).map(Some)
+}
+
 fn mcp(a: &Args) -> R {
-    let server = match a.get("--bridge") {
-        Some(b) => {
-            let port = port_of(b)?;
-            TexturecraftMcp::bridge(BridgeClient::new(port, client_token(port, a.get("--token").map(str::to_string)).map_err(s)?))
-        }
+    let server = match mcp_bridge_port(a)? {
+        Some(port) => TexturecraftMcp::bridge(BridgeClient::new(port, client_token(port, a.get("--token").map(str::to_string)).map_err(s)?)),
         None => TexturecraftMcp::headless(Headless::new(Headless::default_session().map_err(s)?, workspace(a)?)),
     };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(s)?;
@@ -447,6 +454,23 @@ fn serve(a: &Args) -> R {
                 None => eprintln!("texturecraft-cli: serving on {addr}; token from TEXTURECRAFT_CONTROL_TOKEN"),
             }
             rpc::serve_listener(listener, h, token).map_err(s)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_bridge_rejects_headless_file_root_options() {
+        let (_, values, bare) = SUBCOMMANDS.iter().find(|(name, _, _)| *name == "mcp").expect("mcp arguments");
+        let args = |items: &[&str]| parse(values, bare, &items.iter().map(|s| s.to_string()).collect::<Vec<_>>()).expect("valid arguments");
+        assert_eq!(mcp_bridge_port(&args(&["--bridge", "7979"])), Ok(Some(7979)));
+        assert_eq!(mcp_bridge_port(&args(&["--read-root", "."])), Ok(None));
+        for root in ["--read-root", "--write-root", "--automation-read-root", "--automation-write-root"] {
+            let bridge = args(&["--bridge", "7979", root, "."]);
+            assert_eq!(mcp_bridge_port(&bridge), Err("file-root options apply to headless MCP and cannot be used with --bridge".into()));
         }
     }
 }
