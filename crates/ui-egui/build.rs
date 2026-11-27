@@ -8,7 +8,7 @@
 
 mod i18n_build;
 
-use skera::{subset_font, Plan, SubsetFlags};
+use skera::{Plan, SubsetFlags, subset_font};
 use skrifa::raw::collections::IntSet;
 use skrifa::raw::types::NameId;
 use skrifa::{FontRef, GlyphId, MetadataProvider, Tag};
