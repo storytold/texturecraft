@@ -151,6 +151,31 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
                 map("Specular", 8, gray(ch(Channel::SpecularLevel, 0))),
             ],
         ),
+        // Roblox SurfaceAppearance: Color (opacity in alpha), Normal, Metalness, Roughness: suffixes
+        // Roblox's importer recognises, so it assigns each map to its slot on reimport.
+        // See `docs/export-roblox-sketchfab.md` for sources and the items still to verify.
+        preset(
+            "Roblox (SurfaceAppearance)",
+            vec![
+                map("Color", 8, base_with_alpha()),
+                map("Normal", 8, normal(VirtualMap::NormalOpenGl)),
+                map("Metalness", 8, gray(ch(Channel::Metallic, 0))),
+                map("Roughness", 8, gray(ch(Channel::Roughness, 0))),
+            ],
+        ),
+        // Sketchfab PBR metal-roughness: separate maps whose suffixes Sketchfab's importer
+        // recognises (base color, normal, metallic, roughness, AO, emissive).
+        preset(
+            "Sketchfab",
+            vec![
+                map("BaseColor", 8, base_with_alpha()),
+                map("Normal", 8, normal(VirtualMap::NormalOpenGl)),
+                map("Metallic", 8, gray(ch(Channel::Metallic, 0))),
+                map("Roughness", 8, gray(ch(Channel::Roughness, 0))),
+                map("AmbientOcclusion", 8, gray(virt(VirtualMap::AoMixed, 0))),
+                map("Emissive", 8, rgb(|k| ch(Channel::Emissive, k))),
+            ],
+        ),
         // Spec: https://docs.godotengine.org/en/stable/tutorials/3d/standard_material_3d.html (ORM material: R occlusion, G roughness, B metallic)
         preset(
             "Godot 4 (ORM)",
@@ -239,6 +264,15 @@ pub const DEFAULT_PRESET: &str = "Document channels + Normal + AO (No Alpha)";
 /// The default template's name before it took the reference's "(No Alpha)" (saved settings and
 /// scripts still use it).
 const OLD_DEFAULT_PRESET: &str = "Document channels + Normal + AO";
+
+/// Largest texture edge (pixels) a built-in preset is meant for, if its target caps it.
+/// Roblox: 1024 is the figure community reports cite; the official limit is not confirmed
+/// (see `docs/export-roblox-sketchfab.md`). `ExportOptions::size` is per UV tile, so for an atlas
+/// divide this by the larger of the tile grid's columns and rows and round down to a power of two
+/// before passing it (1024 over three columns is 256, not 341: other sizes are rejected).
+pub fn preset_max_size(name: &str) -> Option<u32> {
+    name.trim().eq_ignore_ascii_case("Roblox (SurfaceAppearance)").then_some(1024)
+}
 
 /// A built-in preset by name (case-insensitive).
 pub fn builtin_preset(name: &str) -> Option<ExportPreset> {

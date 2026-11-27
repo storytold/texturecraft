@@ -133,6 +133,8 @@ Built-in presets (each one lists the public specification its packing follows in
 | Unity HDRP (Mask Map) | `BaseMap`, `MaskMap` (R metal, G AO, B detail = 0, A smoothness), `Normal` (OpenGL) |
 | Unity Standard (Metallic Smoothness) | `Albedo`, `MetallicSmoothness` (R metal, A smoothness), `Normal` (OpenGL), `Occlusion` |
 | Blender (Principled BSDF) | `BaseColor`, `Metallic`, `Roughness`, `Normal` (OpenGL), `Height` (16-bit), `Emission`, `Specular` |
+| Roblox (SurfaceAppearance) | `Color` (A = opacity), `Normal` (OpenGL, unverified), `Metalness`, `Roughness` (grayscale PNG); max size 1024 via `preset_max_size` (unverified) |
+| Sketchfab | `BaseColor` (A = opacity), `Normal` (OpenGL), `Metallic`, `Roughness`, `AmbientOcclusion`, `Emissive` |
 | Godot 4 (ORM) | `albedo` (A = opacity), `orm` (R AO, G roughness, B metal), `normal` (OpenGL), `emission` |
 | OpenPBR (separate maps) | one map per OpenPBR Surface input the set has: `base_color`, `base_metalness`, `specular_roughness`, `specular_roughness_anisotropy`, `coat_weight`, `coat_roughness`, `fuzz_weight`, `fuzz_color`, `fuzz_roughness`, `transmission_weight`, `subsurface_weight`, `emission_color`, `geometry_opacity`, `geometry_normal` (OpenGL), `height` (16-bit) |
 | Unity URP Lit (Metallic Smoothness) | `BaseMap`, `MetallicMap` (R metal, A smoothness), `NormalMap` (OpenGL), `OcclusionMap`, `EmissionMap` |

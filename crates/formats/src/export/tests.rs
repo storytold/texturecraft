@@ -1577,6 +1577,86 @@ fn write_files_accepts_a_long_nested_folder_and_stem() {
 }
 
 #[test]
+fn roblox_and_sketchfab_presets() {
+    use crate::presets::preset_max_size;
+    let mut chans = default_channels();
+    chans.extend([Channel::Opacity, Channel::AmbientOcclusion, Channel::Emissive]);
+    let mut fx = Fx::new(&chans);
+    fx.set_all(Channel::Metallic, |_, _| [1.0; 3]);
+    fx.set_all(Channel::Roughness, |_, _| [0.25; 3]);
+    fx.set_all(Channel::Opacity, |_, _| [0.5; 3]);
+    fx.set_all(Channel::AmbientOcclusion, |_, _| [0.0; 3]);
+    fx.set_all(Channel::Emissive, |_, _| [1.0, 0.0, 0.0]);
+    let names = |files: &[ExportedFile]| files.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+    let near = |got: u8, want: i32, what: &str| assert!((got as i32 - want).abs() <= 1, "{what}: {got} vs {want}");
+
+    let roblox = fx.render_preset("Roblox (SurfaceAppearance)");
+    assert_eq!(names(&roblox), ["sphere_Body_Set_Color.png", "sphere_Body_Set_Normal.png", "sphere_Body_Set_Metalness.png", "sphere_Body_Set_Roughness.png"]);
+    let color = decode(find(&roblox, "_Color.")).to_rgba8();
+    near(color.get_pixel(1, 1)[3], 128, "Color alpha is the opacity channel");
+    near(decode(find(&roblox, "_Metalness.")).to_luma8().get_pixel(1, 1)[0], 255, "Metalness");
+    near(decode(find(&roblox, "_Roughness.")).to_luma8().get_pixel(1, 1)[0], 64, "Roughness");
+    assert_eq!(decode(find(&roblox, "_Metalness.")).color().channel_count(), 1, "grayscale");
+    assert!(roblox.iter().all(|f| f.width == RES && f.height == RES));
+    assert_eq!(preset_max_size("roblox (surfaceappearance)"), Some(1024));
+    assert_eq!(preset_max_size("Sketchfab"), None);
+    // Power-of-two resize, within the limit.
+    let mut opts = ExportOptions::new(builtin_preset("Roblox (SurfaceAppearance)").unwrap());
+    opts.size = Some(32);
+    assert!(fx.render(&opts).iter().all(|f| (f.width, f.height) == (32, 32)));
+
+    // The flat normal (0.5, 0.5, 1) encodes the same in OpenGL and DirectX, so tilt one texel: +Y green in OpenGL.
+    let mut tilted = Fx::new(&chans);
+    tilted.set(Channel::Normal, 1, 1, [0.5, 1.0, 1.0]);
+    let up = |files: &[ExportedFile], suffix: &str| decode(find(files, suffix)).to_rgb8().get_pixel(1, 1)[1];
+    let gl = up(&tilted.render_preset("glTF PBR Metal Roughness"), "_Normal.");
+    let dx = up(&tilted.render_preset("Unreal Engine (Packed)"), "_Normal.");
+    assert_ne!(gl, dx, "the fixture tells OpenGL from DirectX apart");
+    assert_eq!(up(&tilted.render_preset("Roblox (SurfaceAppearance)"), "_Normal."), gl, "Roblox normals are OpenGL (Y+)");
+    assert_eq!(up(&tilted.render_preset("Sketchfab"), "_Normal."), gl, "Sketchfab normals are OpenGL (Y+)");
+
+    let sk = fx.render_preset("Sketchfab");
+    assert_eq!(
+        names(&sk),
+        [
+            "sphere_Body_Set_BaseColor.png",
+            "sphere_Body_Set_Normal.png",
+            "sphere_Body_Set_Metallic.png",
+            "sphere_Body_Set_Roughness.png",
+            "sphere_Body_Set_AmbientOcclusion.png",
+            "sphere_Body_Set_Emissive.png"
+        ]
+    );
+    near(decode(find(&sk, "_BaseColor.")).to_rgba8().get_pixel(1, 1)[3], 128, "BaseColor alpha");
+    near(decode(find(&sk, "_Metallic.")).to_luma8().get_pixel(1, 1)[0], 255, "Metallic");
+    near(decode(find(&sk, "_Roughness.")).to_luma8().get_pixel(1, 1)[0], 64, "Roughness");
+    near(decode(find(&sk, "_AmbientOcclusion.")).to_luma8().get_pixel(1, 1)[0], 0, "AO of a fully occluded set");
+    let emissive = decode(find(&sk, "_Emissive.")).to_rgb8();
+    let px = emissive.get_pixel(1, 1);
+    assert!(px[0] > 200 && px[1] < 5 && px[2] < 5, "red emission stays red: {px:?}");
+}
+
+/// A set without Opacity, AO or Emissive channels skips the maps that need them and exports the rest.
+#[test]
+fn roblox_and_sketchfab_presets_on_a_set_without_the_optional_channels() {
+    let fx = Fx::new(&default_channels());
+    let stems = |preset: &str| {
+        let files = fx.render_preset(preset);
+        assert!(files.iter().all(|f| f.width == RES && f.height == RES && !f.bytes.is_empty()), "{preset}");
+        assert!(!decode(find(&files, "_Normal.")).color().has_alpha(), "{preset}: no opacity channel, so no alpha");
+        files.into_iter().map(|f| f.name).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        stems("Roblox (SurfaceAppearance)"),
+        ["sphere_Body_Set_Color.png", "sphere_Body_Set_Normal.png", "sphere_Body_Set_Metalness.png", "sphere_Body_Set_Roughness.png"]
+    );
+    assert_eq!(
+        stems("Sketchfab"),
+        ["sphere_Body_Set_BaseColor.png", "sphere_Body_Set_Normal.png", "sphere_Body_Set_Metallic.png", "sphere_Body_Set_Roughness.png"]
+    );
+}
+
+#[test]
 fn specular_glossiness_exports_ignore_the_ior_specular_setting() {
     let mut fx = Fx::new(&[Channel::BaseColor, Channel::Specular, Channel::Glossiness, Channel::SpecularLevel]);
     fx.set_all(Channel::Specular, |_, _| [0.3, 0.2, 0.1]);
