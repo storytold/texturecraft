@@ -5946,6 +5946,7 @@ dependencies = [
 name = "texturecraft"
 version = "0.6.1"
 dependencies = [
+ "craft-host",
  "craft-image-codecs",
  "craft-menu",
  "craft-update",
@@ -5956,6 +5957,7 @@ dependencies = [
  "log",
  "rfd",
  "ron",
+ "rustix 1.1.6",
  "serde_json",
  "texturecraft-automation",
  "texturecraft-engine",
@@ -5963,6 +5965,7 @@ dependencies = [
  "winit",
  "winresource",
  "winsafe",
+ "x11rb-protocol",
 ]
 
 [[package]]
@@ -6136,6 +6139,7 @@ dependencies = [
  "texturecraft-bake",
  "texturecraft-compose",
  "texturecraft-core",
+ "texturecraft-formats",
  "texturecraft-geom",
  "texturecraft-texel",
  "wasm-bindgen-futures",

@@ -12,6 +12,16 @@ Third-party material
 This product bundles third-party material under its own licenses, listed below. The per-file
 list (author, source, license) is in ATTRIBUTION.md.
 
+PhotoCraft Linux pen and display probing code, adapted in apps/texturecraft/src/xwayland_pen.rs
+from storytold/photocraft at 830316b775f1f6734498ac6e39fd1298955ff93f.
+Copyright (c) 2026 ArtCraft Team and the PhotoCraft contributors.
+Licensed under the MIT License or the Apache License, Version 2.0, at your option
+(LICENSE-MIT, LICENSE-APACHE).
+
+Linux X11 setup probe components:
+- rustix — Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT.
+- x11rb-protocol — MIT OR Apache-2.0. Copyright 2019 x11rb contributors.
+
 Studio Small 09 HDR environment (assets/hdr/studio_small_09_512.hdr),
 by Sergej Majboroda (Poly Haven) — CC0-1.0.
 Source: https://polyhaven.com/a/studio_small_09 (1K HDR, reduced to 512x256).

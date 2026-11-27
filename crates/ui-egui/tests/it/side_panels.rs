@@ -177,6 +177,31 @@ fn export_mesh_asks_the_options_then_the_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn recompute_normals_is_an_enabled_keyboard_operable_checkbox() {
+    let mut harness = app();
+    let context = harness.ctx.clone();
+    texturecraft_ui_egui::menus::invoke(harness.state_mut(), &context, "file.exportMesh");
+    harness.run_steps(SETTLE_FRAMES);
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, "Recompute vertex normals");
+    assert!(!checkbox.accesskit_node().is_disabled(), "the option is really available");
+    assert!(!is_on(&checkbox), "stored normals are kept until the user opts in");
+    assert!(!harness.state().ui.mesh_recompute_normals);
+
+    checkbox.focus();
+    harness.key_press(egui::Key::Space);
+    harness.run_steps(SETTLE_FRAMES);
+    assert!(harness.state().ui.mesh_recompute_normals, "Space changes the setting used by export");
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, "Recompute vertex normals");
+    assert!(is_on(&checkbox), "the accessibility tree reports the checked state");
+    assert_eq!(checkbox.accesskit_node().label().as_deref(), Some("Recompute vertex normals"));
+
+    checkbox.click();
+    harness.run_steps(SETTLE_FRAMES);
+    assert!(!harness.state().ui.mesh_recompute_normals, "a pointer click turns it back off");
+    assert!(!is_on(&harness.get_by_role_and_label(Role::CheckBox, "Recompute vertex normals")));
+}
+
 /// Whether the Log lists `line` (the status bar under it repeats the last message)
 fn log_lists(harness: &Harness<'_, TextureCraftApp>, line: &str) -> bool {
     harness.query_all_by_label(line).any(|node| node.rect().bottom() < STATUS_BAR_TOP)
@@ -287,6 +312,70 @@ fn shader_settings_show_the_reference_rows_and_the_shader_choice() {
     let open_pbr = harness.get_by_label(&tiles[4]);
     assert!(!open_pbr.accesskit_node().is_disabled() && is_on(&open_pbr), "open-pbr is the current shader");
     assert!(harness.get_by_label(&tiles[1]).accesskit_node().is_disabled(), "the others are not available yet");
+}
+
+#[test]
+fn the_unchecked_ior_control_is_visible_at_each_brightness() {
+    use craft_theme::{Contrast, Rgba, contrast_ratio, non_text_contrast_min};
+    use texturecraft_ui_egui::theme::{Brightness, Tokens};
+
+    let mut harness = app();
+    click_rail(&mut harness, "Shader Settings");
+    let minimum_contrast = non_text_contrast_min(Contrast::Standard);
+
+    for brightness in Brightness::ALL {
+        harness.state_mut().ui.prefs.brightness = brightness;
+        harness.run_steps(SETTLE_FRAMES);
+
+        let checkbox = harness.get_by_role_and_label(Role::CheckBox, "Use IOR for specular reflection");
+        let bounds = checkbox.rect();
+        let panel = Tokens::get(&harness.ctx).panel;
+        let indicator = harness
+            .output()
+            .shapes
+            .iter()
+            .filter_map(|painted| match &painted.shape {
+                egui::Shape::Rect(frame) if painted.clip_rect.contains_rect(frame.rect) && bounds.contains_rect(frame.rect) => Some(frame),
+                _ => None,
+            })
+            .find(|frame| frame.fill.a() > 0 || !frame.stroke.is_empty())
+            .expect("the unchecked indicator is painted inside its accessibility bounds");
+        let fill = panel.blend(indicator.fill);
+        let outline = if indicator.stroke.width > 0.0 { fill.blend(indicator.stroke.color) } else { fill };
+        let contrast = |color: egui::Color32| contrast_ratio(Rgba(color.to_array()), Rgba(panel.to_array()));
+        let ratio = contrast(fill).max(contrast(outline));
+
+        assert!(ratio >= minimum_contrast, "{brightness:?}: the unchecked box has {ratio:.2}:1 contrast against the panel");
+    }
+}
+
+#[test]
+fn keyboard_toggles_ior_reflectance_only_in_metallic_roughness() {
+    let mut harness = app();
+    let label = "Use IOR for specular reflection";
+    harness.state_mut().ui.dock.focus(Panel::Shader);
+    harness.state_mut().session.modified = false;
+    harness.run_steps(SETTLE_FRAMES);
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, label);
+    assert_eq!(checkbox.accesskit_node().toggled(), Some(egui::accesskit::Toggled::False));
+    checkbox.focus();
+    harness.run_steps(SETTLE_FRAMES);
+
+    harness.key_press(egui::Key::Space);
+    harness.run_steps(SETTLE_FRAMES);
+
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, label);
+    assert!(checkbox.is_focused());
+    assert!(is_on(&checkbox));
+    assert!(harness.state().session.doc.project.display.ior_specular);
+    assert!(harness.state().session.modified);
+
+    harness.state_mut().run("display.set", serde_json::json!({"specGloss": true})).unwrap();
+    harness.run_steps(SETTLE_FRAMES);
+
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, label);
+    assert!(checkbox.accesskit_node().is_disabled());
+    assert!(is_on(&checkbox), "the current preference is retained");
 }
 
 #[test]

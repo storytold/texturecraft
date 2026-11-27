@@ -510,13 +510,31 @@ pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                 ui.add_space(SHELF_GROUP_GAP);
             }
 
-            for (icon, label) in [(ic::HOURGLASS, "Snooze Autosave"), (ic::ARROWS_CLOCKWISE, "Resources Updater")] {
-                ui.add_enabled_ui(false, |ui| icon_button(ui, icon, tr(label), false, SHELF_BUTTON_SIZE))
-                    .inner
-                    .on_disabled_hover_text(tr(crate::unavailable::NOT_AVAILABLE));
-            }
+            ui.add_enabled_ui(false, |ui| icon_button(ui, ic::HOURGLASS, tr("Snooze Autosave"), false, SHELF_BUTTON_SIZE))
+                .inner
+                .on_disabled_hover_text(tr(crate::unavailable::NOT_AVAILABLE));
+            resources_updater_button(app, ui);
         });
     });
+}
+
+/// The shelf's Resources Updater button: opens or closes its window while a project is open
+#[cfg(not(target_arch = "wasm32"))]
+fn resources_updater_button(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
+    let open = app.ui.windows.resources_updater.is_some();
+    let label = tr("Resources Updater");
+    let button = ui.add_enabled_ui(app.session.project_open, |ui| icon_button(ui, ic::ARROWS_CLOCKWISE, label, open, SHELF_BUTTON_SIZE)).inner;
+    if button.on_disabled_hover_text(tr("Open a project to check its resources")).clicked() {
+        crate::resources_updater::toggle(app);
+    }
+}
+
+/// The browser reads no files from disk, so there is nothing to update
+#[cfg(target_arch = "wasm32")]
+fn resources_updater_button(_: &mut TextureCraftApp, ui: &mut egui::Ui) {
+    ui.add_enabled_ui(false, |ui| icon_button(ui, ic::ARROWS_CLOCKWISE, tr("Resources Updater"), false, SHELF_BUTTON_SIZE))
+        .inner
+        .on_disabled_hover_text(tr(crate::unavailable::NOT_AVAILABLE));
 }
 
 /// Width of the icon rail beside the dock

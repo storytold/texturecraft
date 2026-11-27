@@ -36,6 +36,7 @@ pub struct ProjectTemplate {
     pub spec_gloss: bool,
     pub parallax: bool,
     pub ior: f32,
+    pub ior_specular: bool,
     pub scatter_color: [f32; 3],
     pub scatter_radius: f32,
 }
@@ -51,6 +52,7 @@ impl Default for ProjectTemplate {
             spec_gloss: d.spec_gloss,
             parallax: d.parallax,
             ior: d.ior,
+            ior_specular: d.ior_specular,
             scatter_color: d.scatter_color,
             scatter_radius: d.scatter_radius,
         }
@@ -116,7 +118,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Project templates",
             [],
             None,
-            "{} → [{name, label, builtin, resolution, normalFormat, channels: [ids], specGloss}]",
+            "{} → [{name, label, builtin, resolution, normalFormat, channels: [ids], specGloss, iorSpecular}]",
             always,
             list
         ),
@@ -189,28 +191,36 @@ impl Session {
         matches.next().is_none().then(|| template.clone())
     }
 
-    /// Start this (new, unpainted) project from template `t`: its channels on every texture set
-    /// and layer, normal format and shader settings. The resolution is the caller's choice.
-    pub fn apply_template(&mut self, t: &ProjectTemplate) {
-        let p = &mut self.doc.project;
-        p.normal_format = t.normal_format;
-        let d = &mut p.display;
-        (d.spec_gloss, d.parallax, d.ior, d.scatter_color, d.scatter_radius) = (t.spec_gloss, t.parallax, t.ior, t.scatter_color, t.scatter_radius);
-        for ts in 0..p.texture_sets.len() {
-            if let Some(set) = p.texture_sets.get_mut(ts) {
-                set.channels = t.channels.clone();
+    /// Apply the template's channels and shader settings to a new, unpainted project.
+    /// The caller chooses the texture set resolution.
+    pub fn apply_template(&mut self, template: &ProjectTemplate) {
+        let project = &mut self.doc.project;
+        project.normal_format = template.normal_format;
+
+        let display = &mut project.display;
+        display.spec_gloss = template.spec_gloss;
+        display.parallax = template.parallax;
+        display.ior = template.ior;
+        display.ior_specular = template.ior_specular;
+        display.scatter_color = template.scatter_color;
+        display.scatter_radius = template.scatter_radius;
+
+        for set_index in 0..project.texture_sets.len() {
+            if let Some(set) = project.texture_sets.get_mut(set_index) {
+                set.channels = template.channels.clone();
             }
-            let wanted: Vec<Channel> = t.channels.iter().map(|(c, _)| *c).collect();
-            for (id, _) in p.walk(ts) {
-                if let Ok(l) = p.layer_mut(id) {
-                    let mode = if l.is_group() { texturecraft_core::BlendMode::Passthrough } else { texturecraft_core::BlendMode::Normal };
-                    l.channels.retain(|c, _| wanted.contains(c));
-                    for c in &wanted {
-                        l.channels.entry(*c).or_insert(ChannelBlend { mode, opacity: 1.0 });
+
+            for (id, _) in project.walk(set_index) {
+                if let Ok(layer) = project.layer_mut(id) {
+                    let mode = if layer.is_group() { texturecraft_core::BlendMode::Passthrough } else { texturecraft_core::BlendMode::Normal };
+                    layer.channels.retain(|channel, _| template.channels.iter().any(|(wanted, _)| channel == wanted));
+                    for &(channel, _) in &template.channels {
+                        layer.channels.entry(channel).or_insert(ChannelBlend { mode, opacity: 1.0 });
                     }
                 }
             }
         }
+
         self.touched();
         self.modified = false;
     }
@@ -277,6 +287,7 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
             "normalFormat": if t.normal_format == NormalFormat::DirectX { "directX" } else { "openGl" },
             "channels": t.channels.iter().map(|(c, _)| c.id()).collect::<Vec<_>>(),
             "specGloss": t.spec_gloss,
+            "iorSpecular": t.ior_specular,
         })
     };
     Ok(json!(builtin_templates().iter().map(|t| entry(t, true)).chain(s.templates.list.iter().map(|t| entry(t, false))).collect::<Vec<_>>()))
@@ -296,6 +307,7 @@ fn save(session: &mut Session, params: &Value) -> Result<Value> {
         spec_gloss: display.spec_gloss,
         parallax: display.parallax,
         ior: display.ior,
+        ior_specular: display.ior_specular,
         scatter_color: display.scatter_color,
         scatter_radius: display.scatter_radius,
     };

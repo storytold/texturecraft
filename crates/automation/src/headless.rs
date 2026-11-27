@@ -225,9 +225,9 @@ impl Headless {
 
     /// Export the working mesh to `path` (obj, glb, usda, usdc or usdz, from `format` or the
     /// extension); obj writes its .mtl and textures, usda and usdc their textures, next to it.
-    pub fn export_mesh(&mut self, path: &str, format: Option<&str>) -> Result<Value, AutomationError> {
+    pub fn export_mesh(&mut self, path: &str, format: Option<&str>, recompute_normals: bool) -> Result<Value, AutomationError> {
         self.require_project()?;
-        let out = self.session.mesh_export(path, format)?;
+        let out = self.session.mesh_export_with_normals(path, format, recompute_normals)?;
         let dir = Path::new(&out.path).parent().and_then(|d| d.to_str()).filter(|d| !d.is_empty()).unwrap_or(".");
         self.create_dir_all(dir)?;
         let mut textures = Vec::new();

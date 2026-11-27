@@ -316,8 +316,10 @@ pub struct DisplaySettings {
     pub scatter_color: [f32; 3],
     /// Subsurface scattering mean free path as a fraction of the mesh's bounding radius.
     pub scatter_radius: f32,
-    /// Index of refraction of transmissive surfaces (where the Transmission channel is painted).
+    /// Index of refraction for transmission and, when enabled, dielectric reflectance.
     pub ior: f32,
+    /// Use IOR to determine dielectric reflectance at normal incidence in Metallic/Roughness.
+    pub ior_specular: bool,
     /// Depth of field of the viewport and the path tracer (thin lens).
     pub dof: DepthOfField,
     /// The selected fill's projection gizmos show in the 3D view (the Projection row's eye)
@@ -381,10 +383,34 @@ pub const ENVIRONMENTS: [&str; 6] = ["Studio Soft", "Studio Contrast", "Overcast
 /// Prefix of [`DisplaySettings::environment`] naming an image resource.
 pub const ENV_RESOURCE_PREFIX: &str = "resource:";
 
+/// Original dielectric F0 multiplier for the Specular Level channel.
+pub const LEGACY_DIELECTRIC_F0_SCALE: f32 = 0.08;
+
+/// Project limits for the index of refraction.
+pub const MIN_INDEX_OF_REFRACTION: f32 = 1.0;
+pub const MAX_INDEX_OF_REFRACTION: f32 = 3.0;
+
 impl DisplaySettings {
     /// The image resource used as the environment, if any.
     pub fn environment_resource(&self) -> Option<&str> {
         self.environment.strip_prefix(ENV_RESOURCE_PREFIX)
+    }
+
+    /// Multiplier for Specular Level in the Metallic/Roughness model.
+    pub fn dielectric_f0_scale(&self) -> f32 {
+        if !self.ior_specular || self.spec_gloss || !self.ior.is_finite() {
+            return LEGACY_DIELECTRIC_F0_SCALE;
+        }
+
+        const AIR_INDEX_OF_REFRACTION: f32 = 1.0;
+        // Specular Level 0.5 corresponds to OpenPBR specular weight 1
+        const SPECULAR_LEVEL_TO_WEIGHT_SCALE: f32 = 2.0;
+        let ior = self.ior.clamp(MIN_INDEX_OF_REFRACTION, MAX_INDEX_OF_REFRACTION);
+        let contrast = ior - AIR_INDEX_OF_REFRACTION;
+        let index_sum = ior + AIR_INDEX_OF_REFRACTION;
+
+        // Square before dividing so IOR 1.5 rounds to the legacy multiplier
+        SPECULAR_LEVEL_TO_WEIGHT_SCALE * contrast.powi(2) / index_sum.powi(2)
     }
 }
 
@@ -416,6 +442,7 @@ impl Default for DisplaySettings {
             scatter_color: [1.0, 0.4, 0.25],
             scatter_radius: 0.1,
             ior: 1.5,
+            ior_specular: false,
             dof: DepthOfField::default(),
             projection_gizmos: true,
         }
@@ -452,6 +479,10 @@ pub struct Project {
     /// The project's colour swatches (linear RGB), in the order they were added; projects without any save none
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub swatches: Vec<[f32; 3]>,
+    /// The files image resources were imported from, by resource name (the Resources Updater
+    /// reads them again). Resources made in the app or imported without a file path have none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resource_sources: BTreeMap<String, crate::ResourceSource>,
 }
 
 impl Project {
@@ -470,6 +501,7 @@ impl Project {
             display: DisplaySettings::default(),
             cameras: Vec::new(),
             swatches: Vec::new(),
+            resource_sources: BTreeMap::new(),
         }
     }
 
@@ -815,6 +847,28 @@ mod tests {
         let mut p = Project::new("t", "builtin:sphere");
         p.texture_sets.push(TextureSet::new("Body", 0, 512));
         p
+    }
+
+    #[test]
+    fn enabling_ior_at_the_default_preserves_legacy_reflectance() {
+        let mut display = DisplaySettings::default();
+        let legacy = display.dielectric_f0_scale();
+
+        display.ior_specular = true;
+
+        assert_eq!(display.dielectric_f0_scale(), legacy);
+    }
+
+    #[test]
+    fn dielectric_reflectance_clamps_ior_and_falls_back_for_non_finite_values() {
+        let scale_at = |ior| DisplaySettings { ior, ior_specular: true, ..DisplaySettings::default() }.dielectric_f0_scale();
+
+        assert_eq!(scale_at(0.5), scale_at(1.0));
+        assert_eq!(scale_at(1.0), 0.0);
+        assert!(scale_at(1.5) < scale_at(3.0));
+        assert_eq!(scale_at(4.0), scale_at(3.0));
+        assert_eq!(scale_at(f32::NAN), LEGACY_DIELECTRIC_F0_SCALE);
+        assert_eq!(scale_at(f32::INFINITY), LEGACY_DIELECTRIC_F0_SCALE);
     }
 
     #[test]

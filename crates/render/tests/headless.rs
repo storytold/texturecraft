@@ -1,4 +1,5 @@
 use texturecraft_compose::{DisplayKind, ImageRes};
+use texturecraft_core::DisplaySettings;
 use texturecraft_geom::glam::Vec3;
 use texturecraft_geom::{OrbitCamera, primitives};
 use texturecraft_render::headless::Headless;
@@ -787,6 +788,31 @@ fn specular_glossiness_takes_f0_from_the_specular_color() {
     let sg = render(&mut h, &shaded(&frame, |s| s.spec_gloss = true), "shader_spec_gloss_gold");
     assert!(warmth(&sg) > warmth(&mr) + 10.0, "a gold F0 tints the reflections ({} vs {})", warmth(&sg), warmth(&mr));
     assert!(sg.mean(200, 100, 280, 180) > 20.0);
+}
+
+#[test]
+fn ior_specular_changes_dielectric_reflections_in_the_viewport_only_for_metallic_roughness() {
+    let Some((mut h, frame)) = setup() else { return };
+
+    // A dark, glossy dielectric at full Specular Level shows mostly its F0
+    fill(&mut h, &[0, 1], DisplayKind::BaseColor, &[5, 5, 5, 255]);
+    fill(&mut h, &[0, 1], DisplayKind::Orm, &[255, 38, 0, 255]);
+    let mut view = |ior: f32, ior_specular: bool, spec_gloss: bool, name: &str| {
+        // Without temporal anti-aliasing each frame is the same still image
+        let display = DisplaySettings { ior, ior_specular, spec_gloss, taa: false, ..DisplaySettings::default() };
+        render(&mut h, &Frame { shade: Shade::from_display(&display), ..frame.clone() }, name)
+    };
+
+    let legacy = view(1.8, false, false, "ior_specular_off");
+    let opt_in = view(1.8, true, false, "ior_specular_on");
+    let default_ior = view(1.5, true, false, "ior_specular_default_ior");
+    let spec_gloss_off = view(1.8, false, true, "ior_specular_spec_gloss_off");
+    let spec_gloss_on = view(1.8, true, true, "ior_specular_spec_gloss_on");
+
+    let (brighter, darker) = (opt_in.mean(200, 100, 280, 180), legacy.mean(200, 100, 280, 180));
+    assert!(brighter > darker + 2.0, "IOR 1.8 reflects more than the legacy F0 ({brighter} vs {darker})");
+    assert_same(&default_ior, &legacy, "IOR 1.5 keeps the legacy reflectance");
+    assert_eq!(spec_gloss_on.px, spec_gloss_off.px, "Specular/Glossiness takes F0 from the Specular color");
 }
 
 #[test]

@@ -98,6 +98,15 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   and alpha images become the brush alpha. Filter by role or remove selected rows before importing.
   Failed rows stay in the dialog for retry. Color LUT, post effects and asset-library import are
   unavailable. The browser imports images straight from its file picker.
+- **Resources Updater:** the desktop tool shelf lists the project's image resources, with outdated
+  resources first. Filter by status or name, and use *Show in folder* to find a linked file. Images
+  imported from disk through Import resources, PBR folders, MaterialX and mesh map import remember
+  their source file. *Update* and *Update All* reread changed files in one undo step. Layers see the
+  updated image, and an imported mesh map refreshes while it still matches the previous source.
+  *Select new resource* links an image to another file. The list refreshes while the window is open,
+  and a notice offers *Update* when changed files are found on opening a project or regaining focus.
+  Linked MaterialCraft packages appear without a source file. Re-cooking a linked fill layer refreshes
+  its cooked maps.
 - **Your own library:** right-click a layer or folder, choose *Create smart material*, and it
   appears under *My smart materials*, pixels and images included. *Create smart mask* in the same
   menu saves just the layer's mask (all its effects, painted pixels and images); it appears under
@@ -258,6 +267,13 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **Its own title bar** with the app icon, menus and window buttons on Windows (and on Linux
   desktops that leave the frame to the app, such as GNOME), the macOS traffic lights over the same
   strip, and the system's frame instead with `prefs.system_title_bar` through `ui.set` (for now).
+- **A pen on a Linux Wayland desktop** can move the cursor and paint as a pointer through Xwayland.
+  At launch, TextureCraft uses Xwayland when it detects a pen, finds the X11 libraries and the
+  local X server accepts setup. Otherwise it uses native Wayland. Set
+  `TEXTURECRAFT_NATIVE_WAYLAND=1` to keep native Wayland. The Flatpak grants X11 access only as a
+  fallback when Wayland is unavailable. Linux pen pressure is tracked separately in
+  [#818](https://github.com/storytold/texturecraft/pull/818) and
+  [#816](https://github.com/storytold/texturecraft/issues/816).
 - **Dockable, tabbed and floating panels**, saved layouts, and panels that reopen where you closed
   them. The right bar's panels (Export, Log, Display Settings, Shader Settings, History) pop out
   beside it; *Undock* makes one a floating window, and its *Dock* button puts it back on the bar.
@@ -279,6 +295,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - A **data folder** of your choice for autosaves, smart materials, presets, templates and UI
   layouts, on any drive (Settings › General › Files › Data folder, with `Documents/TextureCraft` as
   the default). Nightly shows its fixed profile path in the same row.
+- **Autosave**: each project keeps its own copy in the data folder's `autosave`, named
+  `<name>-copy-<suffix>.tcraft` after its saved file (or, until it is saved, the project), so projects made from
+  one mesh never overwrite each other's copy.
 - A **Settings window** (Edit › Settings) with General, Shortcuts and Libraries pages; changes
   apply on OK and Cancel drops them. General holds the language (or the system's), the 3D view's
   rotation, zoom and wheel speeds with inverse directions, GPU or CPU bake rays, resource limits
@@ -292,8 +311,10 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   channel to a text file with each entry's recorded UTC time, severity and source. The desktop app asks
   for a destination, and the browser downloads the file.
 - A **History** panel: click any step to go back to it, or forward again to an undone one.
-- **10 languages:** English, French, German, Spanish, Portuguese, Italian, Japanese, Chinese,
-  Korean and Arabic, switchable live.
+- **11 languages:** English, French, German, Spanish, Portuguese, Italian, Russian, Japanese,
+  Chinese, Korean and Arabic, switchable live. A build without the shared craft-i18n catalogs
+  offers English only, and Japanese, Chinese, Korean and Arabic can be picked only where a font
+  for their script is available (craft-fonts or the system's); otherwise they show greyed out.
 - **In the browser:** the same app compiled to WebAssembly, on WebGPU or WebGL2, with touch
   navigation and project open, save and download.
 

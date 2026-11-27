@@ -82,7 +82,7 @@ The evidence column includes the November 16 scores for comparison.
 | UI/UX fidelity | ~75% | 20 | TBD | Layer targeting, the workspace, Bake Mode and export dialogs changed. Live task, layout, shortcut and accessibility checks remain. November 16 estimate ~65% |
 | File formats / interchange | ~70% | 10 | TBD | Shared import/export codecs, rebuilt UV persistence and linked `.mcmat` v3 have landed. Project/output contracts, `.spp` and destination-tool coverage remain open. November 16 estimate ~60% |
 | Hardware (GPU, pen, displays) | ~50% | 8 | TBD | One Windows GPU exercised; pen tilt, pressure across platforms and display coverage remain incomplete. November 16 estimate ~50% |
-| Localization | ~35% | 4 | TBD | Ten picker languages in source; optional shared catalogs/fonts and native-language review need current measurement. November 16 estimate ~35% |
+| Localization | ~35% | 4 | TBD | Eleven picker languages in source; optional shared catalogs/fonts and native-language review need current measurement. November 16 estimate ~35% |
 | Performance | ~45% | 10 | TBD | Main added dirty-region uploads, cheaper undo snapshots and faster glTF lookups. Establish response-time and memory budgets with representative large projects. November 16 estimate ~40% |
 | Stability | ~60% | 10 | TBD | The live baseline covered small save/reopen and undo/redo. Rebuilt UV layouts gained persistence checks. Recovery, large projects and long sessions remain open. November 16 estimate ~55% |
 | Platforms | ~70% | 3 | TBD | Desktop and web build paths exist. Nightly packaging and supervised signing workflows landed for Windows, Linux and macOS. Install, update and hardware checks remain. November 16 estimate ~65% |
@@ -151,7 +151,7 @@ signed release installation remain outside the November 25 test evidence.
 
 ## Languages
 
-The [picker](crates/ui-egui/src/i18n.rs) contains ten languages. Shared catalogs are optional at
+The [picker](crates/ui-egui/src/i18n.rs) contains eleven languages. Shared catalogs are optional at
 build time; missing entries fall back to English, and builds without catalogs offer English only.
 The older [coverage table](docs/localization-parity.md) predates catalog migration, so its “100%”
 rows are not a current measurement. The November 16 live audit ran an English build without external catalogs.

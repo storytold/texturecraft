@@ -344,6 +344,68 @@ pub fn open_in_materialcraft(package: &std::path::Path) -> Result<()> {
     })
 }
 
+/// Prefix of the folders [`stage_handoff_package`] makes in the temp folder.
+#[cfg(not(target_arch = "wasm32"))]
+const HANDOFF_PREFIX: &str = "texturecraft-open-";
+
+/// Folders from earlier hand-offs older than this are removed (MaterialCraft may still have a young one open).
+#[cfg(not(target_arch = "wasm32"))]
+const HANDOFF_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Write `package` as `file_name` inside a new folder only this call can have made under the temp folder, and return the
+/// file's path (for [`open_in_materialcraft`]). A fixed `<temp>/<name>` is guessable: on a shared `/tmp` another user
+/// could plant a file or link there first and the write would go through it. The folder name is random, is created
+/// exclusively (mode `0700` on Unix) and the file is created with `create_new` (mode `0600`), so nothing planted is ever written through.
+/// The folder stays after the call because MaterialCraft needs the file while it is open; folders over a week old go.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn stage_handoff_package(file_name: &str, package: &[u8]) -> Result<std::path::PathBuf> {
+    stage_handoff_package_in(&std::env::temp_dir(), file_name, package)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stage_handoff_package_in(base: &std::path::Path, file_name: &str, package: &[u8]) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+    let io = |e: std::io::Error| EngineError::Other(format!("cannot stage the package for MaterialCraft: {e}"));
+    if file_name.is_empty() || std::path::Path::new(file_name).file_name() != Some(std::ffi::OsStr::new(file_name)) {
+        return Err(EngineError::Other(format!("`{file_name}` is not a plain file name")));
+    }
+    sweep_old_handoffs(base, HANDOFF_MAX_AGE);
+    // Dropped (and removed) on any early return, so a failed write leaves no empty folder behind.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(HANDOFF_PREFIX);
+    // tempfile makes folders with the default mode (0755 under the usual umask), so ask for 0700 and 0600 explicitly.
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    let dir = builder.tempdir_in(base).map_err(io)?;
+    let path = dir.path().join(file_name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&path).map_err(io)?;
+    file.write_all(package).map_err(io)?;
+    file.sync_all().map_err(io)?;
+    let _ = dir.keep();
+    Ok(path)
+}
+
+/// Remove hand-off folders in `base` last changed more than `max_age` ago. Only real folders with our prefix are
+/// touched (never a link), and every failure is ignored: a leftover folder costs disk space, not work.
+#[cfg(not(target_arch = "wasm32"))]
+fn sweep_old_handoffs(base: &std::path::Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(base) else { return };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(HANDOFF_PREFIX) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
+        let old = meta.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > max_age);
+        if meta.is_dir() && old {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Source file extensions are chosen from the linked resource name, never an untrusted path.
 pub fn source_extension(name: &str) -> &'static str {
     if name.to_ascii_lowercase().ends_with(".mcmat") {
@@ -623,6 +685,7 @@ impl Session {
 
             for name in old_names.iter().filter(|name| !used_names.contains(name)) {
                 session.doc.resources.remove(name);
+                session.doc.project.resource_sources.remove(name);
             }
 
             Ok(names)
@@ -710,5 +773,83 @@ mod tests {
         assert_eq!(typed(&p, &json!("#aabbccdd")), None);
         assert_eq!(typed(&p, &json!("#+f+f+f")), None);
         assert!(typed(&p, &json!("#ff8000")).is_some());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tc_handoff_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A file another user planted at the old, guessable `<temp>/<name>` is never written through.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn handoff_package_is_not_written_through_a_planted_link() {
+        let base = scratch("planted");
+        let victim = base.join("victim.txt");
+        std::fs::write(&victim, b"precious").unwrap();
+        // The old code wrote `<temp>/<name>` with `fs::write`; a hard link there reaches the victim on every platform.
+        std::fs::hard_link(&victim, base.join("wood.mcraft")).unwrap();
+
+        let path = super::stage_handoff_package_in(&base, "wood.mcraft", b"package").unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(std::fs::read(&path).unwrap(), b"package");
+        assert_ne!(path.parent().unwrap(), base, "the file is inside a folder of its own");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Every hand-off gets its own empty-until-written folder, even when the name repeats.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn handoff_packages_get_distinct_folders() {
+        let base = scratch("distinct");
+        let a = super::stage_handoff_package_in(&base, "m.mcraft", b"a").unwrap();
+        let b = super::stage_handoff_package_in(&base, "m.mcraft", b"b").unwrap();
+        assert_ne!(a.parent(), b.parent());
+        assert_eq!((std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap()), (b"a".to_vec(), b"b".to_vec()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(a.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A name with a path in it cannot leave the new folder.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn handoff_package_rejects_names_that_are_paths() {
+        let base = scratch("names");
+        for bad in ["", "..", "a/b.mcraft", "../x.mcraft"] {
+            assert!(super::stage_handoff_package_in(&base, bad, b"x").is_err(), "{bad}");
+        }
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0, "a rejected name leaves nothing behind");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Old hand-off folders are swept; young ones, other folders and files stay.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn handoff_sweep_removes_only_old_handoff_folders() {
+        let base = scratch("sweep");
+        let old = base.join("texturecraft-open-old");
+        let other = base.join("somebody-elses-folder");
+        let file = base.join("texturecraft-open-file");
+        for dir in [&old, &other] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(&file, b"x").unwrap();
+        // Zero age limit: everything with the prefix that is a folder counts as old.
+        super::sweep_old_handoffs(&base, std::time::Duration::ZERO);
+        assert!(!old.exists() && other.exists() && file.exists());
+        let young = base.join("texturecraft-open-young");
+        std::fs::create_dir(&young).unwrap();
+        super::sweep_old_handoffs(&base, std::time::Duration::from_secs(3600));
+        assert!(young.exists());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

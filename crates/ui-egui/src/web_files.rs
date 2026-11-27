@@ -337,9 +337,9 @@ mod web {
     pub fn export_mesh(app: &mut TextureCraftApp, ext: &str) {
         let name = format!("{}.{ext}", sanitize_file_stem(&app.session.doc.project.name));
         let bytes = match ext {
-            "glb" => app.session.mesh_glb_bytes(),
-            "usdz" => app.session.mesh_usd(texturecraft_engine::formats::UsdFormat::Usdz).map(|u| u.bytes),
-            _ => app.session.mesh_obj_bytes(),
+            "glb" => app.session.mesh_glb_bytes_with_normals(app.ui.mesh_recompute_normals),
+            "usdz" => app.session.mesh_usd_with_normals(texturecraft_engine::formats::UsdFormat::Usdz, app.ui.mesh_recompute_normals).map(|u| u.bytes),
+            _ => app.session.mesh_obj_bytes_with_normals(app.ui.mesh_recompute_normals),
         };
         match bytes.map_err(|e| e.to_string()).and_then(|b| download(&name, &b)) {
             Ok(()) => app.toast(trf("Downloaded {name}", &[("name", &name)]), false),

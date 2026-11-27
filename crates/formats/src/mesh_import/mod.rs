@@ -25,7 +25,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use texturecraft_geom::glam::{Mat4, Vec2, Vec3, Vec4};
-use texturecraft_geom::unwrap::{all_triangles_degenerate, auto_unwrap, weld_ids};
+use texturecraft_geom::unwrap::{all_triangles_degenerate, auto_unwrap};
 use texturecraft_geom::{BaseColor, MAX_TRIANGLES, Mesh, SubMesh, UvGBuffer};
 
 use crate::{FormatError, Result};
@@ -508,7 +508,7 @@ fn geometry(raw: RawMesh) -> Result<(Mesh, Vec<String>, Option<Vec<Vec2>>)> {
 
     mesh.normals = match normals {
         Some(n) if n.len() == mesh.positions.len() => n.into_iter().map(|v| v.try_normalize().unwrap_or(Vec3::Y)).collect(),
-        _ => smooth_normals(&mesh),
+        _ => mesh.smooth_normals(),
     };
     if let Some(c) = colors.filter(|c| c.len() == mesh.positions.len()) {
         mesh.colors = c.into_iter().map(|v| if v.is_finite() { v.clamp(Vec4::ZERO, Vec4::ONE) } else { Vec4::ONE }).collect();
@@ -639,23 +639,6 @@ fn orbit_cameras(raw: &[RawCamera], mesh: &Mesh) -> Vec<texturecraft_core::Camer
             })
         })
         .collect()
-}
-
-/// Area-weighted smooth normals over welded positions (UV seams do not split shading).
-fn smooth_normals(mesh: &Mesh) -> Vec<Vec3> {
-    let welded_vertices = weld_ids(&mesh.positions);
-    let mut normals = vec![Vec3::ZERO; mesh.positions.len()];
-    for triangle in mesh.indices.as_chunks::<3>().0 {
-        let p = |i: u32| mesh.positions.get(i as usize).copied().unwrap_or_default();
-        let face = (p(triangle[1]) - p(triangle[0])).cross(p(triangle[2]) - p(triangle[0]));
-        for v in triangle {
-            if let Some(a) = welded_vertices.get(*v as usize).and_then(|w| normals.get_mut(*w as usize)) {
-                *a += face;
-            }
-        }
-    }
-
-    welded_vertices.iter().map(|w| normals.get(*w as usize).and_then(|n| n.try_normalize()).unwrap_or(Vec3::Y)).collect()
 }
 
 /// Inspects `mesh` and generates its UV report (overlaps, out-of-range UVs, warnings).

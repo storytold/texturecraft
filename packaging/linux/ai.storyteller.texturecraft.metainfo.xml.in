@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- Translated strings in this file may be used under its CC0-1.0 metadata license. -->
 <!-- AppStream metadata (software centres, Flathub). Template: package.sh and the Flatpak
      manifest substitute @VERSION@ and @DATE@ from Cargo.toml and the build date. -->
 <component type="desktop-application">
@@ -7,6 +8,7 @@
   <project_license>MIT OR Apache-2.0</project_license>
   <name>TextureCraft</name>
   <summary>Paint PBR textures directly on 3D meshes</summary>
+  <summary xml:lang="ru">Рисование PBR-текстур прямо на 3D-моделях</summary>
   <developer id="ai.storyteller">
     <name>Learning Machines LLC</name>
   </developer>
@@ -16,11 +18,21 @@
       expect: familiar menus, shortcuts, panels and tools, with texture sets,
       layers, masks, fills and effects painted straight onto the model.
     </p>
+    <p xml:lang="ru">
+      TextureCraft — открытая нативная программа для рисования 3D-текстур, устроенная так,
+      как привыкли художники по текстурам: знакомые меню, сочетания клавиш, панели и
+      инструменты, а наборы текстур, слои, маски, заливки и эффекты наносятся прямо на
+      модель.
+    </p>
     <ul>
       <li>Open glTF/GLB, FBX, COLLADA, USD (USDA/USDC/USDZ), Alembic, OBJ, PLY and STL meshes and save projects as .tcraft</li>
+      <li xml:lang="ru">Открытие сеток glTF/GLB, FBX, COLLADA, USD (USDA/USDC/USDZ), Alembic, OBJ, PLY и STL и сохранение проектов в .tcraft</li>
       <li>Paint base colour, roughness, metallic, normal and height together with PBR brushes</li>
+      <li xml:lang="ru">Рисование базового цвета, шероховатости, металличности, нормалей и высоты одновременно с помощью PBR-кистей</li>
       <li>Bake mesh maps and export texture sets as PNG, EXR, TGA, JPEG or TIFF</li>
+      <li xml:lang="ru">Запекание карт сетки и экспорт наборов текстур в PNG, EXR, TGA, JPEG или TIFF</li>
       <li>Every action is a command, scriptable from a CLI and a JSON control channel</li>
+      <li xml:lang="ru">Каждое действие — это команда, которую можно вызывать из CLI и через управляющий канал JSON</li>
     </ul>
   </description>
   <launchable type="desktop-id">ai.storyteller.texturecraft.desktop</launchable>
@@ -36,9 +48,13 @@
   </categories>
   <keywords>
     <keyword>texture painting</keyword>
+    <keyword xml:lang="ru">рисование текстур</keyword>
     <keyword>pbr</keyword>
+    <keyword xml:lang="ru">pbr</keyword>
     <keyword>3d</keyword>
+    <keyword xml:lang="ru">3d</keyword>
     <keyword>mesh</keyword>
+    <keyword xml:lang="ru">сетка</keyword>
   </keywords>
   <branding>
     <color type="primary" scheme_preference="light">#f0c39c</color>

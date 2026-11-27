@@ -48,14 +48,15 @@ fn install_with(ctx: &egui::Context, shell: ShellInfo, windows: Arc<dyn WindowSy
     if let Some(frame) = frame {
         spec = spec.frame(frame);
     }
+
     embed::install(ctx, spec, &ui_fonts()).map(drop).map_err(|error| format!("the UI runtime could not be installed: {error}"))
 }
 
 /// Installs the runtime on the desktop window's context, once, before the first pass, with the window's `frame`
-/// ([`crate::titlebar::TitleBar::decide`]).
+/// ([`crate::titlebar::TitleBar::decide`]) and the `backend` the window opened on.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn install(ctx: &egui::Context, frame: Decision) -> Result<(), String> {
-    let shell = ShellInfo::default().backend(craft_host::target::Backend::from_env());
+pub fn install(ctx: &egui::Context, frame: Decision, backend: craft_host::target::Backend) -> Result<(), String> {
+    let shell = ShellInfo::default().backend(backend);
     install_with(ctx, shell, Arc::new(craft_window::system::SystemWindows), Some(frame))
 }
 

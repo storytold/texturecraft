@@ -245,6 +245,27 @@ impl Mesh {
         self.normals = normals.into_iter().map(|v| v.try_normalize().unwrap_or(Vec3::Y)).collect();
     }
 
+    /// Area-weighted smooth normals over welded positions, so UV and material seams do not split shading.
+    pub fn smooth_normals(&self) -> Vec<Vec3> {
+        let welded_vertices = crate::unwrap::weld_ids(&self.positions);
+        let mut normals = vec![Vec3::ZERO; self.positions.len()];
+        for triangle in self.indices.as_chunks::<3>().0 {
+            let p = |i: u32| self.positions.get(i as usize).copied().unwrap_or_default();
+            let face = (p(triangle[1]) - p(triangle[0])).cross(p(triangle[2]) - p(triangle[0]));
+            for v in triangle {
+                if let Some(accumulated) = welded_vertices.get(*v as usize).and_then(|welded| normals.get_mut(*welded as usize)) {
+                    *accumulated += face;
+                }
+            }
+        }
+        welded_vertices.iter().map(|welded| normals.get(*welded as usize).and_then(|normal| normal.try_normalize()).unwrap_or(Vec3::Y)).collect()
+    }
+
+    /// Replace normals with [`Mesh::smooth_normals`] on this mesh.
+    pub fn compute_smooth_normals(&mut self) {
+        self.normals = self.smooth_normals();
+    }
+
     /// The faces MikkTSpace sees: each importer quad (a fan pair marked in [`Mesh::diagonals`])
     /// as one four-corner face, like Blender hands it over, and every other triangle as a
     /// triangle. Polygons with more than four corners stay fan triangles. The vertex and index

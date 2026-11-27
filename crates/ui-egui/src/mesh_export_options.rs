@@ -31,6 +31,7 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
     let mut open = true;
     let (mut export, mut cancel) = (false, false);
+    let mut triangulated = true;
     crate::windows::dialog(ctx, "mesh_export_options", tr("Mesh Export Options"), &mut open).show(ctx, |ui| {
         ui.set_width(DIALOG_WIDTH);
 
@@ -38,24 +39,26 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
         ui.add(egui::RadioButton::new(true, tr("Without displacement/tessellation")));
         option(
             ui,
-            true,
+            &mut triangulated,
+            false,
             tr("Apply triangulation"),
             &[
                 tr("Splits every face with more than three corners into triangles; triangles stay as they are."),
                 tr("TextureCraft keeps meshes as triangles, so the exported mesh is always triangulated."),
             ],
         );
-        ui.add_space(GROUP_GAP);
-        unavailable::greyed(ui, |ui| ui.add(egui::RadioButton::new(false, tr("With displacement/tessellation"))));
         option(
             ui,
+            &mut app.ui.mesh_recompute_normals,
             true,
             tr("Recompute vertex normals"),
             &[
                 tr("Replaces the mesh's vertex normals with newly computed ones in the exported file."),
-                tr("TextureCraft cannot do this yet: it writes the vertex normals the mesh has in the project."),
+                tr("On: smooth area-weighted normals from the exported geometry. Off: the project's stored normals. The project itself is not changed."),
             ],
         );
+        ui.add_space(GROUP_GAP);
+        unavailable::greyed(ui, |ui| ui.add(egui::RadioButton::new(false, tr("With displacement/tessellation"))));
         ui.add_space(8.0);
 
         // One row keeps the window to its contents; a bare right-to-left layout fills the screen height
@@ -76,12 +79,16 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     }
 }
 
-/// A greyed option under a choice, ticked as the reference shows it, with an info icon at the
-/// row's right end whose tooltip has the paragraphs `info`
-fn option(ui: &mut Ui, checked: bool, label: &str, info: &[&str]) {
+/// An option under a choice, greyed when `enabled` is false, with an info icon at the row's right
+/// end whose tooltip has the paragraphs `info`.
+fn option(ui: &mut Ui, checked: &mut bool, enabled: bool, label: &str, info: &[&str]) {
     ui.horizontal(|ui| {
         ui.add_space(OPTION_INDENT);
-        unavailable::checkbox(ui, checked, label);
+        if enabled {
+            ui.checkbox(checked, label);
+        } else {
+            unavailable::checkbox(ui, *checked, label);
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let icon = ui.label(egui::RichText::new(egui_phosphor::regular::INFO).color(Tokens::get(ui.ctx()).text_dim));
             icon.on_hover_ui(|ui| {

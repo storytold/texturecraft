@@ -10,6 +10,8 @@
 mod anchor_properties;
 mod angle_dial;
 mod ask;
+#[cfg(not(target_arch = "wasm32"))]
+mod autosave_name;
 mod bake_job;
 pub mod bake_mode;
 mod bake_preset;
@@ -141,6 +143,8 @@ mod resolution_band;
 mod resource_panel;
 mod resource_picker;
 mod resource_picker_item;
+#[cfg(not(target_arch = "wasm32"))]
+mod resources_updater;
 mod round_gizmo;
 mod running_bake;
 #[cfg(not(target_arch = "wasm32"))]
@@ -176,6 +180,7 @@ pub mod thumbs;
 mod tile_edits;
 mod tile_picture;
 pub mod titlebar;
+pub mod toast_action;
 pub mod toolbar;
 pub mod ui_state_store;
 pub mod unavailable;
@@ -257,6 +262,8 @@ pub struct Toast {
     pub error: bool,
     pub until: f64,
     pub show_log: bool,
+    /// A button after the text that acts on the notice
+    pub action: Option<toast_action::ToastAction>,
     announce: bool,
 }
 
@@ -362,10 +369,19 @@ pub struct TextureCraftApp {
     /// When the next autosave is due (seconds of app time; desktop only).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     next_autosave: f64,
+    /// The unsaved project (its id) and the suffix of its autosave copy.
+    #[cfg(not(target_arch = "wasm32"))]
+    unsaved_autosave_suffix: Option<(u64, u64)>,
     /// The brightness and accent the style was last built for.
     styled: Option<(theme::Brightness, theme::Accent)>,
     /// Whether the window had focus last frame.
     focused: bool,
+    /// The outdated resources the last "changed on disk" notice named, so an unchanged set is not announced again
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) resources_notified: std::collections::BTreeSet<String>,
+    /// The project the Resources Updater last checked on opening (see `resources_updater::follow_project`)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) resources_project: Option<u64>,
     /// The update check and prompt (desktop only).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) updates_rt: updates_ui::Runtime,
@@ -505,8 +521,14 @@ impl TextureCraftApp {
             fired_clipboard: Vec::new(),
             last_time: 0.0,
             next_autosave,
+            #[cfg(not(target_arch = "wasm32"))]
+            unsaved_autosave_suffix: None,
             styled: None,
             focused: true,
+            #[cfg(not(target_arch = "wasm32"))]
+            resources_notified: std::collections::BTreeSet::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            resources_project: None,
             #[cfg(not(target_arch = "wasm32"))]
             updates_rt: updates_ui::Runtime::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -665,13 +687,24 @@ impl TextureCraftApp {
     }
 
     pub fn toast(&mut self, text: impl Into<String>, error: bool) {
-        self.toasts.push(Toast { text: text.into(), error, until: self.last_time + if error { 6.0 } else { 3.0 }, show_log: false, announce: false });
+        const ERROR_SECONDS: f64 = 6.0;
+        const NOTICE_SECONDS: f64 = 3.0;
+        let until = self.last_time + if error { ERROR_SECONDS } else { NOTICE_SECONDS };
+
+        self.toasts.push(Toast { text: text.into(), error, until, show_log: false, action: None, announce: false });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn announce_latest_toast(&mut self) {
+        if let Some(toast) = self.toasts.last_mut() {
+            toast.announce = true;
+        }
     }
 
     /// An error toast that stays until the user dismisses it (for a problem that persists and
     /// is reported once, like a texture set the GPU could not hold).
     pub fn toast_sticky(&mut self, text: impl Into<String>) {
-        self.toasts.push(Toast { text: text.into(), error: true, until: f64::INFINITY, show_log: false, announce: false });
+        self.toasts.push(Toast { text: text.into(), error: true, until: f64::INFINITY, show_log: false, action: None, announce: false });
     }
 
     /// Bake texture sets in the background, one after another; invalid set indices show an error without starting anything
@@ -1073,11 +1106,7 @@ impl TextureCraftApp {
 
         self.next_autosave = now + period;
         let dir = user_dir("autosave");
-        let path = dir.join(format!(
-            "{}.{}",
-            texturecraft_engine::formats::export::sanitize_file_stem(&self.session.doc.project.name),
-            texturecraft_engine::core::PROJECT_EXT
-        ));
+        let path = self.autosave_path(&dir);
         let snapshot = self.session.project_snapshot();
         let spawned = std::thread::Builder::new().name("texturecraft-autosave".into()).spawn(move || {
             let result =
@@ -1226,8 +1255,14 @@ impl eframe::App for TextureCraftApp {
         let focused = ctx.input(|input| input.viewport().focused).unwrap_or(true);
         if focused && !self.focused {
             self.library = None;
+
+            // Files may have been edited in another app meanwhile
+            #[cfg(not(target_arch = "wasm32"))]
+            resources_updater::check_files(self);
         }
         self.focused = focused;
+        #[cfg(not(target_arch = "wasm32"))]
+        resources_updater::follow_project(self);
 
         let scale = self.ui.prefs.ui_scale.clamp(*UI_SCALE_APPLIED.start(), *UI_SCALE_APPLIED.end());
         if (ctx.zoom_factor() - scale).abs() > SAME_ZOOM_TOLERANCE {
@@ -1468,14 +1503,17 @@ fn toasts(app: &mut TextureCraftApp, ctx: &egui::Context) {
     if app.toasts.iter().any(|t| t.until.is_finite()) {
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
+
     let tk = theme::Tokens::get(ctx);
     let mut dismissed = None;
     let mut show_log = false;
+    let mut clicked_action = None;
 
     // Limit toast dimensions so the dismiss button stays visible
     let screen = ctx.content_rect().size();
     let max_width = (screen.x - 52.0).clamp(120.0, 360.0);
     let max_text_height = (screen.y * 0.35).clamp(48.0, 220.0);
+
     egui::Area::new(egui::Id::unique("toasts")).anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -36.0)).show(ctx, |ui| {
         for (i, t) in app.toasts.iter().enumerate() {
             egui::Frame::NONE
@@ -1493,14 +1531,22 @@ fn toasts(app: &mut TextureCraftApp, ctx: &egui::Context) {
                         ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                             egui::ScrollArea::vertical().id_salt(("toast", i)).max_height(max_text_height).show(ui, |ui| {
                                 ui.set_max_width(width);
-                                let label = ui.add(egui::Label::new(egui::RichText::new(&t.text).color(tk.text_strong)).wrap());
-                                if t.announce {
-                                    ui.ctx().accesskit_node_builder(label.id, |node| node.set_live(egui::accesskit::Live::Polite));
+                                let message = ui.add(egui::Label::new(egui::RichText::new(&t.text).color(tk.text_strong)).wrap());
+                                if t.announce || t.action.is_some() {
+                                    ui.ctx().accesskit_node_builder(message.id, |node| node.set_live(egui::accesskit::Live::Polite));
                                 }
                             });
                             if t.show_log && ui.link(i18n::tr("Open Log")).clicked() {
                                 show_log = true;
                                 dismissed = Some(i);
+                            }
+                            if let Some(action) = t.action {
+                                let button = ui.button(i18n::tr(action.label()));
+                                button.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, i18n::tr(action.accessible_name())));
+                                if button.clicked() {
+                                    clicked_action = Some(action);
+                                    dismissed = Some(i);
+                                }
                             }
                         });
                         if sticky && widgets::icon_button(ui, egui_phosphor::regular::X, i18n::tr("Dismiss"), false, 18.0).clicked() {
@@ -1511,6 +1557,7 @@ fn toasts(app: &mut TextureCraftApp, ctx: &egui::Context) {
             ui.add_space(4.0);
         }
     });
+
     if let Some(i) = dismissed.filter(|i| *i < app.toasts.len()) {
         app.toasts.remove(i);
     }
@@ -1518,5 +1565,9 @@ fn toasts(app: &mut TextureCraftApp, ctx: &egui::Context) {
     if show_log {
         app.ui.log_channel = log_panel::LogChannel::General;
         crate::rail_popup::open(app, crate::docking::Panel::Log);
+    }
+
+    if let Some(action) = clicked_action {
+        action.run(app);
     }
 }

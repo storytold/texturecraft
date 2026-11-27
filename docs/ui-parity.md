@@ -71,8 +71,10 @@ that closes it back onto the bar; the float is saved with the UI state.
   with materials that refer to the exported textures; greyed in the browser), *Export shaders
   parameters* greyed, *Include all*, *Save settings* and "N textures selected for export").
   *Export MaterialX* beside them is a TextureCraft addition: it adds `materialX: true` to the
-  export. The prompt's *With displacement/tessellation* choice and both option checkboxes are
-  greyed; TextureCraft exports the mesh as it is.
+  export. The prompt's *With displacement/tessellation* choice and *Apply triangulation* are greyed
+  (TextureCraft exports the mesh as it is, triangulated). *Recompute vertex normals* works and sits under
+  *Without displacement/tessellation*, off by default: it writes smooth area-weighted normals to the
+  exported copy only.
 - **Window menu:** Views lists *Renderer Settings* (a panel of its own: the tracer in use, the
   samples so far and a note; it floats when first opened and is not opened by itself in Rendering
   mode), *Properties - Paint* while a project is open (other tools read "Properties - <tool>",

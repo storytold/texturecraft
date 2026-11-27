@@ -2787,12 +2787,12 @@ fn fill_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn open_link_in_materialcraft(app: &mut TextureCraftApp, layer: LayerId, link: &texturecraft_engine::core::MaterialLink) {
     let ext = texturecraft_engine::link_cmds::source_extension(&link.package);
-    let path = std::env::temp_dir().join(format!("{}.{ext}", texturecraft_engine::formats::export::sanitize_file_stem(&link.name)));
+    let file_name = format!("{}.{ext}", texturecraft_engine::formats::export::sanitize_file_stem(&link.name));
     let opened = app
         .session
         .link_package(layer)
-        .and_then(|package| std::fs::write(&path, package.as_slice()).map_err(|err| texturecraft_engine::EngineError::Other(err.to_string())))
-        .and_then(|()| texturecraft_engine::link_cmds::open_in_materialcraft(&path));
+        .and_then(|package| texturecraft_engine::link_cmds::stage_handoff_package(&file_name, package.as_slice()))
+        .and_then(|path| texturecraft_engine::link_cmds::open_in_materialcraft(&path));
     match opened {
         Ok(()) => app.toast(tr("Opened in MaterialCraft: use File > Send to TextureCraft there to bring your changes back"), false),
         Err(e) => app.toast(e.to_string(), true),
