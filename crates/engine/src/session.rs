@@ -462,6 +462,9 @@ pub struct Session {
     pub images: texturecraft_compose::ImageStore,
     /// Resource names whose decoded pixels match a library alpha.
     pub(crate) library_alphas: BTreeSet<String>,
+    /// Resources whose file was read for the Resources Updater, by name: the verdict stays while the file's size and time do
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) resource_checks: std::collections::HashMap<String, crate::resource_check::ResourceCheck>,
     /// Temporary texel mask limiting paint strokes (not saved, not in the history).
     pub quick_mask: crate::quick_mask::QuickMask,
     /// A path sublayer is being repainted from its paths (the only way to paint into one).
@@ -549,6 +552,8 @@ impl Session {
             blending_clipboard: None,
             images: Default::default(),
             library_alphas: BTreeSet::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            resource_checks: std::collections::HashMap::new(),
             quick_mask: Default::default(),
             painting_paths: false,
             path_cache: None,
@@ -980,6 +985,7 @@ impl Session {
         let (label, restored) = self.undo.pop().ok_or_else(|| EngineError::Other("nothing to undo".into()))?;
         let current = std::mem::replace(&mut self.doc, restored);
         self.after_history(&current);
+        self.forget_replaced_images(&current);
         self.redo.push((label.clone(), current));
         self.sync_images();
         Ok(label)
@@ -1000,6 +1006,7 @@ impl Session {
         let (label, restored) = self.redo.pop().ok_or_else(|| EngineError::Other("nothing to redo".into()))?;
         let current = std::mem::replace(&mut self.doc, restored);
         self.after_history(&current);
+        self.forget_replaced_images(&current);
         self.undo.push((label.clone(), current));
         self.sync_images();
         Ok(label)

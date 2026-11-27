@@ -281,7 +281,9 @@ impl Session {
 
     fn store_bake_maps(&mut self, texture_set: usize, resolution: u32, height: u32, maps: std::collections::BTreeMap<BakedMap, Arc<Vec<f32>>>) -> Result<()> {
         let entry = self.doc.baked.entry(texture_set).or_default();
-        if entry.resolution != resolution || entry.maps.keys().any(|map| entry.height(*map) != height) {
+        let size_changed = entry.resolution != resolution || entry.maps.keys().any(|map| entry.height(*map) != height);
+        crate::meshmap_cmds::detach_imported_sources(&mut self.doc.project, texture_set, |map| size_changed || maps.contains_key(&map));
+        if size_changed {
             entry.maps.clear();
         }
 

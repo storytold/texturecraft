@@ -23,6 +23,7 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     {
         crate::project_config::show(app, ctx);
         crate::import_resources::show(app, ctx);
+        crate::resources_updater::show(app, ctx);
     }
     crate::keymap::window(app, ctx);
     crate::export_window::show(app, ctx);

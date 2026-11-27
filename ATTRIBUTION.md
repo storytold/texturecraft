@@ -28,6 +28,7 @@ licensed and keep their license file next to them.
 | `assets/hdr/studio_small_09_512.hdr` | Studio Small 09: a small photo studio with octaboxes on a white infinity cyc, equirect HDR reduced to 512×256 (2×2 box filter, Radiance RLE); lights the Properties panel's material orbs | Sergej Majboroda (Poly Haven) | [Poly Haven release](https://polyhaven.com/a/studio_small_09), [1K Radiance HDR](https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/studio_small_09_1k.hdr) (MD5 `d5d7eb9d26d341d6aa4d11c1a54fd97c`) | [CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/) |
 | `docs/brand/artcraft-*.svg`, `docs/brand/artcraft-*.png` | ArtCraft logo and mark | ArtCraft Team | storytold/craftrules `assets/brand/` | ArtCraft brand terms, not open source ([`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt)) |
 | `crates/formats/src/mesh_import/usd/fixtures/crafted-references.usdc` | Synthetic USDC class/reference/time-sample acceptance fixture | ArtCraft Team and craft-libs contributors | [Pinned generator and provenance](crates/formats/src/mesh_import/usd/fixtures/README.md) | MIT (`crates/formats/src/mesh_import/usd/fixtures/LICENSE-MIT`) |
+| `apps/texturecraft/src/xwayland_pen.rs` | Pen on Wayland opens the window through Xwayland: pen detection, the Xwayland decision and the X11 library check (adapted, reduced to the pen decision) | PhotoCraft contributors | storytold/photocraft `830316b775f1f6734498ac6e39fd1298955ff93f`: [`apps/photocraft/src/tablet.rs`](https://github.com/storytold/photocraft/blob/830316b775f1f6734498ac6e39fd1298955ff93f/apps/photocraft/src/tablet.rs), [`apps/photocraft/src/linux_libs.rs`](https://github.com/storytold/photocraft/blob/830316b775f1f6734498ac6e39fd1298955ff93f/apps/photocraft/src/linux_libs.rs) | MIT OR Apache-2.0 |
 
 ## Third-party assets compiled into the binary
 
@@ -52,6 +53,8 @@ time (nothing is bundled); see [docs/localization-parity.md](docs/localization-p
 | `xcap` | Windows screen pixel capture | https://github.com/nashaofu/xcap | Apache-2.0 |
 | `widestring` | Windows string handling through `xcap` | https://github.com/VoidStarKat/widestring-rs | MIT OR Apache-2.0 |
 | `x11rb` | X11 pointer and pixel capture | https://github.com/psychon/x11rb | MIT OR Apache-2.0 |
+| `x11rb-protocol` | X11 setup and Xauthority for the Linux pen startup probe | https://github.com/psychon/x11rb | MIT OR Apache-2.0 |
+| `rustix` | Linux socket and hostname APIs for the X11 setup probe | https://github.com/bytecodealliance/rustix | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | `zbus` | Wayland desktop color-picker portal | https://github.com/z-galaxy/zbus | MIT |
 
 ## Procedural content (no asset files)

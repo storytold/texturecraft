@@ -126,9 +126,7 @@ impl TextureCraftApp {
             }
         }
 
-        if let Some(toast) = self.toasts.last_mut() {
-            toast.announce = true;
-        }
+        self.announce_latest_toast();
     }
 }
 
@@ -232,6 +230,10 @@ mod tests {
         assert!(h.state().session.modified);
         assert_eq!(h.state().ui.windows.unsaved, Some(Unsaved::Quit));
         assert!(prompt_is_usable(&h), "the prompt answers again after the failed write");
+
+        let message = &h.state().toasts.iter().find(|toast| toast.error).expect("the failed write shows an error").text;
+        let announced = h.get_all_by_label(message).any(|node| node.accesskit_node().live() == egui::accesskit::Live::Polite);
+        assert!(announced, "the save error is announced away from focus");
     }
 
     #[test]

@@ -235,7 +235,7 @@ keeps its state in a throwaway file.
 | `session.inspect` | | project, mesh, texture sets, layer stack, tool, camera, display, history |
 | `ui.inspect` | | UI state, viewport rect, fps, bake progress (`baking`, 0..1), the running bake's stage (`bakeStatus`, e.g. "Baking Ambient Occlusion (2/4)") and live preview (`bakePreview`, see *Live bake preview*), toasts, `titleBar` (who draws the title bar this run: `app`, `integrated` on macOS, or `system`) |
 | `ui.menu.list` | | the menu catalog: `{menu, submenu, label, id, shortcut, implemented, enabled, checked}` |
-| `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window; `ui.resetUi` opens its question; `file.exportMesh` opens the Mesh Export Options prompt, whose Export asks for the file; `ui.view.export` opens the right bar's Export panel). `{"id": "ui.layout.apply", "name": "<layout>"}` switches to a legacy named panel layout (still accessible through assigned shortcuts) (panels only; mode, zoom and wireframes stay) and errors when no layout has that name. `ui.layout.save` still saves the active mode; `ui.layout.save.painting`, `ui.layout.save.rendering` and `ui.layout.save.baking` ask where to save only that mode's panels and view arrangement as a JSON file (without preferences or recent projects); loading preserves the other modes, `ui.layout.load` asks for one to load ("Load UI Layout"); `ui.toolbar.docks` and `ui.toolbar.tools` show or hide the right bar and the painting tools; the disabled Snooze Autosave and Resources Updater buttons stay visible when Tools is off; `ui.view.renderer` toggles the Renderer Settings panel (Rendering Mode only). `{"id": "ui.layout.swap"}` swaps the 3D and 2D views of the split layout (F4) |
+| `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window; `ui.resetUi` opens its question; `file.exportMesh` opens the Mesh Export Options prompt, whose Export asks for the file; `ui.view.export` opens the right bar's Export panel). `{"id": "ui.layout.apply", "name": "<layout>"}` switches to a legacy named panel layout (still accessible through assigned shortcuts) (panels only; mode, zoom and wireframes stay) and errors when no layout has that name. `ui.layout.save` still saves the active mode; `ui.layout.save.painting`, `ui.layout.save.rendering` and `ui.layout.save.baking` ask where to save only that mode's panels and view arrangement as a JSON file (without preferences or recent projects); loading preserves the other modes, `ui.layout.load` asks for one to load ("Load UI Layout"); `ui.toolbar.docks` and `ui.toolbar.tools` show or hide the right bar and the painting tools; the disabled Snooze Autosave button and the Resources Updater button (enabled while a project is open) stay visible when Tools is off; `ui.view.renderer` toggles the Renderer Settings panel (Rendering Mode only). `{"id": "ui.layout.swap"}` swaps the 3D and 2D views of the split layout (F4) |
 | `ui.menu.invoke` id `project.sample` | `{id}` | File > Open Sample Project opens a picker for a `.tcraft` file. On desktop, it copies any missing bundled samples (currently `Material Ball.tcraft`) into `Samples` under the data folder and opens the picker there. If preparation fails, it shows an error and opens the picker without a start folder. In the browser, the picker uses local files. The direct `project.sample` engine command generates a sample for automation. |
 | `ui.menu.invoke` id `ui.saveAsTemplate` | `{id}` | File > More Save Options > Save As Template opens a save dialog in the user templates folder. The choice supplies the file path and template name to `project.template.save`. `ui.saveReduced` (Save and Reduce File Size) is listed as not implemented and not enabled |
 | `ui.menu.invoke` ids `ui.help.releaseNotes`, `ui.help.showLog`, `ui.help.exportLog` | `{id}` | Help > Release Notes opens the releases page in the browser; Help > Show Log opens the current desktop run's rolling `log.txt` in the system text-file handler; Help > Export Log exports the session log with each entry’s recorded UTC time, severity and source (a save dialog on desktop with a `Log_TextureCraft_<version>_<date>_<os>_<gpuMode>.txt` name, a download on the web) |
@@ -368,7 +368,8 @@ A `prefs` object without `language` sets the system language (`""`), the default
   File › Save.
 
 Through `command_run`, every `file.*` command but `file.close` and `file.removeUnused` (and
-`file.reimportMesh` without a `path`) is refused, and so is any command given a `path` or `dir`, at the top level or in
+`file.reimportMesh` without a `path`) is refused, and so are `resource.status`, `resource.update` and `resource.relink` (they read
+the files a project names) and any command given a `path` or `dir`, at the top level or in
 a `files` entry (`resource.import`, `material.save`, `material.load`, `textureSet.meshMap.import`, …), in both modes: use the workspace tools below. `resource.text`
 takes a font family, not a path: it reads only the system's font folders.
 
@@ -489,6 +490,31 @@ Brush preset operations are engine commands. Send each through `command.run` wit
 printf '%s\n' '{"id":1,"method":"command.run","params":{"id":"project.new","params":{"mesh":"torus"}}}' \
               '{"id":2,"method":"render","params":{"width":512,"height":512}}' | texturecraft-cli serve
 ```
+
+## Resources Updater
+
+An image resource read from a file remembers that file (its absolute path and modification time,
+saved with the project): `resource.import {path}`, the images `file.importPbrFolder` stores unchanged
+(not ORM channels split out, not archive entries), the images of `file.importMaterialX` and the files of
+`textureSet.meshMap.import` (with their mesh map: an update resamples it while it still holds what the
+old file gave it, so a bake or another image set over it since is kept). The shelf's Resources Updater
+window lists the project's images and linked MaterialCraft packages. It checks image files when it opens, on
+Refresh, twice a second while it stays open, once after a project opens and when the app gets the
+focus back; a notice ("N resources changed on disk", with an Update button) appears when the set of
+outdated resources differs from the last notice. A file whose size matches but whose time changed is
+read once. Its verdict is kept until its size or time changes again. When the file has no usable
+modification time, each check compares its contents.
+
+| Command | Params and result |
+|---|---|
+| `resource.status` | `{}` → `{resources: [{name, status, path?, error?}], total, outdated}`; `status` is `outdated` (the file's size or contents differ from the resource), `missing` (the file is gone or unreadable, `error` says why), `upToDate`, `noSource` (made in the app or imported without a path) or `material` (the package of a linked MaterialCraft material, stored in the project without a source file); outdated first, then by name. An equal-size file is compared when its modification time changed or is unknown |
+| `resource.update` | `{names?: [name]}` (default: every outdated resource) → `{updated, failed: [{name, error}]}`: reads the files again and replaces the resources' bytes and pixels under the same names, so every layer, mask and view using them recomposites; one undo step, none when nothing changed. A file that cannot be read fails alone; when none could be read the command is an error. Unknown names and resources without a file are refused |
+| `resource.relink` | `{name, path}` → `{name, path}`: an image resource takes the image file's pixels (within the image import limits) and follows that file from then on; one undo step |
+
+For linked fill layers, `material.link.cook` refreshes the separate cooked image maps from the stored package.
+
+These commands read host paths stored in the project, so MCP and `serve` refuse them through
+`command_run`; the desktop app's control channel and the trusted local CLI run them.
 
 ## PBR texture folders
 

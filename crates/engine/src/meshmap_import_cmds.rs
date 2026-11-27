@@ -4,12 +4,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{Value, json};
-use texturecraft_core::BakedMap;
+use texturecraft_core::{BakedMap, MeshMapSlot, ResourceSource};
 
 use crate::commands::{CommandSpec, always, bad, strp};
 use crate::meshmap_cmds::{FIRST_TILE, image_map_size, tile_number, use_images};
 use crate::meshmap_file_name::{baked_map_from_file_name, texture_set_from_file_name};
 use crate::resource_cmds::read_image_file;
+use crate::resource_update_cmds::file_source;
 use crate::{Result, Session, cmd};
 
 const CMD: &str = "textureSet.meshMap.import";
@@ -84,11 +85,20 @@ fn import_with_budget(s: &mut Session, p: &Value, max_bytes: u64) -> Result<Valu
 
             let mut images = BTreeMap::new();
             for (tile, path) in tiles {
+                let slot = MeshMapSlot { texture_set: *ts, map: *map, tile: *tile };
+                let source = ResourceSource { mesh_map: Some(slot), ..file_source(path) };
                 let bytes = read_image_file(CMD, path, remaining_bytes)?;
                 reserve_bytes(&mut remaining_bytes, bytes.len() as u64)?;
 
                 let bytes_per_texel = size_of::<[f32; 4]>() as u64;
                 let name = s.add_image_resource(path, bytes, remaining_bytes / bytes_per_texel)?;
+
+                // The slot follows only its latest file
+                for earlier in s.doc.project.resource_sources.values_mut().filter(|earlier| earlier.mesh_map == Some(slot)) {
+                    earlier.mesh_map = None;
+                }
+                s.doc.project.resource_sources.insert(name.clone(), source);
+
                 let image = s.images.get(&name).ok_or_else(|| bad(CMD, format!("no decoded image `{name}`")))?;
                 reserve_bytes(&mut remaining_bytes, u64::from(image.width) * u64::from(image.height) * bytes_per_texel)?;
                 images.insert(*tile, image.clone());
@@ -98,7 +108,8 @@ fn import_with_budget(s: &mut Session, p: &Value, max_bytes: u64) -> Result<Valu
         }
         Ok(assigned)
     });
-    // A failed edit leaves the document as it was; forget the images it decoded
+
+    // Forget images decoded during an edit that rolled back
     if result.is_err() {
         s.sync_images();
     }

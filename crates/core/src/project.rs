@@ -479,6 +479,10 @@ pub struct Project {
     /// The project's colour swatches (linear RGB), in the order they were added; projects without any save none
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub swatches: Vec<[f32; 3]>,
+    /// The files image resources were imported from, by resource name (the Resources Updater
+    /// reads them again). Resources made in the app or imported without a file path have none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resource_sources: BTreeMap<String, crate::ResourceSource>,
 }
 
 impl Project {
@@ -497,6 +501,7 @@ impl Project {
             display: DisplaySettings::default(),
             cameras: Vec::new(),
             swatches: Vec::new(),
+            resource_sources: BTreeMap::new(),
         }
     }
 

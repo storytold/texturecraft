@@ -15,6 +15,8 @@ mod nightly_session;
 mod process_identity;
 mod profile_root;
 mod window_frame;
+#[cfg(target_os = "linux")]
+mod xwayland_pen;
 
 use std::ffi::OsString;
 
@@ -334,8 +336,7 @@ fn launch_arguments(arguments: Vec<OsString>) -> Result<Vec<String>, String> {
 }
 
 fn main() {
-    // Windows: the update helper is a copy of this program started with `--finish-update`. A
-    // Nightly install is updated by ArtCraft Launcher, so it never installs an update itself.
+    // Stable handles --finish-update on Windows while the launcher updates Nightly
     #[cfg(windows)]
     if build_flavor::COMPILED == build_flavor::BuildFlavor::Stable
         && let Some(result) = craft_update::self_update::finish(&texturecraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>())
@@ -343,15 +344,16 @@ fn main() {
         std::process::exit(i32::from(result.is_err()));
     }
 
-    // Windows: the eyedropper's pointer keeper (screen_pick) is a copy of this program started with
-    // its own argument. It reads no user state and is started without the profile tokens, so it
-    // runs before the launch protocol would refuse it.
+    // Dispatch the Windows pointer keeper before launch validation because it has no profile tokens
     #[cfg(windows)]
     if std::env::args_os().nth(1).is_some_and(|arg| arg == texturecraft_ui_egui::screen_pick::KEEPER_ARG) {
         std::process::exit(texturecraft_ui_egui::screen_pick::keep_pointer());
     }
 
-    let Some(arguments) = prepare_launch() else { return };
+    let Some(arguments) = prepare_launch() else {
+        return;
+    };
+
     let nightly = launch_profile::current().is_nightly();
     let args = match launch_arguments(arguments).and_then(parse_args_from) {
         Ok(Some(a)) => a,
@@ -361,8 +363,8 @@ fn main() {
             std::process::exit(2);
         }
     };
-    // The control server is a stable-install service: a Nightly window is driven by the Launcher,
-    // and its token file would sit in the shared temp folder rather than its private profile.
+
+    // Keep the control token out of the shared temp folder for a private Nightly profile
     if nightly && args.control.is_some() {
         eprintln!("texturecraft: TextureCraft Nightly cannot start a control server (--control); use the stable app or texturecraft-cli");
         std::process::exit(2);
@@ -377,9 +379,8 @@ fn main() {
         previous_hook(info);
     }));
 
-    // Scripted runs use temporary files so they cannot overwrite saved settings. Otherwise eframe
-    // is told the file explicitly, so `with_app_id` cannot move Stable's `app.ron` out of the
-    // folder `storage_dir` keeps `ui.json` and `errors.log` in (see `settings_folder`).
+    // Scripted runs use temporary files to protect saved settings
+    // An explicit eframe path keeps app.ron with ui.json and errors.log despite the app ID
     let no_prefs_path =
         std::env::var_os("TEXTURECRAFT_NO_PREFS").map(|_| std::env::temp_dir().join(format!("texturecraft-noprefs-{}.ron", std::process::id())));
     let persistence_path = no_prefs_path.clone().or_else(|| storage_dir().map(|dir| dir.join("app.ron")));
@@ -393,8 +394,16 @@ fn main() {
     prefs.apply_work_threads();
     prefs.apply_resource_limits();
     let session = initial_session(&args);
-    let frame_decision = TitleBar::decide(prefs.system_title_bar);
+
+    // Xwayland can forward pen input as pointer events on Wayland desktops
+    #[cfg(target_os = "linux")]
+    let use_xwayland_for_pen = xwayland_pen::opens_through_xwayland();
+    #[cfg(not(target_os = "linux"))]
+    let use_xwayland_for_pen = false;
+    let backend = if use_xwayland_for_pen { craft_host::target::Backend::X11 } else { craft_host::target::Backend::from_env() };
+    let frame_decision = TitleBar::decide(prefs.system_title_bar, backend);
     let title_bar = TitleBar::of(&frame_decision.frame);
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_app_id(os_window::app_id())
         .with_title(os_window::name())
@@ -403,15 +412,32 @@ fn main() {
     if let Some(i) = icon() {
         viewport = viewport.with_icon(i);
     }
+
     let viewport = texturecraft_ui_egui::titlebar::viewport(&frame_decision, viewport);
     let mut options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, persistence_path, ..Default::default() };
+    #[cfg(target_os = "linux")]
+    if use_xwayland_for_pen {
+        use winit::platform::x11::EventLoopBuilderExtX11 as _;
+
+        options.event_loop_builder = Some(Box::new(|builder| {
+            builder.with_x11();
+        }));
+        let notice = texturecraft_ui_egui::i18n::trf(
+            "Opening the window through Xwayland for pen input. Set {variable}=1 to keep Wayland.",
+            &[("variable", &xwayland_pen::NATIVE_WAYLAND_VARIABLE)],
+        );
+        eprintln!("texturecraft: {notice}");
+    }
+
     if let Err(e) = gpu::configure(&mut options, args.gpu, args.power_pref) {
         fatal(&e.to_string(), true);
         std::process::exit(2);
     }
+
     let control = args.control;
-    // The Nightly session record: one owner per profile, an unclean exit reported by the next
-    // start, and no document name, path or diagnostic payload collected.
+
+    // Nightly records one owner per profile so the next launch can report an unclean exit
+    // The record carries no document name, path or diagnostics
     let (nightly_session, session_health_warning) = match nightly_session::Session::begin_with_health(
         launch_profile::current().root(),
         build_flavor::BUILT_VERSION,
@@ -424,12 +450,13 @@ fn main() {
         }
     };
     let previous_nightly_unclean = nightly_session.as_ref().is_some_and(nightly_session::Session::previous_unclean);
-    // Set once a window has posted the interruption notice; until then the record must survive.
+
+    // Keep the record until a window has posted the interruption notice
     let unclean_notice_shown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let notice_shown_in_window = unclean_notice_shown.clone();
     let nightly_session: nightly_session::Shared = std::sync::Arc::new(std::sync::Mutex::new(nightly_session));
-    // The exit hook is the controlled return on macOS, where every quit ends the process inside
-    // AppKit's terminate and `run_native` never returns. Elsewhere the return path below finishes.
+
+    // AppKit terminates the process without returning from run_native, so macOS needs the exit hook
     let finish_at_exit = {
         let shared = nightly_session.clone();
         let shown = unclean_notice_shown.clone();
@@ -450,7 +477,8 @@ fn main() {
             if let Err(e) = craft_menu::mac::install_app_menu(&cc.egui_ctx, window_name) {
                 log::warn!("the app menu could not be installed: {e}");
             }
-            texturecraft_ui_egui::framework::install(&cc.egui_ctx, frame_decision)?;
+
+            texturecraft_ui_egui::framework::install(&cc.egui_ctx, frame_decision, backend)?;
             let frame_guard = window_frame::service(cc, matches!(title_bar, TitleBar::App(_)));
             let mut app = TextureCraftApp::new(cc, session);
             app.title_bar = title_bar;
@@ -470,8 +498,8 @@ fn main() {
             Ok(Box::new(Shell { app, window_frame: frame_guard, exit_hook: Some(Box::new(finish_at_exit)) }))
         }),
     );
-    // A controlled return, including a handled startup error. On macOS a window already finished in
-    // its exit hook, so this is then a no-op.
+
+    // Close the session record on controlled return, including handled startup errors
     nightly_session::finish_once(&nightly_session, unclean_notice_shown.load(std::sync::atomic::Ordering::Relaxed));
     if let Err(e) = result {
         fatal(&e.to_string(), true);

@@ -68,12 +68,12 @@ const NIGHTLY_ICONS: [(f32, &[u8]); 5] = [
 impl TitleBar {
     /// Decide who draws the title bar; call once at startup, before the window is created, and
     /// hand the decision to the window ([`viewport`]) and the runtime (`framework::install`).
-    /// `system` is Settings › Interface › System title bar.
-    pub fn decide(system: bool) -> Decision {
+    /// `system` is Settings › Interface › System title bar; `backend` is the one the window opens on.
+    pub fn decide(system: bool, backend: craft_host::target::Backend) -> Decision {
         let choice = craft_window::Choice::probe(PREFIX);
         let wanted = Self::from_choice(choice.frame(), choice.overridden(), system);
         let pref = if wanted == TitleBar::System { TitleBarPref::System } else { TitleBarPref::Integrated };
-        craft_window::policy::decide_for(PREFIX, craft_host::target::Backend::from_env(), pref)
+        craft_window::policy::decide_for(PREFIX, backend, pref)
     }
 
     /// The bar a decided `frame` gives.
@@ -93,6 +93,7 @@ impl TitleBar {
         if overridden.is_none() && system {
             return TitleBar::System;
         }
+
         match frame {
             Frame::App(layout) => TitleBar::App(layout.clone()),
             Frame::Desktop if overridden.is_some() => TitleBar::System,
@@ -238,15 +239,18 @@ mod tests {
     #[test]
     fn the_override_wins_then_the_setting_then_the_platform() {
         let gnome = Frame::App(Layout::parse("appmenu:close"));
-        // TEXTURECRAFT_TITLEBAR=app / =system, whatever the setting.
+
+        // The environment override wins regardless of the saved setting
         for system in [false, true] {
             assert_eq!(TitleBar::from_choice(&gnome, Some(true), system), TitleBar::App(Layout::parse("appmenu:close")));
             assert_eq!(TitleBar::from_choice(&Frame::Desktop, Some(false), system), TitleBar::System);
         }
-        // The setting brings the system's frame back.
+
+        // The saved setting selects the system frame without an override
         assert_eq!(TitleBar::from_choice(&gnome, None, true), TitleBar::System);
         assert_eq!(TitleBar::from_choice(&Frame::Desktop, None, true), TitleBar::System);
-        // The platform: a compositor that leaves the frame to the app gets the app's.
+
+        // Otherwise the desktop determines who draws the frame
         assert_eq!(TitleBar::from_choice(&gnome, None, false), TitleBar::App(Layout::parse("appmenu:close")));
         let desktop = TitleBar::from_choice(&Frame::Desktop, None, false);
         let expected = if cfg!(windows) {
