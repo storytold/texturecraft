@@ -4,8 +4,9 @@
 //!
 //! Methods: the app's `ping`, `command.run {id, params?}`, `command.list {filter?}`,
 //! `session.inspect`, plus `command.batch {steps}`, `project.open {path}`,
-//! `project.save {path?}`, `mesh.import {path, resolution?, name?}`, `mesh.reimport {path?,
-//! preserveStrokes?}`, `mesh.export {path, format?}`, `bake.mesh.add {path, cage?}`,
+//! `project.save {path?}`, `mesh.import {path, resolution?, name?}`,
+//! `mesh.reimport {path?, preserveStrokes?}`, `mesh.export {path, format?, recomputeNormals?}`,
+//! `bake.mesh.add {path, cage?}`,
 //! `resource.import {path}`, `material.save {path, layer?, name?}`, `material.load {path}`
 //! (workspace-scoped versions of the engine commands),
 //! `textures.export {dir, …}`, `render {view?, width?, height?, yaw?, pitch?}` (PNG base64, the
@@ -94,7 +95,7 @@ impl Headless {
             "project.save" => self.save(str_of(p, "path")),
             "mesh.import" => self.import_mesh(required(p, "path")?, u32_of(p, "resolution")?, str_of(p, "name")),
             "mesh.reimport" => self.reimport_mesh(str_of(p, "path"), bool_of(p, "preserveStrokes")?),
-            "mesh.export" => self.export_mesh(required(p, "path")?, str_of(p, "format")),
+            "mesh.export" => self.export_mesh(required(p, "path")?, str_of(p, "format"), bool_of(p, "recomputeNormals")?),
             "bake.mesh.add" => self.add_bake_mesh(required(p, "path")?, bool_of(p, "cage")?),
             "resource.import" => self.import_resource(required(p, "path")?),
             "material.save" => self.material_save(p),

@@ -1,6 +1,6 @@
 //! TextureCraft in the browser.
 //!
-//! Runs the same [`texturecraft_ui_egui::TextureCraftApp`] as the desktop app through eframe's web
+//! Runs the same `TextureCraftApp` as the desktop app through eframe's web
 //! runner (wgpu: WebGPU where available, WebGL2 otherwise). Build with `trunk build --release`
 //! from this directory (`packaging/web/package.sh` zips the result).
 //!

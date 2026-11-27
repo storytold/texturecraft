@@ -57,3 +57,23 @@ pillow and potracer):
 OPT=0.4 DP=1 python3 vectorize_tile.py source.png '#c2672b' 2048 2 texturecraft.svg
 OPT=1.0 DP=0 python3 vectorize_tile.py source.png '#c2672b' 1024 4 texturecraft-small.svg
 ```
+
+## Nightly icon
+
+The Nightly build ships the same engraving on a deeper copper field (`#643418`): the background
+contribution of each pixel is replaced and the ink, paper and alpha padding are left exactly as
+they are. No badge, crescent or letter is added, so the two icons differ only in the field.
+
+| File | What |
+|---|---|
+| `texturecraft-nightly.png` | 256 px window icon (`apps/texturecraft/src/main.rs`) |
+| `texturecraft-nightly-1024.png` | full tile, 1024 px (docs) |
+| `texturecraft-nightly.icns` | macOS icon set, the stable `.icns`'s own PNG slots recoloured |
+| `texturecraft-nightly.ico` | Windows icon, the stable `.ico`'s own frames (16 to 256 px) recoloured |
+| `nightly/<size>.png` | per-size renders for the Nightly package and the title bar's icon in a Nightly window (16 to 512 px). Kept out of `hicolor/`, which Stable's Linux and FreeBSD packagers copy whole |
+| `nightly-provenance.json` | the inputs, the palette, the transform and the SHA-256 of every output |
+
+`packaging/nightly-icons.py` derives all of them from the committed stable renders (no upscale, no
+resvg, no Pillow): run it after `packaging/icons.sh` changes a stable file, and
+`python3 packaging/nightly-icons.py --check` (part of `packaging/nightly-tests.py`) fails when a
+committed Nightly file has drifted.

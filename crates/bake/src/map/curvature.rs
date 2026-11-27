@@ -7,6 +7,8 @@ use texturecraft_geom::{Hit, Mesh, Surface};
 
 const RING_COUNT: usize = 4;
 const WALL_RADIUS_TEXELS: f32 = 1.5;
+/// How far the smooth-shading ring reaches, in sampling radii: a distance on the mesh, so a rounded surface reads alike at every map size and wherever its UV texels are larger or smaller
+const SPREAD_RADII: f32 = 4.0;
 const CONCAVE_WEIGHT: f32 = 1.5;
 const LOW_POLY_CONVEX_WEIGHT: f32 = 1.5;
 const HIGH_POLY_CONVEX_WEIGHT: f32 = 0.5;
@@ -20,6 +22,7 @@ const GENTLE_CURVATURE_THRESHOLD: f32 = 0.1;
 pub(super) struct Curvature {
     pub(super) is_enabled: bool,
     walls: f32,
+    /// Reach of the smooth-shading ring, in mesh units
     spread: f32,
     fallback: f32,
     texels: Vec<f32>,
@@ -64,7 +67,8 @@ impl Curvature {
             rays_per_sample,
             wall_count: ring.first().map_or(0, Vec::len),
             walls,
-            spread: walls * 4.0 / 3.0,
+            // In mesh units: a ring sized in texels followed the UV layout, so a sphere read brighter where its texels were larger
+            spread: radius * SPREAD_RADII,
             fallback,
             texels: (0..triangle_count).into_par_iter().map(|t| texel(t).filter(|v| v.is_finite()).unwrap_or(fallback)).collect(),
             low: CurvatureTuning {
@@ -87,7 +91,7 @@ impl Curvature {
 
     fn radii(&self, tuning: &CurvatureTuning, texel: f32) -> [f32; RING_COUNT] {
         let r = self.walls * texel;
-        [r, r, self.spread * texel, tuning.true_radius]
+        [r, r, self.spread, tuning.true_radius]
     }
 
     fn directions(&self, ring: usize, tangent: Vec3, bitangent: Vec3) -> impl Iterator<Item = Vec3> + '_ {

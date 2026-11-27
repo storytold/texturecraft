@@ -1,20 +1,19 @@
 # Releasing TextureCraft
 
-The recipe is craftrules' [release playbook](release-playbook.md); this page covers what is
+The recipe is the [release playbook](release-playbook.md); this page covers what is
 specific to TextureCraft. The pipeline is [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 
 ## Release manager checklist
 
 The steps below are the release manager's; agents never create the `release` branch, tags or
-GitHub Releases. The shared runbook with copy-paste `gh` commands is craftrules
-`release/cut-a-release.md`.
+GitHub Releases. Follow the checklist below and the linked release playbook.
 
 ### 1. One-time repository setup (org admin)
 
 Status on 2026-10-23: `storytold/texturecraft` has the `release` environment (deployable from
 `release` only) and the `release` ruleset (steps 1 and 2 below). Still to do before the first run:
 the secrets (step 3) and the runner group (step 4); the `release` branch is created by the first
-release push. An org admin runs craftrules `release/signing-setup.md` steps 1-2 for this repo:
+release push. An org admin completes the following setup for this repo:
 
 1. Create the **`release` environment**, with deployment branches limited to `release`.
 2. Add the **ruleset on `refs/heads/release`** (restrict creations, updates and deletions, block
@@ -32,21 +31,26 @@ release push. An org admin runs craftrules `release/signing-setup.md` steps 1-2 
 
    Those twelve (`APPLE_*` and `KEYCHAIN_PASSWORD`, `AZURE_*`) are all a signed release needs;
    `GITHUB_TOKEN` is provided by Actions.
-4. Add the repo to the org's **Default runner group** (Settings → Actions → Runner groups). The
-   macOS job (`macos-15-xlarge`) and the FreeBSD job (`github-ubuntu-16core`) run on larger runners,
-   which only serve repos in that group; outside it they wait for a runner forever, with no error.
+4. Add the repo to the org's **Default runner group** (Settings → Actions → Runner groups) for the
+   larger macOS runner (`macos-15-xlarge`). The FreeBSD release job runs its VM on `ubuntu-latest`.
 
 ### 2. Set the version
 
-On `main`:
+Start from an up-to-date `main` and create a version-bump branch:
 
 ```sh
+git switch main
+git pull --ff-only
+git switch -c bump-version-0.2.0
 cargo xtask version                 # prints the current version
 cargo xtask version set 0.2.0       # or 0.2.0-rc.1 for a pre-release
 ```
 
 `set` rewrites `[workspace.package] version` in the root `Cargo.toml` (the single source of truth)
-and refreshes `Cargo.lock`. Commit, push, and wait for CI on `main` to pass.
+and refreshes `Cargo.lock`. Commit the version bump on that branch, push the branch, and open
+a pull request into `main`. Wait for the applicable checks to pass and for review, then merge
+the pull request. Do not push changes directly to `main`. Wait for CI on the merged `main`
+commit to pass before cutting the release below.
 
 ### 3. Cut the release
 
@@ -104,15 +108,16 @@ All file names are `texturecraft-<version>-<platform>-<arch>.<ext>`, written to 
 | Windows x64, x86, arm64 | `-windows-<arch>.msi`, `-windows-<arch>-portable.zip` | `packaging/windows/package.ps1` |
 | Linux x86_64, aarch64 (Ubuntu 22.04, glibc 2.35) | `.AppImage` + `.AppImage.zsync`, `.deb`, `.rpm`, `.tar.gz` | `packaging/linux/package.sh` |
 | Flatpak x86_64, aarch64 | `-linux-<arch>.flatpak`, repackaged from the Linux tarball | `packaging/linux/flatpak-bundle.sh` |
-| FreeBSD x86_64 (14.3 VM on `github-ubuntu-16core`) | `-freebsd-x86_64.tar.gz` | `packaging/freebsd/package.sh` |
+| FreeBSD x86_64 and aarch64 (aarch64 is cross-compiled in the x86_64 VM) | `-freebsd-<arch>.tar.gz` | `packaging/freebsd/package.sh` |
 | Web | `texturecraft-web-<version>.zip` (trunk, `wasm-release` profile; hosting notes in `packaging/web/README.md`) | `packaging/web/package.sh` |
 
 Every desktop package ships both binaries, `texturecraft` and `texturecraft-cli` (on macOS the CLI
 is its own zip next to the DMG). Release builds embed the craft-fonts interface font (Inter) and CJK UI fonts
 (`CRAFT_FONTS_REF` in `release.yml`) and ship their `OFL-<family>.txt` licences with the other
-notices. The packaging
-scripts smoke-test `texturecraft-cli --version`, and the Linux job also runs the AppImage with
-`--version`, so both binaries must print their version and exit without opening a window.
+notices. The packaging scripts smoke-test `texturecraft-cli --version` where they can run the
+staged binary. The FreeBSD aarch64 release cross-build skips that check. The Linux job also runs
+the AppImage with `--version` as a non-blocking check. Both binaries must print their version and
+exit without opening a window.
 
 ## TextureCraft-specific values
 
@@ -150,6 +155,13 @@ entry and icons).
 Secrets live only in the `release` environment and are all optional: a missing one gives an
 unsigned artifact and a `::warning::`, never a failed build.
 
+The supervised nightly signer does not sign from `release`: it runs on `refs/heads/nightly-signer`,
+which only ever fast-forwards to reviewed main commits, and the `release` environment must admit
+`nightly-signer` alongside `release` before the first dispatch. Everything that can reach it is the
+trust closure: all of `.github/` and `packaging/`, including `packaging/env.sh`, which
+`packaging/macos/import-cert.sh` sources with the Apple keys. Stable releases still come only from
+`refs/heads/release`.
+
 - macOS: `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `KEYCHAIN_PASSWORD` (import into a
   temporary keychain, `packaging/macos/import-cert.sh`), then `APPLE_ID`, `APPLE_PASSWORD`,
   `APPLE_TEAM_ID` for `notarytool` and stapling. Without them the app is ad-hoc signed.
@@ -160,7 +172,7 @@ unsigned artifact and a `::warning::`, never a failed build.
 ## Icons
 
 `assets/app-icon/texturecraft.svg` is the engraved zebra (the owner's original drawing, vectorised
-to three colours, craftrules `standards/icon-design.md`); `texturecraft-small.svg` is a lighter
+to three colours); `texturecraft-small.svg` is a lighter
 trace for the hicolor scalable icon. `packaging/icons.sh` renders everything else with resvg and
 `cargo xtask ico|icns`: the hicolor PNGs (16-512 px) and scalable SVG, `texturecraft-1024.png`,
 `texturecraft.ico` and `texturecraft.icns`. The outputs are committed; rerun it after changing the
@@ -168,7 +180,7 @@ artwork and keep `ATTRIBUTION.md` in step. See `assets/app-icon/README.md`.
 
 ## Local checks
 
-- `cargo xtask ci`: fmt, clippy, tests, `cargo xtask layers`, `cargo xtask wasm`.
+- `cargo xtask ci`: fmt, clippy, tests, `cargo xtask layers`, `cargo xtask wasm` (not run by `ci` on Windows; the other hosts cover it).
 - `bash packaging/linux/apprun-test.sh` and `bash packaging/freebsd/package.sh --dry-run` run
   anywhere with bash.
 - `packaging/macos/package.sh --arch aarch64` on a Mac builds an ad-hoc signed DMG.

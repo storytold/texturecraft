@@ -1,7 +1,7 @@
 # Roblox and Sketchfab export presets
 
 Built-in presets in `crates/formats/src/presets.rs`: **Roblox (SurfaceAppearance)** and
-**Sketchfab (PBR Metal Roughness)**. They show up in the export dialog, `export.preset.list` and
+**Sketchfab**. They show up in the export dialog, `export.preset.list` and
 `texturecraft-cli export --preset`.
 
 ## Roblox (SurfaceAppearance)
@@ -14,14 +14,21 @@ Built-in presets in `crates/formats/src/presets.rs`: **Roblox (SurfaceAppearance
 | `Roughness.png` | grayscale roughness |
 
 The file name endings are suffixes Roblox's importer recognises (color, normal, metalness, roughness),
-so reimport assigns each map to its slot.
+so reimport assigns each map to its slot. This holds for an atlas export (UVs in 0 to 1). A UV-tiled
+export names its files like `Normal.1001.png`; Roblox does not document stripping the tile number
+before matching the suffix, so with tiles assign the maps by hand.
+
+`ExportOptions::size` is per UV tile. To stay within the size limit with a tile grid, divide it by the
+larger of the grid's columns and rows and round down to a power of two (three columns: 256, not 341).
 
 Sources:
 - Reimport and texture suffixes: <https://create.roblox.com/docs/art/modeling/reimport>
 - SurfaceAppearance guide: <https://create.roblox.com/docs/art/modeling/surface-appearance>
 - SurfaceAppearance API: <https://create.roblox.com/docs/reference/engine/classes/SurfaceAppearance>
 
-## Sketchfab (PBR Metal Roughness)
+## Sketchfab
+
+The template is named exactly `Sketchfab`, so it fills the export window's first-group "Sketchfab" entry.
 
 `BaseColor` (A = opacity), `Normal` (OpenGL), `Metallic`, `Roughness`, `AmbientOcclusion`,
 `Emissive`, all 8-bit PNG. Sketchfab detects map types from file name suffixes (roughness, metalness

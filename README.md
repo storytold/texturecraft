@@ -32,6 +32,7 @@
   <img alt="MCP server for agents" src="https://img.shields.io/badge/agents-MCP%20server-555555?style=flat-square">
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-555555?style=flat-square">
   <br>
+  <a href="https://sonarcloud.io/project/overview?id=storytold_texturecraft"><img alt="Scanned by SonarCloud" src="https://img.shields.io/badge/Scanned_by-SonarCloud-4b9fd5?style=flat-square&logo=sonarqubecloud&logoColor=white"></a>
   <a href="https://coderabbit.ai"><img alt="Reviewed by CodeRabbit" src="https://img.shields.io/coderabbit/prs/github/storytold/texturecraft?style=flat-square&label=Reviewed%20by%20CodeRabbit&logo=coderabbit"></a>
 </p>
 
@@ -145,7 +146,7 @@ The full list of what's in it is in [`docs/features.md`](docs/features.md).
 git clone https://github.com/storytold/texturecraft
 cd texturecraft
 
-cargo run --release -p texturecraft                          # desktop app (opens a sample project)
+cargo run --release -p texturecraft                          # desktop app (starts with no project)
 cargo run --release -p texturecraft -- model.glb             # a new project from a mesh
 cargo run --release -p texturecraft -- --control 7878        # + JSON control channel
 cargo run --release -p texturecraft-cli -- mcp               # MCP server (stdio)
@@ -153,11 +154,11 @@ cargo run --release -p texturecraft-cli -- new builtin:crate crate.tcraft --samp
 cargo run --release -p texturecraft-cli -- render crate.tcraft crate.png --samples 256   # path traced
 cargo run --release -p texturecraft-cli -- export crate.tcraft textures                 # headless export
 cd apps/texturecraft-web && trunk serve                      # web build
-cargo xtask ci                                               # fmt, clippy, tests, layering, wasm
+cargo xtask ci                                               # fmt, clippy, tests, layering, wasm (not on Windows)
 ```
 
-You need Rust 1.95 or newer. The app opens with a baked sample project and a start window (new project, open, recent projects); **File ▸ New project** starts
-from a built-in mesh, a project template or your own mesh file (UVs are generated if it has none).
+You need Rust 1.95 or newer. The app opens with no project (**File ▸ Open sample project** loads a baked one, and **File ▸ Close** returns to the empty state).
+**File ▸ New project** starts from your own mesh file and a project template. TextureCraft generates UVs if the mesh has none.
 
 Japanese, Chinese, Korean and Arabic interface text uses the fonts of
 [storytold/craft-fonts](https://github.com/storytold/craft-fonts) where it has them, an optional
@@ -255,6 +256,7 @@ are built, signed and published. Every bundled asset is listed with its licence 
 | Build | File |
 |---|---|
 | x86_64 | `texturecraft-<ver>-freebsd-x86_64.tar.gz` |
+| aarch64 (ARM64) | `texturecraft-<ver>-freebsd-aarch64.tar.gz` |
 
 ### Web (WebAssembly)
 

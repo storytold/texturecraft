@@ -22,7 +22,7 @@ Clean-room mesh-map baking from low-poly UVs and optional high-poly meshes. Pers
 | World Normal | World-space shading normal |
 | ID | Vertex Color, Material Color, Mesh ID, Submesh ID, or File ID; Hue Shift, Random, and Grayscale generation |
 | Ambient Occlusion | Independent ray count, distance interval, units, cone and distribution; backface and self-occlusion modes; None, Linear or Smooth attenuation; optional ground plane |
-| Bent Normal | Independent occlusion settings and mean visible direction, encoded in world space |
+| Bent Normal | Independent occlusion settings and mean visible direction, encoded in tangent space like the normal map (OpenGL green, low-poly tangent frame) |
 | Thickness | Inward ray distances with self-occlusion filtering; raw, ray-distance or per-UV-tile min/max normalization |
 | Curvature | Mesh-ray curvature with radius, ray count, self-intersection and automatic/manual tonemapping; normal-map curvature with detail strength and corresponding UV-edge seam blending |
 | Position | All axes or a selected axis; scene or material bounds; box, uniform sphere-style or raw coordinates |

@@ -32,6 +32,7 @@ fn sample() -> Sample {
         pixels,
         baked: [(0, baked)].into(),
         mesh: Some(("glb".into(), vec![1, 2, 3, 4, 5])),
+        mesh_uvs: None,
         high_poly: vec![("b_high.obj".into(), vec![7; 9]), ("a_high.ply".into(), vec![6])],
         cage: Some(("cage.obj".into(), vec![5, 5])),
         bake_paint: [((0, texturecraft_core::BakePaintTarget::Skew), BakePaintData { width: 3, height: 2, values: vec![0.0, 0.25, 0.5, 0.75, 1.0, 0.125] })]
@@ -55,6 +56,7 @@ fn assert_same(a: &ProjectFile, b: &ProjectFile) {
     }
     assert_eq!(a.baked, b.baked);
     assert_eq!(a.mesh, b.mesh);
+    assert_eq!(a.mesh_uvs, b.mesh_uvs);
     assert_eq!((&a.high_poly, &a.cage), (&b.high_poly, &b.cage), "bake meshes keep their order");
     assert_eq!(a.bake_paint, b.bake_paint);
     assert_eq!(a.thumbnail, b.thumbnail);
@@ -80,6 +82,89 @@ fn round_trip_is_identical_and_deterministic() {
     builtin.thumbnail = None;
     builtin.project.mesh = "builtin:sphere".into();
     assert_same(&builtin, &load_project_bytes(&save_project_bytes(&builtin).unwrap()).unwrap());
+}
+
+#[test]
+fn shared_project_schema_round_trips_the_app_document() {
+    let project = sample().pf.project;
+    let original = serde_json::to_value(&project).unwrap();
+    let document: craft_tcraft::ProjectDocument = serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(document.format_version, project.format_version);
+    assert_eq!(serde_json::to_value(document).unwrap(), original);
+}
+
+#[test]
+fn legacy_bakes_load_as_is_without_layout_conversion() {
+    let mut sample = sample();
+    sample.pf.project.format_version = 1;
+    sample.pf.pixels.layers.clear();
+    let set = &mut sample.pf.project.texture_sets[0];
+    set.resolution = 256;
+    set.uv_tiles = vec![1001, 1002];
+    set.tile_resolutions.insert(1002, 128);
+    let pixels: Vec<f32> = (0..16).flat_map(|y| (0..32).map(move |x| (y * 32 + x) as f32)).collect();
+    sample.pf.baked.insert(0, BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(pixels))].into() });
+
+    let loaded = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
+    assert_eq!(loaded.project.format_version, TANGENT_BENT_NORMAL_VERSION);
+    assert_eq!(loaded.baked, sample.pf.baked, "old bake pixels are accepted without preserving their former layout");
+    assert_eq!(loaded.bake_paint, sample.pf.bake_paint, "correction paint remains in the working layout");
+    let reopened = load_project_bytes(&save_project_bytes(&loaded).unwrap()).unwrap();
+    assert_same(&loaded, &reopened);
+}
+
+#[test]
+fn a_bent_normal_declared_without_pixels_in_an_older_project_is_dropped_and_reported() {
+    let mut sample = sample();
+    sample.pf.project.texture_sets[0].baked.insert(BakedMap::BentNormal);
+    assert!(!sample.pf.baked[&0].maps.contains_key(&BakedMap::BentNormal));
+    sample.pf.project.format_version = TANGENT_BENT_NORMAL_VERSION - 1;
+    let older = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
+    assert!(!older.project.texture_sets[0].baked.contains(&BakedMap::BentNormal));
+    assert_eq!(older.warnings.len(), 1, "{:?}", older.warnings);
+    assert!(older.warnings[0].contains("\"A\""), "{}", older.warnings[0]);
+}
+
+#[test]
+fn a_bent_normal_with_pixels_but_no_declaration_in_an_older_project_is_dropped_and_reported() {
+    let mut sample = sample();
+    let bent = Arc::new([0.5, 1.0, 0.5].repeat(16 * 16));
+    sample.pf.baked.get_mut(&0).unwrap().maps.insert(BakedMap::BentNormal, bent);
+    assert!(!sample.pf.project.texture_sets[0].baked.contains(&BakedMap::BentNormal));
+    sample.pf.project.format_version = TANGENT_BENT_NORMAL_VERSION - 1;
+    let older = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
+    assert!(!older.baked[&0].maps.contains_key(&BakedMap::BentNormal));
+    assert_eq!(older.warnings.len(), 1, "{:?}", older.warnings);
+    assert!(older.warnings[0].contains("\"A\""), "{}", older.warnings[0]);
+}
+
+#[test]
+fn world_space_bent_normals_of_older_projects_are_dropped_for_a_rebake() {
+    let mut sample = sample();
+    let bent = Arc::new([0.5, 1.0, 0.5].repeat(16 * 16));
+    sample.pf.baked.get_mut(&0).unwrap().maps.insert(BakedMap::BentNormal, bent);
+    sample.pf.project.texture_sets[0].baked.insert(BakedMap::BentNormal);
+
+    // A current project keeps its tangent-space bent normals
+    let current = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
+    assert!(current.warnings.is_empty(), "{:?}", current.warnings);
+    assert_same(&sample.pf, &current);
+
+    // One saved before tangent space held world vectors: they go, the other maps stay
+    sample.pf.project.format_version = TANGENT_BENT_NORMAL_VERSION - 1;
+    let older = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
+    assert_eq!(older.warnings.len(), 1, "{:?}", older.warnings);
+    assert!(older.warnings[0].contains("\"A\"") && older.warnings[0].contains("Bent Normals"), "{}", older.warnings[0]);
+    let maps = &older.baked[&0].maps;
+    assert!(!maps.contains_key(&BakedMap::BentNormal));
+    assert!(maps.contains_key(&BakedMap::AmbientOcclusion) && maps.contains_key(&BakedMap::Normal));
+    assert!(!older.project.texture_sets[0].baked.contains(&BakedMap::BentNormal));
+    assert_eq!(older.project.texture_sets[0].bake, sample.pf.project.texture_sets[0].bake, "the bake settings stay for the re-bake");
+
+    // Saved again, the project is current and opens without the warning
+    let reopened = load_project_bytes(&save_project_bytes(&older).unwrap()).unwrap();
+    assert!(reopened.warnings.is_empty(), "{:?}", reopened.warnings);
+    assert_same(&older, &reopened);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -208,6 +293,145 @@ fn duplicate_entry_names_are_made_unique_on_save() {
     assert_eq!(res, vec![vec![3], vec![4]]);
 }
 
+/// Every entry of a zip in file order: (name, method, crc, sizes, the compressed bytes as stored).
+/// The zip headers around them (version fields, zip64 size placeholders) are not part of this:
+/// copying an entry between zips rewrites them.
+#[allow(clippy::type_complexity)]
+fn payloads(zip: &[u8]) -> Vec<(String, CompressionMethod, u32, u64, u64, Vec<u8>)> {
+    let mut a = ZipArchive::new(Cursor::new(zip)).unwrap();
+    (0..a.len())
+        .map(|i| {
+            let mut f = a.by_index_raw(i).unwrap();
+            let mut raw = Vec::new();
+            f.read_to_end(&mut raw).unwrap();
+            (f.name().unwrap().into_owned(), f.compression(), f.crc32(), f.size(), f.compressed_size(), raw)
+        })
+        .collect()
+}
+
+/// A project with several baked maps and pixel layers, big enough that entries stream in chunks.
+fn big_sample() -> ProjectFile {
+    let mut s = sample();
+    let mut x = 12345u32;
+    let mut noise = |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (i as f32 * 0.001).sin() * 0.5 + 0.5 + (x >> 24) as f32 * 1e-4
+            })
+            .collect()
+    };
+    let r = 300usize;
+    let maps = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Position]
+        .into_iter()
+        .map(|m| (m, Arc::new(noise(r * r * m.components()))))
+        .collect();
+    s.pf.baked.insert(1, BakedMaps { resolution: r as u32, maps });
+    s.pf.mesh = Some(("obj".into(), noise(5000).iter().map(|v| (v * 200.0) as u8).collect()));
+    s.pf
+}
+
+fn serial_bytes(pf: &ProjectFile) -> Vec<u8> {
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    entries::write_serial(&mut zip, entries(pf).unwrap()).unwrap();
+    zip.finish().unwrap().into_inner()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parallel_bytes(pf: &ProjectFile, workers: usize, budget: u64) -> Vec<u8> {
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    entries::parallel::write(&mut zip, entries(pf).unwrap(), workers, budget).unwrap();
+    zip.finish().unwrap().into_inner()
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn save_plan_follows_the_reserved_cores_and_the_ram_share() {
+    // No cap of 8 workers any more, only the entry count and the cores.
+    assert_eq!(entries::plan(64, 1, 100, 1000, 50), (63, 500));
+    assert_eq!(entries::plan(64, 1, 20, 1000, 50).0, 20);
+    // 0 reserved uses every core; more reserved than cores still leaves one worker.
+    assert_eq!(entries::plan(16, 0, 100, 1000, 100), (16, 1000));
+    assert_eq!(entries::plan(4, 9, 100, 1000, 100).0, 1);
+    assert_eq!(entries::plan(1, 0, 100, 1000, 100).0, 1);
+    // The share is of the RAM given, clamped to 1..=100 percent, and never overflows.
+    assert_eq!(entries::plan(2, 1, 5, 1000, 0).1, 10);
+    assert_eq!(entries::plan(2, 1, 5, 1000, 250).1, 1000);
+    assert_eq!(entries::plan(2, 1, 5, u64::MAX, 100).1, u64::MAX);
+    assert_eq!(entries::plan(2, 1, 5, u64::MAX, 50).1, u64::MAX / 2);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn parallel_save_with_any_reserved_cores_and_ram_share_matches_serial() {
+    let pf = big_sample();
+    let want = payloads(&serial_bytes(&pf));
+    let n = want.len();
+    // (cpus, reserved cores, available RAM, percent): none reserved, all reserved, a tiny and a huge share.
+    for (cpus, reserved, ram, percent) in [(8, 0, 1u64 << 40, 100u8), (8, 1, 1 << 40, 50), (8, 99, 1 << 40, 50), (16, 0, 1000, 1), (6, 1, u64::MAX, 100)] {
+        let (workers, budget) = entries::plan(cpus, reserved, n, ram, percent);
+        let got = parallel_bytes(&pf, workers, budget);
+        assert!(payloads(&got) == want, "{cpus} cpus, {reserved} reserved, {ram} bytes at {percent}%");
+        assert_same(&pf, &load_project_bytes(&got).unwrap());
+    }
+    // The setting is read by the public save; extreme values still save the same entries.
+    for (reserved, percent) in [(0, 100), (1000, 1), (1, 50)] {
+        set_save_resources(reserved, percent);
+        assert!(payloads(&save_project_bytes(&pf).unwrap()) == want, "{reserved} reserved, {percent}%");
+    }
+    set_save_resources(DEFAULT_RESERVED_CORES, DEFAULT_RAM_PERCENT);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn parallel_save_writes_the_same_entries_as_serial() {
+    let pf = big_sample();
+    let serial = serial_bytes(&pf);
+    let want = payloads(&serial);
+    assert!(want.len() > 10);
+    for (workers, budget) in [(0, 1), (2, u64::MAX), (4, u64::MAX), (8, 1), (3, 100_000)] {
+        let got = parallel_bytes(&pf, workers, budget);
+        assert!(payloads(&got) == want, "{workers} workers, budget {budget}");
+        assert_same(&pf, &load_project_bytes(&got).unwrap());
+    }
+    // The public entry point (threads chosen by the machine) agrees too, and loads back.
+    assert!(payloads(&save_project_bytes(&pf).unwrap()) == want);
+    assert_same(&pf, &load_project_bytes(&serial).unwrap());
+}
+
+/// The files written before entries were compressed in parallel: each entry written in one go.
+fn reference_one_shot(pf: &ProjectFile) -> Vec<u8> {
+    let deflate = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).large_file(true);
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    zip.start_file("project.json", deflate).unwrap();
+    zip.write_all(&serde_json::to_vec_pretty(&pf.project).unwrap()).unwrap();
+    for (ts, maps) in &pf.baked {
+        for (m, data) in &maps.maps {
+            zip.start_file(format!("baked/{ts}_{}.bin", m.id()), deflate).unwrap();
+            zip.write_all(&header(maps.resolution, maps.height(*m), m.components(), 0)).unwrap();
+            let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            zip.write_all(&bytes).unwrap();
+        }
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+/// Streaming a baked map into the compressor in chunks may place deflate block boundaries a few
+/// bytes differently than one big write, so the stored bytes can differ slightly; what the entry
+/// holds (name, method, CRC, size) must not, and the compressed size stays within 0.01%.
+#[test]
+fn baked_entries_hold_what_the_one_shot_writer_wrote() {
+    let mut pf = big_sample();
+    (pf.mesh, pf.high_poly, pf.cage, pf.bake_paint, pf.thumbnail, pf.resources) = (None, vec![], None, BTreeMap::new(), None, BTreeMap::new());
+    pf.pixels = PixelStore::default();
+    let (new, old) = (payloads(&save_project_bytes(&pf).unwrap()), payloads(&reference_one_shot(&pf)));
+    assert_eq!(new.len(), old.len());
+    for (n, o) in new.iter().zip(&old) {
+        assert_eq!((&n.0, n.1, n.2, n.3), (&o.0, o.1, o.2, o.3));
+        assert!(n.4.abs_diff(o.4) <= 64 + o.4 / 10_000, "{}: {} vs {}", n.0, n.4, o.4);
+    }
+}
+
 #[test]
 fn bake_model_options_survive_the_project_archive() {
     use texturecraft_core::{BackfaceMode, CageType, HeightNormalization};
@@ -327,6 +551,125 @@ fn recovery_defaults_unreadable_bake_blocks() {
 }
 
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_failing_entry_is_an_error_not_a_hang() {
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for fail_at in [0usize, 3, 9] {
+        let list: Vec<Entry<'_>> = (0..10)
+            .map(|i| Entry {
+                name: format!("e{i}"),
+                options: opts,
+                weight: 10,
+                body: Box::new(move |w| {
+                    if i == fail_at {
+                        return Err(std::io::Error::other("boom"));
+                    }
+                    if i == 5 && fail_at == 9 {
+                        panic!("worker panic");
+                    }
+                    w.write_all(&[i as u8; 100])
+                }),
+            })
+            .collect();
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        assert!(entries::parallel::write(&mut zip, list, 4, 25).is_err(), "fail at {fail_at}");
+    }
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_late_failing_entry_after_good_ones_is_its_own_error() {
+    // Only the last entry fails and nothing panics, so the error must come from that entry.
+    for (workers, budget) in [(4usize, 25u64), (4, u64::MAX), (2, 1)] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            let list: Vec<Entry<'_>> = (0..10)
+                .map(|i| Entry {
+                    name: format!("e{i}"),
+                    options: opts,
+                    weight: 10,
+                    body: Box::new(move |w| if i == 9 { Err(std::io::Error::other("late boom")) } else { w.write_all(&[i as u8; 100]) }),
+                })
+                .collect();
+            let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+            let res = entries::parallel::write(&mut zip, list, workers, budget);
+            let _ = tx.send(res.map_err(|e| matches!(&e, FormatError::Io(io) if io.to_string() == "late boom")));
+        });
+        let res =
+            rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap_or_else(|e| panic!("save did not finish ({e}): {workers} workers, budget {budget}"));
+        assert_eq!(res, Err(true), "{workers} workers, budget {budget}");
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn assert_entry_streams_to_destination(method: CompressionMethod, budget: u64) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let path = std::env::temp_dir().join(format!("texturecraft-entry-streaming-{}-{method:?}.zip", std::process::id()));
+    let destination = std::fs::File::create(&path).unwrap();
+    let observed_destination = destination.try_clone().unwrap();
+    let reached_destination = AtomicBool::new(false);
+    let mut random = 12345u32;
+    let payload: Vec<u8> = (0..131_072)
+        .map(|_| {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            random as u8
+        })
+        .collect();
+    let compressed = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let mut list: Vec<Entry<'_>> = (0..2)
+        .map(|index| Entry { name: format!("before{index}"), options: compressed, weight: 128, body: Box::new(|writer| writer.write_all(&[7; 128])) })
+        .collect();
+    list.push(Entry {
+        name: "target".into(),
+        options: SimpleFileOptions::default().compression_method(method),
+        weight: payload.len() as u64,
+        body: Box::new(|writer| {
+            let before_bytes = observed_destination.metadata()?.len();
+            writer.write_all(&payload)?;
+            writer.flush()?;
+            reached_destination.store(observed_destination.metadata()?.len() > before_bytes, Ordering::Relaxed);
+            Ok(())
+        }),
+    });
+    list.push(Entry { name: "after".into(), options: compressed, weight: 128, body: Box::new(|writer| writer.write_all(&[9; 128])) });
+    let mut writer = ZipWriter::new(destination);
+
+    let result = entries::parallel::write(&mut writer, list, 4, budget);
+    drop(writer.finish().unwrap());
+    drop(observed_destination);
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    result.unwrap();
+    assert!(reached_destination.load(Ordering::Relaxed), "{method:?} was buffered instead of streamed");
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+    let names: Vec<_> = (0..archive.len()).map(|index| archive.by_index(index).unwrap().name().unwrap().into_owned()).collect();
+    assert_eq!(names, ["before0", "before1", "target", "after"]);
+    let mut actual = Vec::new();
+    archive.by_name("target").unwrap().read_to_end(&mut actual).unwrap();
+    assert_eq!(actual, payload);
+    let mut after = Vec::new();
+    archive.by_name("after").unwrap().read_to_end(&mut after).unwrap();
+    assert_eq!(after, [9; 128]);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn stored_entries_reach_the_destination_during_their_body() {
+    assert_entry_streams_to_destination(CompressionMethod::Stored, 1 << 20);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn over_budget_entries_reach_the_destination_during_their_body() {
+    assert_entry_streams_to_destination(CompressionMethod::Deflated, 4096);
+}
+
+#[test]
 fn recovery_skips_unsupported_baked_map_entries() {
     let expected = sample().pf;
     let bytes = edit_archive(&expected, |name, _| {
@@ -386,4 +729,278 @@ fn recovery_does_not_accept_unrelated_json_errors() {
 
     let error = load_project_bytes(&bytes).unwrap_err();
     assert!(error.to_string().contains("duplicate field"), "{error}");
+}
+
+#[test]
+fn project_open_limit_counts_every_loaded_entry_kind() {
+    let paint = sample().paint;
+    let baked = [header(16, 16, 1, 0), vec![0; 16 * 16 * 4]].concat();
+    let entries = [
+        ("resources/test.bin".to_string(), vec![1; 1024]),
+        ("mesh.obj".to_string(), vec![2; 1024]),
+        ("highpoly/test.obj".to_string(), vec![3; 1024]),
+        ("cage/test.obj".to_string(), vec![4; 1024]),
+        ("thumbnail.png".to_string(), vec![5; 1024]),
+        (format!("pixels/layer_{}_baseColor.bin", paint.0), tile_bin(128, 4, &[(0, 0)])),
+        (format!("pixels/mask_{}.bin", paint.0), tile_bin(128, 2, &[(0, 0)])),
+        ("baked/0_ambientOcclusion.bin".to_string(), baked.clone()),
+        ("bake_paint/0_skew.bin".to_string(), baked),
+    ];
+
+    for (name, data) in entries {
+        let bytes = zip_with(&[(&name, data)]);
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let total_bytes: u64 = (0..archive.len()).map(|index| archive.by_index(index).unwrap().size()).sum();
+
+        let accepted = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes)).unwrap();
+        let error = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes - 1)).unwrap_err();
+        let raised_limit = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes + 1)).unwrap();
+
+        assert!(matches!(error, FormatError::TooLarge(_)), "{name}: {error}");
+        assert!(error.to_string().contains(&format!("{} bytes", total_bytes - 1)), "{name}: {error}");
+        assert_same(&accepted, &raised_limit);
+    }
+}
+
+#[test]
+fn project_open_limit_is_shared_across_the_whole_archive() {
+    let project = sample().pf;
+    let bytes = serial_bytes(&project);
+    let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+    let total_bytes: u64 = (0..archive.len()).map(|index| archive.by_index(index).unwrap().size()).sum();
+
+    let accepted = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes)).unwrap();
+    let error = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes - 1)).unwrap_err();
+
+    assert_same(&project, &accepted);
+    assert!(matches!(error, FormatError::TooLarge(_)), "{error}");
+}
+
+#[test]
+fn entry_reads_stop_at_the_smaller_of_the_entry_and_project_limits() {
+    for (entry_limit, project_limit, expected_read) in [(8, 100, 9), (100, 8, 9)] {
+        let mut reader = Cursor::new(vec![1; 1000]);
+        let mut budget = LoadBudget::new(project_limit);
+
+        let error = read_all(&mut reader, entry_limit, &mut budget, "resource").unwrap_err();
+
+        assert!(matches!(error, FormatError::TooLarge(_)), "{error}");
+        assert_eq!(reader.position(), expected_read);
+    }
+}
+
+#[test]
+fn oversized_baked_data_is_rejected_before_reading_its_payload() {
+    let mut reader = Cursor::new(header(16, 16, 1, 0));
+    let mut budget = LoadBudget::new(BIN_HEADER_BYTES as u64 + 16 * 16 * 4 - 1);
+
+    let error = read_baked(&mut reader, BIN_HEADER_BYTES as u64 + 16 * 16 * 4, 1, &mut budget, "baked map").unwrap_err();
+
+    assert!(matches!(error, FormatError::TooLarge(_)), "the size guard must run before the truncated read: {error}");
+    assert_eq!(reader.position(), BIN_HEADER_BYTES as u64);
+}
+
+#[test]
+fn archive_preflight_counts_ignored_entries_and_allows_the_exact_limit() {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for name in ["project.json", "unknown/future-data"] {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(&[0; 16]).unwrap();
+    }
+    let bytes = writer.finish().unwrap().into_inner();
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+
+    check_archive(&mut archive, 32).unwrap();
+    let error = check_archive(&mut archive, 31).unwrap_err();
+
+    assert!(matches!(error, FormatError::TooLarge(_)), "{error}");
+}
+
+#[test]
+fn overlapping_archive_entries_are_rejected_before_decompression() {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("resource", SimpleFileOptions::default()).unwrap();
+    writer.write_all(&[0; 16]).unwrap();
+    writer.shallow_copy_file("resource", "copy").unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+
+    let error = check_archive(&mut archive, 32).unwrap_err();
+
+    assert!(error.to_string().contains("overlapping ZIP entries"), "{error}");
+}
+
+#[test]
+fn actual_decompression_is_bounded_even_when_the_declared_size_is_small() {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("resource", SimpleFileOptions::default().compression_method(CompressionMethod::Deflated)).unwrap();
+    writer.write_all(&vec![0; 1 << 20]).unwrap();
+    let mut bytes = writer.finish().unwrap().into_inner();
+    let directory = ZipArchive::new(Cursor::new(&bytes)).unwrap().central_directory_start() as usize;
+    // The central header stores the uncompressed size at byte 24
+    bytes.get_mut(directory + 24..directory + 28).unwrap().copy_from_slice(&1u32.to_le_bytes());
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+    check_archive(&mut archive, 1024).unwrap();
+    let mut entry = archive.by_index(0).unwrap();
+    let mut budget = LoadBudget::new(1024);
+
+    let error = read_all(&mut entry, MAX_RESOURCE, &mut budget, "resource").unwrap_err();
+
+    assert!(
+        matches!(error, FormatError::TooLarge(_)) || error.to_string().contains("larger than its declared uncompressed size"),
+        "actual bytes must be bounded independently of ZIP sizes: {error}"
+    );
+}
+
+#[test]
+fn baked_dimensions_must_match_the_entry_before_reserving_payload_bytes() {
+    let mut reader = Cursor::new(header(1024, 1024, 3, 0));
+    let mut budget = LoadBudget::new(16 << 20);
+
+    let error = read_baked(&mut reader, BIN_HEADER_BYTES as u64, 3, &mut budget, "baked map").unwrap_err();
+
+    assert!(error.to_string().contains("24 bytes for a 1024×1024×3 map"), "{error}");
+    assert_eq!(budget.remaining(), (16 << 20) - BIN_HEADER_BYTES as u64);
+    assert_eq!(reader.position(), BIN_HEADER_BYTES as u64);
+}
+
+#[test]
+fn streamed_float_chunks_preserve_bits_across_the_chunk_boundary() {
+    let values: Vec<u32> = (0..BAKED_CHUNK + 3).map(|index| (index as u32).wrapping_mul(0x9e3779b9)).collect();
+    let mut bytes = header(values.len() as u32, 1, 1, 0);
+    bytes.extend(values.iter().flat_map(|bits| bits.to_le_bytes()));
+    let declared = bytes.len() as u64;
+    let mut reader = Cursor::new(bytes);
+    let mut budget = LoadBudget::new(declared);
+
+    let (_, _, decoded) = read_baked(&mut reader, declared, 1, &mut budget, "baked map").unwrap();
+
+    assert_eq!(decoded.into_iter().map(f32::to_bits).collect::<Vec<_>>(), values);
+    assert_eq!(reader.position(), declared);
+    assert_eq!(budget.remaining(), 0);
+}
+
+#[test]
+fn archive_indexing_does_not_scan_large_payloads_and_rejects_large_metadata() {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("resource", SimpleFileOptions::default().compression_method(CompressionMethod::Stored)).unwrap();
+    writer.write_all(&vec![7; 1 << 20]).unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+
+    let mut archive = open_archive(Cursor::new(bytes), 4096).unwrap();
+    let mut first_byte = [0; 1];
+    archive.by_index(0).unwrap().read_exact(&mut first_byte).unwrap();
+
+    assert_eq!(first_byte, [7]);
+
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("a".repeat(5000), SimpleFileOptions::default()).unwrap();
+    writer.write_all(&[7]).unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+
+    assert!(open_archive(Cursor::new(bytes), 4096).is_err());
+}
+
+#[test]
+fn zip64_entry_counts_remain_supported_and_bounded() {
+    for count in [65_536, MAX_ENTRIES + 1] {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for index in 0..count {
+            writer.start_file(format!("e{index}"), SimpleFileOptions::default().compression_method(CompressionMethod::Stored)).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let mut archive = open_archive(Cursor::new(bytes), MAX_ZIP_METADATA_BYTES).unwrap();
+        let result = check_archive(&mut archive, 0);
+
+        assert_eq!(archive.len(), count);
+        if count <= MAX_ENTRIES {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(FormatError::TooLarge(_))), "{result:?}");
+        }
+    }
+}
+
+fn rebuilt_uvs_sample() -> ProjectFile {
+    let mut project_file = sample().pf;
+    project_file.project.mesh_rebuild_uvs = true;
+    project_file.mesh_uvs = Some(vec![Vec2::new(0.25, 0.75), Vec2::new(1.0, 0.0), Vec2::new(0.5, 0.125)]);
+    project_file
+}
+
+#[test]
+fn a_saved_uv_layout_round_trips_in_format_4() {
+    const ADDITIONAL_CORNERS: usize = 3000;
+
+    let mut project_file = rebuilt_uvs_sample();
+    let layout = project_file.mesh_uvs.as_mut().unwrap();
+
+    // Exercise full batches and a partial final batch with distinct UVs
+    layout.extend((0..ADDITIONAL_CORNERS).map(|corner| Vec2::new(corner as f32 / ADDITIONAL_CORNERS as f32, 0.5)));
+
+    let loaded = load_project_bytes(&save_project_bytes(&project_file).unwrap()).unwrap();
+
+    assert_eq!(loaded.mesh_uvs, project_file.mesh_uvs);
+    assert_eq!(loaded.project.format_version, REBUILT_MESH_UVS_VERSION);
+}
+
+#[test]
+fn a_saved_uv_layout_requires_format_4_and_the_rebuild_setting() {
+    let project_file = rebuilt_uvs_sample();
+    let older_version = edit_project_json(&project_file, |json| json["format_version"] = TANGENT_BENT_NORMAL_VERSION.into());
+    let disabled_rebuild = edit_project_json(&project_file, |json| json["mesh_rebuild_uvs"] = false.into());
+
+    for archive in [older_version, disabled_rebuild] {
+        let error = load_project_bytes(&archive).map(|_| ()).expect_err("the archive has inconsistent UV layout metadata");
+
+        assert!(error.to_string().contains(UV_LAYOUT_ENTRY), "{error}");
+    }
+}
+
+#[test]
+fn a_rebuilt_project_cannot_be_saved_without_its_layout() {
+    let mut project_file = rebuilt_uvs_sample();
+    project_file.mesh_uvs = None;
+
+    let error = save_project_bytes(&project_file).map(|_| ()).expect_err("the snapshot is missing the rebuilt UV layout");
+
+    assert!(error.to_string().contains(UV_LAYOUT_ENTRY), "{error}");
+}
+
+#[test]
+fn rebuilt_uvs_without_a_valid_saved_layout_are_refused() {
+    let project_file = rebuilt_uvs_sample();
+    let without_layout = edit_archive(&project_file, |name, _| {
+        if name == UV_LAYOUT_ENTRY {
+            *name = "ignored.bin".into();
+        }
+    });
+    let edited_layout = |edit: fn(&mut Vec<u8>)| {
+        edit_archive(&project_file, |name, data| {
+            if name == UV_LAYOUT_ENTRY {
+                edit(data);
+            }
+        })
+    };
+    let truncated = edited_layout(|data| data.truncate(data.len() - 1));
+    let trailing_bytes = edited_layout(|data| data.push(0));
+    let short_header = edited_layout(|data| data.truncate(8));
+    let wrong_count = edited_layout(|data| data[8] = 9);
+    let non_finite = edited_layout(|data| data[12..16].copy_from_slice(&f32::NAN.to_le_bytes()));
+    let bad_magic = edited_layout(|data| data[0] = b'X');
+
+    for (case, bytes) in [
+        ("missing", without_layout),
+        ("truncated", truncated),
+        ("trailing bytes", trailing_bytes),
+        ("short header", short_header),
+        ("wrong count", wrong_count),
+        ("non-finite", non_finite),
+        ("bad magic", bad_magic),
+    ] {
+        let error = load_project_bytes(&bytes).unwrap_err();
+        assert!(!is_guard_error(&error), "{case}: {error}");
+    }
 }
