@@ -5,6 +5,7 @@ use egui::{Color32, CornerRadius, Rect, Response, RichText, Sense, Stroke, Strok
 
 use crate::drawn_icon::DrawnIcon;
 use crate::i18n::tr;
+use crate::press_edit::PressEdit;
 use crate::theme::Tokens;
 
 /// The drag-and-drop payload of type `T` released on `resp` this frame. Unlike
@@ -31,21 +32,28 @@ pub(crate) fn press_edit(ui: &Ui, id: egui::Id, changed: bool) -> Option<bool> {
         return None;
     }
 
-    ui.memory_mut(|memory| {
-        let edits = memory.caches.cache::<egui::cache::FramePublisher<egui::Id, u64>>();
+    // Kept in memory, not a frame cache: a floating panel in its own OS window ends a pass of its own inside ours, which would clear it every frame
+    let frame = ui.ctx().cumulative_frame_nr();
+    ui.data_mut(|data| {
         let id = id.with("pointer edit");
-        let previous = edits.get(&id).copied();
+        let previous = data.get_temp::<PressEdit>(id);
         let merge = match press {
             Some(start) => {
-                let continuing = previous == Some(start);
+                let continuing = previous.is_some_and(|previous| previous.press == start);
                 if changed || continuing {
-                    edits.set(id, start);
+                    // Only the latest press's editors can merge, so its first change forgets every editor of the older ones
+                    let latest_press = egui::Id::unique("pointer edit press");
+                    if data.get_temp::<u64>(latest_press) != Some(start) {
+                        data.remove_by_type::<PressEdit>();
+                        data.insert_temp(latest_press, start);
+                    }
+                    data.insert_temp(id, PressEdit { press: start, frame });
                 }
                 continuing
             }
 
             // A final movement still belongs to the press that ended
-            None => release_only && previous.is_some(),
+            None => release_only && previous.is_some_and(|previous| previous.frame + 1 >= frame),
         };
         changed.then_some(merge)
     })

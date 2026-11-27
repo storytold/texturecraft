@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 use texturecraft_bake::tracing::Tracer;
 use texturecraft_bake::{BakeOutput, BakePaintMap, MAX_RAYS, Progress};
 use texturecraft_core::{
-    BackfaceMode, BakeAntialiasing, BakeResolution, BakeSettings, BakeSyncGroup, BakedMap, CurvatureMethod, PositionMode, RayDistribution, RaySettings,
-    SelfOcclusion,
+    BackfaceMode, BakeAntialiasing, BakeResolution, BakeSettings, BakeSource, BakeSyncGroup, BakedMap, CurvatureMethod, PositionMode, RayDistribution,
+    RaySettings, SelfOcclusion,
 };
 use texturecraft_geom::Mesh;
 
@@ -121,7 +121,8 @@ pub(super) fn parse_mesh(file_name: &str, bytes: Vec<u8>) -> Result<BakeMesh> {
     let imported = texturecraft_formats::import_high_poly_bytes(file_name, &bytes).map_err(|e| EngineError::Other(format!("{file_name}: {e}")))?;
     let base_color = imported.base_color.into_iter().map(|c| c.map(Arc::new)).collect();
     let folder = std::path::Path::new(file_name).parent().map(|folder| folder.display().to_string()).filter(|folder| !folder.is_empty());
-    Ok(BakeMesh { name: file_name.to_string(), folder, bytes: Arc::new(bytes), mesh: Arc::new(imported.mesh), base_color })
+    let fingerprint = texturecraft_core::fingerprint(&bytes);
+    Ok(BakeMesh { name: file_name.to_string(), folder, bytes: Arc::new(bytes), mesh: Arc::new(imported.mesh), base_color, fingerprint })
 }
 
 impl Session {
@@ -130,9 +131,14 @@ impl Session {
         self.bake_task_of(texture_set, None)
     }
 
+    /// A task that bakes only `maps` of texture set `texture_set`, checked or not; its other baked maps stay as they are
+    pub fn bake_task_for(&self, texture_set: usize, maps: &[BakedMap]) -> Result<BakeTask> {
+        self.bake_task_of(texture_set, Some(maps))
+    }
+
     /// The bake of texture set `texture_set`'s map `map` alone, checked or not
     pub fn bake_task_only(&self, texture_set: usize, map: BakedMap) -> Result<BakeTask> {
-        self.bake_task_of(texture_set, Some(map))
+        self.bake_task_of(texture_set, Some(&[map]))
     }
 
     /// Prepare a display-only bake, retaining previous pixels only for the displayed map's excluded UV tiles
@@ -142,20 +148,19 @@ impl Session {
         Ok(task)
     }
 
-    fn bake_task_of(&self, texture_set: usize, only: Option<BakedMap>) -> Result<BakeTask> {
+    fn bake_task_of(&self, texture_set: usize, only: Option<&[BakedMap]>) -> Result<BakeTask> {
         let set = self.doc.project.texture_set(texture_set)?;
         if !set.has_enabled_bake_tiles() {
             return Err(EngineError::Other(format!("texture set {} has no UV tiles selected for baking", set.name)));
         }
 
         let mut settings = set.bake.clone();
-        if let Some(map) = only {
-            settings.maps.select([map]);
+        if let Some(maps) = only {
+            settings.maps.select(maps.iter().copied());
         }
 
         // Read from the maps that bake, so a map baked alone while unchecked still gets the colours
-        let needs_low_color = settings.maps.opacity.is_enabled
-            || (settings.maps.id.is_enabled && settings.maps.id.parameters.source == texturecraft_core::IdColorSource::MaterialColor);
+        let needs_low_color = settings.maps.enabled().any(|map| settings.maps.reads_material_colors(map));
         let low_base_color = if needs_low_color && (settings.high_poly.use_low_as_high || self.doc.bake_meshes.high.is_empty()) {
             self.doc
                 .bake_meshes
@@ -183,6 +188,8 @@ impl Session {
         let previous_maps = if excluded_tiles.is_empty() { Default::default() } else { self.doc.baked.get(&texture_set).cloned().unwrap_or_default() };
 
         let tracer = chosen_tracer(GPU_TRACER.get(), GPU_RAYTRACING.load(Ordering::Relaxed));
+        let sources = self.task_bake_sources(set, settings.maps.enabled());
+
         Ok(BakeTask {
             low_base_color,
             ts: texture_set,
@@ -198,6 +205,9 @@ impl Session {
             excluded_tiles,
             previous_maps,
             tracer,
+            sources,
+            painted_stroke: self.painted_strokes,
+            region: None,
         })
     }
 
@@ -260,26 +270,36 @@ impl Session {
     /// Store a finished bake as one undo step
     pub fn apply_bake(&mut self, texture_set: usize, output: BakeOutput) -> Result<()> {
         let tracer = output.tracer.clone();
-        self.edit("Bake mesh maps", |session| session.store_bake(texture_set, output))?;
+        self.edit("Bake mesh maps", |session| session.store_bake(texture_set, output, None))?;
         self.log.info("Baker", format!("Baked texture set {texture_set} ({tracer})"));
         Ok(())
     }
 
-    /// Apply a streamed bake like [`Session::apply_bake`], keeping the maps' shared buffers (the
-    /// preview that showed them holds the same ones)
+    /// Apply a streamed bake like [`Session::apply_bake`], keeping the buffers the preview that showed them shares
     pub fn apply_streamed_bake(&mut self, texture_set: usize, output: StreamedBake) -> Result<()> {
         let tracer = output.tracer.clone();
-        self.edit("Bake mesh maps", |session| session.store_bake_maps(texture_set, output.resolution, output.height, output.maps))?;
+        self.edit("Bake mesh maps", |session| {
+            session.store_bake_maps(texture_set, output.resolution, output.height, output.maps, Some((&output.sources, output.painted_stroke)))
+        })?;
         self.log.info("Baker", format!("Baked texture set {texture_set} ({tracer})"));
         Ok(())
     }
 
-    fn store_bake(&mut self, texture_set: usize, output: BakeOutput) -> Result<()> {
+    /// Store `output`, recording what its maps were baked from when known (see [`Session::record_bake_sources`])
+    fn store_bake(&mut self, texture_set: usize, output: BakeOutput, recorded: Option<(&BTreeMap<BakedMap, BakeSource>, u64)>) -> Result<()> {
         let maps = output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(pixels))).collect();
-        self.store_bake_maps(texture_set, output.resolution, output.height, maps)
+        self.store_bake_maps(texture_set, output.resolution, output.height, maps, recorded)
     }
 
-    fn store_bake_maps(&mut self, texture_set: usize, resolution: u32, height: u32, maps: std::collections::BTreeMap<BakedMap, Arc<Vec<f32>>>) -> Result<()> {
+    pub(super) fn store_bake_maps(
+        &mut self,
+        texture_set: usize,
+        resolution: u32,
+        height: u32,
+        maps: BTreeMap<BakedMap, Arc<Vec<f32>>>,
+        recorded: Option<(&BTreeMap<BakedMap, BakeSource>, u64)>,
+    ) -> Result<()> {
+        let stored: Vec<BakedMap> = maps.keys().copied().collect();
         let entry = self.doc.baked.entry(texture_set).or_default();
         let size_changed = entry.resolution != resolution || entry.maps.keys().any(|map| entry.height(*map) != height);
         crate::meshmap_cmds::detach_imported_sources(&mut self.doc.project, texture_set, |map| size_changed || maps.contains_key(&map));
@@ -290,18 +310,20 @@ impl Session {
         entry.resolution = resolution;
         entry.maps.extend(maps);
         self.doc.project.texture_set_mut(texture_set)?.baked = entry.maps.keys().copied().collect();
-        Ok(())
+        self.record_bake_sources(texture_set, recorded, &stored)
     }
 
-    /// Bake texture set `ts` now (blocking), on the CPU when `cpu`; returns where the rays ran.
-    pub fn bake_now(&mut self, ts: usize, cpu: bool) -> Result<String> {
-        let mut task = self.bake_task(ts)?;
+    /// Bake texture set `texture_set` now (blocking), on the CPU when `cpu`; returns where the rays ran
+    pub fn bake_now(&mut self, texture_set: usize, cpu: bool) -> Result<String> {
+        let mut task = self.bake_task(texture_set)?;
         if cpu {
             task.tracer = None;
         }
-        let out = task.run(&Progress::new())?;
-        let tracer = out.tracer.clone();
-        self.apply_bake(ts, out)?;
+
+        let output = task.run(&Progress::new())?;
+        let tracer = output.tracer.clone();
+        self.edit("Bake mesh maps", |session| session.store_bake(texture_set, output, Some((&task.sources, task.painted_stroke))))?;
+        self.log.info("Baker", format!("Baked texture set {texture_set} ({tracer})"));
         Ok(tracer)
     }
 
@@ -845,16 +867,21 @@ fn bake_run(session: &mut Session, params: &Value) -> Result<Value> {
         for (index, settings) in next {
             session.doc.project.texture_set_mut(index)?.bake = settings;
         }
+        session.begin_bake_log(&sets);
 
         let mut tracers = Vec::with_capacity(sets.len());
         for &index in &sets {
-            let mut task = session.bake_task(index)?;
-            if cpu {
-                task.tracer = None;
+            session.bake_log.set_started(index);
+            let baked = bake_one_set(session, index, cpu);
+            match baked {
+                Ok(tracer) => tracers.push(tracer),
+                Err(error) => {
+                    session.bake_log.set_failed(index, &error.to_string());
+                    // The edit rolls back the sets baked before this one too
+                    session.bake_log.discard();
+                    return Err(error);
+                }
             }
-            let output = task.run(&Progress::new())?;
-            tracers.push(output.tracer.clone());
-            session.store_bake(index, output)?;
         }
         Ok(tracers)
     })?;
@@ -863,6 +890,24 @@ fn bake_run(session: &mut Session, params: &Value) -> Result<Value> {
     }
     session.update();
     Ok(json!({ "baked": sets, "tracer": tracers }))
+}
+
+/// Bake every checked map of texture set `index` at once, store them and mark them baked in the Baking Log
+fn bake_one_set(session: &mut Session, index: usize, cpu: bool) -> Result<String> {
+    let mut task = session.bake_task(index)?;
+    session.bake_log.high_polys_loaded(index);
+    if cpu {
+        task.tracer = None;
+    }
+
+    let maps = task.maps();
+    let output = task.run(&Progress::new())?;
+    let tracer = output.tracer.clone();
+    session.store_bake(index, output, Some((&task.sources, task.painted_stroke)))?;
+    for map in maps {
+        session.bake_log.map_baked(index, map);
+    }
+    Ok(tracer)
 }
 
 #[cfg(test)]

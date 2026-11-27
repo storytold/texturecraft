@@ -436,6 +436,35 @@ fn textured_glb(mesh: &Mesh, dy: f32, png: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn reimporting_a_low_poly_texture_changes_opacity_provenance() {
+    use texturecraft_engine::core::BakeChange;
+    use texturecraft_engine::formats::MeshFile;
+
+    let mesh = primitives::builtin("plane").unwrap();
+    let name = "painted.glb";
+    let mut session = Session::from_mesh_bytes(name, &textured_glb(&mesh, 0.0, &quadrants_png()), 128, "painted").unwrap();
+    execute(&mut session, "bake.run", &json!({ "resolution": 32, "maps": ["opacity", "position"], "dilation": 0 })).unwrap();
+    execute(&mut session, "bake.autoRebake", &json!({ "map": "opacity" })).unwrap();
+    let prior_opacity = session.baked(0).unwrap().maps[&BakedMap::Opacity].clone();
+    let mut opaque = Vec::new();
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([255; 4])).write_to(&mut std::io::Cursor::new(&mut opaque), image::ImageFormat::Png).unwrap();
+
+    let replacement = MeshFile { name: name.into(), bytes: textured_glb(&mesh, 0.0, &opaque), warnings: Vec::new() };
+    session.reimport_mesh(Some(replacement), false).unwrap();
+
+    assert_eq!(session.bake_changes(0, BakedMap::Opacity), [BakeChange::LowPoly]);
+    assert!(session.bake_changes(0, BakedMap::Position).is_empty());
+    assert_eq!(session.out_of_date_maps(0).len(), 1);
+    assert_eq!(session.auto_rebake_due().first().map(|entry| entry.1), Some(BakedMap::Opacity));
+
+    execute(&mut session, "bake.run", &json!({})).unwrap();
+    let reopened = Session::from_project_bytes(&session.to_project_bytes().unwrap()).unwrap();
+
+    assert_ne!(reopened.baked(0).unwrap().maps[&BakedMap::Opacity], prior_opacity);
+    assert!(reopened.auto_rebake_due().is_empty());
+}
+
+#[test]
 fn opacity_samples_a_textured_gltf_high_poly() {
     let mut session = plane_session();
     let low = session.mesh.as_ref().clone();
@@ -526,13 +555,14 @@ fn opacity_samples_textures_next_to_a_high_poly() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A plane session whose vertex normals lean, with a high poly plane `dy` above it.
-fn leaning_session(lean: bool) -> Session {
+/// Two parallel planes, with tilted low-poly vertex normals when `lean` is true.
+pub(super) fn leaning_session(lean: bool) -> Session {
     let mut mesh = primitives::builtin("plane").unwrap();
     if lean {
         mesh.normals = vec![texturecraft_engine::geom::glam::Vec3::new(0.6, 0.8, 0.0); mesh.positions.len()];
         mesh.compute_tangents();
     }
+
     let high_text = obj(&mesh, 0.1, f32::MAX, [1.0; 3]);
     let mut s = Session::new_project("t", mesh, "builtin:plane", None, 256).unwrap();
 

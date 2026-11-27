@@ -1,7 +1,7 @@
 use crate::cage::RayFrame;
 use crate::map::BakeContext;
 use crate::tracing::{CpuTracer, Tracer};
-use crate::{BakeError, BakeOutput, BakeRequest, MeshExtent, Progress};
+use crate::{BakeError, BakeOutput, BakeRequest, MeshExtent, Progress, RegionBake};
 use std::sync::atomic::Ordering::Relaxed;
 use texturecraft_core::{BakeSettings, BakedMap};
 
@@ -24,9 +24,21 @@ impl<'a> BakePasses<'a> {
         excluded_tiles: &[(u32, u32)],
         tracer: Option<&dyn Tracer>,
     ) -> Result<BakeOutput, BakeError> {
+        self.bake_map_in(map, progress, excluded_tiles, None, tracer)
+    }
+
+    /// [`BakePasses::bake_map`] sampling only `region`'s texels, as [`crate::bake_tiles_in`] does
+    pub fn bake_map_in(
+        &mut self,
+        map: BakedMap,
+        progress: &Progress,
+        excluded_tiles: &[(u32, u32)],
+        region: Option<RegionBake>,
+        tracer: Option<&dyn Tracer>,
+    ) -> Result<BakeOutput, BakeError> {
         let mut settings = self.request.settings.clone();
         settings.maps.select([map]);
-        self.run(&settings, progress, excluded_tiles, tracer, super::STRIP_TEXELS)
+        self.run(&settings, progress, excluded_tiles, region, tracer, super::STRIP_TEXELS)
     }
 
     pub(super) fn run(
@@ -34,6 +46,7 @@ impl<'a> BakePasses<'a> {
         settings: &BakeSettings,
         progress: &Progress,
         excluded_tiles: &[(u32, u32)],
+        region: Option<RegionBake>,
         tracer: Option<&dyn Tracer>,
         strip_texels: usize,
     ) -> Result<BakeOutput, BakeError> {
@@ -56,7 +69,7 @@ impl<'a> BakePasses<'a> {
             }
         };
         let context = BakeContext::with_frame(&request, *extent, frame);
-        let bake = |tracer: &dyn Tracer| super::bake_prepared(&request, &context, progress, strip_texels, tracer, excluded_tiles);
+        let bake = |tracer: &dyn Tracer| super::bake_prepared(&request, &context, progress, strip_texels, tracer, excluded_tiles, region);
         match tracer {
             Some(tracer) => match bake(tracer) {
                 Err(BakeError::Tracer(error)) => {

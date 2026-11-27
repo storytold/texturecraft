@@ -595,7 +595,7 @@ fn a_loaded_cage_can_be_removed_while_the_cage_does_not_apply() {
     session.add_high_poly_bytes("High.obj", b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".to_vec()).unwrap();
     let mesh = session.mesh.clone();
     session.doc.bake_meshes.cage =
-        Some(texturecraft_engine::BakeMesh { name: "Cage.obj".into(), folder: None, bytes: Default::default(), mesh, base_color: Vec::new() });
+        Some(texturecraft_engine::BakeMesh { name: "Cage.obj".into(), folder: None, bytes: Default::default(), mesh, base_color: Vec::new(), fingerprint: 0 });
     let settings = &mut session.doc.project.texture_sets[0].bake;
     (settings.cage.kind, settings.high_poly.use_low_as_high) = (CageType::CustomFile, true);
     harness.run_steps(3);
@@ -696,4 +696,74 @@ fn picking_material_while_painting_keeps_bake_modes_neutral_material() {
     harness.run_steps(3);
 
     assert!(harness.state().ui.bake_visualization.neutral_shown, "bake mode still opens on the neutral material");
+}
+
+#[test]
+fn a_click_on_the_middle_of_an_out_of_date_row_selects_its_map_and_bakes_nothing() {
+    use serde_json::json;
+    use texturecraft_engine::execute;
+
+    // Use two sets so the row shows all hover icons alongside the out-of-date clock
+    let mut harness = harness(None);
+    execute(&mut harness.state_mut().session, "bake.settings", &json!({ "dilation": 4 })).unwrap();
+    harness.state_mut().ui.dock.focus(Panel::CommonSettings);
+    harness.run_steps(3);
+    harness.get_by_label("Out of date: Ambient Occlusion");
+
+    select_map(&mut harness, "Ambient Occlusion");
+
+    assert!(harness.state().bake_progress().is_none(), "the click landed on the row, not its Bake Only icon");
+    assert!(harness.state().ui.dock.is_visible(Panel::MeshMapSettings), "selecting a map fronts its settings");
+    harness.get_by_label("Attenuation");
+}
+
+#[test]
+fn a_baked_maps_row_shows_out_of_date_once_its_settings_change() {
+    use serde_json::json;
+    use texturecraft_engine::execute;
+
+    let mesh = texturecraft_engine::geom::primitives::builtin("plane").unwrap();
+    let mut session = texturecraft_engine::Session::new_project("t", mesh, "builtin:plane", None, 128).unwrap();
+    execute(&mut session, "bake.run", &json!({ "resolution": 64, "maps": ["position"], "dilation": 0 })).unwrap();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.mode = Mode::Baking;
+    harness.run_steps(4);
+
+    assert!(harness.query_by_label("Out of date: Position").is_none(), "just baked");
+
+    execute(&mut harness.state_mut().session, "bake.settings", &json!({ "dilation": 4 })).unwrap();
+    harness.run_steps(3);
+
+    let description = harness.get_by_label("Out of date: Position").accesskit_node().description();
+    assert!(description.is_some_and(|reasons| !reasons.is_empty()), "what changed is read without hovering");
+    assert!(harness.query_by_label("Out of date: Normal").is_none(), "never baked: not out of date");
+}
+
+#[test]
+fn dragging_secondary_rays_is_one_undo_step() {
+    let mut harness = harness(Some(BakedMap::AmbientOcclusion));
+    select_map(&mut harness, "Ambient Occlusion");
+    let rays_before = harness.state().session.doc.project.texture_sets[0].bake.maps.ao.parameters.rays.rays;
+    let history_steps = harness.state().session.history_labels().len();
+
+    let track = harness.get_by_role_and_label(Role::Slider, "Secondary Rays").rect();
+    let at = |share: f32| egui::pos2(track.left() + track.width() * share, track.center().y);
+
+    harness.drag_at(at(0.2));
+    harness.run_steps(crate::DRAG_STEP_FRAMES);
+    for step in 1..=3 {
+        harness.hover_at(at(0.2 + 0.15 * step as f32));
+        harness.run_steps(crate::DRAG_STEP_FRAMES);
+    }
+
+    // The release moves too, and that last change still belongs to the drag
+    harness.drop_at(at(0.8));
+    harness.run_steps(crate::SETTLE_FRAMES);
+
+    let session = &harness.state().session;
+    assert_ne!(session.doc.project.texture_sets[0].bake.maps.ao.parameters.rays.rays, rays_before, "the drag changed the rays");
+    assert_eq!(session.history_labels().len(), history_steps + 1, "{:?}", session.history_labels());
 }

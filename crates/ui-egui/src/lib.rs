@@ -10,6 +10,7 @@
 mod anchor_properties;
 mod angle_dial;
 mod ask;
+mod auto_rebake;
 #[cfg(not(target_arch = "wasm32"))]
 mod autosave_name;
 mod bake_job;
@@ -18,6 +19,7 @@ mod bake_preset;
 pub mod bake_presets;
 mod bake_report;
 mod bake_scene;
+pub mod baking_log;
 mod color_management;
 mod color_picker;
 mod color_selection_editor;
@@ -121,6 +123,7 @@ mod placed_fill_slot;
 mod placement;
 mod pointer_lock;
 mod popup_drag;
+mod press_edit;
 mod preview_dots;
 mod preview_image;
 mod preview_request;
@@ -294,6 +297,8 @@ pub struct TextureCraftApp {
     pub bake: Option<BakeJob>,
     /// What the bake running now has done so far, for the summary when it ends
     pub bake_report: bake_report::BakeReport,
+    /// When the out-of-date auto-rebake maps are rebaked
+    auto_rebake: auto_rebake::AutoRebake,
     /// The Import PBR textures dialog while it is open.
     pub pbr_import: Option<pbr_import::PbrDialog>,
     pub resize: Option<ResizeJob>,
@@ -476,6 +481,7 @@ impl TextureCraftApp {
             gpu_memory: (Vec::new(), None),
             bake: None,
             bake_report: Default::default(),
+            auto_rebake: Default::default(),
             pbr_import: None,
             resize: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -732,8 +738,12 @@ impl TextureCraftApp {
         self.session.bake_preview_begin(orders);
 
         let total = sets.len();
+        match only {
+            Some(map) => self.session.begin_map_bake_log(&sets, &[map]),
+            None => self.session.begin_bake_log(&sets),
+        }
         self.bake_report = bake_report::BakeReport::started(self.last_time);
-        self.bake = Some(BakeJob { queue: sets, current: None, total, mesh_id: self.session.mesh_id, only });
+        self.bake = Some(BakeJob { queue: sets, current: None, total, mesh_id: self.session.mesh_id, only, rebake: None });
     }
 
     /// Re-cook MaterialCraft material layer `layer` in the background. While one cook of the layer
@@ -850,17 +860,21 @@ impl TextureCraftApp {
             if let Some(running) = &job.current {
                 running.progress.cancel.store(true, Ordering::Relaxed);
             }
+            self.session.bake_log.cancel(job.current.as_ref().map(|running| running.set_index));
             self.bake = None;
             return;
         }
 
         ctx.request_repaint_after(BAKE_POLL_INTERVAL);
-        if let Some(running) = &job.current {
+        if let Some(running) = &mut job.current {
             let set_index = running.set_index;
 
             // Wait for the sender to close so the last map also gets a preview frame
             match running.maps.try_recv() {
                 Ok(map) => {
+                    running.finished.resolution = map.resolution;
+                    running.finished.maps.insert(map.map, map.data.clone());
+                    self.session.bake_log.map_baked(set_index, map.map);
                     self.session.bake_preview_map(set_index, map);
                     return;
                 }
@@ -874,22 +888,21 @@ impl TextureCraftApp {
                     job.current = None;
 
                     match self.session.apply_streamed_bake(set_index, output) {
-                        Ok(()) => self.bake_report.map_count += maps_baked,
+                        Ok(()) => {
+                            self.session.bake_log.set_finished(set_index);
+                            self.bake_report.map_count += maps_baked;
+                        }
                         Err(error) => self.bake_failed(set_index, &error.to_string()),
                     }
                 }
                 Ok(Err(error)) => {
                     // The worker's error ends the whole bake; the maps of the sets before it stay
-                    self.bake_failed(set_index, &error.to_string());
-                    self.cancel_bake();
-                    self.finish_bake_report();
+                    self.end_failed_bake(set_index, &error.to_string());
                     return;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.bake_failed(set_index, i18n::tr("The bake worker stopped"));
-                    self.cancel_bake();
-                    self.finish_bake_report();
+                    self.end_failed_bake(set_index, i18n::tr("The bake worker stopped"));
                     return;
                 }
             }
@@ -906,17 +919,23 @@ impl TextureCraftApp {
 
         let set_index = job.queue.remove(0);
         let only = job.only;
+        let rebake = job.rebake.as_ref().map(|(_, map, _, stroke)| (*map, stroke.is_some()));
 
         self.session.bake_preview_set_current(set_index);
-        let task = match only {
-            Some(map) => self.session.bake_task_only(set_index, map),
-            None => self.session.bake_task(set_index),
+        self.session.bake_log.set_started(set_index);
+        let task = match (rebake, only) {
+            (Some((map, true)), _) => self.session.bake_painted_task(set_index, map),
+            (Some((map, false)), _) => self.session.bake_task_for(set_index, &self.session.auto_rebake_maps(set_index, map)),
+            (None, Some(map)) => self.session.bake_task_only(set_index, map),
+            (None, None) => self.session.bake_task(set_index),
         };
         match task {
             Ok(task) => {
+                self.session.bake_log.high_polys_loaded(set_index);
                 let progress = Arc::new(Progress::new());
                 let worker_progress = progress.clone();
                 let maps_total = task.maps().len();
+                let (sources, painted_stroke) = (task.sources.clone(), task.painted_stroke);
                 let maps_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let worker_done = maps_done.clone();
                 let (sender, maps) = std::sync::mpsc::channel();
@@ -930,16 +949,29 @@ impl TextureCraftApp {
                 });
 
                 if let Some(job) = self.bake.as_mut() {
-                    job.current = Some(RunningBake { set_index, progress, receiver, maps, maps_done, maps_total });
+                    job.current =
+                        Some(RunningBake { set_index, progress, receiver, maps, maps_done, maps_total, finished: Default::default(), sources, painted_stroke });
                 }
             }
             Err(error) => self.bake_failed(set_index, &error.to_string()),
         }
     }
 
+    /// End the bake at texture set `set_index`, whose worker failed: none of its maps are kept, the queued sets are canceled
+    fn end_failed_bake(&mut self, set_index: usize, error: &str) {
+        if let Some(job) = &mut self.bake {
+            job.current = None;
+        }
+
+        self.bake_failed(set_index, error);
+        self.cancel_bake();
+        self.finish_bake_report();
+    }
+
     /// Note a texture set whose bake failed: one Log line, counted in the summary
     fn bake_failed(&mut self, set_index: usize, error: &str) {
         self.session.log.error("Baker", format!("Bake of texture set {set_index} failed: {error}"));
+        self.session.bake_log.set_failed(set_index, error);
         self.bake_report.failed_set_count += 1;
     }
 
@@ -952,23 +984,66 @@ impl TextureCraftApp {
             self.session.log.info("Baker", line);
         }
 
+        if self.bake_report.auto_rebake && !failed {
+            return;
+        }
+
         self.toast(text, failed);
         if let Some(toast) = self.toasts.last_mut() {
             toast.show_log = failed;
         }
     }
 
-    /// Cancel the active worker, discard queued sets and restore the view. The current set's
-    /// preview maps are discarded; previously applied sets keep their results and undo steps.
+    /// Cancel the bake and restore the view. Keep applied sets and any eligible maps from the running set.
     pub fn cancel_bake(&mut self) {
         let Some(job) = self.bake.take() else { return };
 
-        if let Some(running) = job.current {
-            running.progress.cancel.store(true, Ordering::Relaxed);
+        let mut discarded = None;
+        let mut worker_failed = false;
+
+        if let Some(mut running) = job.current {
+            running.progress.cancel();
+            let set_index = running.set_index;
+
+            if job.mesh_id != self.session.mesh_id {
+                discarded = Some(set_index);
+            } else {
+                // Collect every map the worker sent, including those the preview never took
+                while let Ok(map) = running.maps.try_recv() {
+                    running.finished.resolution = map.resolution;
+                    running.finished.maps.insert(map.map, map.data);
+                    self.session.bake_log.map_baked(set_index, map.map);
+                }
+
+                let failure = match running.receiver.try_recv() {
+                    Ok(Ok(_) | Err(texturecraft_engine::EngineError::BakeCancelled)) | Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(i18n::tr("The bake worker stopped").to_owned()),
+                };
+
+                if let Some(error) = failure {
+                    self.bake_failed(set_index, &error);
+                    worker_failed = true;
+                } else {
+                    let kept = self.session.keep_canceled_bake(set_index, running.finished, &running.sources, running.painted_stroke);
+                    match kept {
+                        Ok(maps) if !maps.is_empty() => {}
+                        Ok(_) => discarded = Some(set_index),
+                        Err(error) => {
+                            self.toast(error.to_string(), true);
+                            discarded = Some(set_index);
+                        }
+                    }
+                }
+            }
         }
 
-        // Only the current set is uncommitted; completed sets remain applied
+        self.session.bake_log.cancel(discarded);
         self.session.bake_preview_end();
+
+        if worker_failed {
+            self.finish_bake_report();
+        }
     }
 
     /// Resize texture set `ts` to `resolution` on a worker thread (the document changes when
@@ -1238,6 +1313,7 @@ impl eframe::App for TextureCraftApp {
         self.poll_bake(ctx);
         self.bake_map_thumbnails.retain_mesh(self.session.mesh_id);
         bake_mode::poll_live_preview(self, ctx);
+        auto_rebake::poll(self, ctx);
         self.poll_resize(ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.poll_high_poly_job(ctx);
