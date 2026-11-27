@@ -40,6 +40,8 @@ skrifa = { version = "0.44", default-features = false, features = ["std"] }
 # The UI's built-in fonts (Ubuntu Light, Hack): text alphas fall back to them without system fonts.
 epaint_default_fonts = "0.37"
 log = "0.4"
+# Canonical forms of exported file names, to find the ones a file system takes as one.
+icu_normalizer = "2.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "tiff", "exr", "hdr", "bmp", "webp"] }
 craft-image-codecs = { git = "https://github.com/storytold/craft-libs", rev = "8fa4db64a9bb943520259ea95331a303ba788f21" }
 half = "2"

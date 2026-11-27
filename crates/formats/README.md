@@ -102,8 +102,9 @@ pub fn preset_to_json(preset: &ExportPreset) -> Result<String>;
   `Padding::{None, Dilation(n), DilationDefault(n), DilationDiffusion(n), Infinite}`; `size` must be a power of two
   (box filter down, bilinear up).
 - File templates: `$project`, `$mesh`, `$textureSet`, `$channel`, `$colorSpace`; names are
-  sanitized to `[A-Za-z0-9_.-]` (reserved device names get a `_` prefix); case-insensitive
-  collisions get `_2`, `_3`, … plus a warning.
+  sanitized: ASCII keeps `[A-Za-z0-9_.-]`, other alphabets keep their characters except controls,
+  spaces and text direction marks, and the rest becomes `_`; a name is at most 200 bytes and reserved
+  device names get a `_` prefix. Case-insensitive collisions get `_2`, `_3`, … plus a warning.
 - A map is written only when one of its sources has data in the texture set (channel present,
   map baked, …); alpha from a missing channel is dropped.
 - Formats: PNG 8/16, JPEG 8 (q 95), JNG 8 (JPEG colour, deflate alpha), PGM 8/16 (gray; colour

@@ -11,7 +11,7 @@ use craft_image_codecs::{DecodeOptions, Format, Limits, SampleType, decode_as_wi
 use texturecraft_core::{Channel, NormalFormat};
 use texturecraft_geom::{Mesh, SubMesh};
 
-use crate::export::sanitize_file_stem;
+use crate::export::{file_name_key, sanitize_file_stem};
 use crate::presets::{GLTF_BASE_COLOR, GLTF_CLEARCOAT, GLTF_EMISSIVE, GLTF_NORMAL, GLTF_ORM, GLTF_SHEEN, gltf_pbr_maps};
 use crate::{ExportOptions, ExportPreset, ExportedFile, FileFormat, FormatError, Result};
 
@@ -104,8 +104,8 @@ fn to_craft_scene(mesh: &Mesh, name: &str, materials: Vec<craft_mesh::Material>,
     scene
 }
 
-/// `id` of each material name, made unique with `_2`, `_3`… where two would be the same, also
-/// ignoring case (the ids name files, and file systems may ignore case).
+/// `id` of each material name, made unique with `_2`, `_3`… where two would name one file (see
+/// [`file_name_key`]).
 pub(crate) fn unique_ids(materials: &[String], id: impl Fn(&str) -> String) -> Vec<String> {
     let mut seen = BTreeSet::new();
     materials
@@ -114,7 +114,7 @@ pub(crate) fn unique_ids(materials: &[String], id: impl Fn(&str) -> String) -> V
             let base = id(m);
             let mut unique = base.clone();
             for n in 2.. {
-                if seen.insert(unique.to_lowercase()) {
+                if seen.insert(file_name_key(&unique)) {
                     break;
                 }
                 unique = format!("{base}_{n}");
@@ -379,6 +379,18 @@ mod tests {
             mtl.contains("newmtl Mat_A\nKd 1 1 1\nmap_Kd m_Mat_A_BaseColor.png") && mtl.contains("newmtl mat_a_2\nKd 1 1 1\nmap_Kd m_mat_a_2_BaseColor.png"),
             "{mtl}"
         );
+    }
+
+    #[test]
+    fn materials_whose_ids_a_file_system_may_merge_stay_apart() {
+        // A final capital sigma, and an accented letter in its two Unicode forms
+        for (first, second) in [("\u{39f}\u{3a3}", "\u{3bf}\u{3c3}"), ("\u{e9}", "e\u{301}")] {
+            let materials = [first.to_string(), second.to_string()];
+
+            let ids = unique_ids(&materials, sanitize_file_stem);
+
+            assert_eq!(ids, [first.to_string(), format!("{second}_2")]);
+        }
     }
 
     #[test]

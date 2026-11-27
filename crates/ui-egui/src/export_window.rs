@@ -283,7 +283,7 @@ fn name_clash(preview: &[ExportSetPlan]) -> Option<String> {
     for (index, set) in preview.iter().enumerate() {
         let Ok(files) = &set.files else { continue };
         for file in planned_names(files) {
-            let (first_index, first_name) = *seen.entry(file.to_ascii_lowercase()).or_insert((index, &set.name));
+            let (first_index, first_name) = *seen.entry(texturecraft_engine::formats::export::file_name_key(file)).or_insert((index, &set.name));
             if first_index != index {
                 return Some(trf(
                     "Texture sets {first} and {second} both export {file}: add $textureSet to the template's file names or rename a texture set",

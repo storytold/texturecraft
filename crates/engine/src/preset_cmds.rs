@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use serde_json::{Value, json};
-use texturecraft_formats::export::{MAX_PRESET_NAME, sanitize_file_stem};
+use texturecraft_formats::export::{MAX_PRESET_NAME, sanitize_library_stem};
 use texturecraft_formats::{ExportPreset, builtin_preset, builtin_presets, preset_from_json};
 
 use crate::commands::{CommandSpec, always, bad, strp};
@@ -53,7 +53,7 @@ fn same_name(a: &str, b: &str) -> bool {
 
 /// Library file stem: two names with the same stem would share a file.
 fn file_key(name: &str) -> String {
-    sanitize_file_stem(name.trim()).to_ascii_lowercase()
+    sanitize_library_stem(name.trim()).to_ascii_lowercase()
 }
 
 impl UserPresets {
@@ -83,7 +83,7 @@ impl UserPresets {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn file(&self, name: &str) -> Option<std::path::PathBuf> {
-        self.dir.as_ref().map(|d| d.join(format!("{}.json", sanitize_file_stem(name.trim()))))
+        self.dir.as_ref().map(|d| d.join(format!("{}.json", sanitize_library_stem(name.trim()))))
     }
 
     /// Mirror a saved preset to the library folder; `replaced` is the name it had before.

@@ -5950,6 +5950,7 @@ dependencies = [
  "flate2",
  "gltf",
  "half",
+ "icu_normalizer",
  "image",
  "png",
  "quick-xml 0.41.0",

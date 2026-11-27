@@ -1,4 +1,4 @@
-use texturecraft_formats::export::sanitize_file_stem;
+use texturecraft_formats::export::sanitize_library_stem;
 use texturecraft_paint::presets::find_preset;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -19,7 +19,7 @@ fn same_name(first_name: &str, second_name: &str) -> bool {
 
 /// Two names with the same file stem would share a file.
 fn file_key(name: &str) -> String {
-    sanitize_file_stem(name.trim()).to_ascii_lowercase()
+    sanitize_library_stem(name.trim()).to_ascii_lowercase()
 }
 
 impl UserBrushes {
@@ -42,7 +42,7 @@ impl UserBrushes {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn file(&self, name: &str) -> Option<std::path::PathBuf> {
-        self.dir.as_ref().map(|directory| directory.join(format!("{}.{BRUSH_EXT}", sanitize_file_stem(name.trim()))))
+        self.dir.as_ref().map(|directory| directory.join(format!("{}.{BRUSH_EXT}", sanitize_library_stem(name.trim()))))
     }
 
     /// The file a preset named `name` that was never written would have.

@@ -366,7 +366,7 @@ fn write(session: &mut Session, template: &ProjectTemplate, chosen_path: Option<
             .get(&template_key)
             .filter(|file| file.parent() == Some(directory))
             .cloned()
-            .unwrap_or_else(|| directory.join(format!("{}.json", texturecraft_formats::export::sanitize_file_stem(&template.name))))
+            .unwrap_or_else(|| directory.join(format!("{}.json", texturecraft_formats::export::sanitize_library_stem(&template.name))))
     } else {
         return Ok(None);
     };

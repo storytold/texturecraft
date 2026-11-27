@@ -1577,6 +1577,115 @@ fn write_files_accepts_a_long_nested_folder_and_stem() {
 }
 
 #[test]
+fn names_keep_other_alphabets_and_replace_what_disguises_or_breaks_a_file() {
+    for kept in ["身体", "Óxido", "O\u{301}xido", "ผิว", "голова"] {
+        assert_eq!(sanitize_file_stem(kept), kept);
+    }
+
+    // ASCII follows the rule it always had
+    assert_eq!(sanitize_file_stem("Body Mat/a:b"), "Body_Mat_a_b");
+
+    // A control, an ideographic space and a mark that reverses the text after it
+    assert_eq!(sanitize_file_stem("a\u{85}b\u{3000}c\u{202e}d"), "a_b_c_d");
+    assert!(sanitize_file_stem("com².png").starts_with('_'), "a reserved port");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_long_name_in_another_alphabet_still_fits_a_file_name() {
+    let fx = Fx::new(&default_channels());
+    let files = fx.render_preset("Unreal Engine (Packed)");
+    let dir = std::env::temp_dir().join(format!("tc-formats-long-unicode-{}", std::process::id()));
+    for long in ["身".repeat(300), format!("a{}", "😀".repeat(300))] {
+        let stem = sanitize_file_stem(&long);
+        assert!(stem.len() <= MAX_STEM && long.starts_with(&stem), "cut between characters: {} bytes", stem.len());
+        assert_eq!(sanitize_file_stem(&stem), stem);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = write_files(&[ExportedFile { name: format!("{stem}.png"), ..files[0].clone() }], &dir).unwrap();
+        assert!(paths[0].is_file());
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn names_that_differ_only_in_the_case_of_an_accented_letter_are_one_file() {
+    let fx = Fx::new(&default_channels());
+    let rendered = fx.render_preset("Unreal Engine (Packed)");
+    let named = |name: &str| ExportedFile { name: name.into(), ..rendered[0].clone() };
+    let mut files = vec![named("Óxido.png"), named("óxido.png")];
+
+    skip_repeated_names(&mut files);
+
+    assert_eq!(files.len(), 1, "the second would replace the first on Windows and macOS");
+}
+
+#[test]
+fn a_reserved_name_that_fills_the_limit_stays_within_it() {
+    for reserved in ["COM².", "con.", "LPT9."] {
+        let stem = sanitize_file_stem(&format!("{reserved}{}", "a".repeat(300)));
+        assert!(stem.starts_with('_') && stem.len() <= MAX_STEM, "{} bytes: {stem}", stem.len());
+        assert_eq!(sanitize_file_stem(&stem), stem, "writing the file accepts the name");
+    }
+}
+
+#[test]
+fn numbering_names_cut_to_the_same_stem_keeps_them_within_the_limit() {
+    // One byte a character fills the limit exactly; four leave it a few bytes short
+    for long in ["a".repeat(300), "😀".repeat(60)] {
+        let mut fx = Fx::new(&default_channels());
+        fx.project.texture_sets[0].name = long;
+        let preset = builtin_preset("Unreal Engine (Packed)").unwrap();
+
+        let planned = list_outputs(&fx.project, 0, "mesh", &ExportOptions::new(preset)).unwrap();
+
+        assert!(planned.len() > 1);
+        let mut names = std::collections::BTreeSet::new();
+        for file in &planned {
+            let stem = file.name.rsplit_once('.').unwrap().0;
+            assert_eq!(sanitize_file_path(stem), stem, "writing the file accepts the name: {} bytes", stem.len());
+            assert!(names.insert(file_name_key(&file.name)), "two files of one name: {}", file.name);
+        }
+    }
+}
+
+#[test]
+fn composed_and_decomposed_letters_are_one_file() {
+    // One accented letter written as one character, and as a letter with a combining accent
+    let (composed, decomposed) = ("\u{e9}", "e\u{301}");
+    let fx = Fx::new(&default_channels());
+    let rendered = fx.render_preset("Unreal Engine (Packed)");
+    let named = |stem: &str| ExportedFile { name: format!("{stem}.png"), ..rendered[0].clone() };
+    let mut files = vec![named(composed), named(decomposed)];
+
+    skip_repeated_names(&mut files);
+
+    assert_eq!(files.len(), 1);
+
+    let color = SourceRef::Channel { channel: Channel::BaseColor, component: 0 };
+    let maps = [composed, decomposed].map(|file| gray_map(file, color.clone())).to_vec();
+    let planned = list_outputs(&fx.project, 0, "mesh", &ExportOptions::new(ExportPreset { name: "forms".into(), maps })).unwrap();
+
+    assert_eq!(planned[0].name, format!("{composed}.png"), "the spelling is kept");
+    assert_eq!(planned[1].name, format!("{decomposed}_2.png"), "the second is numbered");
+}
+
+#[test]
+fn greek_sigmas_that_a_file_system_may_merge_are_one_file() {
+    let fx = Fx::new(&default_channels());
+    let rendered = fx.render_preset("Unreal Engine (Packed)");
+    let named = |name: &str| ExportedFile { name: name.into(), ..rendered[0].clone() };
+    // The capital at the end of a word, and the final form of the small letter
+    for (first, second) in [("ΟΔΟΣ_a.png", "οδοσ_a.png"), ("σ.png", "ς.png")] {
+        let mut files = vec![named(first), named(second)];
+
+        skip_repeated_names(&mut files);
+
+        assert_eq!(files.len(), 1, "{first} and {second}");
+    }
+}
+
+#[test]
 fn specular_glossiness_exports_ignore_the_ior_specular_setting() {
     let mut fx = Fx::new(&[Channel::BaseColor, Channel::Specular, Channel::Glossiness, Channel::SpecularLevel]);
     fx.set_all(Channel::Specular, |_, _| [0.3, 0.2, 0.1]);

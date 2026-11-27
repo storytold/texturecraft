@@ -16,6 +16,7 @@ use std::collections::{BTreeSet, HashMap, hash_map::Entry};
 use std::io::Cursor;
 
 use craft_image_codecs::{ChannelLayout, EncodeOptions, Format as CodecFormat, Image as CodecImage, SampleType};
+use icu_normalizer::DecomposingNormalizerBorrowed;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use texturecraft_compose::{BakedMaps, Composite};
@@ -563,17 +564,82 @@ pub fn channel_label(map: &MapSpec) -> &'static str {
         .unwrap_or("constant")
 }
 
-/// Keep `[A-Za-z0-9_.-]`, replace everything else with `_`; never empty or a reserved device name.
+/// A file name stem for exported files: ASCII keeps `[A-Za-z0-9_.-]` and other alphabets keep their characters, except
+/// controls, spaces and the characters that reorder text; the rest becomes `_`. At most [`MAX_STEM`] bytes, never empty
+/// or a reserved device name.
 pub fn sanitize_file_stem(s: &str) -> String {
-    let mut out: String = s.chars().take(MAX_STEM).map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '_' }).collect();
+    sanitize_stem(s, |c| if c.is_ascii() { is_ascii_name_char(c) } else { !(c.is_control() || c.is_whitespace() || is_direction_control(c)) })
+}
+
+/// [`sanitize_file_stem`] keeping ASCII only: the files of the user's saved presets, brushes and templates are found
+/// again by their names, so those names stay as earlier versions wrote them.
+pub fn sanitize_library_stem(s: &str) -> String {
+    sanitize_stem(s, is_ascii_name_char)
+}
+
+/// The form of a file name that compares equal for names Windows or macOS may treat as one file.
+pub fn file_name_key(name: &str) -> String {
+    // macOS takes the composed and decomposed forms of a letter as one name, so compare them decomposed. Lower case
+    // letter by letter, as file systems compare: `str::to_lowercase` writes a capital sigma as the final form at the
+    // end of a word. Where names are case folded, the two small sigmas are one letter too
+    let nfd = DecomposingNormalizerBorrowed::new_nfd();
+    let lower: String = nfd.normalize(name).chars().flat_map(char::to_lowercase).map(|c| if c == 'ς' { 'σ' } else { c }).collect();
+    nfd.normalize(&lower).into_owned()
+}
+
+/// `name` cut between characters to at most `max_bytes`
+fn cut_to(name: &mut String, max_bytes: usize) {
+    let mut end = max_bytes.min(name.len());
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name.truncate(end);
+}
+
+/// The sanitized path `stem` numbered `_k`, its file name cut so the number still fits within [`MAX_STEM`] bytes
+fn numbered_stem(stem: &str, k: u32) -> String {
+    let suffix = format!("_{k}");
+    let name_start = stem.rfind('/').map_or(0, |slash| slash + 1);
+    let mut numbered = stem.to_string();
+    cut_to(&mut numbered, name_start + MAX_STEM.saturating_sub(suffix.len()));
+    numbered.push_str(&suffix);
+    numbered
+}
+
+fn is_ascii_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
+}
+
+/// Marks that change the order text is shown in, which can disguise a file's name or extension.
+fn is_direction_control(c: char) -> bool {
+    matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+fn sanitize_stem(s: &str, keep: impl Fn(char) -> bool) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        let c = if keep(c) { c } else { '_' };
+
+        // File systems limit a name in bytes, and a character of another alphabet takes several
+        if out.len() + c.len_utf8() > MAX_STEM {
+            break;
+        }
+        out.push(c);
+    }
     if out.trim_matches('.').is_empty() {
         out = "texture".into();
     }
     let device = out.split('.').next().unwrap_or_default().to_ascii_uppercase();
-    let reserved = matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (device.len() == 4 && (device.starts_with("COM") || device.starts_with("LPT")) && device.ends_with(|c: char| c.is_ascii_digit()));
-    if reserved {
+    let port = device.strip_prefix("COM").or_else(|| device.strip_prefix("LPT"));
+
+    // Windows also reserves the ports numbered with superscript digits
+    let numbered_port = port.is_some_and(|number| {
+        let mut digits = number.chars();
+        digits.next().is_some_and(|digit| digit.is_ascii_digit() || matches!(digit, '¹' | '²' | '³')) && digits.next().is_none()
+    });
+    if matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered_port {
         out.insert(0, '_');
+        cut_to(&mut out, MAX_STEM);
     }
     out
 }
@@ -692,14 +758,14 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
 
             // Compare names case-insensitively for Windows and macOS
             let mut k = 2;
-            while used.contains(&name.to_ascii_lowercase()) {
-                name = format!("{stem}_{k}.{ext}");
+            while used.contains(&file_name_key(&name)) {
+                name = format!("{}.{ext}", numbered_stem(&stem, k));
                 k += 1;
             }
             if k > 2 {
                 warnings.push(format!("\"{stem}.{ext}\" is produced by more than one map; this one was renamed to \"{name}\""));
             }
-            let lower = name.to_ascii_lowercase();
+            let lower = file_name_key(&name);
             used.insert(lower.clone());
             if !enabled {
                 continue;
@@ -724,10 +790,13 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
 
             // Use a UDIM name only when substituting its tile recovers the output name
             // Truncation or literal placeholder text can make that substitution ambiguous
-            let udim_name = token_stem.filter(|t| tile.is_some_and(|n| t.contains("UDIMTOKEN") && t.replace("UDIMTOKEN", &n.to_string()) == stem)).map(|t| {
-                let renamed = if k > 2 { format!("_{}", k - 1) } else { String::new() };
-                format!("{t}{renamed}.{ext}").replace("UDIMTOKEN", "<UDIM>")
-            });
+            let renamed = if k > 2 { format!("_{}", k - 1) } else { String::new() };
+
+            // A numbered name that had to be cut no longer follows the pattern
+            let whole = name == format!("{stem}{renamed}.{ext}");
+            let udim_name = token_stem
+                .filter(|t| whole && tile.is_some_and(|n| t.contains("UDIMTOKEN") && t.replace("UDIMTOKEN", &n.to_string()) == stem))
+                .map(|t| format!("{t}{renamed}.{ext}").replace("UDIMTOKEN", "<UDIM>"));
             out.push(PlannedFile { name, map: i, format, bit_depth, dither, tile, udim_name, warnings });
         }
     }
@@ -1551,7 +1620,7 @@ fn keep_first_names<T>(files: Vec<T>, name: impl Fn(&T) -> &str, warnings: impl 
     let mut kept = Vec::with_capacity(files.len());
     for file in files {
         let filename = name(&file);
-        match first.entry(filename.to_ascii_lowercase()) {
+        match first.entry(file_name_key(filename)) {
             Entry::Occupied(previous) => {
                 if let Some(winner) = kept.get_mut(*previous.get()) {
                     warnings(winner).push(format!(
@@ -1587,7 +1656,7 @@ pub fn write_files(files: &[ExportedFile], dir: &std::path::Path) -> Result<Vec<
             return Err(FormatError::Invalid(format!("\"{}\" is not a file name or a relative path", f.name)));
         }
 
-        let lower = f.name.to_ascii_lowercase();
+        let lower = file_name_key(&f.name);
         if seen_dirs.contains(&lower) {
             return Err(FormatError::Invalid(format!("\"{}\" cannot be both an exported file and a folder", f.name)));
         }

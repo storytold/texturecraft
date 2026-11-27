@@ -922,7 +922,7 @@ fn reserved_names(params: &Value) -> Result<HashMap<String, Option<usize>>> {
             .iter()
             .map(|name| {
                 name.as_str()
-                    .map(|name| (name.to_ascii_lowercase(), None))
+                    .map(|name| (texturecraft_formats::export::file_name_key(name), None))
                     .ok_or_else(|| bad("file.exportTextures", "`reservedNames` must be a list of file names"))
             })
             .collect(),
@@ -941,7 +941,7 @@ fn reserve_export_names(
 ) -> HashSet<usize> {
     let mut blocked_maps = HashSet::new();
     plans.retain(|plan| {
-        let name = plan.name.to_ascii_lowercase();
+        let name = texturecraft_formats::export::file_name_key(&plan.name);
         if reserved_patterns.iter().any(|pattern| udim_matches(pattern, &name)) {
             blocked_maps.insert(plan.map);
             warnings.push(format!(
@@ -1161,7 +1161,7 @@ fn write_materialx(
                 return true;
             }
 
-            let pattern = texture.file.to_ascii_lowercase();
+            let pattern = texturecraft_formats::export::file_name_key(&texture.file);
             if taken_names.iter().any(|(filename, owner)| *owner != Some(index) && udim_matches(&pattern, filename)) {
                 warnings.push(format!(
                     "MaterialX: \"{}\" also matches another texture set's files. Rename a texture set or change the template file names",
@@ -1180,7 +1180,7 @@ fn write_materialx(
         let material_name = format!("{mesh_name}_{}", set.name);
         let stem = texturecraft_formats::export::sanitize_file_stem(&material_name);
         let filename = format!("{stem}.mtlx");
-        let Entry::Vacant(entry) = taken_names.entry(filename.to_ascii_lowercase()) else {
+        let Entry::Vacant(entry) = taken_names.entry(texturecraft_formats::export::file_name_key(&filename)) else {
             warnings.push(format!(
                 "MaterialX: texture set \"{}\" exports as \"{filename}\" like an earlier file of this export, so its .mtlx was not written. Rename one of the texture sets",
                 set.name
