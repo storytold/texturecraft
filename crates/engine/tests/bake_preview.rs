@@ -1,5 +1,5 @@
 //! Live bake preview: maps stream into the view while a bake runs, the view mode comes back,
-//! painting is paused, a cancelled bake leaves the set it was baking alone (sets finished before it
+//! painting is paused, ending the preview leaves the set it was baking alone (sets finished before it
 //! stay applied), the streamed pixels are the ones a single bake makes, and the preview and the
 //! document share each map's buffer instead of holding two copies.
 
@@ -208,14 +208,14 @@ fn cancelling_mid_bake_leaves_the_document_and_the_shown_maps_whole() {
 
     assert!(result.is_err(), "a cancelled bake fails");
 
-    // The two maps that landed are whole and equal to a full bake's; the others are still neutral
+    // Compare the streamed pixels with a full bake to verify each preview is complete
     let shown = session.bake_preview_baked(0).unwrap();
     assert_eq!(shown.maps.len(), 2);
     for (map, data) in &shown.maps {
         assert!(**data == full.maps[map], "{map:?}");
     }
 
-    // What the app does on cancel: end the preview; the document keeps what it had
+    // The UI applies eligible maps separately through keep_canceled_bake
     session.bake_preview_end();
 
     assert_eq!(session.doc.baked.get(&0).cloned(), before);

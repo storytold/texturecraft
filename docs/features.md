@@ -173,6 +173,17 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   channel with the summary and the message for each failed set.
 - **Live bake preview:** while the app bakes, each mesh map shows on the model as soon as it is
   finished; the bake bar follows the newest map, pins a finished one or shows the material.
+- **Baking Log** at the bottom of Bake mode: the latest bake map by map (Baking Process), the high
+  poly files each set loads (High Poly Parameters) and how parts paired by name (Matching by Name),
+  with an issues filter; a failed or canceled map opens its settings. `bake.log` returns the same rows.
+- **Out-of-date mesh maps:** each bake records what every map was baked from; a map whose mesh, high
+  poly, cage or settings changed since shows a clock in Mesh Map Bakers (`outOfDate` in
+  `project.inspect`), and a generator reading a missing or out-of-date map shows one line with a
+  Bake button.
+- **Auto-rebake:** one map per texture set (`bake.autoRebake`, a row icon in Mesh Map Bakers) is
+  baked again in the background in Bake mode once what it is baked from stops changing. On an
+  eligible map, a skew or cage stroke rebakes the stroke's box and pads the result. The first skew
+  stroke turns it on for the Normal map if the set has no Auto-rebake map.
 - **Export presets** for glTF PBR Metal Roughness, Unreal Engine (packed), Unity HDRP (mask map),
   Unity Standard, Unity URP Lit, USD Preview Surface, Blender (Principled BSDF), Godot 4 (ORM), OpenPBR (with the coat, fuzz,
   anisotropy, transmission and subsurface maps), separate maps, mesh maps and document channels, in

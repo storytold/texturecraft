@@ -71,16 +71,19 @@ fn the_view_shows_each_map_as_it_lands_and_the_previous_mode_comes_back() {
 }
 
 #[test]
-fn cancelling_restores_the_view_and_leaves_the_document_alone() {
+fn cancelling_before_a_map_finishes_restores_the_view_and_leaves_the_document_alone() {
     let mut harness = harness();
     let before = harness.state().session.doc.baked.get(&0).cloned();
 
+    // One frame starts the worker; a finished map shows only from the next one
     harness.state_mut().start_bake(vec![0]);
-    harness.run_steps(2);
+    harness.run_steps(1);
 
     assert!(harness.state().session.bake_preview_active());
+
     let (at, viewport) = (texturecraft_engine::geom::glam::Vec2::new(5.0, 5.0), texturecraft_engine::geom::glam::Vec2::new(100.0, 100.0));
     assert!(harness.state_mut().session.begin_stroke(at, viewport, 1.0).is_err(), "painting is paused");
+
     harness.state_mut().cancel_bake();
     harness.run_steps(2);
 
@@ -134,6 +137,7 @@ fn a_ready_result_waits_for_the_map_stream_to_close() {
         total: 1,
         mesh_id,
         only: None,
+        rebake: None,
         current: Some(RunningBake {
             set_index: 0,
             progress: Arc::new(Progress::new()),
@@ -141,6 +145,9 @@ fn a_ready_result_waits_for_the_map_stream_to_close() {
             maps,
             maps_done: Arc::new(AtomicUsize::new(MAPS.len())),
             maps_total: MAPS.len(),
+            finished: Default::default(),
+            sources: Default::default(),
+            painted_stroke: 0,
         }),
     });
 
@@ -149,6 +156,7 @@ fn a_ready_result_waits_for_the_map_stream_to_close() {
 
     assert!(harness.state().bake.is_some(), "an open map stream can still deliver a map");
     assert_eq!(harness.state().session.doc.baked, before);
+
     for map in finished_maps {
         map_sender.send(map).unwrap();
     }
@@ -162,6 +170,7 @@ fn a_ready_result_waits_for_the_map_stream_to_close() {
         assert!(harness.state().session.bake_preview_baked(0).unwrap().maps.contains_key(&map));
         assert_eq!(harness.state().session.doc.baked, before);
     }
+
     harness.run_steps(1);
 
     assert!(harness.state().bake.is_none());

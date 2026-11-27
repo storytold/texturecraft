@@ -63,7 +63,7 @@ pub(super) fn untinted(_index: usize) -> &'static [Color32] {
     &[]
 }
 
-pub(super) fn paint_focus_outline(painter: &Painter, rect: Rect, color: Color32) {
+pub(crate) fn paint_focus_outline(painter: &Painter, rect: Rect, color: Color32) {
     painter.rect_stroke(rect, CornerRadius::same(CONTROL_RADIUS), Stroke::new(FOCUS_OUTLINE_WIDTH, color), StrokeKind::Inside);
 }
 

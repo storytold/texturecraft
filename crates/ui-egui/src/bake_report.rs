@@ -10,16 +10,19 @@ pub struct BakeReport {
     pub map_count: usize,
     /// Number of texture sets whose bake failed
     pub failed_set_count: usize,
+    /// A rebake the app started by itself (Auto-rebake): only a failure makes a toast
+    pub auto_rebake: bool,
 }
 
 impl BakeReport {
-    pub fn started(now: f64) -> Self {
-        BakeReport { started_at_seconds: now, ..Default::default() }
+    pub fn started(now_seconds: f64) -> Self {
+        BakeReport { started_at_seconds: now_seconds, ..Default::default() }
     }
 
     /// The toast text, the Log line and whether the toast is an error (some set failed)
-    pub fn summary(&self, now: f64) -> (String, String, bool) {
-        let time = duration_text((now - self.started_at_seconds).max(0.0));
+    pub fn summary(&self, now_seconds: f64) -> (String, String, bool) {
+        let time = duration_text((now_seconds - self.started_at_seconds).max(0.0));
+
         let line = if self.failed_set_count == 0 {
             format!("Bake finished: {} maps in {time}", self.map_count)
         } else {
@@ -35,6 +38,7 @@ impl BakeReport {
                 tr("Failures are listed in the Log.")
             )
         };
+
         (text, line, self.failed_set_count > 0)
     }
 }
@@ -57,7 +61,7 @@ mod tests {
 
     #[test]
     fn success_names_maps_and_time() {
-        let report = BakeReport { started_at_seconds: 10.0, map_count: 6, failed_set_count: 0 };
+        let report = BakeReport { started_at_seconds: 10.0, map_count: 6, failed_set_count: 0, auto_rebake: false };
 
         let (text, line, failed) = report.summary(22.34);
 
@@ -68,7 +72,7 @@ mod tests {
 
     #[test]
     fn failures_are_counted_and_point_to_the_log() {
-        let report = BakeReport { started_at_seconds: 0.0, map_count: 3, failed_set_count: 2 };
+        let report = BakeReport { started_at_seconds: 0.0, map_count: 3, failed_set_count: 2, auto_rebake: false };
 
         let (text, _, failed) = report.summary(125.0);
 

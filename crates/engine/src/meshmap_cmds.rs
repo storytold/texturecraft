@@ -65,14 +65,20 @@ pub(crate) fn detach_imported_sources(project: &mut Project, texture_set: usize,
 /// The tile number a set without UV tiles keys its one image by
 pub(crate) const FIRST_TILE: u32 = *UDIM_RANGE.start();
 
-/// Use `images` (by UV tile; one at [`FIRST_TILE`] without UV tiles) as mesh map `map` of set `ts` in the caller's edit; returns its width
-pub(crate) fn use_images(s: &mut Session, cmd: &str, ts: usize, map: BakedMap, images: &BTreeMap<u32, Arc<ImageRes>>) -> Result<u32> {
-    let (width, data) = crate::mesh_map_sampler::MeshMapSampler::new(s, cmd, ts, map, images)?.render();
+/// Use `images` (by UV tile; one at [`FIRST_TILE`] without UV tiles) as mesh map `map` of set `texture_set` in the caller's edit; returns its width
+pub(crate) fn use_images(session: &mut Session, command: &str, texture_set: usize, map: BakedMap, images: &BTreeMap<u32, Arc<ImageRes>>) -> Result<u32> {
+    let (width, data) = crate::mesh_map_sampler::MeshMapSampler::new(session, command, texture_set, map, images)?.render();
 
-    let entry = s.doc.baked.entry(ts).or_default();
+    let entry = session.doc.baked.entry(texture_set).or_default();
     entry.resolution = width;
     entry.maps.insert(map, Arc::new(data));
-    s.doc.project.texture_set_mut(ts)?.baked.insert(map);
+
+    let set = session.doc.project.texture_set_mut(texture_set)?;
+    set.baked.insert(map);
+
+    // Imported pixels have no bake provenance
+    set.bake_sources.remove(&map);
+
     Ok(width)
 }
 
@@ -128,22 +134,26 @@ fn udim_in(name: &str) -> Option<usize> {
     })
 }
 
-fn clear(s: &mut Session, p: &Value) -> Result<Value> {
-    const CMD: &str = "textureSet.meshMap.clear";
-    let ts = ts_param(s, p, CMD)?;
-    let map = map_param(p, CMD)?;
-    if !s.doc.baked.get(&ts).is_some_and(|b| b.maps.contains_key(&map)) {
-        return Err(bad(CMD, format!("texture set {ts} has no {} map", map.id())));
+fn clear(session: &mut Session, params: &Value) -> Result<Value> {
+    const COMMAND: &str = "textureSet.meshMap.clear";
+    let texture_set = ts_param(session, params, COMMAND)?;
+    let map = map_param(params, COMMAND)?;
+    if !session.doc.baked.get(&texture_set).is_some_and(|baked| baked.maps.contains_key(&map)) {
+        return Err(bad(COMMAND, format!("texture set {texture_set} has no {} map", map.id())));
     }
 
-    s.edit("Clear mesh map", |s| {
-        if let Some(b) = s.doc.baked.get_mut(&ts) {
-            b.maps.remove(&map);
+    session.edit("Clear mesh map", |session| {
+        if let Some(baked) = session.doc.baked.get_mut(&texture_set) {
+            baked.maps.remove(&map);
         }
-        s.doc.project.texture_set_mut(ts)?.baked.remove(&map);
-        detach_imported_sources(&mut s.doc.project, ts, |previous| previous == map);
+
+        let set = session.doc.project.texture_set_mut(texture_set)?;
+        set.baked.remove(&map);
+        set.bake_sources.remove(&map);
+        detach_imported_sources(&mut session.doc.project, texture_set, |previous| previous == map);
 
         Ok(())
     })?;
+
     Ok(Value::Null)
 }

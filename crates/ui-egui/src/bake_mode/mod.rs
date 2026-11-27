@@ -23,6 +23,7 @@ mod map_settings;
 mod map_thumbnails;
 mod mesh_map_bakers;
 pub use map_thumbnails::MapThumbnails;
+mod row_click;
 mod set_picker;
 mod set_picker_purpose;
 mod set_picker_row;
@@ -230,15 +231,16 @@ fn edit_settings(
 
     let mut settings = before.clone();
     let reset = egui::ScrollArea::vertical().id_salt(scroll_id).auto_shrink([false; 2]).show(ui, |ui| contents(app, ui, &mut settings)).inner;
-    if settings == before && reset.is_none() {
-        return false;
-    }
+
+    // One drag is one undo step: a press's later changes continue its first one
+    let Some(merge) = crate::widgets::press_edit(ui, ui.make_persistent_id((scroll_id, "press")), settings != before || reset.is_some()) else { return false };
 
     let mut patch = settings_patch(&before, &settings);
     if let (Some(fields), Some(Value::Object(reset))) = (patch.as_object_mut(), reset) {
         fields.extend(reset);
     }
-    app.run("bake.settings", json!({ "ts": texture_sets, "patch": patch }));
+
+    app.run("bake.settings", json!({ "ts": texture_sets, "patch": patch, "merge": merge }));
     true
 }
 

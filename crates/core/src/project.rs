@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BakeSettings, BakeSyncGroup, BakedMap, Channel, ChannelFormat, ContentsOffset, CoreError, Effect, Layer, LayerId, LayerKind, Result};
+use crate::{BakeSettings, BakeSource, BakeSyncGroup, BakedMap, Channel, ChannelFormat, ContentsOffset, CoreError, Effect, Layer, LayerId, LayerKind, Result};
 
 pub use crate::env_alignment::EnvAlignment;
 pub use crate::shadow_mode::ShadowMode;
@@ -69,6 +69,12 @@ pub struct TextureSet {
     /// Mesh maps that have been baked (pixels live with the engine / project file).
     #[serde(default)]
     pub baked: BTreeSet<BakedMap>,
+    /// What each baked map was baked from; a map without a record (imported, or older project) is never out of date
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bake_sources: BTreeMap<BakedMap, BakeSource>,
+    /// The one mesh map the app rebakes by itself when what it is baked from changes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_rebake: Option<BakedMap>,
     #[serde(default = "yes")]
     pub visible: bool,
     /// UDIM numbers of the UV tiles this set paints, ascending (UV tiles mode);
@@ -171,6 +177,8 @@ impl TextureSet {
             height_strength: 1.0,
             bake: BakeSettings::default(),
             baked: BTreeSet::new(),
+            bake_sources: BTreeMap::new(),
+            auto_rebake: None,
             visible: true,
             uv_tiles: Vec::new(),
             bake_excluded_tiles: BTreeSet::new(),
@@ -185,6 +193,19 @@ impl TextureSet {
 
     pub fn has_enabled_bake_tiles(&self) -> bool {
         self.uv_tiles.is_empty() || self.uv_tiles.iter().any(|tile| !self.bake_excluded_tiles.contains(tile))
+    }
+
+    /// Fingerprint of the shared bake settings (not the set's check) and baked UV tiles (not their working resolutions)
+    pub fn bake_settings_fingerprint(&self) -> u64 {
+        let mut common = self.bake.common;
+        common.is_enabled = true;
+        let shared = (common, &self.bake.high_poly, &self.bake.cage, &self.bake.skew, &self.uv_tiles, &self.bake_excluded_tiles);
+        crate::fingerprint(serde_json::to_string(&shared).unwrap_or_default().as_bytes())
+    }
+
+    /// Fingerprint of `map`'s own bake settings (not whether it is checked)
+    pub fn map_settings_fingerprint(&self, map: BakedMap) -> u64 {
+        crate::fingerprint(self.bake.maps.parameters_json(map).to_string().as_bytes())
     }
 
     /// Height strength for slopes measured over the whole texture width (the viewport shader,

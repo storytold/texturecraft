@@ -548,7 +548,7 @@ fn default_true() -> bool {
 }
 
 /// The bake layout's version: saved bake docks from an older one load as `Dock::for_baking`
-const BAKE_LAYOUT_VERSION: u32 = 2;
+const BAKE_LAYOUT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
@@ -686,6 +686,12 @@ pub struct UiState {
     /// The Log panel's shown channel tab
     #[serde(default)]
     pub log_channel: crate::log_panel::LogChannel,
+    /// The Baking Log panel's shown tab
+    #[serde(default)]
+    pub baking_log_tab: crate::baking_log::BakingLogTab,
+    /// Whether the Baking Log keeps only the rows with an issue
+    #[serde(default)]
+    pub baking_log_issues_only: bool,
     /// The project template the last New project was created from (name or label)
     #[serde(default)]
     pub last_template: String,
@@ -849,6 +855,8 @@ impl Default for UiState {
             bake_preset_name: String::new(),
             layout_dialog: None,
             log_channel: crate::log_panel::LogChannel::default(),
+            baking_log_tab: crate::baking_log::BakingLogTab::default(),
+            baking_log_issues_only: false,
             last_template: String::new(),
             log_selection: Default::default(),
             log_anchor: None,
@@ -1021,6 +1029,24 @@ mod tests {
             reloaded.sync_mode_dock();
             assert_eq!(reloaded, ui, "a current layout is not reset again");
         }
+    }
+
+    #[test]
+    fn a_saved_bake_dock_with_the_log_at_the_bottom_gets_the_baking_log_there() {
+        use crate::docking::Panel;
+
+        let mut ui = UiState { mode: Mode::Baking, ..UiState::default() };
+        ui.sync_mode_dock();
+        ui.dock.close(Panel::BakingLog);
+        ui.dock.focus(Panel::Log);
+        let mut saved = serde_json::to_value(&ui).unwrap();
+        saved["bake_layout_version"] = serde_json::json!(2);
+
+        let mut loaded: UiState = serde_json::from_value(saved).unwrap();
+        loaded.sync_mode_dock();
+
+        assert!(loaded.dock.is_visible(Panel::BakingLog), "the Baking Log takes the bottom of the bake layout");
+        assert!(!loaded.dock.is_open(Panel::Log), "the general Log stays in Window > Views");
     }
 
     #[test]

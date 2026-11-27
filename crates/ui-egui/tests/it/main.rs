@@ -3,6 +3,7 @@
 
 mod alpha_parameters;
 mod anchor_point;
+mod auto_rebake;
 mod bake_job_mesh;
 mod bake_live_preview;
 mod bake_map_rows;
@@ -10,6 +11,7 @@ mod bake_mode;
 mod bake_presets;
 mod bake_reset_menus;
 mod bake_sync;
+mod baking_log;
 mod brush_drag;
 mod brush_section_reset;
 mod camera_views;
@@ -43,6 +45,7 @@ mod fill_symmetry_rows;
 mod filter_picker;
 mod folder_properties;
 mod frame_selection;
+mod generator_bake_note;
 mod generator_panel;
 mod generator_picker;
 mod help_menu_664;
@@ -192,6 +195,24 @@ fn assert_list_leaves_the_wheel_and_closes(harness: &mut Harness<'_, TextureCraf
 
     click_at(harness, egui::pos2(button.min.x - OUTSIDE_OFFSET, button.min.y));
     assert!(!egui::Popup::is_any_open(&harness.ctx), "a click outside closes the list");
+}
+
+/// Maximum frames to wait for a test condition
+const STEP_UNTIL_FRAMES: usize = 4000;
+/// Time to yield to background workers between frames
+const STEP_UNTIL_PAUSE: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Step frames until `done` holds, up to a generous limit
+fn step_until(harness: &mut Harness<'_, TextureCraftApp>, expected_event: &str, done: impl Fn(&TextureCraftApp) -> bool) {
+    for _ in 0..STEP_UNTIL_FRAMES {
+        harness.run_steps(1);
+        if done(harness.state()) {
+            return;
+        }
+
+        std::thread::sleep(STEP_UNTIL_PAUSE);
+    }
+    panic!("{expected_event} did not happen");
 }
 
 /// Presses and releases the primary button at `at` without moving, as a pointer click does

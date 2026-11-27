@@ -97,6 +97,19 @@ pub(crate) fn baked_map_label(map: texturecraft_engine::core::BakedMap) -> &'sta
     }
 }
 
+/// Why a baked map is out of date: one sentence for what changed after its bake
+pub(crate) fn bake_change_reason(change: texturecraft_engine::core::BakeChange) -> &'static str {
+    use texturecraft_engine::core::BakeChange;
+
+    match change {
+        BakeChange::LowPoly => n_("The mesh changed after this bake."),
+        BakeChange::HighPoly => n_("The high poly files changed after this bake."),
+        BakeChange::Cage => n_("The cage changed after this bake."),
+        BakeChange::Settings => n_("The common bake settings changed after this bake."),
+        BakeChange::MapSettings => n_("This map's bake settings changed after this bake."),
+    }
+}
+
 /// The saved language that follows the operating system's (Settings > Language > Default (System Language)).
 pub const SYSTEM_LANGUAGE: &str = "";
 

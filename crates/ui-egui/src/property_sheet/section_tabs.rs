@@ -110,7 +110,7 @@ fn tab_rect(strip: Rect, left: f32, right: f32) -> Rect {
 }
 
 /// The shown tab's box over `tab`: the panel's colour, rounded, so it rises from the panel below the strip
-fn shown_tab_box(painter: &Painter, tokens: &Tokens, tab: Rect) {
+pub(crate) fn shown_tab_box(painter: &Painter, tokens: &Tokens, tab: Rect) {
     painter.rect_filled(tab, CornerRadius::same(TAB_ROUNDING), tokens.panel);
 }
 
