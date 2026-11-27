@@ -210,8 +210,8 @@ impl Builder<'_> {
     fn fill(&mut self, name: &str, sources: Sources) -> Layer {
         let id = self.p.alloc_id();
         let enabled: Vec<Channel> = sources.iter().map(|(c, _)| *c).filter(|c| self.channels.contains(c)).collect();
-        let projection = Projection::Triplanar { scale: 1.0, sharpness: 8.0, offset: [0.0; 3] };
-        Layer::new(id, name, LayerKind::Fill(Fill { sources: sources.into_iter().collect(), projection, link: None }), &enabled)
+        let projection = Projection::triplanar();
+        Layer::new(id, name, LayerKind::Fill(Fill { sources: sources.into_iter().collect(), projection, ..Fill::default() }), &enabled)
     }
 
     /// A fill masked by smart mask preset `mask` (inverted: present where the preset is not).
@@ -782,8 +782,13 @@ pub fn brush_values(id: &str) -> Option<Vec<(Channel, [f32; 3])>> {
 /// `scale` (the same fill evaluation a layer with that material uses).
 pub(crate) fn brush_fill(id: LayerId, sources: Vec<(Channel, Source)>, scale: f32) -> Layer {
     let channels: Vec<Channel> = sources.iter().map(|(channel, _)| *channel).collect();
-    let projection = Projection::Triplanar { scale, sharpness: 8.0, offset: [0.0; 3] };
-    Layer::new(id, "Brush material", LayerKind::Fill(Fill { sources: sources.into_iter().collect(), projection, link: None }), &channels)
+    let projection = Projection::Triplanar { scale, sharpness: 8.0, offset: [0.0; 3], uv: Default::default(), projector: Default::default() };
+    Layer::new(
+        id,
+        "Brush material",
+        LayerKind::Fill(Fill { sources: sources.into_iter().collect(), projection, sampling: Default::default(), link: None, material: None }),
+        &channels,
+    )
 }
 
 /// Where [`apply_at`] puts a material.
@@ -809,35 +814,45 @@ pub fn apply(s: &mut Session, id: &str) -> Result<LayerId> {
 
 /// [`apply`] at `place` (one undo step).
 pub fn apply_at(s: &mut Session, id: &str, place: Place) -> Result<LayerId> {
-    let m = find(id).ok_or_else(|| EngineError::Other(format!("unknown material `{id}`")))?;
-    let label = format!("Add {}", m.label);
+    let material = find(id).ok_or_else(|| EngineError::Other(format!("unknown material `{id}`")))?;
+    let label = format!("Add {}", material.label);
     s.edit(&label, |s| {
         let ts = s.ts();
         let mut channels = s.doc.project.texture_set(ts)?.channel_list();
 
         // Lobe channels the material uses join the texture set (other channels it lacks are skipped)
-        let missing: Vec<Channel> = Channel::LOBES.into_iter().filter(|c| !channels.contains(c)).collect();
-        let layers = build(&mut Builder { p: &mut s.doc.project, channels: [channels.clone(), missing.clone()].concat() }, m.id)?;
-        for c in missing.into_iter().filter(|c| layers.iter().any(|l| l.channels.contains_key(c))) {
-            crate::set_cmds::add_channel(s, ts, c)?;
-            channels.push(c);
+        let missing: Vec<Channel> = Channel::LOBES.into_iter().filter(|channel| !channels.contains(channel)).collect();
+        let layers = build(&mut Builder { p: &mut s.doc.project, channels: [channels.clone(), missing.clone()].concat() }, material.id)?;
+        for channel in missing.into_iter().filter(|channel| layers.iter().any(|layer| layer.channels.contains_key(channel))) {
+            crate::set_cmds::add_channel(s, ts, channel)?;
+            channels.push(channel);
         }
+
         let top = if layers.len() == 1 {
-            let l = layers.into_iter().next().ok_or_else(|| EngineError::Other("empty material".into()))?;
-            crate::layer_cmds::insert_selected(s, l)?
+            let mut layer = layers.into_iter().next().ok_or_else(|| EngineError::Other("empty material".into()))?;
+
+            // A plain material's fill remembers it, so its Material side names it
+            if !material.smart
+                && let LayerKind::Fill(fill) = &mut layer.kind
+            {
+                fill.material = Some(material.id.to_string());
+            }
+
+            crate::layer_cmds::insert_selected(s, layer)?
         } else {
-            let gid = s.doc.project.alloc_id();
-            let mut group = Layer::new(gid, m.label, LayerKind::Group { children: Vec::new(), collapsed: false }, &channels);
-            for c in group.channels.values_mut() {
-                *c = ChannelBlend { mode: BlendMode::Passthrough, opacity: 1.0 };
+            let folder_id = s.doc.project.alloc_id();
+            let mut folder = Layer::new(folder_id, material.label, LayerKind::folder(), &channels);
+            for blend in folder.channels.values_mut() {
+                *blend = ChannelBlend { mode: BlendMode::Passthrough, opacity: 1.0 };
             }
-            let gid = crate::layer_cmds::insert_selected(s, group)?;
-            for l in layers {
-                s.doc.project.insert_layer(ts, l, Some(gid), true)?;
+            let folder_id = crate::layer_cmds::insert_selected(s, folder)?;
+            for layer in layers {
+                s.doc.project.insert_layer(ts, layer, Some(folder_id), true)?;
             }
-            s.select_one(ts, gid);
-            gid
+            s.select_one(ts, folder_id);
+            folder_id
         };
+
         place.apply(s, top)?;
         Ok(top)
     })

@@ -9,7 +9,10 @@ use texturecraft_ui_egui::state::{FileType, MapExport, SetExport};
 /// The Export textures window open on the first texture set's page
 fn harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     h.state_mut().ui.windows.export = true;
@@ -151,4 +154,15 @@ fn a_map_the_template_no_longer_has_is_ignored() {
     h.state_mut().ui.export.sets.insert(0, o);
     h.run_steps(3);
     assert_eq!(selected(&h), before, "the export still plans every file");
+}
+
+#[test]
+fn each_row_names_its_own_map() {
+    let h = harness();
+
+    // The default template names its maps with $channel: each row shows the map it writes
+    assert!(h.query_all_by_label_contains("$channel").next().is_none(), "the channel variable is filled in");
+    for id in ["baseColor", "metallic", "roughness"] {
+        assert!(h.query_all_by_label_contains(&format!("_{id}")).next().is_some(), "a row for {id}");
+    }
 }

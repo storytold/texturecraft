@@ -46,7 +46,7 @@ fn narrow_toolbars_keep_scroll_arrows_and_mode_buttons_separate() {
             harness.run_steps(4);
             let left = harness.get_by_label("Scroll left").rect();
             let right = harness.get_by_label("Scroll right").rect();
-            let bake = harness.get_by_label("Bake Mesh Maps (Ctrl+Shift+B)").rect();
+            let bake = harness.get_by_label("Bake Mesh Maps (F8)").rect();
             let (_, clip) = size_label(&harness);
             for button in [left, right, bake] {
                 assert_eq!(button.size(), egui::Vec2::splat(button_size));
@@ -135,10 +135,8 @@ fn compact_view_buttons_can_be_scrolled_into_view_and_clicked() {
 #[test]
 fn mode_buttons_keep_their_order_and_dispatch_commands() {
     let mut harness = toolbar_harness(700.0, Tool::Paint);
-    for (label, mode) in
-        [("Bake Mesh Maps (Ctrl+Shift+B)", Mode::Baking), ("Rendering (path traced) (F10)", Mode::Rendering), ("Painting (F9)", Mode::Painting)]
-    {
-        let bake = harness.get_by_label("Bake Mesh Maps (Ctrl+Shift+B)").rect();
+    for (label, mode) in [("Bake Mesh Maps (F8)", Mode::Baking), ("Rendering (path traced) (F10)", Mode::Rendering), ("Painting (F9)", Mode::Painting)] {
+        let bake = harness.get_by_label("Bake Mesh Maps (F8)").rect();
         let paint = harness.get_by_label("Painting (F9)").rect();
         let render = harness.get_by_label("Rendering (path traced) (F10)").rect();
         assert!(bake.right() < paint.left() && paint.right() < render.left());
@@ -199,7 +197,11 @@ fn toolbar_window_snapshots() {
 
     std::fs::create_dir_all(&directory).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).wgpu().build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().session.tool.tool = Tool::Path;
     harness.state_mut().session.tool.brush.lazy = 20.0;
     for (width, scale) in [(1600.0, 1.0), (960.0, 1.0), (960.0, 1.5)] {

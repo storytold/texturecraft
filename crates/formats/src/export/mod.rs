@@ -53,14 +53,18 @@ pub const FILE_TOKENS: [(&str, &str); 6] = [
     ("$udim", "UV tile number (1001 for sets without UV tiles)"),
 ];
 
-/// Why `template` is not a valid file name template: path separators, `..`, control characters
-/// and unknown `$` variables are refused.
+/// Why `template` is not a valid file name template. `/` separates folders inside the output
+/// directory; a backslash, `..`, a leading `/`, an empty folder name, control characters and
+/// unknown `$` variables are refused.
 pub fn template_error(template: &str) -> Option<String> {
     if template.trim().is_empty() || template.len() > MAX_TEMPLATE {
         return Some(format!("file name \"{template}\" is empty or longer than {MAX_TEMPLATE} bytes"));
     }
-    if template.contains(['/', '\\']) || template.contains("..") || template.chars().any(char::is_control) {
-        return Some(format!("file name \"{template}\" contains a path separator, \"..\" or a control character"));
+    if template.contains('\\') || template.contains("..") || template.chars().any(char::is_control) {
+        return Some(format!("file name \"{template}\" contains a backslash, \"..\" or a control character"));
+    }
+    if template.split('/').any(|segment| segment.trim().is_empty()) {
+        return Some(format!("file name \"{template}\" starts or ends with \"/\" or has an empty folder name"));
     }
     let mut rest = template;
     while let Some(i) = rest.find('$') {
@@ -196,7 +200,7 @@ pub enum VirtualMap {
     Glossiness,
     /// Baked AO × AO channel (per the texture set's AO mixing).
     AoMixed,
-    /// Dielectric reflectance at normal incidence: 0.08 × specular level.
+    /// Dielectric reflectance at normal incidence: Specular Level scaled by the project's shader settings.
     F0,
     /// 1 − glossiness (specular/glossiness projects).
     Roughness,
@@ -514,7 +518,7 @@ fn normal_present(set: &TextureSet) -> bool {
 }
 
 /// A source with real data in this texture set (constants never count).
-fn source_present(set: &TextureSet, s: &SourceRef) -> bool {
+pub(crate) fn source_present(set: &TextureSet, s: &SourceRef) -> bool {
     match s {
         SourceRef::Channel { channel: Channel::Normal, .. } => normal_present(set),
         SourceRef::Channel { channel, .. } => set.has_channel(*channel),
@@ -546,7 +550,8 @@ fn layout<'m>(set: &TextureSet, map: &'m MapSpec) -> Vec<(Dest, &'m SourceRef)> 
     out
 }
 
-fn channel_label(map: &MapSpec) -> &'static str {
+/// What `$channel` becomes in `map`'s file names: the id of its first non-constant source.
+pub fn channel_label(map: &MapSpec) -> &'static str {
     map.channels
         .iter()
         .find_map(|(_, s)| match s {
@@ -573,6 +578,11 @@ pub fn sanitize_file_stem(s: &str) -> String {
     out
 }
 
+/// [`sanitize_file_stem`] for each `/`-separated folder name and the file stem.
+pub fn sanitize_file_path(s: &str) -> String {
+    s.split('/').map(sanitize_file_stem).collect::<Vec<_>>().join("/")
+}
+
 /// The files `opts` produces for texture set `ts`, without rendering (for the export dialog).
 /// Template variables: [`FILE_TOKENS`].
 pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &ExportOptions) -> Result<Vec<PlannedFile>> {
@@ -585,6 +595,8 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
     }
 
     let mut used = BTreeSet::new();
+    let mut active_files = BTreeSet::new();
+    let mut active_dirs = BTreeSet::new();
     let mut out = Vec::new();
     let tiles: Vec<Option<u32>> = if set.uv_tiles.is_empty() || opts.atlas { vec![None] } else { set.uv_tiles.iter().copied().map(Some).collect() };
     let grid = set.tile_grid();
@@ -634,11 +646,13 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
                 check_psd_size(size, channels, bit_depth)?;
             }
 
+            // A name of the project, mesh or texture set never adds a folder
+            let no_folder = |name: &str| name.replace('/', "_");
             let stem = template
                 .replace("$udim", &tile.unwrap_or(1001).to_string())
-                .replace("$project", &project.name)
-                .replace("$mesh", mesh_name)
-                .replace("$textureSet", &set.name)
+                .replace("$project", &no_folder(&project.name))
+                .replace("$mesh", &no_folder(mesh_name))
+                .replace("$textureSet", &no_folder(&set.name))
                 .replace("$channel", channel_label(map))
                 .replace("$colorSpace", color_space);
 
@@ -646,14 +660,14 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
             let token_stem = tile.map(|_| {
                 let t = template
                     .replace("$udim", "UDIMTOKEN")
-                    .replace("$project", &project.name)
-                    .replace("$mesh", mesh_name)
-                    .replace("$textureSet", &set.name)
+                    .replace("$project", &no_folder(&project.name))
+                    .replace("$mesh", &no_folder(mesh_name))
+                    .replace("$textureSet", &no_folder(&set.name))
                     .replace("$channel", channel_label(map))
                     .replace("$colorSpace", color_space);
-                sanitize_file_stem(&t)
+                sanitize_file_path(&t)
             });
-            let stem = sanitize_file_stem(&stem);
+            let stem = sanitize_file_path(&stem);
             let ext = format.extension();
             let mut name = format!("{stem}.{ext}");
             let mut warnings = Vec::new();
@@ -685,10 +699,24 @@ pub fn list_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &Export
             if k > 2 {
                 warnings.push(format!("\"{stem}.{ext}\" is produced by more than one map; this one was renamed to \"{name}\""));
             }
-            used.insert(name.to_ascii_lowercase());
+            let lower = name.to_ascii_lowercase();
+            used.insert(lower.clone());
             if !enabled {
                 continue;
             }
+
+            if active_dirs.contains(&lower) {
+                return Err(FormatError::Invalid(format!("\"{name}\" cannot be both an exported file and a folder")));
+            }
+            let mut prefix = lower.as_str();
+            while let Some((folder, _)) = prefix.rsplit_once('/') {
+                if active_files.contains(folder) {
+                    return Err(FormatError::Invalid(format!("\"{name}\" cannot use \"{folder}\" as a folder because another map exports that file")));
+                }
+                active_dirs.insert(folder.to_owned());
+                prefix = folder;
+            }
+            active_files.insert(lower);
 
             if color_map && requested_space != space {
                 warnings.push(format!("\"{name}\" packs colour into one channel (L), so it is written in linear Rec.709, not {}", requested_space.name()));
@@ -742,6 +770,7 @@ struct Sampler<'a> {
     /// Normal convention overriding every normal output.
     normal_override: Option<NormalFormat>,
     project_normal: NormalFormat,
+    dielectric_f0_scale: f32,
 }
 
 fn unpack(v: [f32; 3]) -> Vec3 {
@@ -828,7 +857,7 @@ impl Sampler<'_> {
                 VirtualMap::NormalOpenGl => self.normal(at, NormalFormat::OpenGl, cache),
                 VirtualMap::NormalDirectX => self.normal(at, NormalFormat::DirectX, cache),
                 VirtualMap::Glossiness => [1.0 - self.channel(Channel::Roughness, at)[0]; 3],
-                VirtualMap::F0 => [0.08 * self.channel(Channel::SpecularLevel, at)[0]; 3],
+                VirtualMap::F0 => [self.dielectric_f0_scale * self.channel(Channel::SpecularLevel, at)[0]; 3],
                 VirtualMap::Roughness => [1.0 - self.channel(Channel::Glossiness, at)[0]; 3],
                 VirtualMap::SheenTint => self.channel(Channel::SheenColor, at).map(|c| c * self.channel(Channel::SheenWeight, at)[0]),
                 VirtualMap::HeightNormal => {
@@ -864,6 +893,11 @@ impl Sampler<'_> {
 /// Render every file of `opts` for `input`'s texture set.
 pub fn render_maps(input: &ExportInput, options: &ExportOptions) -> Result<Vec<ExportedFile>> {
     let planned = list_outputs(input.project, input.ts, input.mesh_name, options)?;
+    render_planned_maps(input, options, planned)
+}
+
+/// Render the retained plans from `list_outputs` for this input and these options.
+pub fn render_planned_maps(input: &ExportInput, options: &ExportOptions, planned: Vec<PlannedFile>) -> Result<Vec<ExportedFile>> {
     let set = input.project.texture_set(input.ts)?;
     let (width, height) = (input.composite.resolution, input.composite.height);
     let grid = set.tile_grid();
@@ -900,7 +934,9 @@ pub fn render_maps(input: &ExportInput, options: &ExportOptions) -> Result<Vec<E
         scales: set.block_scales(),
         normal_override: options.normal_format,
         project_normal: input.project.normal_format,
+        dielectric_f0_scale: input.project.display.dielectric_f0_scale(),
     };
+
     planned
         .into_iter()
         .map(|planned_file| {
@@ -1537,21 +1573,68 @@ fn keep_first_names<T>(files: Vec<T>, name: impl Fn(&T) -> &str, warnings: impl 
 /// Write exported files into `dir` (created if missing) via [`crate::write_batch_atomic`]:
 /// all filenames are validated and staged before any rename, and a later rename failure rolls
 /// back earlier publications (concurrent readers may briefly observe a mixed generation during
-/// the rename loop). Names must be plain file names.
+/// the rename loop). Names are file names, or relative paths with `/` between sanitized folder
+/// names; the folders are created inside `dir`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_files(files: &[ExportedFile], dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
-    std::fs::create_dir_all(dir)?;
-    let mut targets = Vec::with_capacity(files.len());
+    let mut seen_files = BTreeSet::new();
+    let mut seen_dirs = BTreeSet::new();
+    let mut rel_targets = Vec::with_capacity(files.len());
     for f in files {
         // Cap the sanitized stem before adding the extension
         let (stem, ext) = f.name.rsplit_once('.').unwrap_or((&f.name, ""));
-        if f.name.is_empty() || stem != sanitize_file_stem(stem) || !ext.chars().all(|c| c.is_ascii_alphanumeric()) || f.name.trim_matches('.').is_empty() {
-            return Err(FormatError::Invalid(format!("\"{}\" is not a plain file name", f.name)));
+        if f.name.is_empty() || stem != sanitize_file_path(stem) || !ext.chars().all(|c| c.is_ascii_alphanumeric()) || f.name.trim_matches('.').is_empty() {
+            return Err(FormatError::Invalid(format!("\"{}\" is not a file name or a relative path", f.name)));
         }
-        targets.push((dir.join(&f.name), f.bytes.as_slice()));
+
+        let lower = f.name.to_ascii_lowercase();
+        if seen_dirs.contains(&lower) {
+            return Err(FormatError::Invalid(format!("\"{}\" cannot be both an exported file and a folder", f.name)));
+        }
+        let mut prefix = lower.as_str();
+        while let Some((folder, _)) = prefix.rsplit_once('/') {
+            if seen_files.contains(folder) {
+                return Err(FormatError::Invalid(format!("\"{}\" cannot use \"{folder}\" as a folder because another exported file has that name", f.name)));
+            }
+            seen_dirs.insert(folder.to_owned());
+            prefix = folder;
+        }
+        seen_files.insert(lower);
+        rel_targets.push((std::path::Path::new(&f.name), f.bytes.as_slice()));
     }
-    crate::write_batch_atomic(targets.iter().map(|(path, bytes)| (path.as_path(), *bytes)))?;
-    Ok(targets.into_iter().map(|(path, _)| path).collect())
+
+    // Open the output directory once and keep every subfolder creation, staging temp file and rename inside that handle
+    std::fs::create_dir_all(dir)?;
+    let root_dir = cap_std::fs::Dir::open_ambient_dir(dir, cap_std::ambient_authority())?;
+    for (rel, _) in &rel_targets {
+        create_export_folders(&root_dir, rel)?;
+    }
+    crate::write_batch_atomic_in_dir(&root_dir, rel_targets)?;
+    Ok(files.iter().map(|f| dir.join(&f.name)).collect())
+}
+
+/// Create each folder in `rel` beneath `root`, refusing a component that is a symbolic link so two
+/// export names cannot resolve to the same file through an in-tree alias.
+#[cfg(not(target_arch = "wasm32"))]
+fn create_export_folders(root: &cap_std::fs::Dir, rel: &std::path::Path) -> Result<()> {
+    let Some(parent) = rel.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+
+    let mut prefix = std::path::PathBuf::new();
+    for component in parent.components() {
+        prefix.push(component);
+        match root.symlink_metadata(&prefix) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(FormatError::Invalid(format!("\"{}\" cannot use a symbolic link as a folder", rel.display())));
+            }
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => return Err(FormatError::Invalid(format!("\"{}\" cannot use an existing file as a folder", rel.display()))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => root.create_dir(&prefix)?,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

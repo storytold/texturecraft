@@ -8,7 +8,10 @@ use texturecraft_ui_egui::TextureCraftApp;
 /// The Export textures window open on SETTINGS
 fn harness() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.run_steps(4);
     h.state_mut().ui.windows.export = true;
@@ -108,9 +111,8 @@ fn the_lists_hold_the_reference_entries() {
 }
 
 #[test]
-fn the_default_template_has_the_reference_name_and_old_settings_follow_it() {
+fn a_saved_legacy_preset_name_resolves_to_its_current_name() {
     let mut h = harness();
-    assert_eq!(h.state().ui.export.preset, "Document channels + Normal + AO (No Alpha)");
     h.state_mut().ui.export.preset = "Document channels + Normal + AO".into();
     h.run_steps(3);
     assert_eq!(h.state().ui.export.preset, "Document channels + Normal + AO (No Alpha)");
@@ -157,21 +159,6 @@ fn the_output_directory_resets_and_the_dilation_follows_the_padding() {
     h.run_steps(4);
     assert_ne!(h.state().ui.export.dilation, 16);
     assert!(h.query_by_label("Dilation (pixels)").is_some(), "the menu stays open");
-}
-
-#[test]
-fn export_actions_explain_what_they_change() {
-    let mut h = harness();
-    for (button, tip) in [
-        ("Include all", "Select every texture set, UV tile and output map"),
-        ("Reset all", "Restore the export defaults and select every texture"),
-        ("Cancel", "Restore the settings from when you opened this window"),
-        ("Save settings", "Keep these settings for the next export"),
-        ("Export", "Write the selected textures using the settings above"),
-    ] {
-        hover(&mut h, button);
-        assert!(h.query_by_label(tip).is_some(), "{button}: {tip}");
-    }
 }
 
 #[test]

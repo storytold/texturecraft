@@ -79,21 +79,33 @@ pub fn find(name: &str) -> Option<&'static SmartMask> {
 
 const UP: [f32; 3] = [0.0, 1.0, 0.0];
 
-/// A mesh-map generator with explicit threshold, softness and noise breakup (curvature as baked, without detail sizes).
+/// A mesh-map generator with explicit threshold, softness and noise breakup (curvature as baked, without detail sizes or the wear, section and light controls)
 pub(crate) fn generator(kind: GeneratorKind, level: f32, softness: f32, noise: f32) -> EffectKind {
-    EffectKind::Generator(Generator { level, softness, noise_amount: noise, detail: None, ..Generator::new(kind) })
+    EffectKind::Generator(Generator { level, softness, noise_amount: noise, detail: None, wear: None, section: None, light: None, ..Generator::new(kind) })
 }
 
 /// A direction or position generator (`invert` flips the result).
 pub(crate) fn directional(kind: GeneratorKind, direction: [f32; 3], level: f32, softness: f32, noise: f32, invert: bool) -> EffectKind {
-    EffectKind::Generator(Generator { level, softness, noise_amount: noise, direction, invert, detail: None, ..Generator::new(kind) })
+    EffectKind::Generator(Generator {
+        level,
+        softness,
+        noise_amount: noise,
+        direction,
+        invert,
+        detail: None,
+        wear: None,
+        section: None,
+        light: None,
+        ..Generator::new(kind)
+    })
 }
 
 /// A triplanar grayscale pattern fill
 pub(crate) fn pattern(kind: ProceduralKind, scale: f32, seed: u32, contrast: f32) -> EffectKind {
     EffectKind::Fill {
         source: Source::Procedural { pattern: Procedural { scale, seed, contrast, ..Procedural::new(kind) }, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() },
-        projection: Projection::Triplanar { scale: 1.0, sharpness: 8.0, offset: [0.0; 3] },
+        projection: Projection::triplanar(),
+        sampling: Default::default(),
     }
 }
 
@@ -222,14 +234,17 @@ impl Session {
             .and_then(|root| pf.project.layers.get(&root))
             .and_then(|l| l.mask.clone())
             .ok_or_else(|| EngineError::Other("the smart mask file has no mask".into()))?;
+
         let resources: BTreeMap<String, Arc<Vec<u8>>> = pf.resources.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
         let src = crate::session::Document {
+            bake_meshes: Default::default(),
             bake_paint: BTreeMap::new(),
             project: pf.project,
             pixels: pf.pixels,
             baked: BTreeMap::new(),
             resources: BTreeMap::new(),
         };
+
         let label = src.project.texture_sets.first().map(|t| t.name.clone()).unwrap_or_default();
         self.edit(&format!("Apply smart mask {label}"), |s| {
             let (ts, _, _) = s.doc.project.locate(layer).ok_or_else(|| EngineError::Other("layer not in a stack".into()))?;

@@ -13,7 +13,7 @@ pub struct GeneratorGlobal {
 
 impl GeneratorGlobal {
     /// The widest blur, as a radius in texels at [`GeneratorGlobal::BLUR_RESOLUTION`].
-    pub const MAX_BLUR: f32 = 64.0;
+    pub const MAX_BLUR: f32 = 72.0;
     /// Narrower than this, the balanced range is a hard step.
     pub const MIN_RANGE: f32 = 1e-6;
     /// The texels per side the blur radius is measured at (2K).

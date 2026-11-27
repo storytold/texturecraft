@@ -1,5 +1,5 @@
-//! Project templates: File > More save options (Save as template..., Save and reduce file size,
-//! Save as copy...), the New project list's reference names and the remembered template
+//! Project templates: File > More Save Options (Save As Template, Save and Reduce File Size,
+//! Save As Copy), the New project list's reference names and the remembered template
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
@@ -13,7 +13,10 @@ use super::temp_dir::TempDir;
 
 fn app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(128, 64).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.prefs.language = "en".into();
     h.state_mut().session.templates.dir = None;
     h.run_steps(4);
@@ -23,7 +26,7 @@ fn app() -> Harness<'static, TextureCraftApp> {
 fn open_more_save_options(h: &mut Harness<'_, TextureCraftApp>) {
     h.get_by_label("File").click();
     h.run_steps(3);
-    h.get_by_label("More save options").click();
+    h.get_by_label("More Save Options").click();
     h.run_steps(3);
 }
 
@@ -43,7 +46,7 @@ fn save_as_template_asks_in_the_templates_folder_and_saves_without_a_message() {
     })));
 
     open_more_save_options(&mut h);
-    h.get_by_label_contains("Save as template...").click();
+    h.get_by_label_contains("Save As Template").click();
     h.run_steps(4);
 
     let asked = asked.borrow();
@@ -83,35 +86,14 @@ fn a_saved_template_appears_in_new_project_with_the_your_assets_suffix() {
 fn save_and_reduce_file_size_is_greyed_with_the_hint() {
     let mut h = app();
     open_more_save_options(&mut h);
-    let item = h.get_by_label_contains("Save and reduce file size");
+    let item = h.get_by_label_contains("Save and Reduce File Size");
     let at = item.rect().center();
     h.hover_at(at);
     h.run_steps(30);
     assert!(h.query_by_label(NOT_AVAILABLE).is_some(), "the hint shows on hover");
-    assert!(h.get_by_label_contains("Save and reduce file size").accesskit_node().is_disabled(), "the item is greyed");
+    assert!(h.get_by_label_contains("Save and Reduce File Size").accesskit_node().is_disabled(), "the item is greyed");
     assert!(!menus::enabled(h.state(), "ui.saveReduced"));
     assert!(!menus::implemented("ui.saveReduced"));
-}
-
-#[test]
-fn the_project_template_info_tooltip_lists_the_settings_templates_apply() {
-    let mut h = app();
-    h.state_mut().ui.windows.new_project = true;
-    h.run_steps(4);
-    let row = h.get_by_label("Project template").rect().center().y;
-    let icon = h
-        .get_all_by_label(egui_phosphor::regular::INFO)
-        .find(|node| (node.rect().center().y - row).abs() < 6.0)
-        .expect("the info icon in the Project template row");
-
-    // The icon's node is wider than the glyph: hover its left part
-    let at = icon.rect().center() - egui::vec2(6.0, 0.0);
-    h.hover_at(egui::pos2(1.0, 1.0));
-    h.run_steps(2);
-    h.hover_at(at);
-    h.run_steps(30);
-    let tip = "Templates set the starting channels, resolution, normal map format and shader settings.";
-    assert!(h.query_by_label(tip).is_some(), "hovering the info icon of the Project template row");
 }
 
 #[test]

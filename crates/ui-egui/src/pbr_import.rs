@@ -100,7 +100,7 @@ pub fn window(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
     let mut open = true;
     let (mut import_clicked, mut cancel_clicked) = (false, false);
-    crate::windows::dialog("pbrImport", tr("Import PBR textures"), &mut open).show(ctx, |ui| {
+    crate::windows::dialog(ctx, "pbrImport", tr("Import PBR Textures"), &mut open).show(ctx, |ui| {
         ui.set_min_width(380.0);
         ui.horizontal(|ui| {
             ui.label(tr("Layer name"));

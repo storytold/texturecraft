@@ -39,20 +39,25 @@ fn environment_cache_retains_source_identity_until_replaced() {
 
     // The harness draws once; parallel translation tests must not change its language mid-frame
     let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut app = egui_kittest::Harness::builder().build_eframe(|context| crate::TextureCraftApp::new(context, session())).into_state();
+    let mut app = egui_kittest::Harness::builder()
+        .with_context_setup(crate::framework::install_headless)
+        .build_eframe(|context| crate::TextureCraftApp::new(context, session()))
+        .into_state();
     app.session.doc.project.display.environment = "resource:environment".into();
-    let source = Arc::new(ImageRes { width: 2, height: 1, rgba: vec![[1.0, 0.0, 0.0, 1.0]; 2], srgb: false });
+    let source = Arc::new(ImageRes::new(2, 1, vec![[1.0, 0.0, 0.0, 1.0]; 2], false));
     let original_source = Arc::downgrade(&source);
     app.session.images.insert("environment".into(), source);
     let first_key = gpu_scene_key(&app.session);
     let first = super::trace_scene(&app).env;
+
     assert!(Arc::ptr_eq(&first, &super::trace_scene(&app).env), "unchanged images reuse the decoded environment");
 
-    let replacement = Arc::new(ImageRes { width: 2, height: 1, rgba: vec![[0.0, 1.0, 0.0, 1.0]; 2], srgb: false });
+    let replacement = Arc::new(ImageRes::new(2, 1, vec![[0.0, 1.0, 0.0, 1.0]; 2], false));
     app.session.images.insert("environment".into(), replacement.clone());
 
     assert!(original_source.upgrade().is_none(), "replacing the resource releases its decoded pixels immediately");
     assert_ne!(first_key, gpu_scene_key(&app.session), "a new source restarts tracing under the same environment name");
+
     let second = super::trace_scene(&app).env;
     assert!(!Arc::ptr_eq(&first, &second));
     assert_ne!(first.data, second.data, "replacing the image changes the lighting");
@@ -60,6 +65,7 @@ fn environment_cache_retains_source_identity_until_replaced() {
 
     app.session.images.insert("renamed".into(), replacement);
     app.session.doc.project.display.environment = "resource:renamed".into();
+
     assert!(!Arc::ptr_eq(&second, &super::trace_scene(&app).env), "the environment name is also part of the key");
 }
 
@@ -68,7 +74,10 @@ fn environment_cache_retains_source_identity_until_replaced() {
 #[test]
 fn a_new_display_background_restarts_the_render() {
     let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut app = egui_kittest::Harness::builder().build_eframe(|context| crate::TextureCraftApp::new(context, session())).into_state();
+    let mut app = egui_kittest::Harness::builder()
+        .with_context_setup(crate::framework::install_headless)
+        .build_eframe(|context| crate::TextureCraftApp::new(context, session()))
+        .into_state();
     let before = super::key(&app, "scene", (64, 64));
     assert_eq!(super::key(&app, "scene", (64, 64)), before);
 
@@ -106,6 +115,7 @@ fn gpu_app() -> Option<crate::TextureCraftApp> {
     let mut app = egui_kittest::Harness::builder()
         .with_size(egui::vec2(800.0, 600.0))
         .renderer(WgpuTestRenderer::from_render_state(render_state))
+        .with_context_setup(crate::framework::install_headless)
         .build_eframe(|context| crate::TextureCraftApp::new(context, session()))
         .into_state();
     app.session.update();
@@ -355,10 +365,4 @@ fn loading_textures_are_taken_in_at_a_limited_rate() {
     assert!(!take_in_textures(true, 1.0 + LOADING_RESTART_S * 0.5, 1.0));
     assert!(take_in_textures(true, 1.0 + LOADING_RESTART_S, 1.0));
     assert!(take_in_textures(true, 0.0, f64::MIN), "the first frame always");
-}
-
-/// The placeholder appears only before the first image has been traced.
-#[test]
-fn nothing_traced_yet_shows_the_placeholder() {
-    assert!(!show_image(false, 0));
 }

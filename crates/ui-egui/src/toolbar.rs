@@ -6,12 +6,13 @@ use serde_json::json;
 use texturecraft_engine::Tool;
 
 use crate::TextureCraftApp;
-use crate::docking::Panel;
+use crate::drawn_icon::DrawnIcon;
+use crate::frame_gizmo::warp_toolbar::{self, WarpTarget};
 use crate::i18n::{tr, trf};
 use crate::keymap::{shortcut_of, tip};
 use crate::state::{Mode, ViewLayout};
 use crate::theme::{GUTTER, Tokens, card};
-use crate::widgets::{bar_slider, icon_button, icon_button_without_tooltip, icon_dropdown_button, icon_dropdown_button_width};
+use crate::widgets::{bar_slider, drawn_icon_button, icon_button, icon_button_without_tooltip, icon_dropdown_button, icon_dropdown_button_width};
 
 const BAR_SPACING: f32 = 10.0;
 const COMPACT_BAR_SPACING: f32 = 4.0;
@@ -58,16 +59,18 @@ pub fn paint_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                     return;
                 }
 
+                let warp_target = WarpTarget::of(app);
+                let tool_usable = warp_target.is_none() && app.session.tool_usable(app.session.tool.tool);
                 ui.add(egui::Separator::default().spacing(BAR_SEPARATOR_WIDTH));
                 if !scroll_views {
                     view_buttons(app, ui);
-                    if app.session.tool_usable(app.session.tool.tool) {
+                    if warp_target.is_some() || tool_usable {
                         ui.add(egui::Separator::default().spacing(BAR_SEPARATOR_WIDTH));
                     }
                 }
 
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    scrolling_tool_controls(app, ui, &tokens, scroll_views);
+                    scrolling_tool_controls(app, ui, &tokens, scroll_views, warp_target, tool_usable);
                 });
             });
         });
@@ -175,7 +178,7 @@ fn rotation_dropdown(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
 }
 
 /// An icon button with a caret that opens `menu` below it, highlighted while open
-fn icon_dropdown(ui: &mut egui::Ui, id_salt: &str, icon: &str, tooltip: &str, menu: impl FnOnce(&mut egui::Ui)) {
+pub(crate) fn icon_dropdown(ui: &mut egui::Ui, id_salt: &str, icon: &str, tooltip: &str, menu: impl FnOnce(&mut egui::Ui)) {
     let button_size = ui.spacing().interact_size.y;
     let popup_id = ui.make_persistent_id(id_salt);
     let open = egui::Popup::is_id_open(ui.ctx(), popup_id);
@@ -198,7 +201,14 @@ fn dropdown_row(ui: &mut egui::Ui, icon: &str, label: &str, shortcut: Option<&st
 }
 
 /// Scroll tool controls and, in narrow viewports, the view buttons
-fn scrolling_tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens, scroll_views: bool) {
+fn scrolling_tool_controls(
+    app: &mut TextureCraftApp,
+    ui: &mut egui::Ui,
+    tokens: &Tokens,
+    scroll_views: bool,
+    warp_target: Option<WarpTarget>,
+    tool_usable: bool,
+) {
     let button_size = ui.spacing().interact_size.y;
     let strip_width = ui.available_width();
     let overflow_id = egui::Id::unique("tool_controls_overflow");
@@ -224,13 +234,14 @@ fn scrolling_tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens:
             scroll_area.show(ui, |ui| {
                 ui.scroll_with_delta(vec2(scroll_delta, 0.0));
                 ui.horizontal_centered(|ui| {
-                    // A tool that can't act on the selection leaves the bar, as the shelf greys it
-                    let tool_usable = app.session.tool_usable(app.session.tool.tool);
-                    if tool_usable {
+                    if let Some(target) = warp_target {
+                        warp_toolbar::controls(app, ui, target);
+                    } else if tool_usable {
                         tool_controls(app, ui, tokens);
                     }
+
                     if scroll_views {
-                        if tool_usable {
+                        if warp_target.is_some() || tool_usable {
                             ui.add(egui::Separator::default().spacing(BAR_SEPARATOR_WIDTH));
                         }
                         let size = vec2(view_buttons_width(button_size, ui.spacing().item_spacing.x), ui.available_height());
@@ -260,31 +271,54 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
     const DEFAULT_LAZY_DISTANCE_PX: f32 = 20.0;
     const TOOL_ICON_SIZE: f32 = 15.0;
 
+    // Slider widths: the longer-named Size and Stroke opacity get more room, Lazy mouse's Distance less
+    const WIDE_SLIDER_WIDTH: f32 = 110.0;
+    const SLIDER_WIDTH: f32 = 100.0;
+    const NARROW_SLIDER_WIDTH: f32 = 90.0;
+
+    /// The sliders show fractions as percentages
+    const PERCENT: f32 = 100.0;
+
+    /// Size's track, in percent of the largest brush
+    const SIZE_PERCENT_RANGE: std::ops::RangeInclusive<f32> = 0.05..=100.0;
+
+    /// Spacing's track, in percent of the brush's diameter
+    const SPACING_PERCENT_RANGE: std::ops::RangeInclusive<f32> = 1.0..=200.0;
+
+    /// Lazy mouse Distance's track, in pixels
+    const LAZY_DISTANCE_RANGE_PX: std::ops::RangeInclusive<f32> = 1.0..=200.0;
+
     let button_size = ui.spacing().interact_size.y;
     let tool = app.session.tool.tool;
-    ui.label(RichText::new(tool_icon(tool)).size(TOOL_ICON_SIZE).color(tokens.text_strong)).on_hover_text(tr(tool.label()));
+    if tool == Tool::ColorPicker {
+        let (icon, response) = ui.allocate_exact_size(vec2(TOOL_ICON_SIZE, TOOL_ICON_SIZE), egui::Sense::hover());
+        DrawnIcon::Pipette.paint(ui.painter(), icon.center(), TOOL_ICON_SIZE, tokens.text_strong);
+        response.on_hover_text(tr(tool.label()));
+    } else {
+        ui.label(RichText::new(tool_icon(tool)).size(TOOL_ICON_SIZE).color(tokens.text_strong)).on_hover_text(tr(tool.label()));
+    }
 
     let brush = &mut app.session.tool.brush;
     match tool {
         Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Smudge | Tool::Clone | Tool::Path => {
-            let mut size = brush.size / MAX_BRUSH_SIZE * 100.0;
-            if bar_slider(ui, tr("Size"), &mut size, 0.05..=100.0, 110.0).changed() {
-                brush.size = (size / 100.0 * MAX_BRUSH_SIZE).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
+            let mut size = brush.size / MAX_BRUSH_SIZE * PERCENT;
+            if bar_slider(ui, tr("Size"), &mut size, SIZE_PERCENT_RANGE, WIDE_SLIDER_WIDTH).changed() {
+                brush.size = (size / PERCENT * MAX_BRUSH_SIZE).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
             }
 
-            let mut flow = brush.flow * 100.0;
-            if bar_slider(ui, tr("Flow"), &mut flow, 0.0..=100.0, 100.0).changed() {
-                brush.flow = flow / 100.0;
+            let mut flow = brush.flow * PERCENT;
+            if bar_slider(ui, tr("Flow"), &mut flow, 0.0..=PERCENT, SLIDER_WIDTH).changed() {
+                brush.flow = flow / PERCENT;
             }
 
-            let mut opacity = brush.opacity * 100.0;
-            if bar_slider(ui, tr("Stroke opacity"), &mut opacity, 0.0..=100.0, 110.0).changed() {
-                brush.opacity = opacity / 100.0;
+            let mut opacity = brush.opacity * PERCENT;
+            if bar_slider(ui, tr("Stroke opacity"), &mut opacity, 0.0..=PERCENT, WIDE_SLIDER_WIDTH).changed() {
+                brush.opacity = opacity / PERCENT;
             }
 
-            let mut spacing = brush.spacing * 100.0;
-            if bar_slider(ui, tr("Spacing"), &mut spacing, 1.0..=200.0, 100.0).changed() {
-                brush.spacing = spacing / 100.0;
+            let mut spacing = brush.spacing * PERCENT;
+            if bar_slider(ui, tr("Spacing"), &mut spacing, SPACING_PERCENT_RANGE, SLIDER_WIDTH).changed() {
+                brush.spacing = spacing / PERCENT;
             }
 
             ui.separator();
@@ -294,7 +328,7 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
             }
             if lazy_on {
                 let mut distance = brush.lazy;
-                if bar_slider(ui, tr("Distance"), &mut distance, 1.0..=200.0, 90.0).changed() {
+                if bar_slider(ui, tr("Distance"), &mut distance, LAZY_DISTANCE_RANGE_PX, NARROW_SLIDER_WIDTH).changed() {
                     brush.lazy = distance;
                 }
             }
@@ -309,9 +343,9 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
 
             if tool == Tool::Smudge {
                 ui.separator();
-                let mut strength = app.session.tool.smudge_strength * 100.0;
-                if bar_slider(ui, tr("Strength"), &mut strength, 0.0..=100.0, 100.0).changed() {
-                    app.session.tool.smudge_strength = (strength / 100.0).clamp(0.0, 1.0);
+                let mut strength = app.session.tool.smudge_strength * PERCENT;
+                if bar_slider(ui, tr("Strength"), &mut strength, 0.0..=PERCENT, SLIDER_WIDTH).changed() {
+                    app.session.tool.smudge_strength = (strength / PERCENT).clamp(0.0, 1.0);
                 }
             }
 
@@ -435,10 +469,14 @@ pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
             ui.spacing_mut().item_spacing.y = SHELF_BUTTON_SPACING;
 
             // Rendering has nothing to paint, so its shelf keeps only the buttons below the tools
-            let tools: &[Tool] = match app.ui.mode {
-                Mode::Painting => &SHELF_TOOLS,
-                Mode::Baking => &BAKING_SHELF_TOOLS,
-                Mode::Rendering => &[],
+            let tools: &[Tool] = if !app.ui.toolbar_tools {
+                &[]
+            } else {
+                match app.ui.mode {
+                    Mode::Painting => &SHELF_TOOLS,
+                    Mode::Baking => &BAKING_SHELF_TOOLS,
+                    Mode::Rendering => &[],
+                }
             };
             if !tools.is_empty() {
                 for &tool in tools {
@@ -456,7 +494,12 @@ pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                             (usable, usable && app.session.tool.tool == tool)
                         }
                     };
-                    let button = ui.add_enabled_ui(usable, |ui| icon_button(ui, tool_icon(tool), &hint, selected, SHELF_BUTTON_SIZE)).inner;
+                    let button = ui
+                        .add_enabled_ui(usable, |ui| match tool {
+                            Tool::ColorPicker => drawn_icon_button(ui, DrawnIcon::Pipette, &hint, selected, SHELF_BUTTON_SIZE),
+                            _ => icon_button(ui, tool_icon(tool), &hint, selected, SHELF_BUTTON_SIZE),
+                        })
+                        .inner;
                     if button.on_disabled_hover_text(tr(tool.label())).clicked() && app.ui.mode == Mode::Painting {
                         app.run("tool.select", json!({"tool": tool.id()}));
                     }
@@ -467,29 +510,31 @@ pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                 ui.add_space(SHELF_GROUP_GAP);
             }
 
-            let quick_mask = &app.session.quick_mask;
-            for (command, icon, label, selected) in [
-                ("viewport.quickMask", ic::SELECTION_BACKGROUND, tr("Quick mask"), quick_mask.enabled),
-                ("viewport.quickMask.edit", ic::SELECTION, tr("Edit quick mask"), quick_mask.editing),
-                ("viewport.quickMask.invert", ic::SELECTION_INVERSE, tr("Invert quick mask"), quick_mask.inverted),
-            ] {
-                let hint = tip(&app.ui.keymap, label, command);
-                let button = ui.add_enabled_ui(crate::menus::enabled(app, command), |ui| icon_button(ui, icon, &hint, selected, SHELF_BUTTON_SIZE)).inner;
-                if button.on_disabled_hover_text(label).clicked() {
-                    app.run(command, json!({}));
-                }
-            }
-
-            ui.add_space(SHELF_GROUP_GAP);
-            ui.separator();
-            ui.add_space(SHELF_GROUP_GAP);
-            let painting = app.ui.mode == Mode::Painting;
-            if ui.add_enabled_ui(painting, |ui| icon_button(ui, ic::SPHERE, tr("Add smart material from the shelf"), false, SHELF_BUTTON_SIZE)).inner.clicked()
-            {
-                app.ui.dock.focus(Panel::Assets);
-            }
+            ui.add_enabled_ui(false, |ui| icon_button(ui, ic::HOURGLASS, tr("Snooze Autosave"), false, SHELF_BUTTON_SIZE))
+                .inner
+                .on_disabled_hover_text(tr(crate::unavailable::NOT_AVAILABLE));
+            resources_updater_button(app, ui);
         });
     });
+}
+
+/// The shelf's Resources Updater button: opens or closes its window while a project is open
+#[cfg(not(target_arch = "wasm32"))]
+fn resources_updater_button(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
+    let open = app.ui.windows.resources_updater.is_some();
+    let label = tr("Resources Updater");
+    let button = ui.add_enabled_ui(app.session.project_open, |ui| icon_button(ui, ic::ARROWS_CLOCKWISE, label, open, SHELF_BUTTON_SIZE)).inner;
+    if button.on_disabled_hover_text(tr("Open a project to check its resources")).clicked() {
+        crate::resources_updater::toggle(app);
+    }
+}
+
+/// The browser reads no files from disk, so there is nothing to update
+#[cfg(target_arch = "wasm32")]
+fn resources_updater_button(_: &mut TextureCraftApp, ui: &mut egui::Ui) {
+    ui.add_enabled_ui(false, |ui| icon_button(ui, ic::ARROWS_CLOCKWISE, tr("Resources Updater"), false, SHELF_BUTTON_SIZE))
+        .inner
+        .on_disabled_hover_text(tr(crate::unavailable::NOT_AVAILABLE));
 }
 
 /// Width of the icon rail beside the dock
@@ -502,7 +547,7 @@ const RAIL_ICON_SIZE: f32 = 26.0;
 const RAIL_ICON_GAP: f32 = 4.0;
 
 /// Padding inside the rail's card around its icons, as the tool shelf's
-const RAIL_CARD_PADDING: egui::Margin = egui::Margin::symmetric(3, 6);
+const RAIL_CARD_PADDING: egui::Margin = SHELF_PADDING;
 
 /// The icon rail: the rail panels that are not in the dock (Export first), each opening its popup
 pub fn rail(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
@@ -529,6 +574,10 @@ pub fn rail(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
 }
 
 pub fn status_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
+    const PROGRESS_WIDTH_PT: f32 = 160.0;
+    const PROGRESS_HEIGHT_PT: f32 = 10.0;
+    const PROGRESS_TEXT_SIZE_PT: f32 = 10.0;
+
     let tk = Tokens::get(ui.ctx());
     egui::Panel::bottom("status_bar")
         .exact_size(22.0)
@@ -536,16 +585,36 @@ pub fn status_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
         .frame(egui::Frame::NONE.fill(tk.chrome).inner_margin(egui::Margin::symmetric(10, 0)))
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
-                if let Some(p) = app.bake_progress() {
-                    ui.add(egui::ProgressBar::new(p).desired_width(160.0).desired_height(10.0).text(RichText::new(tr("Baking")).size(10.0)));
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(progress) = app.save_progress() {
+                    ui.add(
+                        egui::ProgressBar::new(progress)
+                            .desired_width(PROGRESS_WIDTH_PT)
+                            .desired_height(PROGRESS_HEIGHT_PT)
+                            .text(RichText::new(tr("Saving project")).size(PROGRESS_TEXT_SIZE_PT)),
+                    );
+                    ui.separator();
+                }
+                if let Some(progress) = app.bake_progress() {
+                    ui.add(
+                        egui::ProgressBar::new(progress)
+                            .desired_width(PROGRESS_WIDTH_PT)
+                            .desired_height(PROGRESS_HEIGHT_PT)
+                            .text(RichText::new(tr("Baking")).size(PROGRESS_TEXT_SIZE_PT)),
+                    );
                     if ui.small_button(tr("Cancel")).clicked() {
                         app.cancel_bake();
                     }
                 } else if let Some(job) = &app.resize {
-                    let bar = egui::ProgressBar::new(job.progress.fraction()).desired_width(160.0).desired_height(10.0);
-                    ui.add(bar.animate(true).text(RichText::new(tr("Resizing")).size(10.0)));
-                } else if let Some(p) = app.gpu.as_ref().and_then(|g| g.composite_progress(&app.session)) {
-                    ui.add(egui::ProgressBar::new(p).desired_width(160.0).desired_height(10.0).text(RichText::new(tr("Compositing")).size(10.0)));
+                    let bar = egui::ProgressBar::new(job.progress.fraction()).desired_width(PROGRESS_WIDTH_PT).desired_height(PROGRESS_HEIGHT_PT);
+                    ui.add(bar.animate(true).text(RichText::new(tr("Resizing")).size(PROGRESS_TEXT_SIZE_PT)));
+                } else if let Some(progress) = app.gpu.as_ref().and_then(|g| g.composite_progress(&app.session)) {
+                    ui.add(
+                        egui::ProgressBar::new(progress)
+                            .desired_width(PROGRESS_WIDTH_PT)
+                            .desired_height(PROGRESS_HEIGHT_PT)
+                            .text(RichText::new(tr("Compositing")).size(PROGRESS_TEXT_SIZE_PT)),
+                    );
                     ui.ctx().request_repaint();
                 } else if let Some(msg) = app.session.log.last() {
                     ui.label(RichText::new(&msg.message).size(11.0).color(tk.text_dim));

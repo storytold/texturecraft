@@ -7,7 +7,7 @@ struct Post {
     b: vec4<f32>, // x vignette, y sharpen, z grain, w bloom threshold
     c: vec4<f32>, // depth of field (fx.wgsl): x circle of confusion at infinity (pixels), y focus depth, z largest circle radius (pixels), w accumulation sample
     d: vec4<f32>, // subsurface blur (fx.wgsl): xyz mean free path per channel (world units), w pixels per world unit at depth 1
-    e: vec4<f32>, // x orthographic camera (1: pixels per world unit don't fall off with depth), y accumulation sample, zw -
+    e: vec4<f32>, // x orthographic camera, y accumulation sample, z hover tint opacity for the scattering composite, w -
     back_top: vec4<f32>, // rgb background color at the top of the view (linear), a -
     back_bottom: vec4<f32>, // rgb background color at the bottom of the view (linear), a -
 };

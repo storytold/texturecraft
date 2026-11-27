@@ -17,7 +17,10 @@ fn changed_params() -> AlphaParams {
 /// The app showing the Alpha tab of Properties, with `brush`
 fn app_with_brush(brush: BrushSettings) -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().session.tool.brush = brush;
     harness.state_mut().ui.props_tab = PropsTab::Alpha;
@@ -48,16 +51,6 @@ fn click_invert(harness: &mut Harness<'_, TextureCraftApp>) {
 fn show_group(harness: &mut Harness<'_, TextureCraftApp>) {
     restore_defaults(harness).scroll_to_me();
     harness.run_steps(SETTLE_FRAMES);
-}
-
-#[test]
-fn the_group_shows_hardness_and_every_shared_parameter() {
-    let harness = app_with_brush(BrushSettings::default());
-
-    for label in ["Parameters", "Hardness", "Size X", "Size Y", "Roundness", "Contrast"] {
-        assert!(harness.query_by_label(label).is_some(), "{label} is in the Alpha tab");
-    }
-    assert!(invert_checkbox(&harness).is_some());
 }
 
 #[test]

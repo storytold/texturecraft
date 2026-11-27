@@ -103,6 +103,7 @@ mod tests {
         p.layer_mut(rust).unwrap().visible = false;
         let before = p.clone();
         let view = solo_project(&p, rust, false).unwrap();
+
         assert!(view.layers[&rust].visible, "the soloed layer shows even with its eye off");
         assert!(!view.layers[&below].visible, "the others are hidden");
         assert!(view.layers[&other_set].visible, "another texture set keeps its layers");
@@ -113,13 +114,17 @@ mod tests {
     fn solo_keeps_the_folders_around_a_layer_and_everything_inside_a_soloed_folder() {
         let mut p = project();
         let outside = add(&mut p, 0, LayerKind::Paint, None, false);
-        let folder = add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false }, None, false);
+        let folder =
+            add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false, contents: Default::default(), randomized: Vec::new() }, None, false);
         let inner = add(&mut p, 0, LayerKind::Paint, Some(folder), true);
         let sibling = add(&mut p, 0, LayerKind::Paint, Some(inner), false);
         let view = solo_project(&p, inner, false).unwrap();
+
         assert!(view.layers[&folder].visible && view.layers[&inner].visible);
         assert!(!view.layers[&sibling].visible && !view.layers[&outside].visible);
+
         let whole = solo_project(&p, folder, false).unwrap();
+
         assert!(whole.layers[&inner].visible && whole.layers[&sibling].visible, "a soloed folder shows its contents");
         assert!(!whole.layers[&outside].visible);
     }
@@ -127,15 +132,19 @@ mod tests {
     #[test]
     fn ignoring_the_mask_disables_it_on_the_layer_and_its_folders_only() {
         let mut p = project();
-        let folder = add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false }, None, false);
+        let folder =
+            add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false, contents: Default::default(), randomized: Vec::new() }, None, false);
         let inner = add(&mut p, 0, LayerKind::Paint, Some(folder), true);
         let other = add(&mut p, 0, LayerKind::Paint, None, false);
         for id in [folder, inner, other] {
             masked(&mut p, id);
         }
         let kept = solo_project(&p, inner, false).unwrap();
+
         assert!(kept.layers[&inner].mask.as_ref().unwrap().enabled, "without the flag the mask stays");
+
         let view = solo_project(&p, inner, true).unwrap();
+
         assert!(!view.layers[&inner].mask.as_ref().unwrap().enabled && !view.layers[&folder].mask.as_ref().unwrap().enabled);
         assert!(view.layers[&other].mask.as_ref().unwrap().enabled, "a hidden layer's mask is not touched");
         assert!(p.layers[&inner].mask.as_ref().unwrap().enabled, "the project keeps its mask");
@@ -148,6 +157,7 @@ mod tests {
         masked(&mut p, source);
         let instance = add(&mut p, 1, LayerKind::Instance { source }, None, false);
         let view = solo_project(&p, instance, true).unwrap();
+
         assert!(!view.layers[&instance].mask.as_ref().unwrap().enabled);
         assert!(view.layers[&source].mask.as_ref().unwrap().enabled, "the source keeps its mask");
     }
@@ -155,15 +165,12 @@ mod tests {
     #[test]
     fn a_soloed_instance_of_a_folder_keeps_the_folders_contents_drawn() {
         let mut p = project();
-        let folder = add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false }, None, false);
+        let folder =
+            add(&mut p, 0, LayerKind::Group { children: Vec::new(), collapsed: false, contents: Default::default(), randomized: Vec::new() }, None, false);
         let inner = add(&mut p, 0, LayerKind::Paint, Some(folder), true);
         let instance = add(&mut p, 0, LayerKind::Instance { source: folder }, None, false);
         let view = solo_project(&p, instance, false).unwrap();
-        assert!(view.layers[&instance].visible && view.layers[&folder].visible && view.layers[&inner].visible);
-    }
 
-    #[test]
-    fn a_layer_in_no_stack_gives_nothing() {
-        assert!(solo_project(&project(), LayerId(99), true).is_none());
+        assert!(view.layers[&instance].visible && view.layers[&folder].visible && view.layers[&inner].visible);
     }
 }

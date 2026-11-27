@@ -30,6 +30,24 @@ impl BlockScales {
         Some([(origin[0] + local[0]) * block / working_size.0.max(1) as f32, (origin[1] + local[1]) * block / working_size.1.max(1) as f32])
     }
 
+    /// Uniform bake atlas UV → working atlas UV, the inverse of [`BlockScales::bake_uv`]
+    pub fn working_uv(&self, uv: [f32; 2], working_size: (u32, u32)) -> Option<[f32; 2]> {
+        if working_size.0 == 0 || working_size.1 == 0 || uv.iter().any(|value| !value.is_finite() || !(0.0..1.0).contains(value)) {
+            return None;
+        }
+
+        if self.scales.is_empty() {
+            return Some(uv);
+        }
+
+        let block = self.block.max(1) as f32;
+        let position = [uv[0] * working_size.0 as f32 / block, uv[1] * working_size.1 as f32 / block];
+        let origin = position.map(f32::floor);
+        let scale = self.at((origin[0] * block) as u32, (origin[1] * block) as u32);
+        let local = [(position[0] - origin[0]) * scale, (position[1] - origin[1]) * scale];
+        Some([(origin[0] + local[0]) * block / working_size.0 as f32, (origin[1] + local[1]) * block / working_size.1 as f32])
+    }
+
     /// The scale at atlas texel (x, y)
     pub fn at(&self, x: u32, y: u32) -> f32 {
         let (bx, by) = (x / self.block.max(1), y / self.block.max(1));

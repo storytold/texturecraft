@@ -69,7 +69,9 @@ fn a_vertex_is_missed_exactly_when_the_bake_ray_misses_it() {
                 tiles: (1, 1),
             };
             let reach = HighPolyReach::new(&request).unwrap();
-            let context = BakeContext::new(&request).unwrap();
+            let extent = crate::MeshExtent::of(request.mesh).unwrap();
+            let frame = crate::cage::RayFrame::new(&request, extent).unwrap();
+            let context = BakeContext::with_frame(&request, extent, &frame);
 
             for (vertex, vertex_reach) in reach.vertices.iter().enumerate() {
                 let (vertex_reach, missed) = (vertex_reach.unwrap(), reach.missed(vertex, max_frontal, max_rear).unwrap());
@@ -94,6 +96,7 @@ fn a_vertex_is_missed_exactly_when_the_bake_ray_misses_it() {
             }
         }
     }
+
     assert!(checked[0] > 100 && checked[1] > 100, "both reached and missed vertices were compared: {checked:?}");
 }
 
@@ -173,11 +176,14 @@ fn matching_by_mesh_name_misses_the_parts_with_another_name() {
         tiles: (1, 1),
     };
     let reach = HighPolyReach::new(&request).unwrap();
-    let context = BakeContext::new(&request).unwrap();
+    let extent = crate::MeshExtent::of(request.mesh).unwrap();
+    let frame = crate::cage::RayFrame::new(&request, extent).unwrap();
+    let context = BakeContext::with_frame(&request, extent, &frame);
     let (_, high_keys) = transfer_keys(&request);
 
     for (vertex, vertex_reach) in reach.vertices.iter().enumerate() {
         let (vertex_reach, missed) = (vertex_reach.unwrap(), reach.missed(vertex, 0.02, 0.01).unwrap());
+
         // On the line where the two parts meet, a ray reaches either part's triangles
         if vertex_reach.high_position.x.abs() < BOUNDARY {
             continue;

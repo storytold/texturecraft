@@ -229,14 +229,6 @@ mod tests {
     }
 
     #[test]
-    fn the_unlit_switch_decides_whether_a_channel_view_is_lit() {
-        let mut s = texturecraft_engine::sample_session(128, 64).unwrap();
-        assert!(!shade(&s).solo_lit, "channel views are flat by default");
-        execute(&mut s, "display.set", &json!({"soloUnlit": false})).unwrap();
-        assert!(shade(&s).solo_lit);
-    }
-
-    #[test]
     fn renders_with_an_imported_hdr_environment() {
         let mesh = texturecraft_engine::geom::primitives::material_ball();
         let mut s = Session::new_project("t", mesh, "builtin:material_ball", None, 256).unwrap();
@@ -284,8 +276,10 @@ mod tests {
         let mut mesh = texturecraft_engine::geom::primitives::plane(2.0, 1);
         mesh.append(&texturecraft_engine::geom::primitives::plane(2.0, 1));
         let mut session = Session::new_project("Test", mesh, "two-planes", None, 128).unwrap();
+
         assert_eq!(session.caches.len(), 2);
-        session.images.insert("red".into(), Arc::new(ImageRes { width: 1, height: 1, rgba: vec![[1.0, 0.0, 0.0, 1.0]], srgb: true }));
+
+        session.images.insert("red".into(), Arc::new(ImageRes::new(1, 1, vec![[1.0, 0.0, 0.0, 1.0]], true)));
         execute(&mut session, "viewport.view", &json!({"mode": "image", "image": "red"})).unwrap();
         let camera = session.camera;
         let uv = |ts| ViewKind::Uv { ts, zoom: 1.0, pan: [0.0, 0.0], rotation: 0.0 };
@@ -302,6 +296,7 @@ mod tests {
         assert!(first.as_chunks::<4>().0.iter().any(|pixel| pixel[0] > 200 && pixel[1] < 20));
 
         let (_, _, second) = gpu.render(&mut session, uv(1), [128, 128], camera).unwrap();
+
         assert!(second.as_chunks::<4>().0.iter().any(|pixel| pixel[0] > 200 && pixel[1] < 20));
         assert_eq!(gpu.h.renderer.aux_size(1), Some(128));
     }

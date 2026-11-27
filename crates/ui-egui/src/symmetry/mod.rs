@@ -102,14 +102,17 @@ pub(crate) fn toolbar_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
         .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
         .show(|ui| settings_popup::show(app, ui));
 
-    // A click outside the popup and the dropdowns it opens (foreground layers too) closes it
+    // Outside clicks and drags dismiss the menu unless they belong to a child popup
     if let Some(shown) = shown
         && !response.clicked()
-        && ui.input(|input| input.pointer.any_click())
-        && let Some(at) = ui.input(|input| input.pointer.interact_pos())
-        && ui.ctx().layer_id_at(at).is_none_or(|layer| layer != shown.response.layer_id && layer.order != egui::Order::Foreground)
     {
-        open = false;
+        let clicked_at = ui.input(|input| input.pointer.interact_pos().filter(|_| input.pointer.any_click()));
+        let click_outside = clicked_at
+            .is_some_and(|at| ui.ctx().layer_id_at(at).is_none_or(|layer| layer != shown.response.layer_id && layer.order != egui::Order::Foreground));
+
+        if click_outside || crate::popup_drag::drag_outside_popups(ui.ctx()) {
+            open = false;
+        }
     }
 
     ui.data_mut(|data| data.insert_temp(popup_id, open));

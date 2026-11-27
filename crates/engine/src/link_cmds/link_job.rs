@@ -1,12 +1,12 @@
 use std::sync::{Arc, atomic::AtomicBool};
 
-use super::{CookReservation, CookedMaterial, EngineError, LinkMemoryBudget, Result};
+use super::{CookReservation, CookedMaterial, EngineError, Result};
 use serde_json::{Map, Value};
 use texturecraft_core::LayerId;
 
 #[cfg(not(target_arch = "wasm32"))]
 use {
-    super::{CookedMap, MaterialInterface, cook_report::CookReport, materialcraft_tool, quiet},
+    super::{CookedMap, LinkMemoryBudget, MaterialInterface, cook_report::CookReport, materialcraft_tool, quiet},
     std::{io::Read, path::Path},
     texturecraft_core::{BakedMap, Channel},
 };
@@ -21,13 +21,15 @@ pub struct LinkJob {
     pub source_ext: &'static str,
     /// The named graph in a linked material; direct package imports use its default.
     pub graph: Option<String>,
-    /// Pixels across (the texture set's resolution).
+    /// Pixels across: the layer's picked resolution (default: the texture set's)
     pub size: u32,
     /// Every parameter's value, by id, in MaterialCraft's typed form.
     pub values: Map<String, Value>,
     /// Graph inputs matched to mesh maps and encoded one at a time in the worker.
     pub input_identifiers: Vec<String>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) baked: Option<texturecraft_compose::BakedMaps>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) budget: LinkMemoryBudget,
     pub canceled: Arc<AtomicBool>,
 }

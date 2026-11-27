@@ -2,10 +2,10 @@ use std::sync::{Arc, Weak};
 
 /// Which shared value a key refers to, without keeping the value alive; the held `Weak` keeps its address from being reused, so a new value never passes for it
 #[derive(Debug)]
-pub(super) struct SharedHandle<T>(Option<Weak<T>>);
+pub(crate) struct SharedHandle<T>(Option<Weak<T>>);
 
 impl<T> SharedHandle<T> {
-    pub(super) fn of(value: Option<&Arc<T>>) -> SharedHandle<T> {
+    pub(crate) fn of(value: Option<&Arc<T>>) -> SharedHandle<T> {
         SharedHandle(value.map(Arc::downgrade))
     }
 }

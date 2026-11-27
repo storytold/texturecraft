@@ -1,8 +1,9 @@
 //! The strip at the top of the window: the app icon at the very left, the menus and the mode label,
-//! and the window's title bar unless the system draws one. As the title bar its empty space moves
-//! the window and follows the system's double-click setting (craft-window's `title_bar`), and on a
-//! window without an OS frame it also has the minimize, maximize/restore and close buttons and
-//! invisible resize zones along the window's edges.
+//! and the window's title bar unless the system draws one. As the title bar it is craft-ui's
+//! `shell::TitleBar`: its free area moves the window and follows the system's double-click
+//! setting, and on a window without an OS frame it has the caption buttons of the desktop's
+//! layout; the window keeps invisible resize zones along its edges where the runtime does not
+//! answer the window's hit test itself (everywhere but Windows).
 //!
 //! Who draws the frame is decided once at startup ([`TitleBar::decide`]): Windows draws no OS
 //! frame, macOS keeps its traffic lights over the strip (a full-size content view with a hidden
@@ -11,12 +12,14 @@
 //! overrides that, and Settings › Interface › System title bar brings the OS frame back on the
 //! next start. The web build has no window frame: the strip is the menu bar.
 
-use craft_window::{Button, Frame, Layout};
+use craft_ui::contract::ShowContainer as _;
+use craft_ui::runtime::windows::WindowHost;
+use craft_window::policy::{Decision, TitleBarPref};
+use craft_window::{Frame, Layout};
 use egui::emath::GuiRounding as _;
-use egui::{Align, Color32, CursorIcon, Id, LayerId, Order, PointerButton, Rect, ResizeDirection, Sense, Stroke, Ui, ViewportCommand, pos2, vec2};
+use egui::{Color32, CursorIcon, Id, LayerId, Order, PointerButton, Rect, ResizeDirection, Sense, Ui, ViewportCommand, pos2, vec2};
 
 use crate::TextureCraftApp;
-use crate::i18n::tr;
 use crate::theme::Tokens;
 
 /// Who draws the window's title bar.
@@ -31,13 +34,9 @@ pub enum TitleBar {
     App(Layout),
 }
 
-/// One caption button: as wide as Windows' own.
-pub const BUTTON_WIDTH: f32 = 46.0;
-/// The room at the strip's left for the macOS traffic lights (their width and the gaps around them).
-const TRAFFIC_LIGHTS: f32 = 78.0;
 /// The app icon's side, in points.
 const ICON: f32 = 16.0;
-/// The space between the strip's edges (or its caption buttons) and its content.
+/// The space between the icon and the menus.
 const PAD: f32 = 8.0;
 /// Resize zone thickness along an edge, and the side of a corner zone.
 const EDGE: f32 = 5.0;
@@ -53,12 +52,38 @@ const ICONS: [(f32, &[u8]); 5] = [
     (64.0, include_bytes!("../../../assets/app-icon/hicolor/64x64/apps/ai.storyteller.texturecraft.png")),
 ];
 
+/// The override variable's prefix: `TEXTURECRAFT_TITLEBAR`.
+const PREFIX: craft_window::Prefix = craft_window::Prefix::new("TEXTURECRAFT");
+
+/// The Nightly strip's icon PNGs, same sizes: the deeper background tells the two windows apart at
+/// a glance and matches the packaged Nightly icon.
+const NIGHTLY_ICONS: [(f32, &[u8]); 5] = [
+    (16.0, include_bytes!("../../../assets/app-icon/nightly/16.png")),
+    (24.0, include_bytes!("../../../assets/app-icon/nightly/24.png")),
+    (32.0, include_bytes!("../../../assets/app-icon/nightly/32.png")),
+    (48.0, include_bytes!("../../../assets/app-icon/nightly/48.png")),
+    (64.0, include_bytes!("../../../assets/app-icon/nightly/64.png")),
+];
+
 impl TitleBar {
-    /// Decide who draws the title bar; call once at startup, before the window is created.
-    /// `system` is Settings › Interface › System title bar.
-    pub fn decide(system: bool) -> TitleBar {
-        let choice = craft_window::Choice::probe(craft_window::Prefix::new("TEXTURECRAFT"));
-        Self::from_choice(choice.frame(), choice.overridden(), system)
+    /// Decide who draws the title bar; call once at startup, before the window is created, and
+    /// hand the decision to the window ([`viewport`]) and the runtime (`framework::install`).
+    /// `system` is Settings › Interface › System title bar; `backend` is the one the window opens on.
+    pub fn decide(system: bool, backend: craft_host::target::Backend) -> Decision {
+        let choice = craft_window::Choice::probe(PREFIX);
+        let wanted = Self::from_choice(choice.frame(), choice.overridden(), system);
+        let pref = if wanted == TitleBar::System { TitleBarPref::System } else { TitleBarPref::Integrated };
+        craft_window::policy::decide_for(PREFIX, backend, pref)
+    }
+
+    /// The bar a decided `frame` gives.
+    pub fn of(frame: &craft_window::policy::Frame) -> TitleBar {
+        use craft_window::policy::Frame as Decided;
+        match frame {
+            Decided::Native => TitleBar::System,
+            Decided::Inset(_) => TitleBar::Integrated,
+            Decided::Integrated(captions) => TitleBar::App(captions.layout.clone()),
+        }
     }
 
     /// `TEXTURECRAFT_TITLEBAR` (`overridden`) wins, then the System title bar setting. Otherwise
@@ -68,6 +93,7 @@ impl TitleBar {
         if overridden.is_none() && system {
             return TitleBar::System;
         }
+
         match frame {
             Frame::App(layout) => TitleBar::App(layout.clone()),
             Frame::Desktop if overridden.is_some() => TitleBar::System,
@@ -75,17 +101,6 @@ impl TitleBar {
             Frame::Desktop if cfg!(target_os = "macos") => TitleBar::Integrated,
             Frame::Desktop => TitleBar::System,
         }
-    }
-
-    /// `builder` with this frame: decorations off for the app's own, and on macOS the content
-    /// under a transparent title bar without its title.
-    pub fn viewport(&self, builder: egui::ViewportBuilder) -> egui::ViewportBuilder {
-        let frame = match self {
-            TitleBar::App(layout) => Frame::App(layout.clone()),
-            _ => Frame::Desktop,
-        };
-        let builder = craft_window::decorate(builder, &frame);
-        if *self == TitleBar::Integrated { builder.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false) } else { builder }
     }
 
     /// The name `ui.inspect` reports: `app`, `integrated` or `system`.
@@ -98,38 +113,48 @@ impl TitleBar {
     }
 }
 
+/// `builder` with the decided frame: decorations off for the app's own, and on macOS the content
+/// under a transparent title bar without its title.
+pub fn viewport(decision: &Decision, builder: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    craft_window::policy::apply(builder, &decision.frame)
+}
+
 /// The strip's height: the body text with room around it, 28 to 32 points (so the macOS traffic
 /// lights and Windows-sized caption buttons fit it).
 pub fn height(ui: &Ui) -> f32 {
     (ui.text_style_height(&egui::TextStyle::Body) + 14.0).clamp(28.0, 32.0)
 }
 
-/// The strip: menus between the app icon and the mode label, the window buttons at the ends the
-/// layout names, and as the title bar its empty space moving the window.
+/// The strip: the app icon, then the menus. Where the system draws the frame it is the menu bar;
+/// otherwise it is the window's title bar (craft-ui's), with the caption buttons where the frame
+/// has them and resize zones along the window's edges.
 pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     let tk = Tokens::get(ui.ctx());
-    let bar = app.title_bar.clone();
-    let (left, right) = match &bar {
-        TitleBar::App(layout) => (layout.left.as_slice(), layout.right.as_slice()),
-        _ => (&[][..], &[][..]),
-    };
-    egui::Panel::top("menu_bar").exact_size(height(ui)).show_separator_line(false).frame(egui::Frame::NONE.fill(tk.chrome)).show(ui, |ui| {
-        let rect = ui.max_rect();
-        // First, so the strip's controls drawn over it keep their own clicks.
-        if bar != TitleBar::System {
-            craft_window::title_bar::empty_area(ui, rect);
-        }
-        let ends = |n: usize| n as f32 * BUTTON_WIDTH;
-        let inset = if bar == TitleBar::Integrated { TRAFFIC_LIGHTS } else { ends(left.len()) + PAD };
-        let content = Rect::from_min_max(pos2(rect.left() + inset, rect.top()), pos2(rect.right() - ends(right.len()) - PAD, rect.bottom()));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(content).layout(egui::Layout::left_to_right(Align::Center)), |ui| {
-            paint_icon(ui);
-            crate::menus::menu_bar(app, ui);
+    let frame = WindowHost::of(ui.ctx()).frame();
+    if matches!(frame, craft_window::policy::Frame::Native) {
+        egui::Panel::top("menu_bar").exact_size(height(ui)).show_separator_line(false).frame(egui::Frame::NONE.fill(tk.chrome)).show(ui, |ui| {
+            let rect = ui.max_rect();
+            let content = Rect::from_min_max(pos2(rect.left() + PAD, rect.top()), pos2(rect.right() - PAD, rect.bottom()));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(content).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                paint_icon(ui);
+                crate::menus::menu_bar(app, ui);
+            });
         });
-        caption_buttons(ui, left, rect.left(), rect);
-        caption_buttons(ui, right, rect.right() - ends(right.len()), rect);
+        return;
+    }
+    egui::Panel::top("menu_bar").show_separator_line(false).frame(egui::Frame::NONE.fill(tk.chrome)).show(ui, |ui| {
+        let bar = craft_ui::shell::TitleBar::new()
+            .show(ui, |ui, _| {
+                paint_icon(ui);
+                crate::menus::menu_bar(app, ui);
+            })
+            .output;
+        if bar.close_requested {
+            ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+        }
     });
-    if matches!(bar, TitleBar::App(_)) {
+    // Windows' frame answers the resize edges itself (the runtime's hit test).
+    if matches!(frame, craft_window::policy::Frame::Integrated(_)) && !cfg!(windows) {
         resize_zones(ui);
     }
 }
@@ -137,7 +162,8 @@ pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
 /// The app icon at the cursor, [`ICON`] points square, centred on the row and on whole pixels.
 fn paint_icon(ui: &mut Ui) {
     let ppp = ui.ctx().pixels_per_point();
-    let Some(&(px, png)) = ICONS.iter().find(|(px, _)| *px >= ICON * ppp - 0.5).or(ICONS.last()) else { return };
+    let icons = if crate::os_window::stable_services_allowed() { &ICONS } else { &NIGHTLY_ICONS };
+    let Some(&(px, png)) = icons.iter().find(|(px, _)| *px >= ICON * ppp - 0.5).or(icons.last()) else { return };
     let id = Id::unique(("app_icon", px as u32));
     let texture = match ui.data(|d| d.get_temp::<Option<egui::TextureHandle>>(id)) {
         Some(t) => t,
@@ -166,92 +192,6 @@ fn maximized(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.viewport().maximized.unwrap_or(false))
 }
 
-/// Caption button ids (stable, so tests and agents can find them).
-fn caption_id(b: Button) -> Id {
-    Id::unique(("titlebar_caption", b as u8))
-}
-
-/// `buttons` from `x` rightwards, the strip's full height, flush with its top so a maximized
-/// window's corner hits the outermost one.
-fn caption_buttons(ui: &mut Ui, buttons: &[Button], x: f32, bar: Rect) {
-    let tk = Tokens::get(ui.ctx());
-    let max = maximized(ui.ctx());
-    let focused = ui.input(|i| i.viewport().focused.unwrap_or(true));
-    for (i, &b) in buttons.iter().enumerate() {
-        let r = Rect::from_min_size(pos2(x + i as f32 * BUTTON_WIDTH, bar.top()), vec2(BUTTON_WIDTH, bar.height()));
-        let resp = ui.interact(r, caption_id(b), Sense::click());
-        let tip = match b {
-            Button::Minimize => tr("Minimize"),
-            Button::Maximize if max => tr("Restore"),
-            Button::Maximize => tr("Maximize"),
-            Button::Close => tr("Close"),
-        };
-        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tip));
-        let close = b == Button::Close;
-        let fill = match (resp.is_pointer_button_down_on(), resp.hovered()) {
-            (true, _) if close => tk.danger.gamma_multiply(0.8),
-            (_, true) if close => tk.danger,
-            (true, _) => tk.button,
-            (_, true) => tk.row_hover,
-            _ => Color32::TRANSPARENT,
-        };
-        ui.painter().rect_filled(r, 0.0, fill);
-        // White on the red, as every system's close button; dimmed while the window is inactive.
-        let ink = if close && resp.hovered() {
-            Color32::WHITE
-        } else if focused {
-            tk.text
-        } else {
-            tk.text_dim
-        };
-        paint_glyph(ui, b, max, r.center(), ink);
-        if resp.on_hover_text(tip).clicked() {
-            ui.ctx().send_viewport_cmd(match b {
-                Button::Minimize => ViewportCommand::Minimized(true),
-                Button::Maximize => ViewportCommand::Maximized(!max),
-                // The same request as the system's close button.
-                Button::Close => ViewportCommand::Close,
-            });
-        }
-    }
-}
-
-/// The 10-point line glyphs, one physical pixel wide per whole step of the screen's scale and on
-/// pixel centres, so they stay crisp at any scale.
-fn paint_glyph(ui: &Ui, b: Button, maximized: bool, at: egui::Pos2, ink: Color32) {
-    let ppp = ui.ctx().pixels_per_point();
-    let px = ppp.round().max(1.0);
-    let stroke = Stroke::new(px / ppp, ink);
-    // An odd width centres the line in a pixel, an even one on a pixel edge.
-    let snap = |v: f32| if px as u32 % 2 == 1 { v.round_to_pixel_center(ppp) } else { v.round_to_pixels(ppp) };
-    let g = Rect::from_min_max(pos2(snap(at.x - 5.0), snap(at.y - 5.0)), pos2(snap(at.x + 5.0), snap(at.y + 5.0)));
-    let p = ui.painter();
-    match b {
-        Button::Minimize => {
-            p.line_segment([g.left_center(), g.right_center()].map(|q| pos2(q.x, snap(q.y))), stroke);
-        }
-        // Restore: a front square with the corner of the one behind it.
-        Button::Maximize if maximized => {
-            let front = Rect::from_min_max(pos2(g.left(), snap(g.top() + 2.0)), pos2(snap(g.right() - 2.0), g.bottom()));
-            p.rect_stroke(front, 0.0, stroke, egui::StrokeKind::Middle);
-            let (l, t) = (snap(g.left() + 2.0), front.top());
-            p.line(
-                vec![pos2(l, t), pos2(l, g.top()), g.right_top(), pos2(g.right(), snap(g.bottom() - 2.0)), pos2(front.right(), snap(g.bottom() - 2.0))],
-                stroke,
-            );
-        }
-        Button::Maximize => {
-            p.rect_stroke(g, 0.0, stroke, egui::StrokeKind::Middle);
-        }
-        Button::Close => {
-            p.line_segment([g.left_top(), g.right_bottom()], stroke);
-            p.line_segment([g.right_top(), g.left_bottom()], stroke);
-        }
-    }
-}
-
-/// The edge and corner zones of a window with content rect `w`: (zone, direction, cursor). Corners
-/// come last so they win where they overlap the edges.
 fn zones(w: Rect) -> [(Rect, ResizeDirection, CursorIcon); 8] {
     use ResizeDirection::*;
     let (e, c) = (EDGE, CORNER);
@@ -292,17 +232,6 @@ fn resize_zones(ui: &mut Ui) {
 /// Once per frame after the UI, on macOS with the integrated strip: the traffic lights centred on
 /// the strip, inset from its left as far as from its top, and AppKit's `movable` flag following
 /// what is under the pointer (`movable` keeps the value last set).
-#[cfg(target_os = "macos")]
-pub fn sync_native(bar: &TitleBar, ui: &Ui, frame: &eframe::Frame, movable: &mut Option<bool>) {
-    if *bar != TitleBar::Integrated {
-        return;
-    }
-    let h = height(ui);
-    // AppKit's buttons are 14 points tall.
-    frame.set_traffic_lights_position(ui.ctx(), egui::Rangef::new(0.0, h), (h - 14.0) / 2.0);
-    craft_window::title_bar::sync_movable(ui.ctx(), movable);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,15 +239,18 @@ mod tests {
     #[test]
     fn the_override_wins_then_the_setting_then_the_platform() {
         let gnome = Frame::App(Layout::parse("appmenu:close"));
-        // TEXTURECRAFT_TITLEBAR=app / =system, whatever the setting.
+
+        // The environment override wins regardless of the saved setting
         for system in [false, true] {
             assert_eq!(TitleBar::from_choice(&gnome, Some(true), system), TitleBar::App(Layout::parse("appmenu:close")));
             assert_eq!(TitleBar::from_choice(&Frame::Desktop, Some(false), system), TitleBar::System);
         }
-        // The setting brings the system's frame back.
+
+        // The saved setting selects the system frame without an override
         assert_eq!(TitleBar::from_choice(&gnome, None, true), TitleBar::System);
         assert_eq!(TitleBar::from_choice(&Frame::Desktop, None, true), TitleBar::System);
-        // The platform: a compositor that leaves the frame to the app gets the app's.
+
+        // Otherwise the desktop determines who draws the frame
         assert_eq!(TitleBar::from_choice(&gnome, None, false), TitleBar::App(Layout::parse("appmenu:close")));
         let desktop = TitleBar::from_choice(&Frame::Desktop, None, false);
         let expected = if cfg!(windows) {
@@ -329,16 +261,6 @@ mod tests {
             TitleBar::System
         };
         assert_eq!(desktop, expected);
-    }
-
-    #[test]
-    fn only_the_app_frame_turns_decorations_off() {
-        let b = TitleBar::App(Layout::default()).viewport(egui::ViewportBuilder::default());
-        assert_eq!(b.decorations, Some(false));
-        let b = TitleBar::Integrated.viewport(egui::ViewportBuilder::default());
-        assert_eq!((b.decorations, b.fullsize_content_view, b.title_shown), (Some(true), Some(true), Some(false)));
-        let b = TitleBar::System.viewport(egui::ViewportBuilder::default());
-        assert_eq!((b.decorations, b.fullsize_content_view), (Some(true), None));
     }
 
     #[test]

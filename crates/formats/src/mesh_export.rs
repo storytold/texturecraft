@@ -7,6 +7,7 @@ pub(crate) mod usd;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+use craft_image_codecs::{DecodeOptions, Format, Limits, SampleType, decode_as_with, png_probe};
 use texturecraft_core::{Channel, NormalFormat};
 use texturecraft_geom::{Mesh, SubMesh};
 
@@ -14,7 +15,7 @@ use crate::export::sanitize_file_stem;
 use crate::presets::{GLTF_BASE_COLOR, GLTF_CLEARCOAT, GLTF_EMISSIVE, GLTF_NORMAL, GLTF_ORM, GLTF_SHEEN, gltf_pbr_maps};
 use crate::{ExportOptions, ExportPreset, ExportedFile, FileFormat, FormatError, Result};
 
-pub use usd::{NamedFiles, UsdExport, UsdFormat, usd_bytes, usd_export_options};
+pub use usd::{NamedFiles, UsdExport, UsdFormat, UsdTextureBinding, usd_bytes, usd_export_options, usd_layer_with_textures, usd_texture_bindings};
 
 /// The mesh as OBJ text (UV v flipped back to OBJ's bottom-up convention).
 /// Invalid mesh data or shared writer limits return an error, never an empty successful export.
@@ -182,12 +183,25 @@ fn png8_options(preset: ExportPreset, normal: NormalFormat) -> ExportOptions {
 }
 
 fn is_black(png: &[u8]) -> bool {
-    image::load_from_memory_with_format(png, image::ImageFormat::Png).map_or(true, |img| img.to_rgb8().iter().all(|v| *v == 0))
+    // Keep the previous PNG decoder's 512 MiB allocation ceiling.
+    let options = DecodeOptions { limits: Limits { max_alloc: 512 << 20, ..Limits::none() }, keep_orientation: true };
+    let Ok(image) = decode_as_with(Format::Png, png, &options) else { return true };
+    let sample = image.sample_type();
+    let layout = image.layout();
+    let pixel_bytes = layout.channels() * sample.bytes();
+    let color_bytes = layout.color_channels() * sample.bytes();
+    let mut colors = image.data().chunks_exact(pixel_bytes).map(|pixel| &pixel[..color_bytes]);
+    match sample {
+        SampleType::U8 => colors.all(|color| color.iter().all(|&value| value == 0)),
+        // The prior RGB8 conversion rounds 16-bit values through 128 to zero.
+        SampleType::U16 => colors.all(|color| color.as_chunks::<2>().0.iter().all(|&value| u16::from_ne_bytes(value) <= 128)),
+        _ => true,
+    }
 }
 
 /// PNG color type 4 (gray + alpha) or 6 (RGBA), from the IHDR chunk.
 fn png_has_alpha(png: &[u8]) -> bool {
-    matches!(png.get(25), Some(4 | 6))
+    png_probe::pixel_model(png).is_ok_and(|model| matches!(model.color_type, 4 | 6))
 }
 
 /// The mesh as binary glTF (GLB) named `name`, with `textures[i]` on material `i` (materials
@@ -424,6 +438,73 @@ mod tests {
         let sampler = material.pbr_metallic_roughness().base_color_texture().unwrap().texture().sampler();
         let expected = (Some(gltf::texture::MagFilter::Linear), Some(gltf::texture::MinFilter::LinearMipmapLinear));
         assert_eq!((sampler.mag_filter(), sampler.min_filter()), expected);
+    }
+
+    #[test]
+    fn mesh_png_maps_keep_only_nonblack_color() {
+        let png = |color, samples: &[u8]| {
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::write_buffer_with_format(&mut out, samples, 1, 1, color, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        let mesh = texturecraft_geom::primitives::cube(1.0);
+        for (bytes, keep) in [
+            (png(image::ColorType::Rgba8, &[0, 0, 0, 255]), false),
+            (png(image::ColorType::Rgba8, &[0, 1, 0, 0]), true),
+            (png(image::ColorType::L16, &128u16.to_ne_bytes()), false),
+            (png(image::ColorType::L16, &129u16.to_ne_bytes()), true),
+            (b"PNG without image data".to_vec(), false),
+        ] {
+            let file = |name: &str, bytes: &[u8]| ExportedFile { name: name.into(), bytes: bytes.to_vec(), width: 1, height: 1, warnings: Vec::new() };
+            let emissive = file("Emissive.png", &bytes);
+            let textures = GlbTextures::from_files(vec![emissive.clone()]);
+            assert_eq!(textures.emissive.as_deref(), keep.then_some(bytes.as_slice()));
+            let glb = glb_bytes(&mesh, "PNG maps", &[textures]).unwrap();
+            let glb = gltf::Gltf::from_slice(&glb).unwrap();
+            assert_eq!(glb.materials().next().unwrap().emissive_texture().is_some(), keep);
+
+            let roughness = png(image::ColorType::L8, &[64]);
+            let usd_maps = vec![emissive, file("Clearcoat.png", &bytes), file("ClearcoatRoughness.png", &roughness)];
+            let usd = usd_bytes(&mesh, "PNG maps", &[usd_maps], UsdFormat::Usda).unwrap();
+            if keep {
+                assert_eq!(usd.textures.len(), 3);
+                for (suffix, expected) in [("_Emissive.png", &bytes), ("_Clearcoat.png", &bytes), ("_ClearcoatRoughness.png", &roughness)] {
+                    let (_, written) = usd.textures.iter().find(|(name, _)| name.ends_with(suffix)).unwrap();
+                    assert_eq!(written, expected);
+                }
+            } else {
+                assert!(usd.textures.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_png_alpha_requires_a_png_with_stored_alpha() {
+        let encode = |color: png::ColorType, samples: &[u8], color_key: bool| {
+            let mut output = Vec::new();
+            let mut encoder = png::Encoder::new(&mut output, 1, 1);
+            encoder.set_color(color);
+            if color_key {
+                encoder.set_trns(vec![0; 6]);
+            }
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(samples).unwrap();
+            writer.finish().unwrap();
+            output
+        };
+        let mut impostor = vec![0; 26];
+        impostor[25] = 6;
+        let mesh = texturecraft_geom::primitives::cube(1.0);
+        for (bytes, expected) in [
+            (encode(png::ColorType::Rgba, &[0, 1, 2, 120], false), gltf::material::AlphaMode::Blend),
+            (encode(png::ColorType::Rgb, &[0, 0, 0], true), gltf::material::AlphaMode::Opaque),
+            (impostor, gltf::material::AlphaMode::Opaque),
+        ] {
+            let textures = GlbTextures { base_color: Some(bytes), ..GlbTextures::default() };
+            let glb = glb_bytes(&mesh, "PNG alpha", &[textures]).unwrap();
+            let glb = gltf::Gltf::from_slice(&glb).unwrap();
+            assert_eq!(glb.materials().next().unwrap().alpha_mode(), expected);
+        }
     }
 
     #[test]

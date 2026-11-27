@@ -77,9 +77,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   pattern resolution separately for each source. Each channel takes its own image, such as a
   normal, roughness or height map. Import it with *File › Import resources...*, then select it
   in the channel's source picker or drop it from the Assets panel onto the channel. Mark
-  DirectX normal maps (Y down) with **DirectX normal map**.
-  For a color channel that reads a pattern or anchor point, choose **Gradient Map** from the
-  three-dot menu beside its source slot. Up to 16 color stops map dark to light across the
+  DirectX normal maps (Y down) by choosing **DirectX** under **Attributes › Normal format**.
+  For a color channel that reads a pattern or anchor point, use `layer.fill.set` with
+  `gradientMap: true` to initialize a ramp, or supply its stops in `colors`. Up to 16 stops map dark to light across the
   pattern or recolor the stack below by its lightness. The **Gradient map** filter does the
   same for a whole layer's content.
   Alt+click a material channel (of a fill or the brush) to keep that channel alone.
@@ -98,6 +98,15 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   and alpha images become the brush alpha. Filter by role or remove selected rows before importing.
   Failed rows stay in the dialog for retry. Color LUT, post effects and asset-library import are
   unavailable. The browser imports images straight from its file picker.
+- **Resources Updater:** the desktop tool shelf lists the project's image resources, with outdated
+  resources first. Filter by status or name, and use *Show in folder* to find a linked file. Images
+  imported from disk through Import resources, PBR folders, MaterialX and mesh map import remember
+  their source file. *Update* and *Update All* reread changed files in one undo step. Layers see the
+  updated image, and an imported mesh map refreshes while it still matches the previous source.
+  *Select new resource* links an image to another file. The list refreshes while the window is open,
+  and a notice offers *Update* when changed files are found on opening a project or regaining focus.
+  Linked MaterialCraft packages appear without a source file. Re-cooking a linked fill layer refreshes
+  its cooked maps.
 - **Your own library:** right-click a layer or folder, choose *Create smart material*, and it
   appears under *My smart materials*, pixels and images included. *Create smart mask* in the same
   menu saves just the layer's mask (all its effects, painted pixels and images); it appears under
@@ -105,8 +114,8 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **MaterialCraft materials:** *File › Import material*, a drop on the window, or MaterialCraft's
   *File › Send to TextureCraft* (it lands under *My smart materials*) adds a `.mcmat` portable
   material, or a `.mcraft` package, as a fill layer. Its exposed graph inputs (numbers, vectors,
-  toggles, options, colors) and presets show in the layer's properties; every change re-cooks
-  the maps through MaterialCraft's command line at the texture set's resolution, on a worker
+  toggles, options, colors) and presets appear in the layer's properties. Editing them re-cooks
+  the maps through MaterialCraft's command line at the selected resolution, on a worker
   thread, with the set's baked mesh maps (curvature, AO, thickness…) feeding graph inputs of the
   same name. *Open in MaterialCraft* edits the graph itself. In the browser the cooked maps paint,
   but the inputs are read-only.
@@ -114,9 +123,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 ## Files and texture sets
 
 - **Open** glTF/GLB, FBX (binary and ASCII), COLLADA, **USD** (usda, usdc, usdz), **Alembic**,
-  OBJ, PLY and STL, or a built-in mesh (the `project.new` command; *File › Open sample project...* opens the
-  material ball); UVs are generated when a mesh has none. A `.gltf`'s buffers
-  and images and a loose USD layer's textures are read from its folder and kept in the project.
+  OBJ, PLY and STL, or a built-in mesh with the `project.new` command. UVs are generated when a mesh
+  has none. A `.gltf`'s buffers and images and a loose USD layer's textures are read from its folder
+  and kept in the project.
   Reimport a changed mesh and your painted strokes stay on the surface. The
   `file.changeMesh` command (trusted local command API and the control channel) moves the project onto a different mesh file and keeps its layers.
   **Edit › Project Configuration...** (desktop) does the same from the 3D MESH section: *Select...* picks the
@@ -124,12 +133,15 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   strokes follow the surface (on by default), and PROJECT SETTINGS sets the project's normal map format and
   shows its UV tiles in the UV workflow tooltip. Edit the tiles in Texture Set Settings.
   Physical size and color management show the same settings as New project.
+- **File › Open Sample Project** opens a `.tcraft` picker. On desktop, the picker starts in
+  `Samples` under the data folder and offers the bundled `Material Ball.tcraft`. In the browser,
+  the picker uses local files.
 - **File › New project...** opens a setup form with BASIC SETTINGS (*Select...* a mesh file,
   the project template, the document resolution; Create waits for a mesh) and ADVANCED SETTINGS (normal
-  map format, *Use UV Tile workflow*, *Import cameras*, *Import baked maps*, physical size, color
+  map format, *Use UV Tile workflow*, *Import cameras*, *Rebuild mesh UVs*, *Import baked maps*, physical size, color
   management). The project is named after the mesh file. Settings TextureCraft does not have yet
-  (tangent space per fragment, UV tiles as separate texture sets, turning auto-unwrap off and its
-  options, a custom unit scale, OpenColorIO) are shown disabled with a hint; projects use Legacy color
+  (tangent space per fragment, UV tiles as separate texture sets, a custom unit scale, OpenColorIO)
+  are shown disabled with a hint; projects use Legacy color
   management. In the browser, *Select...* opens the browser's file picker.
 - **UDIM / UV tiles:** detected on import or switched on later, with a resolution per tile (blurs,
   other filters and height-to-normal slopes keep their size in UV space at any tile resolution)
@@ -138,7 +150,7 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   channel types to add or remove. Show, hide or invert them all at once, or **focus** on the
   active one. The project's **normal map format** (OpenGL or DirectX, in Texture Set Settings)
   says how a normal map image set as a mesh map is read, and is the default for export.
-- **Projects** are a single `.tcraft` file: the mesh, every layer (sparse and lossless), baked maps
+- **Projects** are a single `.tcraft` file: the mesh (with its generated UV layout when *Rebuild mesh UVs* was chosen), every layer (sparse and lossless), baked maps
   and imported images. **Project templates** start new work from a saved setup. *File › More save options › Save as template...* saves the open project's setup (dialog "Save template", in the user templates folder, no confirmation); New project lists "Default (OpenPBR)", the other built-ins with " (starter_assets)", yours with " (your_assets)", and opens on the template of the last project. *More save options* also has *Save as copy...* and *Save and reduce file size* (greyed, "Not available yet"). Closing the app,
   or opening, starting or closing another project, with unsaved changes asks whether to save them
   first (in the browser too, where Save downloads the project and closing or reloading the tab
@@ -162,21 +174,48 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **Live bake preview:** while the app bakes, each mesh map shows on the model as soon as it is
   finished; the bake bar follows the newest map, pins a finished one or shows the material.
 - **Export presets** for glTF PBR Metal Roughness, Unreal Engine (packed), Unity HDRP (mask map),
-  Unity Standard, Blender (Principled BSDF), Godot 4 (ORM), OpenPBR (with the coat, fuzz,
+  Unity Standard, Unity URP Lit, USD Preview Surface, Blender (Principled BSDF), Godot 4 (ORM), OpenPBR (with the coat, fuzz,
   anisotropy, transmission and subsurface maps), separate maps, mesh maps and document channels, in
   PNG, JPEG, JNG, PGM, TGA, TIFF, BMP, WEBP, PSD, EXR or HDR at 8 bits (optionally dithered), 16
   bits or 32-bit float (TIFF, EXR, HDR; 16-bit half float for EXR), with UV padding (dilation,
   infinite, or dilation + diffusion), size override and OpenGL or DirectX normals.
 - **Output template editor:** build your own presets with per-channel packing, converted maps and per-channel inversion,
-  and share them as JSON. Right-click a preset to rename, duplicate or remove it; F2 renames.
+  and share them as JSON. File names may hold folders (`Roughness/$textureSet_Roughness`).
+  Right-click a preset to rename, duplicate or remove it; F2 renames.
 - **Export panel** on the right bar: *Export Mesh...* asks for the mesh export options, then for
   the file; *Export Textures...* opens the Export textures window (Settings, Output templates and
   List of exports, *Include all*, *Save settings* and the number of textures the export writes;
   *Cancel* goes back to the settings the window opened with, *Maximum size for all Texture Sets*
   exports every set at the largest set's size; a click on a texture set overrides its template,
   file type, size or padding, and each output map's file type and bit depth, or leaves a map out;
-  Export shows the progress, a console of its steps and the written files, and can be canceled
-  between texture sets).
+  Export shows the progress, a console of its steps, the written files and the export's
+  warnings (each once), and can be canceled between texture sets).
+- **USD asset export:** the *Export USD asset* checkbox on the Export textures window's Global
+  settings (off by default, remembered with the other settings) also writes `<mesh>.usd` (binary USD) next to
+  the exported textures when the last selected texture set is written. It holds the whole mesh with
+  one UsdPreviewSurface material per texture set; each material refers to the textures that texture
+  set was exported with (its own output template, file type, size and normal format) by relative
+  file name. Base colour, roughness, metallic, normal, emissive colour, opacity, clear coat and clear
+  coat roughness are bound; a packed template (ORM, mask map) binds several inputs to different
+  channels of one file. A UDIM map that lost a tile to an earlier texture set's file name or to a
+  UDIM pattern an earlier MaterialX document of the export uses gets no binding, and a mesh with no materials gets one implicit "default" material bound to the Default
+  texture set. Ambient occlusion, height and specular are not bound (the material has occlusion,
+  displacement and specularColor inputs, but TextureCraft does not fill them), nor are glossiness
+  (no matching input) and baked maps; sheen, anisotropy, transmission, scatter and coat normal have no
+  UsdPreviewSurface input. Colour maps written as sRGB are tagged sRGB, other maps raw; a DirectX normal map is
+  flipped back in the material. A texture set outside the export has no textures in the file. A
+  canceled export writes none, and a failure to write it is a warning. In the browser the option is
+  greyed.
+- **MaterialX export:** the *Export MaterialX* checkbox on the Export textures window's Global
+  settings (off by default, remembered with the other settings) writes an OpenPBR `.mtlx` for
+  each selected texture set with usable maps. Materials reference textures beside the document.
+  The export reuses compatible OpenPBR maps and writes dedicated maps for the other supported
+  inputs using the set's effective settings. Dedicated maps use PNG when the chosen file type
+  is unsuitable, and a DirectX export keeps its selected normal alongside a separate OpenGL
+  normal for the material. The export console identifies collisions and skipped files.
+  The browser shows the option disabled. The exporter supports OpenPBR maps including base
+  color, roughness and normals. Standard Surface, coat normal, specular level, anisotropy angle
+  and constants such as IOR remain open.
 - **Mesh export** to OBJ with an MTL material library and its maps (PBR extension keys for
   roughness, metallic, normal and coat; UV-tiled sets keep their UDIM UVs and export their maps
   through Export textures), textured GLB (with clear coat and sheen) and USD (with clear coat).
@@ -224,10 +263,17 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 
 - **Swap 3D/2D** (F4, Viewport menu and the layout dropdown, rebindable) puts the 2D view on the left and the 3D view on the right in the split layout. Painting, the divider and the views' headers work on both sides, and the choice is kept with the UI state.
 - A modern look in **four brightness levels** (dark, medium dark, medium light and light) with
-  **seven accent colors**, set in Settings › General › Appearance.
+  **seven accent colors**, set for now only through `ui.set` (`prefs.brightness`, `prefs.accent`).
 - **Its own title bar** with the app icon, menus and window buttons on Windows (and on Linux
   desktops that leave the frame to the app, such as GNOME), the macOS traffic lights over the same
-  strip, and Settings › General › Appearance › System title bar for the system's frame instead.
+  strip, and the system's frame instead with `prefs.system_title_bar` through `ui.set` (for now).
+- **A pen on a Linux Wayland desktop** can move the cursor and paint as a pointer through Xwayland.
+  At launch, TextureCraft uses Xwayland when it detects a pen, finds the X11 libraries and the
+  local X server accepts setup. Otherwise it uses native Wayland. Set
+  `TEXTURECRAFT_NATIVE_WAYLAND=1` to keep native Wayland. The Flatpak grants X11 access only as a
+  fallback when Wayland is unavailable. Linux pen pressure is tracked separately in
+  [#818](https://github.com/storytold/texturecraft/pull/818) and
+  [#816](https://github.com/storytold/texturecraft/issues/816).
 - **Dockable, tabbed and floating panels**, saved layouts, and panels that reopen where you closed
   them. The right bar's panels (Export, Log, Display Settings, Shader Settings, History) pop out
   beside it; *Undock* makes one a floating window, and its *Dock* button puts it back on the bar.
@@ -247,21 +293,28 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **No project at launch**: empty views, panels and toolbars until you create or open one (File ›
   New project, Open, Recent projects, Open sample project); File › Close returns to that state.
 - A **data folder** of your choice for autosaves, smart materials, presets, templates and UI
-  layouts, on any drive (Settings › General › Folders; `Documents/TextureCraft` by default).
+  layouts, on any drive (Settings › General › Files › Data folder, with `Documents/TextureCraft` as
+  the default). Nightly shows its fixed profile path in the same row.
+- **Autosave**: each project keeps its own copy in the data folder's `autosave`, named
+  `<name>-copy-<suffix>.tcraft` after its saved file (or, until it is saved, the project), so projects made from
+  one mesh never overwrite each other's copy.
 - A **Settings window** (Edit › Settings) with General, Shortcuts and Libraries pages; changes
   apply on OK and Cancel drops them. General holds the language (or the system's), the 3D view's
   rotation, zoom and wheel speeds with inverse directions, GPU or CPU bake rays, resource limits
   (worker threads, cores kept for the UI, RAM while saving, project size on open) and the autosave
-  interval. Shortcuts rebinds any command in the sections Actions, Mouse shortcuts and Modifiers shortcuts (Delete clears a binding, a shared shortcut warns and keeps OK disabled, Reset all to default restores every key); the window reopens on the page it was closed on. Libraries adds or removes folders whose saved smart
+  interval. Reset UI restores the system language. The General page also controls the automatic
+  Bake mode map preview. Shortcuts rebinds any command in the sections Actions, Mouse shortcuts and Modifiers shortcuts (Delete clears a binding, a shared shortcut warns and keeps OK disabled, Reset all to default restores every key); the window reopens on the page it was closed on. Libraries adds or removes folders whose saved smart
   materials and masks the shelf lists.
-- The **shortcut list** (Settings › Shortcuts and Help › Shortcuts list) names the actions as the reference does and starts with its default keys (Switch to baking mode Ctrl+Shift+B, Select next and previous camera `>` and `<`, Viewers layout F1 to F4); Show mesh wireframe is a bindable command.
+- The **shortcut list** (Settings › Shortcuts and Help › Shortcuts list) names the actions as the reference does and starts with its default keys (Switch to baking mode F8, Select next and previous camera `>` and `<`, Viewers layout F1 to F4); Show mesh wireframe is a bindable command.
 - A **shortcut editor** with conflict detection, listing every menu item and every command a key can run (commands that need a path, name or similar are left out), and every shortcut shown in its tooltip.
 - **Help menu:** Release notes... opens the project's releases page. Export log... writes every
   channel to a text file with each entry's recorded UTC time, severity and source. The desktop app asks
   for a destination, and the browser downloads the file.
 - A **History** panel: click any step to go back to it, or forward again to an undone one.
-- **10 languages:** English, French, German, Spanish, Portuguese, Italian, Japanese, Chinese,
-  Korean and Arabic, switchable live.
+- **11 languages:** English, French, German, Spanish, Portuguese, Italian, Russian, Japanese,
+  Chinese, Korean and Arabic, switchable live. A build without the shared craft-i18n catalogs
+  offers English only, and Japanese, Chinese, Korean and Arabic can be picked only where a font
+  for their script is available (craft-fonts or the system's); otherwise they show greyed out.
 - **In the browser:** the same app compiled to WebAssembly, on WebGPU or WebGL2, with touch
   navigation and project open, save and download.
 

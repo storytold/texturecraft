@@ -43,7 +43,7 @@ pub(crate) fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
         0 => import_hdr = environment(app, ui, &mut display),
         1 => camera(app, ui, &mut display),
         2 => post_effects(ui, &mut display),
-        3 => render_settings(ui, &mut display),
+        3 => render_settings(app, ui, &mut display),
         _ => visualization(app, ui, &mut display),
     });
 
@@ -57,8 +57,7 @@ pub(crate) fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
         }
 
         app.session.doc.project.display = display;
-        app.session.modified = true;
-        app.session.revision = app.session.revision.wrapping_add(1);
+        app.session.mark_modified();
     }
 
     if import_hdr {
@@ -255,9 +254,19 @@ fn post_effects(ui: &mut Ui, display: &mut DisplaySettings) {
     }
 }
 
-/// Temporal anti-aliasing
-fn render_settings(ui: &mut Ui, display: &mut DisplaySettings) {
+/// Temporal anti-aliasing and the viewport texture resolution (an app setting, not the project's)
+fn render_settings(app: &mut TextureCraftApp, ui: &mut Ui, display: &mut DisplaySettings) {
     ui.checkbox(&mut display.taa, tr("Temporal anti-aliasing (refines the 3D view while it is still)"));
+    ui.horizontal(|ui| {
+        ui.label(tr("Texture resolution"));
+        for (value, label) in [(0_u8, tr("Full")), (1, tr("Half")), (2, tr("Quarter"))] {
+            ui.selectable_value(&mut app.ui.prefs.viewport_texture, value, label);
+        }
+    })
+    .response
+    .on_hover_text(tr(
+        "Size of the textures the viewport shows: lower uses less GPU memory with large texture sets. Painting and export keep full resolution.",
+    ));
 }
 
 /// The mesh wireframe and the single-channel views
@@ -287,7 +296,11 @@ mod tests {
 
     fn display_harness() -> Harness<'static, TextureCraftApp> {
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
-        let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_step_dt(0.01).build_eframe(|cc| TextureCraftApp::new(cc, session));
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1600.0, 1200.0))
+            .with_step_dt(0.01)
+            .with_context_setup(crate::framework::install_headless)
+            .build_eframe(|cc| TextureCraftApp::new(cc, session));
         harness.state_mut().ui.prefs.language = "en".into();
         harness.state_mut().ui.dock.focus(crate::docking::Panel::Display);
         harness.run_steps(4);

@@ -80,6 +80,9 @@ pub fn specs() -> Vec<CommandSpec> {
 pub type FileList = Vec<(String, u64)>;
 /// Reads a file of the list by name.
 pub type Loader<'a> = &'a dyn Fn(&str) -> std::result::Result<Vec<u8>, String>;
+/// The file on disk a file of the list is read from (None: an archive entry or bytes in memory),
+/// asked right before reading it.
+type Locator<'a> = &'a dyn Fn(&str) -> Option<texturecraft_core::ResourceSource>;
 
 mod pbr_options;
 mod take;
@@ -137,10 +140,16 @@ impl Session {
     /// Import the maps found among `files` as one fill layer on the active texture set; `load`
     /// reads a file by name. Returns the reply of `file.importPbrFolder`.
     pub fn import_pbr(&mut self, files: &FileList, load: Loader, options: &PbrOptions) -> Result<Value> {
-        self.import_pbr_with_budget(files, load, options, import_memory_budget())
+        self.import_pbr_with_budget(files, load, &|_| None, options, import_memory_budget())
     }
 
-    fn import_pbr_with_budget(&mut self, files: &FileList, load: Loader, options: &PbrOptions, memory_budget: u64) -> Result<Value> {
+    /// [`Session::import_pbr`] that records the disk files `locate` names, so the Resources Updater can read them again
+    #[cfg(not(target_arch = "wasm32"))]
+    fn import_pbr_located(&mut self, files: &FileList, load: Loader, locate: Locator, options: &PbrOptions) -> Result<Value> {
+        self.import_pbr_with_budget(files, load, locate, options, import_memory_budget())
+    }
+
+    fn import_pbr_with_budget(&mut self, files: &FileList, load: Loader, locate: Locator, options: &PbrOptions, memory_budget: u64) -> Result<Value> {
         let set = detect_with(files, &options.choose)?;
         if set.is_empty() {
             return Err(EngineError::Other(format!(
@@ -193,6 +202,10 @@ impl Session {
         let mut fill = Fill { projection: options.projection.clone(), ..Fill::default() };
         let mut added: Vec<(String, Arc<Vec<u8>>)> = Vec::new();
         let mut decoded = Vec::new();
+
+        // Disk files read by name, and the resources that hold one of them unchanged
+        let mut file_sources: BTreeMap<String, texturecraft_core::ResourceSource> = BTreeMap::new();
+        let mut resource_sources: Vec<(String, texturecraft_core::ResourceSource)> = Vec::new();
         let mut channels: Vec<Channel> = Vec::new();
         let mut total_texels = 0u64;
         let mut retained_bytes = 0u64;
@@ -231,6 +244,9 @@ impl Session {
                     let loaded = if allowed_texels == 0 {
                         Err("not enough memory is available to import more textures".to_string())
                     } else {
+                        if let Some(source) = locate(&file) {
+                            file_sources.insert(file.clone(), source);
+                        }
                         load(&file).and_then(|bytes| {
                             if bytes.len() as u64 > MAX_FILE_BYTES {
                                 return Err(format!("the file is over {} MB", MAX_FILE_BYTES >> 20));
@@ -288,10 +304,15 @@ impl Session {
                     }
                 };
                 let base = texturecraft_formats::sanitize_resource_name(&resource_name);
-                let (mut unique, mut suffix_index) = (base.clone(), 2);
-                while self.doc.resources.contains_key(&unique) || added.iter().any(|(a, _)| *a == unique) {
-                    unique = format!("{suffix_index}_{base}");
-                    suffix_index += 1;
+                let unique = crate::resource_cmds::unique_resource_name(base, |name| {
+                    self.doc.resources.contains_key(name) || added.iter().any(|(added_name, _)| added_name == name)
+                });
+
+                // Only a resource holding the file's own bytes can be compared with it later
+                if take == Take::Whole
+                    && let Some(source) = file_sources.get(&file)
+                {
+                    resource_sources.push((unique.clone(), source.clone()));
                 }
 
                 added.push((unique.clone(), resource_bytes));
@@ -316,6 +337,7 @@ impl Session {
             for (n, bytes) in &added {
                 s.doc.resources.insert(n.clone(), bytes.clone());
             }
+            s.doc.project.resource_sources.extend(resource_sources);
             let id = s.doc.project.alloc_id();
             crate::layer_cmds::insert_selected(s, Layer::new(id, layer_name.clone(), LayerKind::Fill(fill), &channels))
         })?;
@@ -358,7 +380,8 @@ pub fn common_name(files: &[String]) -> Option<String> {
 
 // Parameters and sources (native)
 
-fn options(cmd: &str, p: &Value) -> Result<PbrOptions> {
+/// The import options in `p`; a warp projection is fitted to `mesh`
+fn options(cmd: &str, p: &Value, mesh: &texturecraft_geom::Mesh) -> Result<PbrOptions> {
     let normal_format = match strp(p, "normalFormat") {
         None | Some("auto") => None,
         Some("openGl" | "opengl") => Some(NormalFormat::OpenGl),
@@ -377,7 +400,7 @@ fn options(cmd: &str, p: &Value) -> Result<PbrOptions> {
     Ok(PbrOptions {
         name: strp(p, "name").filter(|name| !name.trim().is_empty()).map(str::to_string),
         normal_format,
-        projection: crate::layer_cmds::projection_from(p, cmd, None)?,
+        projection: crate::layer_cmds::projection_from(p, cmd, None, || crate::warp_cmds::fitted_frame(mesh))?,
         choose,
     })
 }
@@ -414,18 +437,23 @@ mod native;
 #[cfg(not(target_arch = "wasm32"))]
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.importPbrFolder";
-    let mut options = options(cmd, p)?;
+    let mut options = options(cmd, p, &s.mesh)?;
     let found = native::find(cmd, p)?;
     if options.name.is_none() {
         options.name = found.name.clone();
     }
-    s.import_pbr(&found.files, &|name| found.load(name), &options)
+    s.import_pbr_located(
+        &found.files,
+        &|name| found.load(name),
+        &|name| found.disk_path(name).map(|path| crate::resource_update_cmds::file_source(&path)),
+        &options,
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn scan(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.scanPbrFolder";
-    let options = options(cmd, p)?;
+    let options = options(cmd, p, &s.mesh)?;
     let found = native::find(cmd, p)?;
     let set = detect_with(&found.files, &options.choose)?;
     let mut reply = report(&set, options.normal_format);
@@ -440,8 +468,8 @@ fn scan(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn import(_: &mut Session, p: &Value) -> Result<Value> {
-    let _ = options("file.importPbrFolder", p)?;
+fn import(s: &mut Session, p: &Value) -> Result<Value> {
+    let _ = options("file.importPbrFolder", p, &s.mesh)?;
     Err(EngineError::Other("file paths are not available in the browser".into()))
 }
 
@@ -461,7 +489,7 @@ mod tests {
         let mut session = Session::new_project("test", crate::geom::primitives::builtin("plane").unwrap(), "builtin:plane", None, 128).unwrap();
         let load = |_: &str| Ok(bytes.clone());
 
-        let result = session.import_pbr_with_budget(&files, &load, &PbrOptions::default(), 64);
+        let result = session.import_pbr_with_budget(&files, &load, &|_| None, &PbrOptions::default(), 64);
 
         assert!(result.unwrap_err().to_string().contains("more than 1 texels"));
         assert!(session.doc.resources.is_empty());
@@ -470,7 +498,7 @@ mod tests {
         assert_eq!(allowed_source_texels(256, 64, 3), 2);
 
         let never_load = |_: &str| -> std::result::Result<Vec<u8>, String> { panic!("no source should load after the budget is spent") };
-        let result = session.import_pbr_with_budget(&files, &never_load, &PbrOptions::default(), 0);
+        let result = session.import_pbr_with_budget(&files, &never_load, &|_| None, &PbrOptions::default(), 0);
 
         assert!(result.unwrap_err().to_string().contains("not enough memory"));
     }

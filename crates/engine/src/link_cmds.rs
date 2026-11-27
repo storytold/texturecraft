@@ -1,17 +1,18 @@
 //! MaterialCraft materials as fill layers. A `.mcmat` portable material becomes a fill whose
 //! channel sources are its cooked maps (image resources) and whose [`MaterialLink`] keeps the
 //! graph's exposed parameters. Changing one re-cooks the maps through `materialcraft-cli` at the
-//! texture set's resolution, with the set's baked mesh maps feeding graph inputs of the same name.
-//! Both apps use the shared craft-mcmat container and the public CLI.
+//! layer's picked resolution (default: the texture set's), with the set's baked mesh maps feeding graph inputs of the same name;
+//! both apps use the shared craft-mcmat container and the public CLI
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
-use texturecraft_core::{Channel, Fill, Layer, LayerId, LayerKind, LinkParam, MaterialLink, Source};
+use texturecraft_core::{Channel, CookResolution, Fill, Layer, LayerId, LayerKind, LinkParam, MaterialLink, Source};
 use texturecraft_formats::RamReservation as CookReservation;
 use texturecraft_formats::mcmat::{MCRAFT_EXT, is_mcmat, is_mcraft, validate_mcmat_version};
 
-use crate::commands::{CommandSpec, bad, boolp, has_layer, layer_param, strp};
+use crate::commands::{CommandSpec, bad, boolp, channel_param, has_layer, layer_param, strp};
 use crate::materials::Place;
 use crate::{EngineError, Result, Session, cmd};
 
@@ -61,12 +62,30 @@ pub fn specs() -> Vec<CommandSpec> {
             "Re-cook MaterialCraft material",
             [],
             None,
-            "{layer?} — re-cooks a MaterialCraft material layer at its texture set's resolution with the set's baked mesh maps",
+            "{layer?} — re-cooks a MaterialCraft material layer at its picked resolution (default: the texture set's) with the set's baked mesh maps",
             has_layer,
             |s, p| {
                 let id = layer_param(s, "material.link.cook", p)?;
                 cook(s, id, Map::new())
             }
+        ),
+        cmd!(
+            "material.link.map",
+            "Map material channel",
+            [],
+            None,
+            "{layer?, channel, output} — makes a channel of a MaterialCraft material layer read another output of the material (an output id such as \"roughness\")",
+            has_layer,
+            map
+        ),
+        cmd!(
+            "material.link.resolution",
+            "Set material resolution",
+            [],
+            None,
+            "{layer?, relative: -3..3 | fixed: 128..8192 (power of two), cook?: true} — the size a MaterialCraft material layer cooks at: the texture set's resolution times 2^relative (0 = the texture set's), or fixed pixels across",
+            has_layer,
+            resolution
         ),
         cmd!(
             "material.link.saveSource",
@@ -81,9 +100,9 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 /// The link of fill layer `id`.
-fn link_of(session: &Session, cmd: &str, id: LayerId) -> Result<MaterialLink> {
+fn link_of<'a>(session: &'a Session, cmd: &str, id: LayerId) -> Result<&'a MaterialLink> {
     match &session.doc.project.layer(id)?.kind {
-        LayerKind::Fill(Fill { link: Some(link), .. }) => Ok(link.as_ref().clone()),
+        LayerKind::Fill(Fill { link: Some(link), .. }) => Ok(link.as_ref()),
         _ => Err(bad(cmd, format!("layer {} is not a MaterialCraft material", id.0))),
     }
 }
@@ -164,17 +183,18 @@ fn preset(s: &mut Session, p: &Value) -> Result<Value> {
     let id = layer_param(s, CMD, p)?;
     let name = strp(p, "name").ok_or_else(|| bad(CMD, "`name` is required"))?;
     let link = link_of(s, CMD, id)?;
-    let values = link.presets.iter().find(|pr| pr.name == name).ok_or_else(|| bad(CMD, format!("`{}` has no preset `{name}`", link.name)))?.values.clone();
+    let preset = link.presets.iter().find(|preset| preset.name == name).ok_or_else(|| bad(CMD, format!("`{}` has no preset `{name}`", link.name)))?;
 
     // Leave values the painter cannot set unchanged
-    let values = values.into_iter().filter(|(k, _)| link.params.iter().any(|p| p.id == *k));
+    let values =
+        preset.values.iter().filter(|(key, _)| link.params.iter().any(|param| &param.id == *key)).map(|(key, value)| (key.clone(), value.clone())).collect();
     update(s, CMD, id, values, boolp(p, "cook").unwrap_or(true))
 }
 
 /// Set parameter values of linked layer `id`; with `cook`, re-cook now (one undo step).
-fn update(s: &mut Session, cmd: &str, id: LayerId, overrides: impl IntoIterator<Item = (String, Value)>, cook_now: bool) -> Result<Value> {
+fn update(s: &mut Session, cmd: &str, id: LayerId, overrides: Map<String, Value>, cook_now: bool) -> Result<Value> {
     let link = link_of(s, cmd, id)?;
-    let values = checked(cmd, &link, &overrides.into_iter().collect::<Map<_, _>>())?;
+    let values = checked(cmd, link, &overrides)?;
     if cook_now {
         return cook(s, id, values);
     }
@@ -190,6 +210,82 @@ fn update(s: &mut Session, cmd: &str, id: LayerId, overrides: impl IntoIterator<
         Ok(())
     })?;
     Ok(json!({"layer": id.0, "cooked": false}))
+}
+
+fn map(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "material.link.map";
+    let id = layer_param(s, CMD, p)?;
+    let channel = channel_param(CMD, p, "channel")?.ok_or_else(|| bad(CMD, "`channel` is required"))?;
+    let output = strp(p, "output").ok_or_else(|| bad(CMD, "`output` is required"))?;
+    link_of(s, CMD, id)?;
+    s.edit("Map material channel", |s| {
+        let LayerKind::Fill(fill) = &mut s.doc.project.layer_mut(id)?.kind else { return Ok(()) };
+        let outputs = fill.link_outputs();
+        let image = outputs.get(output).ok_or_else(|| bad(CMD, format!("the material has no output `{output}`")))?.clone();
+        let normal_format = match fill.sources.get(&channel) {
+            Some(Source::Image { normal_format, .. }) => *normal_format,
+            _ => Default::default(),
+        };
+        fill.sources.insert(channel, Source::Image { name: image, normal_format });
+        if let Some(link) = &mut fill.link {
+            if output == channel.id() {
+                link.mapping.remove(&channel);
+            } else {
+                link.mapping.insert(channel, output.to_string());
+            }
+
+            // Sources no longer name every output once one is mapped elsewhere
+            link.outputs = outputs;
+        }
+        Ok(())
+    })?;
+    Ok(json!({"layer": id.0, "channel": channel.id(), "output": output}))
+}
+
+/// The `relative` or `fixed` param of `material.link.resolution`; `Some(None)` is the texture set's own size
+pub(crate) fn picked_resolution(p: &Value) -> Option<Option<CookResolution>> {
+    match (p.get("relative"), p.get("fixed")) {
+        (Some(factor), None) => {
+            let factor = i8::try_from(factor.as_i64()?).ok().filter(|factor| CookResolution::FACTORS.contains(factor))?;
+            Some((factor != 0).then_some(CookResolution::Relative(factor)))
+        }
+        (None, Some(size)) => {
+            let size = u32::try_from(size.as_i64()?).ok().filter(|size| CookResolution::cookable(*size))?;
+            Some(Some(CookResolution::Fixed(size)))
+        }
+        _ => None,
+    }
+}
+
+fn resolution(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "material.link.resolution";
+    let id = layer_param(s, CMD, p)?;
+    let size = picked_resolution(p).ok_or_else(|| bad(CMD, "give `relative` (-3..3) or `fixed` (a power of two from 128 to 8192)"))?;
+    let link = link_of(s, CMD, id)?;
+    let store = |s: &mut Session| {
+        s.edit(EDIT, |s| {
+            if let LayerKind::Fill(Fill { link: Some(link), .. }) = &mut s.doc.project.layer_mut(id)?.kind {
+                link.resolution = size;
+            }
+            Ok(())
+        })
+    };
+    if !boolp(p, "cook").unwrap_or(true) {
+        // Only the stored size changes, so the size it already has adds no undo step
+        if link.resolution != size {
+            store(s)?;
+        }
+
+        return Ok(json!({"layer": id.0, "cooked": false}));
+    }
+
+    // Install the resolution and maps in one edit so a failed install also leaves the old resolution
+    let mut job = s.link_job(id, &Map::new())?;
+    let (texture_set, _, _) = s.doc.project.locate(id).ok_or_else(|| bad(CMD, format!("layer {} is not in a stack", id.0)))?;
+    job.size = size.unwrap_or(CookResolution::TEXTURE_SET).size(s.doc.project.texture_set(texture_set)?.resolution);
+    let material = job.run()?;
+    s.install_link_cook(id, &material, s.merge_edits, Some(size))?;
+    Ok(json!({"layer": id.0, "cooked": true, "size": job.size}))
 }
 
 fn cook(s: &mut Session, id: LayerId, overrides: Map<String, Value>) -> Result<Value> {
@@ -248,6 +344,68 @@ pub fn open_in_materialcraft(package: &std::path::Path) -> Result<()> {
     })
 }
 
+/// Prefix of the folders [`stage_handoff_package`] makes in the temp folder.
+#[cfg(not(target_arch = "wasm32"))]
+const HANDOFF_PREFIX: &str = "texturecraft-open-";
+
+/// Folders from earlier hand-offs older than this are removed (MaterialCraft may still have a young one open).
+#[cfg(not(target_arch = "wasm32"))]
+const HANDOFF_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Write `package` as `file_name` inside a new folder only this call can have made under the temp folder, and return the
+/// file's path (for [`open_in_materialcraft`]). A fixed `<temp>/<name>` is guessable: on a shared `/tmp` another user
+/// could plant a file or link there first and the write would go through it. The folder name is random, is created
+/// exclusively (mode `0700` on Unix) and the file is created with `create_new` (mode `0600`), so nothing planted is ever written through.
+/// The folder stays after the call because MaterialCraft needs the file while it is open; folders over a week old go.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn stage_handoff_package(file_name: &str, package: &[u8]) -> Result<std::path::PathBuf> {
+    stage_handoff_package_in(&std::env::temp_dir(), file_name, package)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stage_handoff_package_in(base: &std::path::Path, file_name: &str, package: &[u8]) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+    let io = |e: std::io::Error| EngineError::Other(format!("cannot stage the package for MaterialCraft: {e}"));
+    if file_name.is_empty() || std::path::Path::new(file_name).file_name() != Some(std::ffi::OsStr::new(file_name)) {
+        return Err(EngineError::Other(format!("`{file_name}` is not a plain file name")));
+    }
+    sweep_old_handoffs(base, HANDOFF_MAX_AGE);
+    // Dropped (and removed) on any early return, so a failed write leaves no empty folder behind.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(HANDOFF_PREFIX);
+    // tempfile makes folders with the default mode (0755 under the usual umask), so ask for 0700 and 0600 explicitly.
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    let dir = builder.tempdir_in(base).map_err(io)?;
+    let path = dir.path().join(file_name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&path).map_err(io)?;
+    file.write_all(package).map_err(io)?;
+    file.sync_all().map_err(io)?;
+    let _ = dir.keep();
+    Ok(path)
+}
+
+/// Remove hand-off folders in `base` last changed more than `max_age` ago. Only real folders with our prefix are
+/// touched (never a link), and every failure is ignored: a leftover folder costs disk space, not work.
+#[cfg(not(target_arch = "wasm32"))]
+fn sweep_old_handoffs(base: &std::path::Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(base) else { return };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(HANDOFF_PREFIX) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
+        let old = meta.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > max_age);
+        if meta.is_dir() && old {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Source file extensions are chosen from the linked resource name, never an untrusted path.
 pub fn source_extension(name: &str) -> &'static str {
     if name.to_ascii_lowercase().ends_with(".mcmat") {
@@ -263,7 +421,7 @@ pub fn source_extension(name: &str) -> &'static str {
 fn cook_source(
     bytes: Vec<u8>,
     size: u32,
-    baked: Option<texturecraft_compose::BakedMaps>,
+    #[cfg(not(target_arch = "wasm32"))] baked: Option<texturecraft_compose::BakedMaps>,
     mut budget: LinkMemoryBudget,
     canceled: Arc<std::sync::atomic::AtomicBool>,
     reservation: CookReservation,
@@ -288,7 +446,9 @@ fn cook_source(
         size,
         values: Map::new(),
         input_identifiers: Vec::new(),
+        #[cfg(not(target_arch = "wasm32"))]
         baked,
+        #[cfg(not(target_arch = "wasm32"))]
         budget,
         canceled,
     };
@@ -343,7 +503,15 @@ impl Session {
         let mut source = Vec::new();
         source.try_reserve_exact(bytes.len()).map_err(|error| EngineError::Other(format!("cannot allocate linked source: {error}")))?;
         source.extend_from_slice(bytes);
-        let (job, material) = cook_source(source, size, self.doc.baked.get(&ts).cloned(), budget, Arc::default(), reservation)?;
+        let (job, material) = cook_source(
+            source,
+            size,
+            #[cfg(not(target_arch = "wasm32"))]
+            self.doc.baked.get(&ts).cloned(),
+            budget,
+            Arc::default(),
+            reservation,
+        )?;
         self.add_cooked_material(&material, job.package, job.source_ext, place)
     }
 
@@ -377,6 +545,9 @@ impl Session {
                 presets: m.interface.presets.clone(),
                 inputs: m.interface.inputs.iter().map(|i| i.identifier.clone()).collect(),
                 size: m.size,
+                resolution: None,
+                mapping: BTreeMap::new(),
+                outputs: BTreeMap::new(),
             };
             let mut fill = Fill { link: Some(Box::new(link)), ..Fill::default() };
             let names = put_maps(s, &stem, &m.maps, &mut fill);
@@ -422,7 +593,7 @@ impl Session {
 
         let mut images = std::collections::HashSet::new();
         for image in self.images.values().filter(|image| images.insert(Arc::as_ptr(image))) {
-            retained_bytes = retained_bytes.saturating_add(image.rgba.capacity() as u64 * std::mem::size_of::<[f32; 4]>() as u64);
+            retained_bytes = retained_bytes.saturating_add(image.retained_texel_bytes());
         }
 
         budget.set_retained(retained_bytes);
@@ -443,30 +614,43 @@ impl Session {
     /// Prepare a re-cook with current parameter values and matching baked mesh maps
     pub fn link_job(&self, id: LayerId, overrides: &Map<String, Value>) -> Result<LinkJob> {
         let link = link_of(self, "material.link", id)?;
+        #[cfg(not(target_arch = "wasm32"))]
         let (texture_set, _, _) = self.doc.project.locate(id).ok_or_else(|| EngineError::Other(format!("layer {} is not in a stack", id.0)))?;
         let mut values = self.link_values(id)?;
         values.extend(overrides.clone());
 
-        // UDIM tiles share one cook at the texture set's base resolution
-        let size = self.doc.project.texture_set(texture_set)?.resolution;
         Ok(LinkJob {
             layer: id,
             package: self.link_package(id)?,
             source_ext: source_extension(&link.package),
             graph: Some(link.graph.clone()),
-            size,
+            size: self.link_size(id)?,
             values,
-            input_identifiers: link.inputs,
+            input_identifiers: link.inputs.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
             baked: self.doc.baked.get(&texture_set).cloned(),
+            #[cfg(not(target_arch = "wasm32"))]
             budget: self.link_memory_budget(),
             canceled: Arc::default(),
         })
+    }
+
+    /// Pixels across linked layer `id` cooks at: its picked resolution, else its texture set's
+    pub fn link_size(&self, id: LayerId) -> Result<u32> {
+        let link = link_of(self, "material.link", id)?;
+        let (texture_set, _, _) = self.doc.project.locate(id).ok_or_else(|| EngineError::Other(format!("layer {} is not in a stack", id.0)))?;
+        // UDIM tiles share one cook at the texture set's base resolution
+        Ok(link.resolution.unwrap_or(CookResolution::TEXTURE_SET).size(self.doc.project.texture_set(texture_set)?.resolution))
     }
 
     /// Install the maps and exposed values returned by a completed [`LinkJob`].
     /// With `merge`, this folds into the previous undo step when that was an edit of the same kind
     /// (a parameter set while the cook ran).
     pub fn apply_link_cook(&mut self, id: LayerId, material: &CookedMaterial, merge: bool) -> Result<()> {
+        self.install_link_cook(id, material, merge, None)
+    }
+
+    fn install_link_cook(&mut self, id: LayerId, material: &CookedMaterial, merge: bool, resolution_change: Option<Option<CookResolution>>) -> Result<()> {
         self.link_memory_budget().check(material_bytes(material))?;
         let names = self.edit_merging(EDIT, merge, |session| {
             let LayerKind::Fill(mut fill) = session.doc.project.layer(id)?.kind.clone() else {
@@ -474,6 +658,10 @@ impl Session {
             };
 
             let link = fill.link.as_mut().ok_or_else(|| EngineError::Other(format!("layer {} is not a MaterialCraft material", id.0)))?;
+            if let Some(resolution) = resolution_change {
+                link.resolution = resolution;
+            }
+
             for parameter in &mut link.params {
                 if let Some(cooked) = material.interface.parameters.iter().find(|candidate| candidate.id == parameter.id) {
                     parameter.value = cooked.value.clone();
@@ -481,8 +669,9 @@ impl Session {
             }
             link.size = material.size;
             let stem = texturecraft_formats::sanitize_resource_name(&link.name);
-            let old_names: Vec<String> =
+            let mut old_names: Vec<String> =
                 fill.sources.values().filter_map(|source| if let Source::Image { name, .. } = source { Some(name.clone()) } else { None }).collect();
+            old_names.extend(fill.link_outputs().into_values());
             let names = put_maps(session, &stem, &material.maps, &mut fill);
             session.doc.project.layer_mut(id)?.kind = LayerKind::Fill(fill);
 
@@ -496,6 +685,7 @@ impl Session {
 
             for name in old_names.iter().filter(|name| !used_names.contains(name)) {
                 session.doc.resources.remove(name);
+                session.doc.project.resource_sources.remove(name);
             }
 
             Ok(names)
@@ -517,9 +707,7 @@ impl Session {
 }
 
 fn material_bytes(material: &CookedMaterial) -> u64 {
-    material.maps.iter().fold(0u64, |total, map| {
-        total.saturating_add(map.bytes.capacity() as u64).saturating_add(map.image.rgba.capacity() as u64 * std::mem::size_of::<[f32; 4]>() as u64)
-    })
+    material.maps.iter().fold(0u64, |total, map| total.saturating_add(map.bytes.capacity() as u64).saturating_add(map.image.retained_texel_bytes()))
 }
 
 /// A resource name that preserves its suffix through a project round trip.
@@ -537,26 +725,34 @@ fn unique(session: &Session, stem: &str, suffix: &str) -> String {
     format!("{stem}{suffix}")
 }
 
-/// Store `maps` as new resources (names carry a fresh id, so the decoded-image cache never
-/// confuses two cooks) and point `fill`'s channels at them. Returns the names, in map order.
+/// Store `maps` as new resources (names carry a fresh id, so the decoded-image cache never confuses two cooks), list them as the link's outputs and point `fill`'s channels at them: each channel at its mapped output, else at the output named like it. Returns the names, in map order
 fn put_maps(s: &mut Session, stem: &str, maps: &[CookedMap], fill: &mut Fill) -> Vec<String> {
     let cook = s.doc.project.alloc_id().0;
     let mut names = Vec::new();
+    let mut outputs = BTreeMap::new();
     for map in maps {
         let channel = map.channel;
         let extension = if map.bytes.starts_with(crate::resource_cmds::EXR_SIGNATURE) { "exr" } else { "png" };
         let name = unique(s, stem, &format!("_{}_{cook}.{extension}", channel.id()));
         s.doc.resources.insert(name.clone(), Arc::clone(&map.bytes));
+        outputs.insert(channel.id().to_string(), name.clone());
+        names.push(name);
+    }
 
-        // Preserve a normal convention the user chose for this layer
+    // Both callers cook a linked fill; one without a link only keeps the stored maps
+    let Some(link) = fill.link.as_mut() else { return names };
+    let channels: BTreeSet<Channel> = maps.iter().map(|map| map.channel).chain(link.mapping.keys().copied()).collect();
+    for channel in channels {
+        let Some(name) = outputs.get(link.output_of(channel)) else { continue };
+
+        // A normal map the user marked DirectX stays marked through re-cooks
         let normal_format = match fill.sources.get(&channel) {
             Some(Source::Image { normal_format, .. }) => *normal_format,
             _ => Default::default(),
         };
         fill.sources.insert(channel, Source::Image { name: name.clone(), normal_format });
-        names.push(name);
     }
-
+    link.outputs = outputs;
     names
 }
 
@@ -577,5 +773,83 @@ mod tests {
         assert_eq!(typed(&p, &json!("#aabbccdd")), None);
         assert_eq!(typed(&p, &json!("#+f+f+f")), None);
         assert!(typed(&p, &json!("#ff8000")).is_some());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tc_handoff_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A file another user planted at the old, guessable `<temp>/<name>` is never written through.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn handoff_package_is_not_written_through_a_planted_link() {
+        let base = scratch("planted");
+        let victim = base.join("victim.txt");
+        std::fs::write(&victim, b"precious").unwrap();
+        // The old code wrote `<temp>/<name>` with `fs::write`; a hard link there reaches the victim on every platform.
+        std::fs::hard_link(&victim, base.join("wood.mcraft")).unwrap();
+
+        let path = super::stage_handoff_package_in(&base, "wood.mcraft", b"package").unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(std::fs::read(&path).unwrap(), b"package");
+        assert_ne!(path.parent().unwrap(), base, "the file is inside a folder of its own");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Every hand-off gets its own empty-until-written folder, even when the name repeats.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn handoff_packages_get_distinct_folders() {
+        let base = scratch("distinct");
+        let a = super::stage_handoff_package_in(&base, "m.mcraft", b"a").unwrap();
+        let b = super::stage_handoff_package_in(&base, "m.mcraft", b"b").unwrap();
+        assert_ne!(a.parent(), b.parent());
+        assert_eq!((std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap()), (b"a".to_vec(), b"b".to_vec()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(a.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A name with a path in it cannot leave the new folder.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn handoff_package_rejects_names_that_are_paths() {
+        let base = scratch("names");
+        for bad in ["", "..", "a/b.mcraft", "../x.mcraft"] {
+            assert!(super::stage_handoff_package_in(&base, bad, b"x").is_err(), "{bad}");
+        }
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0, "a rejected name leaves nothing behind");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Old hand-off folders are swept; young ones, other folders and files stay.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn handoff_sweep_removes_only_old_handoff_folders() {
+        let base = scratch("sweep");
+        let old = base.join("texturecraft-open-old");
+        let other = base.join("somebody-elses-folder");
+        let file = base.join("texturecraft-open-file");
+        for dir in [&old, &other] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(&file, b"x").unwrap();
+        // Zero age limit: everything with the prefix that is a folder counts as old.
+        super::sweep_old_handoffs(&base, std::time::Duration::ZERO);
+        assert!(!old.exists() && other.exists() && file.exists());
+        let young = base.join("texturecraft-open-young");
+        std::fs::create_dir(&young).unwrap();
+        super::sweep_old_handoffs(&base, std::time::Duration::from_secs(3600));
+        assert!(young.exists());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

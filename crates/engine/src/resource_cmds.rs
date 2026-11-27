@@ -42,7 +42,31 @@ pub(crate) const MAX_BYTES: usize = 512 << 20;
 pub(crate) const EXR_SIGNATURE: &[u8] = &[0x76, 0x2f, 0x31, 0x01];
 
 pub(crate) fn decoded(d: texturecraft_formats::DecodedImage) -> Arc<ImageRes> {
-    Arc::new(ImageRes { width: d.width, height: d.height, rgba: d.rgba, srgb: d.srgb })
+    Arc::new(ImageRes::new(d.width, d.height, d.rgba, d.srgb))
+}
+
+/// Disambiguate a sanitized resource name without losing its archive key on save.
+pub(crate) fn unique_resource_name(base: String, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(&base) {
+        return base;
+    }
+
+    let (stem, extension) = base.rfind('.').map_or((base.as_str(), ""), |start| base.split_at(start));
+    let mut index = 2;
+    loop {
+        let discriminator = format!("{index}_");
+        let available = MAX_RESOURCE_NAME_LEN - discriminator.len();
+
+        // An unusually long extension must leave room for the name itself
+        let (stem, extension) = if extension.len() < available { (stem, extension) } else { (base.as_str(), "") };
+        let stem = &stem[..stem.len().min(available - extension.len())];
+        let name = format!("{discriminator}{stem}{extension}");
+        if !taken(&name) {
+            return name;
+        }
+
+        index += 1;
+    }
 }
 
 impl Session {
@@ -79,19 +103,7 @@ impl Session {
             base.insert_str(0, &prefix);
         }
 
-        let (stem, extension) = base.rfind('.').map_or((base.as_str(), ""), |extension_start| base.split_at(extension_start));
-        let mut name = base.clone();
-        let mut duplicate_index = 2;
-        while self.doc.resources.contains_key(&name) {
-            let discriminator = format!("{duplicate_index}_");
-            let available = MAX_RESOURCE_NAME_LEN - discriminator.len();
-
-            // Leave room for a stem even for names that end in an unusually long extension
-            let (stem, extension) = if extension.len() < available { (stem, extension) } else { (base.as_str(), "") };
-            let stem = stem.get(..stem.len().min(available - extension.len())).unwrap_or(stem);
-            name = format!("{discriminator}{stem}{extension}");
-            duplicate_index += 1;
-        }
+        let name = unique_resource_name(base, |name| self.doc.resources.contains_key(name) || crate::fill_alpha::library_alpha_of(name).is_some());
 
         self.doc.resources.insert(name.clone(), Arc::new(bytes));
         self.images.insert(name.clone(), decoded(image));
@@ -102,6 +114,7 @@ impl Session {
     /// Decode resources that are not decoded yet and forget removed ones (after undo, redo, load).
     pub fn sync_images(&mut self) {
         self.images.retain(|name, _| self.doc.resources.contains_key(name));
+        self.library_alphas.retain(|name| self.images.contains_key(name));
 
         let mut linked_packages = std::collections::HashSet::new();
         let mut linked_images = std::collections::HashMap::new();
@@ -132,6 +145,10 @@ impl Session {
             };
             match image {
                 Ok(image) => {
+                    if crate::fill_alpha::matches_saved_picture(name, &image) {
+                        self.library_alphas.insert(name.clone());
+                    }
+
                     self.images.insert(name.clone(), decoded(image));
                 }
                 Err(error) => self.log.warn(crate::log::LIBRARY_SOURCE, format!("resource {name}: {error}")),
@@ -139,6 +156,16 @@ impl Session {
         }
 
         self.drop_missing_image_view();
+    }
+
+    /// Undo and redo restore resource bytes under the same name (the Resources Updater replaces
+    /// them in place): the pixels decoded from the bytes `other` held are stale
+    pub(crate) fn forget_replaced_images(&mut self, other: &crate::Document) {
+        for (name, bytes) in &self.doc.resources {
+            if other.resources.get(name).is_some_and(|previous| !Arc::ptr_eq(previous, bytes)) {
+                self.images.remove(name);
+            }
+        }
     }
 
     /// The "Other..." view cannot show an image that is gone (removed or renamed): the material comes back
@@ -167,8 +194,16 @@ fn list(s: &Session) -> Value {
 #[cfg(not(target_arch = "wasm32"))]
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
     let path = strp(p, "path").ok_or_else(|| bad("resource.import", "`path` is required"))?;
+    let prefix = strp(p, "prefix").unwrap_or("");
+
+    let source = crate::resource_update_cmds::file_source(path);
     let bytes = read_image_file("resource.import", path, MAX_BYTES as u64)?;
-    let name = s.import_resource_bytes_prefixed(strp(p, "prefix").unwrap_or(""), path, bytes)?;
+
+    let name = s.edit("Import resource", |session| {
+        let name = session.add_image_resource_prefixed(prefix, path, bytes, texturecraft_formats::MAX_RESOURCE_TEXELS)?;
+        session.doc.project.resource_sources.insert(name.clone(), source);
+        Ok(name)
+    })?;
     Ok(json!({ "name": name }))
 }
 
@@ -247,15 +282,17 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     if !s.doc.resources.contains_key(&name) {
         return Err(bad("resource.remove", format!("no resource `{name}`")));
     }
+
     s.edit("Remove resource", |s| {
         s.doc.resources.remove(&name);
+        s.doc.project.resource_sources.remove(&name);
         Ok(())
     })?;
     s.sync_images();
     Ok(Value::Null)
 }
 
-/// Drop resources unused by layers, mask effects, the brush alpha, the stencil or the environment.
+/// Drop resources unused by layers, mesh maps, paint tools or the environment (one undo step)
 fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
     let mut used = Vec::new();
     for set in &s.doc.project.texture_sets {
@@ -265,11 +302,18 @@ fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
     }
     used.extend(s.tool.stencil.as_ref().map(|st| st.image.clone()));
     used.extend(s.tool.brush.alpha_image.clone());
+    used.extend(s.tool.mask_image.clone());
     used.extend(s.doc.project.display.environment_resource().map(str::to_string));
+    used.extend(s.doc.project.resource_sources.iter().filter_map(|(name, source)| {
+        let slot = source.mesh_map?;
+        s.doc.baked.get(&slot.texture_set).is_some_and(|baked| baked.maps.contains_key(&slot.map)).then(|| name.clone())
+    }));
+
     let unused: Vec<String> = s.doc.resources.keys().filter(|k| !used.contains(k)).cloned().collect();
     if !unused.is_empty() {
         s.edit("Remove unused resources", |s| {
             s.doc.resources.retain(|k, _| !unused.contains(k));
+            s.doc.project.resource_sources.retain(|k, _| !unused.contains(k));
             Ok(())
         })?;
         s.sync_images();
@@ -307,7 +351,7 @@ fn add_image_fill(s: &mut Session, p: &Value) -> Result<Value> {
     let raw_name = strp(p, "name").ok_or_else(|| bad("layer.add.image", "`name` is required"))?;
     let name = resolve_resource_name(s, raw_name)?;
     let ch = channel_param("layer.add.image", p, "channel")?.unwrap_or(Channel::BaseColor);
-    let projection = crate::layer_cmds::projection_from(p, "layer.add.image", None)?;
+    let projection = crate::layer_cmds::projection_from(p, "layer.add.image", None, || crate::warp_cmds::fitted_frame(&s.mesh))?;
     let ts = s.ts();
     let label = std::path::Path::new(&name).file_stem().and_then(|n| n.to_str()).unwrap_or("Image").to_string();
     let layer_name = s.doc.project.next_layer_name(ts, &label);

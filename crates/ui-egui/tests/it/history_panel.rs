@@ -10,7 +10,10 @@ use texturecraft_ui_egui::docking::Panel;
 
 /// Show document history so row clicks exercise the same command dispatch as the application
 fn history_harness(session: Session) -> Harness<'static, TextureCraftApp> {
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.dock.focus(Panel::History);
     harness.run_steps(4);
     harness
@@ -167,7 +170,10 @@ fn clicking_a_history_step_returns_to_it() {
         texturecraft_engine::execute(&mut session, "layer.rename", &json!({"layer": layer.0, "name": name})).unwrap();
     }
     let done = session.history_labels().len();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.state_mut().ui.dock.focus(Panel::History);
     h.run_steps(4);
     let name = |h: &Harness<'_, TextureCraftApp>| h.state().session.doc.project.layers[&layer].name.clone();

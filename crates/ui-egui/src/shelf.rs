@@ -413,17 +413,6 @@ pub(crate) fn tiles(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
     ui.add_space(SECTION_GAP);
 }
 
-/// The distinct categories of `items`, in order of first appearance.
-pub(crate) fn categories<T>(items: &[T], category: impl Fn(&T) -> &'static str) -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = Vec::new();
-    for c in items.iter().map(category) {
-        if !out.contains(&c) {
-            out.push(c);
-        }
-    }
-    out
-}
-
 /// Read the user's saved smart materials (desktop library folder and the added library locations) unless they are already listed
 #[cfg(not(target_arch = "wasm32"))]
 fn scan_library(app: &mut TextureCraftApp) {
@@ -657,7 +646,14 @@ fn big_preview(ui: &Ui, thumbs: &mut Thumbs, preview: impl FnOnce() -> ShelfPrev
     let requested_size_px = (BIG_PREVIEW_SIZE * ctx.pixels_per_point()).round() as usize;
 
     // High display scales must respect the orb camera's allocation limit
-    let on_the_orb = matches!(&preview, ShelfPreview::SmartMask(_) | ShelfPreview::SmartMaterial(_));
+    let on_the_orb = matches!(
+        &preview,
+        ShelfPreview::SmartMask(_)
+            | ShelfPreview::Generator(_)
+            | ShelfPreview::Curvature { .. }
+            | ShelfPreview::GeneratorSet { .. }
+            | ShelfPreview::SmartMaterial(_)
+    );
     let size_px = if on_the_orb { requested_size_px.clamp(1, MAX_PREVIEW_SIZE_PX) } else { requested_size_px };
 
     // Scrolling moves tiles beneath a stationary pointer

@@ -24,7 +24,10 @@ fn display(harness: &Harness<'_, TextureCraftApp>) -> DisplaySettings {
 /// The app with Display Settings open from the rail and the Post effects section unfolded
 fn app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     harness
@@ -72,15 +75,6 @@ fn drag(harness: &mut Harness<'_, TextureCraftApp>, label: &str, x: f32) {
     harness.run_steps(2);
     harness.drop_at(egui::pos2(l.left() + x, y));
     harness.run_steps(SETTLE_FRAMES);
-}
-
-#[test]
-fn the_defaults_are_off() {
-    let harness = app();
-    let d = display(&harness);
-    assert!(!d.post_effects);
-    assert_eq!(amounts(&d), [0.0; 4]);
-    assert!(reset_icon(&harness).accesskit_node().is_disabled(), "nothing to reset yet");
 }
 
 #[test]

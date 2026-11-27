@@ -1,9 +1,12 @@
 # .deb and .rpm packages (nfpm: https://nfpm.goreleaser.com). Run by package.sh, which stages
 # the file tree, substitutes its path for ${STAGE} (nfpm doesn't expand env vars in `src`) and
-# exports VERSION and NFPM_ARCH.
+# exports VERSION, NFPM_ARCH, NFPM_NAME, NFPM_BIN and NFPM_CLI (the Nightly package renames the
+# first two and has no CLI, so package.sh removes the CLI entry for it). By hand, all five are
+# needed:
 #
-#   nfpm package -f packaging/linux/nfpm.yaml -p deb -t dist/release/
-name: texturecraft
+#   VERSION=1.2.3 NFPM_ARCH=amd64 NFPM_NAME=texturecraft NFPM_BIN=texturecraft \
+#   NFPM_CLI=texturecraft-cli nfpm package -f packaging/linux/nfpm.yaml -p deb -t dist/release/
+name: ${NFPM_NAME}
 arch: ${NFPM_ARCH}
 platform: linux
 version: ${VERSION}
@@ -66,12 +69,15 @@ overrides:
       - xdg-desktop-portal
 
 contents:
-  - src: ${STAGE}/usr/bin/texturecraft
-    dst: /usr/bin/texturecraft
+  - src: ${STAGE}/usr/bin/${NFPM_BIN}
+    dst: /usr/bin/${NFPM_BIN}
     file_info: { mode: 0755 }
-  - src: ${STAGE}/usr/bin/texturecraft-cli
-    dst: /usr/bin/texturecraft-cli
+  - src: ${STAGE}/usr/bin/${NFPM_CLI}
+    dst: /usr/bin/${NFPM_CLI}
     file_info: { mode: 0755 }
+  - src: ${STAGE}/usr/lib/
+    dst: /usr/lib/
+    type: tree
   - src: ${STAGE}/usr/share/
     dst: /usr/share/
     type: tree

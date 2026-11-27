@@ -63,14 +63,18 @@ when it is not docked). Each opens a popup beside the bar with its title in capi
 button that turns it into a floating window, and *Close*. A floating rail panel has a *Dock* button
 that closes it back onto the bar; the float is saved with the UI state.
 
-- **Export:** SEND TO lists three targets and a Configure button, all greyed with "Not available
-  yet". The reference names other products there; TextureCraft says *Export to image editor*,
-  *Send to compositing app* and *Send to 3D staging app*. EXPORT has *Export Mesh...* (the
+- **Export:** the dock shows EXPORT only (the reference's SEND TO part has no counterpart here and
+  is left out, [#789](https://github.com/storytold/texturecraft/issues/789)). EXPORT has *Export Mesh...* (the
   *Mesh Export Options* prompt, then the file choice) and *Export Textures...* (the Export textures
   window: *Global settings* above the texture sets, *General Export Parameters*, *Export USD asset*
-  and *Export shaders parameters* greyed, *Include all*, *Save settings* and "N textures selected
-  for export"). The prompt's *With displacement/tessellation* choice and both option checkboxes are
-  greyed; TextureCraft exports the mesh as it is.
+  (off by default; it adds `usdAsset` to the last texture set's export, which writes `<mesh>.usd`
+  with materials that refer to the exported textures; greyed in the browser), *Export shaders
+  parameters* greyed, *Include all*, *Save settings* and "N textures selected for export").
+  *Export MaterialX* beside them is a TextureCraft addition: it adds `materialX: true` to the
+  export. The prompt's *With displacement/tessellation* choice and *Apply triangulation* are greyed
+  (TextureCraft exports the mesh as it is, triangulated). *Recompute vertex normals* works and sits under
+  *Without displacement/tessellation*, off by default: it writes smooth area-weighted normals to the
+  exported copy only.
 - **Window menu:** Views lists *Renderer Settings* (a panel of its own: the tracer in use, the
   samples so far and a note; it floats when first opened and is not opened by itself in Rendering
   mode), *Properties - Paint* while a project is open (other tools read "Properties - <tool>",
@@ -152,7 +156,7 @@ that closes it back onto the bar; the float is saved with the UI state.
 | UI-12 | Generator depth and property coverage | **UI + source.** The picker contains seven kinds. Switching to Position, changing Global balance and duplicating the effect worked. Shared global adjustments, resolution and input slots already exist; that does not establish the richer generator/control inventory in [#374](https://github.com/storytold/texturecraft/issues/374) | Audit each generator's inputs, micro-detail behavior and controls against the reference; do not count seven shared implementations as equivalent to its whole catalog |
 | UI-13 | Narrow workspace readability | **UI.** At 1280 × 800 the app rendered, both views stayed visible and the toolbar exposed scroll arrows. Layer names/types became heavily truncated, the layer toolbar wrapped, and Properties needed scrolling. This was not an input-failure or docking-persistence test | Repeat the editing tasks at smaller sizes, widen/rearrange panels, check full-name tooltips and keyboard access, and retain the layout after restart. Since then: the Layers toolbar stays on one row at 1280 × 800 (its channel box shrinks), and a cut-short layer name or type shows in full on hover. Properties scrolling and restart persistence are unchanged |
 | UI-14 | Assets panel filters | **UI + source.** The type dropdown lists the reference entries in its order, Fonts and Show all included. Saved searches and Filter by path are separate scrollable panes with a divider that supports pointer and keyboard resizing and saves its position with the UI state ([#640](https://github.com/storytold/texturecraft/issues/640)). Fonts, the built-in saved searches Favorites, 3D Assets and Flattened layers, and the System fonts and User fonts libraries are listed but greyed with "Not available yet" | Give fonts, favorites, 3D assets and flattened layers real assets, then enable those rows and check that each one filters the grid |
-| UI-15 | Edit > Settings ([#637](https://github.com/storytold/texturecraft/issues/637)) | **Source + headless UI tests.** The window has the reference's General, Shortcuts and Libraries pages with OK and Cancel, and the General sections in its order (no Privacy section: TextureCraft sends no usage data). Language (with Default (System Language)), the camera rotation, zoom and wheel speeds with Inverse direction, Enable GPU raytracing, the Shortcuts page and adding or removing library locations work. Show keyboard helper, Show world axes, Background color, Only display the selected material when painting, Viewport Scaling, Default UV scale for materials, simplified thumbnails, the other baking options, the preview cache and shader, the temporary cache directory, sparse virtual texture and the IRAY HARDWARE choices are shown disabled with "Not available yet". A location's Default choice is fixed to your_assets. The Shortcuts page has the sections Actions, Mouse shortcuts and Modifiers shortcuts and a Reset all to default button; Delete clears a binding; a shared shortcut shows a warning naming the other action, a warning on the page icon and the footer "One or several errors have been found in Shortcuts settings", and OK stays disabled until it is gone (the mouse and modifier rows are shown disabled, the viewports read those gestures from code). The shortcut list uses the reference's action names, order and default keys ("Open project", "Save as project", "Switch to baking mode" Ctrl+Shift+B, "Switch to edition mode" F9, "Camera projection: Perspective view" F5, "Show entire mesh/path", "Select next camera" `>`, "Select previous camera" `<`, "Viewers layout: 3D/2D" F1 to "Viewers layout: Swap 3D/2D" F4 and so on); Quit keeps Ctrl+Q and the menus keep their own texts. "Show mesh wireframe" is a new bindable command without a key; "Pause Engine Computation" (Shift+Esc) and "Toggle animation" (Space) are listed disabled with "Not available yet". The window reopens on the page it was closed on. With a project open the Libraries page hides the add row and shows "Library locations can't be added/removed when a project is opened."; the default library's "−" says "Cannot remove the default library.". "GPU raytracing not available for your hardware." shows under the Baking options when there is no GPU. TextureCraft's own settings (appearance, viewport textures, resources, autosave, folders) follow the reference sections | Run the window in the native app; wire each disabled control as its function lands |
+| UI-15 | Edit > Settings ([#637](https://github.com/storytold/texturecraft/issues/637)) | **Source + headless UI tests.** The window has the reference's General, Shortcuts and Libraries pages with OK and Cancel, and the General sections in its order (no Privacy section: TextureCraft sends no usage data). Language (Default (System Language) by default and after a reset), the camera rotation, zoom and wheel speeds with Inverse direction, Show world axes (the 3D view's X, Y and Z corner), the Shortcuts page and adding or removing library locations work. Enable GPU raytracing defaults to on when the native bake adapter supports its compute shaders. Unsupported hardware and the browser show it off and disabled ([#823](https://github.com/storytold/texturecraft/issues/823)). Show keyboard helper (on), Only display the selected material when painting (off), Save preprocessed scene files (on) and the Local cache directory are editable preferences saved for future use. R restores the default per-user cache path or the Nightly profile cache path. Enable live preview baking process (on) controls the automatic Bake mode map preview when the panel's Map Preview switch is also on. Viewport Scaling opens but lists only Auto, so there is nothing to change. Default UV scale for materials, simplified thumbnails, the preview cache budget and shader, the Files cache directory and sparse virtual texture are shown disabled with "Not available yet". There is no IRAY HARDWARE section. A location's Default choice is fixed to your_assets. The Shortcuts page has the sections Actions, Mouse shortcuts and Modifiers shortcuts and a Reset all to default button; Delete clears a binding; a shared shortcut shows a warning naming the other action, a warning on the page icon and the footer "One or several errors have been found in Shortcuts settings", and OK stays disabled until it is gone (the mouse and modifier rows are shown disabled, the viewports read those gestures from code). The shortcut list uses the reference's action names, order and default keys ("Open project", "Save as project", "Switch to baking mode" F8, "Switch to edition mode" F9, "Camera projection: Perspective view" F5, "Show entire mesh/path", "Select next camera" `>`, "Select previous camera" `<`, "Viewers layout: 3D/2D" F1 to "Viewers layout: Swap 3D/2D" F4 and so on); Quit keeps Ctrl+Q and the menus keep their own texts. "Show mesh wireframe" is a new bindable command without a key; "Pause Engine Computation" (Shift+Esc) and "Toggle animation" (Space) are listed disabled with "Not available yet". Seven unavailable transform and warp actions follow "Export Textures...". Their example keys can still be bound to working commands. The window reopens on the page it was closed on. With a project open the Libraries page hides the add row and shows "Library locations can't be added/removed when a project is opened."; the default library's "−" says "Cannot remove the default library.". "GPU raytracing not available for your hardware." shows under Baking options when GPU baking is unavailable. The reference's TEMPORARY FILES section is called FILES and also holds the Data folder. Stable installations can edit the path. Nightly shows the fixed profile path. TextureCraft's own settings follow the reference sections: RESOURCES (Max CPU threads for work, default every thread, and Cores kept for the UI as sliders in steps of 1 with the core count beside them, Max RAM while saving as a 0-100% slider, Max project size on open, Recent projects limit) and AUTOSAVE. There is no appearance, viewport, folders or analytics section: the viewport texture resolution (Full, Half, Quarter) is in Display Settings › Render settings, and interface scale, brightness, accent color and the system title bar stay in the saved settings and `ui.set` | Run the window in the native app; wire each disabled control as its function lands |
 
 Bake workflow (issue [#651](https://github.com/storytold/texturecraft/issues/651)): Mesh Map Bakers
 has a Presets menu (save, load, delete named bake settings; Apply to All Texture Sets) and a finished
@@ -187,7 +191,7 @@ list, not a feature-completion denominator.
 | F09 Generator editing | UI | Pass | Layer context menu added a generator to that mask. Selecting Position and dragging Global balance changed the mask/viewport; inspection recorded balance about 0.279 |
 | F10 Duplicate an effect | UI | Pass | Ctrl+D produced a separate Generator copy with the same parameters and a Duplicate effect history step |
 | F11 UV rectangle fill | UI | Pass | Tool 4, UV-island mode and a rectangle across two UV islands wrote 88 tiles per painted channel on a new paint layer. Undo removed that fill. Topology was visible in the tool |
-| F12 Bake from the UI | UI | Pass | F8 (now Ctrl+Shift+B), 256 px, low mesh used as high mesh, Check All and Bake completed all ten map types. The UI log reported CPU execution; this is separate from the GPU command check |
+| F12 Bake from the UI | UI | Pass | F8, 256 px, low mesh used as high mesh, Check All and Bake completed all ten map types. The UI log reported CPU execution; this is separate from the GPU command check |
 | F13 Texture-export flow | UI + accessibility text entry | Pass | Inspected Settings, Output templates and List of exports, then clicked Export. Eight 1024 px PNGs decoded successfully; all eight were byte-identical to command exports from the same saved project/options. The base-color output was inspected visually. Template creation/editing was not exercised |
 | F14 Save and reopen | Mixed | Pass within scope | Ctrl+S and the native Save As dialog saved four layers, two generator effects, 21 painted tiles per channel and ten 256 px baked maps. Reopening through `file.open` matched inspected layers, texture sets and mesh. This was not a complete keyboard-only open-dialog test |
 | F15 Smaller window | Scripted resize + UI inspection | Partial | 1280 × 800 rendered with working layout structure; the readability limits are UI-13. No full task suite at that size |
@@ -220,7 +224,7 @@ built-in `udim_plane`, a uniform fill and a tile-1002 resolution override.
 - The shelf displayed four columns at the larger size, with type controls and search. Do not
   treat every older shelf-layout request as a currently missing implementation.
 - A missing mask-thumbnail menu does not mean mask effects are unavailable: the layer-name menu
-  worked. A missing MaterialX UI option does not mean the exporter is absent.
+  worked.
 
 ## Still unverified
 
@@ -289,15 +293,16 @@ that numbers hide once a tile is under 40 points on screen.
   adds "Maximum size for all Texture Sets" and 128. Padding uses the reference order; the
   dilation width is a button with a "Dilation (pixels)" slider, greyed for paddings without a
   width. Include all, Reset all, Cancel, Save settings, Export and the two greyed checkboxes carry
-  tooltips explaining which settings are applied, kept or restored.
+  tooltips saying what they select, write, keep or restore. The window is 1100 x 740 as in the reference
+  ([#789](https://github.com/storytold/texturecraft/issues/789)).
   Cancel, and closing the window, go back to the settings the window opened with; the window
   always opens on SETTINGS.
 - **Texture set pages** ([#669](https://github.com/storytold/texturecraft/issues/669)): a click
   on a texture set row shows its *General Export Parameters*: Output template, File type, Size and
   Padding with the inherited value as text (for example "1024x1024 (Texture Set size)"). The
   pencil button ("Enable override") turns a row into its list; a set with an override gets "*"
-  ("Override(s) active"). The header menu has *Override every item* and *Disable
-  override for all items*. The template list leaves out the entries the reference leaves out
+  ("Override(s) active"). The header menu has *Override every item* and *Clear all
+  overrides*. The template list leaves out the entries the reference leaves out
   there; sizes read "128x128" ... "8192x8192". Export, the footer count and LIST OF EXPORTS use
   each set's own settings. Ticks and overrides belong to the project and follow each texture set
   by name (another project starts without them); renaming a template on OUTPUT TEMPLATES takes
@@ -336,9 +341,37 @@ that numbers hide once a tile is under 40 points on screen.
   list is titled *Presets* and lists the templates sorted by name, without the template list's
   first group. A right click on a preset offers *Rename*, *Duplicate* and *Remove* (Rename and
   Remove are greyed for built-in templates, which are read-only); F2 renames the selected one.
-  "+" creates "new_export_preset", Duplicate "<name>_copy". *Naming pattern* (*OpenPBR*; the
-  reference's second pattern names another vendor's material and is left out) with its info
-  tooltip sits above the input maps. The middle reads "Current preset: <name>", *Output maps*
-  with *Create:* Gray, RGB, R+G+B, RGB+A, R+G+B+A, and a footer with drag-and-drop guidance and the number of output maps. TextureCraft keeps its
-  own list tools (rename, import, export) and asks before deleting; R+G+B and R+G+B+A create the
-  same maps as RGB and RGB+A (each channel takes its own source in either).
+  "+" creates "new_export_preset", Duplicate "<name>_copy". The *Presets* row holds copy, "−"
+  and "+" without tooltips ([#789](https://github.com/storytold/texturecraft/issues/789)).
+  *Naming pattern* (*OpenPBR*; the reference's second pattern names another vendor's material and
+  is left out) with its info tooltip sits at the right end of the tab row; this tab has no
+  *Include all*, *Reset all* or texture count, and *Save settings* and *Export* are greyed. The
+  middle reads "Current preset: <name>", *Output maps* with *Create:* Gray, RGB, R+G+B, RGB+A,
+  R+G+B+A on the same row, and a footer with drag-and-drop guidance and the number of output
+  maps. Each output map is one row: a drag grip (drag it onto another row to move the map), the
+  file name, "$" ("Insert a variable": $project,
+  $mesh, $textureSet, $udim, $uvTileName greyed, $colorSpace, then TextureCraft's $channel), the
+  channel swatches (Gr, RGB or R, G, B, then A), the file format ("File format") and bit depth
+  ("Bit depth"; "8 bits + dithering" greyed, templates do not keep it) lists, duplicate and "×".
+  Create names new rows "Gray", "RGB" and "RGBA" after "$mesh_$textureSet_", so the
+  texture sets of one export do not write the same file, with "_1", "_2" when taken. An
+  empty swatch's tooltip reads "Empty (writes black)" ("Empty (writes white)" for A, the other
+  way round when the swatch is inverted), a filled one
+  "<map>, <part>", e.g. "Base color, red channel" or "Metallic, gray value". Dropping a map on a
+  swatch asks "Which part of <map>?": a gray map offers *Gray value* and *Alpha channel*, a colour map
+  *Gray value*, *Red channel*, *Green channel*, *Blue channel* and *Alpha channel*, on the RGB swatch first *Red, green and blue*; Escape assigns
+  nothing. TextureCraft cannot read a map's gray or alpha yet, so those choices are greyed. A
+  click on a swatch offers *Clear channel*, on RGB, R, G and B also *Separate R, G and B*; R, G
+  and B that read different maps or are inverted differently cannot be joined (the item is greyed). The right side has the
+  *Input maps* pane in the OpenPBR parameter groups (Base ... Geometry, then Other for
+  TextureCraft's channels outside OpenPBR), each map TextureCraft has under its own name,
+  and a pane with *Mesh maps* above *Converted maps* (highlighted). Maps the selected template
+  uses get a square in their swatch's colour. OpenPBR inputs TextureCraft has no channel for
+  are greyed and cannot be dragged; *Converted maps* lists the maps TextureCraft computes. TextureCraft keeps
+  some things the reference does not have, out of the way: Import and Export of template files
+  at the end of a preset's right-click menu and in a *Template actions* button (three dots, left of
+  copy on the *Presets* row) that the keyboard reaches, with Import focused when it opens; a swatch's right-click menu with Invert (an inverted
+  swatch has a corner mark), Black, Gray 50%, White, the constant's value and the map's layout
+  (RGB, RGBA, Gray, Gray + A); *Move up* and *Move down* in the grip's right-click menu and the
+  arrow keys on a focused grip; the planned file name in the file name's tooltip; and
+  converted maps of its own such as Normal from height, Roughness from glossiness and Sheen color × weight. Built-in templates stay read-only and deleting asks first.
