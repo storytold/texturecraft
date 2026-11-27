@@ -1181,7 +1181,8 @@ impl eframe::App for TextureCraftApp {
         self.last_time = now;
 
         let style = (self.ui.prefs.brightness, self.ui.prefs.accent);
-        if self.styled != Some(style) {
+        let theme_changed = self.styled != Some(style);
+        if theme_changed {
             theme::apply(ctx, style.0, style.1);
             self.styled = Some(style);
         }
@@ -1242,6 +1243,10 @@ impl eframe::App for TextureCraftApp {
             self.autosave(now);
         }
         i18n::set_language(&self.ui.prefs.language);
+        let rtl = matches!(i18n::current().code, "ar" | "he");
+        if theme_changed || ctx.global_style().right_to_left != rtl {
+            ctx.all_styles_mut(|s| s.right_to_left = rtl);
+        }
         #[cfg(target_arch = "wasm32")]
         {
             keymap::sync_captured(&self.ui.keymap);

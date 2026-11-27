@@ -157,11 +157,11 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
     let tokens = Tokens::get(ctx);
     let frame = egui::Frame::popup(&ctx.global_style()).fill(tokens.panel).stroke(egui::Stroke::new(1.0, tokens.accent));
-    let (top_right, width) = placement(ctx, strip, icon);
+    let (pivot, anchor_pos, width) = placement(ctx, strip, icon);
     let mut closed = false;
     let mut undocked = false;
     let mut dragged_from = None;
-    egui::Area::new(area_id()).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_TOP).fixed_pos(top_right).show(ctx, |ui| {
+    egui::Area::new(area_id()).order(egui::Order::Foreground).pivot(pivot).fixed_pos(anchor_pos).show(ctx, |ui| {
         frame.show(ui, |ui| {
             ui.set_width(width - frame.total_margin().sum().x);
             let title_top = ui.cursor().top();
@@ -195,12 +195,18 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     }
 }
 
-/// The popup's top right corner, beside the rail and level with its icon, and its width (egui keeps the area on screen)
-fn placement(ctx: &egui::Context, strip: Rect, icon: Rect) -> (Pos2, f32) {
-    let right = strip.left() - RAIL_GAP;
+/// The popup's top-corner pivot beside the rail and level with its icon, its position, and its width.
+fn placement(ctx: &egui::Context, strip: Rect, icon: Rect) -> (egui::Align2, Pos2, f32) {
     let viewport = ctx.data(|data| data.get_temp::<Rect>(viewport_id()));
-    let width = viewport.map_or(POPUP_MIN_WIDTH, |viewport| right - (viewport.right() - VIEWPORT_OVERHANG)).max(POPUP_MIN_WIDTH);
-    (Pos2::new(right, icon.top()), width)
+    if ctx.global_style().right_to_left {
+        let left = strip.right() + RAIL_GAP;
+        let width = viewport.map_or(POPUP_MIN_WIDTH, |viewport| (viewport.left() + VIEWPORT_OVERHANG) - left).max(POPUP_MIN_WIDTH);
+        (egui::Align2::LEFT_TOP, Pos2::new(left, icon.top()), width)
+    } else {
+        let right = strip.left() - RAIL_GAP;
+        let width = viewport.map_or(POPUP_MIN_WIDTH, |viewport| right - (viewport.right() - VIEWPORT_OVERHANG)).max(POPUP_MIN_WIDTH);
+        (egui::Align2::RIGHT_TOP, Pos2::new(right, icon.top()), width)
+    }
 }
 
 /// A press outside the popup and the rail, unless in one of the popup's own dropdowns or its colour picker window
@@ -230,7 +236,10 @@ fn body(app: &mut TextureCraftApp, ui: &mut Ui, panel: Panel, available_height: 
 
 /// The panel's name in capitals, which drags like a tab, then Undock and Close: whether each was clicked, and where a drag started
 fn title_row(ui: &mut Ui, tokens: &Tokens, panel: Panel) -> (bool, bool, Option<Rect>) {
-    let row = ui.horizontal(|ui| {
+    let rtl = ui.style().right_to_left;
+    let layout = if rtl { egui::Layout::right_to_left(egui::Align::Center) } else { egui::Layout::left_to_right(egui::Align::Center) };
+    let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y.max(TITLE_BUTTON_SIZE));
+    let row = ui.allocate_ui_with_layout(size, layout, |ui| {
         ui.label(RichText::new(tr(panel.name()).to_uppercase()).strong().color(tokens.text_strong));
         ui.add_space((ui.available_width() - 2.0 * TITLE_BUTTON_SIZE - TITLE_BUTTON_GAP).max(0.0));
         let undock = icon_button(ui, ic::ARROW_SQUARE_OUT, tr("Undock"), false, TITLE_BUTTON_SIZE);
@@ -240,7 +249,11 @@ fn title_row(ui: &mut Ui, tokens: &Tokens, panel: Panel) -> (bool, bool, Option<
     });
 
     let (row, (undock, close)) = (row.response.rect, row.inner);
-    let title = Rect::from_min_max(row.min, egui::pos2(undock.rect.left(), row.bottom()));
+    let title = if rtl {
+        Rect::from_min_max(egui::pos2(undock.rect.right(), row.top()), row.max)
+    } else {
+        Rect::from_min_max(row.min, egui::pos2(undock.rect.left(), row.bottom()))
+    };
     let drag = ui.interact(title, ui.scope_id().with("rail_popup_title"), Sense::drag()).on_hover_cursor(egui::CursorIcon::Grab);
     (close.clicked(), undock.clicked(), drag.drag_started().then_some(title))
 }

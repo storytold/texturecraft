@@ -120,7 +120,9 @@ impl TextureCraftApp {
             Brightness::Light | Brightness::MediumLight => craft_theme::Mode::Light,
             Brightness::Dark | Brightness::MediumDark => craft_theme::Mode::Dark,
         };
-        let mut root = RootEnv::new().mode(mode).scale(Scale::new(scale));
+        let dir =
+            if matches!(crate::i18n::current().code, "ar" | "he") { craft_ui::runtime::env::Direction::Rtl } else { craft_ui::runtime::env::Direction::Ltr };
+        let mut root = RootEnv::new().mode(mode).scale(Scale::new(scale)).direction(dir);
         // Hide UI on another key leaves Tab to focus traversal and the shortcuts
         root.tab_toggles_chrome = crate::keymap::shortcut_of(&self.ui.keymap, "ui.hideUi") == Some("Tab");
         let app_modal = crate::docking::input_blocked(self, ctx).then_some(ViewportId::ROOT);

@@ -134,7 +134,9 @@ pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
         egui::Panel::top("menu_bar").exact_size(height(ui)).show_separator_line(false).frame(egui::Frame::NONE.fill(tk.chrome)).show(ui, |ui| {
             let rect = ui.max_rect();
             let content = Rect::from_min_max(pos2(rect.left() + PAD, rect.top()), pos2(rect.right() - PAD, rect.bottom()));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(content).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            let row =
+                if ui.style().right_to_left { egui::Layout::right_to_left(egui::Align::Center) } else { egui::Layout::left_to_right(egui::Align::Center) };
+            ui.scope_builder(egui::UiBuilder::new().max_rect(content).layout(row), |ui| {
                 paint_icon(ui);
                 crate::menus::menu_bar(app, ui);
             });
@@ -178,7 +180,8 @@ fn paint_icon(ui: &mut Ui) {
         }
     };
     let row = ui.max_rect();
-    let min = pos2(ui.cursor().min.x, row.center().y - ICON / 2.0).round_to_pixels(ppp);
+    let x = if ui.style().right_to_left { ui.cursor().max.x - ICON } else { ui.cursor().min.x };
+    let min = pos2(x, row.center().y - ICON / 2.0).round_to_pixels(ppp);
     if let Some(t) = texture {
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         ui.painter().image(t.id(), Rect::from_min_size(min, vec2(ICON, ICON)), uv, Color32::WHITE);

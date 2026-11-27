@@ -462,10 +462,14 @@ const SHELF_PADDING: egui::Margin = egui::Margin::symmetric(3, 6);
 
 pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let tokens = Tokens::get(ui.ctx());
-    egui::Panel::left("tool_shelf").resizable(false).exact_size(SHELF_WIDTH).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
+    let rtl = ui.style().right_to_left;
+    let panel = if rtl { egui::Panel::right("tool_shelf") } else { egui::Panel::left("tool_shelf") };
+    panel.resizable(false).exact_size(SHELF_WIDTH).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
         // The tools start level with the panels' contents, below their tab strips
         let top = GUTTER + crate::docking::TAB_HEIGHT as i8;
-        card(ui, &tokens, egui::Margin { left: GUTTER, right: 0, top, bottom: GUTTER }, SHELF_PADDING, |ui| {
+        let margin =
+            if rtl { egui::Margin { left: 0, right: GUTTER, top, bottom: GUTTER } } else { egui::Margin { left: GUTTER, right: 0, top, bottom: GUTTER } };
+        card(ui, &tokens, margin, SHELF_PADDING, |ui| {
             ui.spacing_mut().item_spacing.y = SHELF_BUTTON_SPACING;
 
             // Rendering has nothing to paint, so its shelf keeps only the buttons below the tools
@@ -534,8 +538,15 @@ const RAIL_CARD_PADDING: egui::Margin = SHELF_PADDING;
 /// The icon rail: the rail panels that are not in the dock (Export first), each opening its popup
 pub fn rail(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let tokens = Tokens::get(ui.ctx());
-    egui::Panel::right("rail").resizable(false).exact_size(RAIL_WIDTH).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
-        card(ui, &tokens, egui::Margin { left: 0, right: GUTTER, top: GUTTER, bottom: GUTTER }, RAIL_CARD_PADDING, |ui| {
+    let rtl = ui.style().right_to_left;
+    let panel = if rtl { egui::Panel::left("rail") } else { egui::Panel::right("rail") };
+    panel.resizable(false).exact_size(RAIL_WIDTH).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
+        let margin = if rtl {
+            egui::Margin { left: GUTTER, right: 0, top: GUTTER, bottom: GUTTER }
+        } else {
+            egui::Margin { left: 0, right: GUTTER, top: GUTTER, bottom: GUTTER }
+        };
+        card(ui, &tokens, margin, RAIL_CARD_PADDING, |ui| {
             ui.spacing_mut().item_spacing.y = RAIL_ICON_GAP;
             crate::rail_popup::begin_rail(ui.ctx(), ui.max_rect());
 

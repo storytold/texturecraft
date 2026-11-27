@@ -301,56 +301,61 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
 pub fn menu_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let tk = Tokens::get(ui.ctx());
     egui::MenuBar::new().ui(ui, |ui| {
-        let ctx = ui.ctx().clone();
-        for top in TOP {
-            ui.menu_button(tr(top), |ui| {
-                ui.set_min_width(220.0);
-                let mut current_sub: Option<&str> = None;
-                let items: Vec<Item> = CATALOG.iter().filter(|i| i.menu == top).copied().collect();
-                for item in &items {
-                    if let Some(s) = item.sub {
-                        if current_sub == Some(s) {
+        let rtl = ui.style().right_to_left;
+        let row = if rtl { egui::Layout::right_to_left(egui::Align::Center) } else { egui::Layout::left_to_right(egui::Align::Center) };
+        ui.with_layout(row, |ui| {
+            let ctx = ui.ctx().clone();
+            for top in TOP {
+                ui.menu_button(tr(top), |ui| {
+                    ui.set_min_width(220.0);
+                    let mut current_sub: Option<&str> = None;
+                    let items: Vec<Item> = CATALOG.iter().filter(|i| i.menu == top).copied().collect();
+                    for item in &items {
+                        if let Some(s) = item.sub {
+                            if current_sub == Some(s) {
+                                continue;
+                            }
+
+                            current_sub = Some(s);
+                            let submenu_enabled = s != "More Save Options" || app.session.project_open;
+                            ui.add_enabled_ui(submenu_enabled, |ui| {
+                                ui.menu_button((menu_mark(ui, None), tr(s)), |ui| {
+                                    if s == "Recent Projects" {
+                                        for path in app.ui.recent.clone() {
+                                            if ui.button((menu_mark(ui, None), path.as_str())).clicked() {
+                                                #[cfg(not(target_arch = "wasm32"))]
+                                                crate::windows::open_path(app, &path);
+                                                ui.close();
+                                            }
+                                        }
+                                        ui.separator();
+                                    }
+                                    for x in items.iter().filter(|x| x.sub == Some(s)) {
+                                        menu_item(app, &ctx, ui, x);
+                                    }
+                                })
+                            });
                             continue;
                         }
 
-                        current_sub = Some(s);
-                        let submenu_enabled = s != "More Save Options" || app.session.project_open;
-                        ui.add_enabled_ui(submenu_enabled, |ui| {
-                            ui.menu_button((menu_mark(ui, None), tr(s)), |ui| {
-                                if s == "Recent Projects" {
-                                    for path in app.ui.recent.clone() {
-                                        if ui.button((menu_mark(ui, None), path.as_str())).clicked() {
-                                            #[cfg(not(target_arch = "wasm32"))]
-                                            crate::windows::open_path(app, &path);
-                                            ui.close();
-                                        }
-                                    }
-                                    ui.separator();
-                                }
-                                for x in items.iter().filter(|x| x.sub == Some(s)) {
-                                    menu_item(app, &ctx, ui, x);
-                                }
-                            })
-                        });
-                        continue;
-                    }
+                        if item.label == "-" {
+                            ui.separator();
+                            continue;
+                        }
 
-                    if item.label == "-" {
-                        ui.separator();
-                        continue;
+                        menu_item(app, &ctx, ui, item);
                     }
-
-                    menu_item(app, &ctx, ui, item);
-                }
+                });
+            }
+            let trailing = if rtl { egui::Layout::left_to_right(egui::Align::Center) } else { egui::Layout::right_to_left(egui::Align::Center) };
+            ui.with_layout(trailing, |ui| {
+                let mode = match app.ui.mode {
+                    Mode::Painting => tr("Painting"),
+                    Mode::Baking => tr("Baking"),
+                    Mode::Rendering => tr("Rendering"),
+                };
+                ui.label(egui::RichText::new(mode).size(11.0).color(tk.text_dim));
             });
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let mode = match app.ui.mode {
-                Mode::Painting => tr("Painting"),
-                Mode::Baking => tr("Baking"),
-                Mode::Rendering => tr("Rendering"),
-            };
-            ui.label(egui::RichText::new(mode).size(11.0).color(tk.text_dim));
         });
     });
 }
