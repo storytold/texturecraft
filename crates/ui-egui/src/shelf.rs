@@ -6,7 +6,8 @@ use serde_json::json;
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_engine::formats::mcmat::MCMAT_EXT;
 use texturecraft_engine::geom::glam::Vec2;
-use texturecraft_engine::orb_preview::MAX_PREVIEW_SIZE_PX;
+#[cfg(not(target_arch = "wasm32"))]
+use texturecraft_engine::material_lib::SMART_MATERIAL_EXT;
 
 use crate::TextureCraftApp;
 use crate::decal_drop::DecalDrop;
@@ -437,6 +438,8 @@ fn scan_library(app: &mut TextureCraftApp) {
         .collect();
     files.sort();
     files.dedup();
+    // Changed and removed files lose their cached previews before the new scan is published
+    app.thumbs.scan_user_materials(&files);
     app.library = Some(files);
 }
 
@@ -448,7 +451,7 @@ fn saved_material_name(path: &std::path::Path) -> &str {
     path.file_stem().and_then(|stem| stem.to_str()).unwrap_or(SAVED_MATERIAL_NAME)
 }
 
-/// The user's saved smart materials matching `filter`, as rows under the grid
+/// Saved smart materials matching `filter`, with orb previews and linked materials as rows
 #[cfg(not(target_arch = "wasm32"))]
 fn library(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str, masks: bool) {
     let tokens = Tokens::get(ui.ctx());
@@ -470,7 +473,21 @@ fn library(app: &mut TextureCraftApp, ui: &mut Ui, filter: &str, masks: bool) {
     }
 
     let mut selected = Vec::new();
-    for path in paths {
+
+    // Saved smart materials get preview tiles; masks and linked MaterialCraft materials stay rows
+    let (smart_materials, rows): (Vec<_>, Vec<_>) = paths.partition(|path| !masks && path.extension().is_some_and(|ext| ext == SMART_MATERIAL_EXT));
+    let view = app.ui.shelf_view;
+    tiles(ui, |ui| {
+        for path in smart_materials {
+            let label = saved_material_name(path);
+            let asset = Asset::Library(path.display().to_string());
+            let texture = |ui: &Ui, thumbs: &mut Thumbs| thumbs.user_material(ui.ctx(), path);
+            if tile_in_view(ui, &mut app.thumbs, texture, |_| Some(ShelfPreview::UserMaterial(path.clone())), label, Some(&asset), view).clicked() {
+                selected.push(asset);
+            }
+        }
+    });
+    for path in rows {
         let label = saved_material_name(path);
 
         // MaterialCraft materials (sent from MaterialCraft) show a graph
@@ -646,15 +663,7 @@ fn big_preview(ui: &Ui, thumbs: &mut Thumbs, preview: impl FnOnce() -> ShelfPrev
     let requested_size_px = (BIG_PREVIEW_SIZE * ctx.pixels_per_point()).round() as usize;
 
     // High display scales must respect the orb camera's allocation limit
-    let on_the_orb = matches!(
-        &preview,
-        ShelfPreview::SmartMask(_)
-            | ShelfPreview::Generator(_)
-            | ShelfPreview::Curvature { .. }
-            | ShelfPreview::GeneratorSet { .. }
-            | ShelfPreview::SmartMaterial(_)
-    );
-    let size_px = if on_the_orb { requested_size_px.clamp(1, MAX_PREVIEW_SIZE_PX) } else { requested_size_px };
+    let size_px = preview.limited_size_px(requested_size_px);
 
     // Scrolling moves tiles beneath a stationary pointer
     let idle_seconds = ui.input(|input| if input.is_scrolling() { 0.0 } else { input.pointer.time_since_last_movement().min(input.time_since_last_scroll()) });
