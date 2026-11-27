@@ -98,6 +98,15 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   and alpha images become the brush alpha. Filter by role or remove selected rows before importing.
   Failed rows stay in the dialog for retry. Color LUT, post effects and asset-library import are
   unavailable. The browser imports images straight from its file picker.
+- **Resources Updater:** the desktop tool shelf lists the project's image resources, with outdated
+  resources first. Filter by status or name, and use *Show in folder* to find a linked file. Images
+  imported from disk through Import resources, PBR folders, MaterialX and mesh map import remember
+  their source file. *Update* and *Update All* reread changed files in one undo step. Layers see the
+  updated image, and an imported mesh map refreshes while it still matches the previous source.
+  *Select new resource* links an image to another file. The list refreshes while the window is open,
+  and a notice offers *Update* when changed files are found on opening a project or regaining focus.
+  Linked MaterialCraft packages appear without a source file. Re-cooking a linked fill layer refreshes
+  its cooked maps.
 - **Your own library:** right-click a layer or folder, choose *Create smart material*, and it
   appears under *My smart materials*, pixels and images included. *Create smart mask* in the same
   menu saves just the layer's mask (all its effects, painted pixels and images); it appears under

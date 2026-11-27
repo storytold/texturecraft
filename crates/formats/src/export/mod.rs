@@ -200,7 +200,7 @@ pub enum VirtualMap {
     Glossiness,
     /// Baked AO × AO channel (per the texture set's AO mixing).
     AoMixed,
-    /// Dielectric reflectance at normal incidence: 0.08 × specular level.
+    /// Dielectric reflectance at normal incidence: Specular Level scaled by the project's shader settings.
     F0,
     /// 1 − glossiness (specular/glossiness projects).
     Roughness,
@@ -770,6 +770,7 @@ struct Sampler<'a> {
     /// Normal convention overriding every normal output.
     normal_override: Option<NormalFormat>,
     project_normal: NormalFormat,
+    dielectric_f0_scale: f32,
 }
 
 fn unpack(v: [f32; 3]) -> Vec3 {
@@ -856,7 +857,7 @@ impl Sampler<'_> {
                 VirtualMap::NormalOpenGl => self.normal(at, NormalFormat::OpenGl, cache),
                 VirtualMap::NormalDirectX => self.normal(at, NormalFormat::DirectX, cache),
                 VirtualMap::Glossiness => [1.0 - self.channel(Channel::Roughness, at)[0]; 3],
-                VirtualMap::F0 => [0.08 * self.channel(Channel::SpecularLevel, at)[0]; 3],
+                VirtualMap::F0 => [self.dielectric_f0_scale * self.channel(Channel::SpecularLevel, at)[0]; 3],
                 VirtualMap::Roughness => [1.0 - self.channel(Channel::Glossiness, at)[0]; 3],
                 VirtualMap::SheenTint => self.channel(Channel::SheenColor, at).map(|c| c * self.channel(Channel::SheenWeight, at)[0]),
                 VirtualMap::HeightNormal => {
@@ -933,6 +934,7 @@ pub fn render_planned_maps(input: &ExportInput, options: &ExportOptions, planned
         scales: set.block_scales(),
         normal_override: options.normal_format,
         project_normal: input.project.normal_format,
+        dielectric_f0_scale: input.project.display.dielectric_f0_scale(),
     };
 
     planned

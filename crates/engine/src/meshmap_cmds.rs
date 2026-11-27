@@ -4,10 +4,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rayon::prelude::*;
 use serde_json::{Value, json};
 use texturecraft_compose::{ImageRes, ImageStore};
-use texturecraft_core::{BakedMap, MAX_RESOLUTION, NormalFormat, UDIM_RANGE, udim_at};
+use texturecraft_core::{BakedMap, MAX_RESOLUTION, Project, UDIM_RANGE};
 
 use crate::commands::{CommandSpec, always, bad, strp};
 use crate::set_cmds::ts_param;
@@ -45,8 +44,22 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         None => BTreeMap::from([(FIRST_TILE, image)]),
     };
 
-    let resolution = s.edit("Use image as mesh map", |s| use_images(s, CMD, ts, map, &images))?;
+    let resolution = s.edit("Use image as mesh map", |s| {
+        let resolution = use_images(s, CMD, ts, map, &images)?;
+        detach_imported_sources(&mut s.doc.project, ts, |previous| previous == map);
+        Ok(resolution)
+    })?;
+
     Ok(json!({ "map": map.id(), "resolution": resolution }))
+}
+
+/// A bake, a manual assignment or a clear ends the import link but keeps the image resource
+pub(crate) fn detach_imported_sources(project: &mut Project, texture_set: usize, replaced: impl Fn(BakedMap) -> bool) {
+    for source in project.resource_sources.values_mut() {
+        if source.mesh_map.is_some_and(|slot| slot.texture_set == texture_set && replaced(slot.map)) {
+            source.mesh_map = None;
+        }
+    }
 }
 
 /// The tile number a set without UV tiles keys its one image by
@@ -54,25 +67,7 @@ pub(crate) const FIRST_TILE: u32 = *UDIM_RANGE.start();
 
 /// Use `images` (by UV tile; one at [`FIRST_TILE`] without UV tiles) as mesh map `map` of set `ts` in the caller's edit; returns its width
 pub(crate) fn use_images(s: &mut Session, cmd: &str, ts: usize, map: BakedMap, images: &BTreeMap<u32, Arc<ImageRes>>) -> Result<u32> {
-    let texture_set = s.doc.project.texture_set(ts)?;
-    let grid = texture_set.tile_grid();
-    if let Some(tile) = texture_set.uv_tiles.iter().find(|tile| grid.is_some() && !images.contains_key(tile)) {
-        return Err(bad(cmd, format!("no image for UV tile {tile}")));
-    }
-
-    let (width, height) = image_map_size(s, cmd, ts)?;
-
-    // Bent normals are tangent-space maps like the normal map, so both follow the project's normal format
-    let flip_green = matches!(map, BakedMap::Normal | BakedMap::BentNormal) && s.doc.project.normal_format == NormalFormat::DirectX;
-    let data = match (grid, images.values().next()) {
-        (_, None) => return Err(bad(cmd, "no image to use")),
-        (None, Some(image)) => resample(map.components(), (width, height), flip_green, |u, v| image.sample(u, v)),
-        // An atlas texel reads the image of the tile its mesh UV falls in
-        (Some(grid), Some(_)) => resample(map.components(), (width, height), flip_green, |u, v| {
-            let uv = grid.from_atlas([u, v]);
-            udim_at(uv).and_then(|tile| images.get(&tile)).map_or([0.0; 4], |image| image.sample(uv[0] - uv[0].floor(), uv[1] - uv[1].floor()))
-        }),
-    };
+    let (width, data) = crate::mesh_map_sampler::MeshMapSampler::new(s, cmd, ts, map, images)?.render();
 
     let entry = s.doc.baked.entry(ts).or_default();
     entry.resolution = width;
@@ -133,26 +128,6 @@ fn udim_in(name: &str) -> Option<usize> {
     })
 }
 
-/// `w` × `h` texels of `comps` values each from `sample` (atlas UV → RGBA), as stored in the
-/// file (mesh maps hold data, not colors, so nothing is linearized); `flip_green` reads a
-/// DirectX normal or bent normal map.
-fn resample(comps: usize, (w, h): (u32, u32), flip_green: bool, sample: impl Fn(f32, f32) -> [f32; 4] + Sync) -> Vec<f32> {
-    let mut out = vec![0.0; w as usize * h as usize * comps];
-    out.par_chunks_mut(w as usize * comps).enumerate().for_each(|(y, row)| {
-        let v = (y as f32 + 0.5) / h as f32;
-        for (x, texel) in row.chunks_exact_mut(comps).enumerate() {
-            let mut c = sample((x as f32 + 0.5) / w as f32, v);
-            if flip_green {
-                c[1] = 1.0 - c[1];
-            }
-            for (o, c) in texel.iter_mut().zip(c) {
-                *o = c;
-            }
-        }
-    });
-    out
-}
-
 fn clear(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "textureSet.meshMap.clear";
     let ts = ts_param(s, p, CMD)?;
@@ -160,11 +135,14 @@ fn clear(s: &mut Session, p: &Value) -> Result<Value> {
     if !s.doc.baked.get(&ts).is_some_and(|b| b.maps.contains_key(&map)) {
         return Err(bad(CMD, format!("texture set {ts} has no {} map", map.id())));
     }
+
     s.edit("Clear mesh map", |s| {
         if let Some(b) = s.doc.baked.get_mut(&ts) {
             b.maps.remove(&map);
         }
         s.doc.project.texture_set_mut(ts)?.baked.remove(&map);
+        detach_imported_sources(&mut s.doc.project, ts, |previous| previous == map);
+
         Ok(())
     })?;
     Ok(Value::Null)

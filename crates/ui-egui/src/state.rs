@@ -14,11 +14,13 @@ mod import_row;
 mod library_location;
 mod project_config;
 mod resource_usage;
+mod resources_updater;
 pub use import_resources::ImportResources;
 pub use import_row::ImportRow;
 pub use library_location::LibraryLocation;
 pub use project_config::ProjectConfig;
 pub use resource_usage::ResourceUsage;
+pub use resources_updater::ResourcesUpdater;
 
 mod console_line;
 mod export_job;
@@ -115,6 +117,9 @@ pub struct Windows {
     /// File > Import resources: the files added so far, imported by Import.
     #[serde(skip)]
     pub import_resources: Option<ImportResources>,
+    /// The Resources Updater: the project's image resources and whether their files changed on disk.
+    #[serde(skip)]
+    pub resources_updater: Option<ResourcesUpdater>,
     /// What waits on the unsaved-changes dialog: save, don't save or cancel.
     #[serde(skip)]
     pub unsaved: Option<Unsaved>,

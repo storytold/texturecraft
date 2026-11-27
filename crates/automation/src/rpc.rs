@@ -89,6 +89,7 @@ impl Headless {
                 if steps.len() > MAX_BATCH_STEPS {
                     return Err(bad(format!("at most {MAX_BATCH_STEPS} steps per batch")));
                 }
+
                 Ok(self.batch(steps))
             }
             "project.open" => self.open(required(p, "path")?),

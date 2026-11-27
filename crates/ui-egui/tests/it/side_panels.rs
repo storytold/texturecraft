@@ -315,6 +315,70 @@ fn shader_settings_show_the_reference_rows_and_the_shader_choice() {
 }
 
 #[test]
+fn the_unchecked_ior_control_is_visible_at_each_brightness() {
+    use craft_theme::{Contrast, Rgba, contrast_ratio, non_text_contrast_min};
+    use texturecraft_ui_egui::theme::{Brightness, Tokens};
+
+    let mut harness = app();
+    click_rail(&mut harness, "Shader Settings");
+    let minimum_contrast = non_text_contrast_min(Contrast::Standard);
+
+    for brightness in Brightness::ALL {
+        harness.state_mut().ui.prefs.brightness = brightness;
+        harness.run_steps(SETTLE_FRAMES);
+
+        let checkbox = harness.get_by_role_and_label(Role::CheckBox, "Use IOR for specular reflection");
+        let bounds = checkbox.rect();
+        let panel = Tokens::get(&harness.ctx).panel;
+        let indicator = harness
+            .output()
+            .shapes
+            .iter()
+            .filter_map(|painted| match &painted.shape {
+                egui::Shape::Rect(frame) if painted.clip_rect.contains_rect(frame.rect) && bounds.contains_rect(frame.rect) => Some(frame),
+                _ => None,
+            })
+            .find(|frame| frame.fill.a() > 0 || !frame.stroke.is_empty())
+            .expect("the unchecked indicator is painted inside its accessibility bounds");
+        let fill = panel.blend(indicator.fill);
+        let outline = if indicator.stroke.width > 0.0 { fill.blend(indicator.stroke.color) } else { fill };
+        let contrast = |color: egui::Color32| contrast_ratio(Rgba(color.to_array()), Rgba(panel.to_array()));
+        let ratio = contrast(fill).max(contrast(outline));
+
+        assert!(ratio >= minimum_contrast, "{brightness:?}: the unchecked box has {ratio:.2}:1 contrast against the panel");
+    }
+}
+
+#[test]
+fn keyboard_toggles_ior_reflectance_only_in_metallic_roughness() {
+    let mut harness = app();
+    let label = "Use IOR for specular reflection";
+    harness.state_mut().ui.dock.focus(Panel::Shader);
+    harness.state_mut().session.modified = false;
+    harness.run_steps(SETTLE_FRAMES);
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, label);
+    assert_eq!(checkbox.accesskit_node().toggled(), Some(egui::accesskit::Toggled::False));
+    checkbox.focus();
+    harness.run_steps(SETTLE_FRAMES);
+
+    harness.key_press(egui::Key::Space);
+    harness.run_steps(SETTLE_FRAMES);
+
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, label);
+    assert!(checkbox.is_focused());
+    assert!(is_on(&checkbox));
+    assert!(harness.state().session.doc.project.display.ior_specular);
+    assert!(harness.state().session.modified);
+
+    harness.state_mut().run("display.set", serde_json::json!({"specGloss": true})).unwrap();
+    harness.run_steps(SETTLE_FRAMES);
+
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, label);
+    assert!(checkbox.accesskit_node().is_disabled());
+    assert!(is_on(&checkbox), "the current preference is retained");
+}
+
+#[test]
 fn a_shader_edit_marks_the_project_modified() {
     let mut harness = app();
     harness.state_mut().session.modified = false;

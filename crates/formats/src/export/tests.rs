@@ -1655,3 +1655,42 @@ fn roblox_and_sketchfab_presets_on_a_set_without_the_optional_channels() {
         ["sphere_Body_Set_BaseColor.png", "sphere_Body_Set_Normal.png", "sphere_Body_Set_Metallic.png", "sphere_Body_Set_Roughness.png"]
     );
 }
+
+#[test]
+fn specular_glossiness_exports_ignore_the_ior_specular_setting() {
+    let mut fx = Fx::new(&[Channel::BaseColor, Channel::Specular, Channel::Glossiness, Channel::SpecularLevel]);
+    fx.set_all(Channel::Specular, |_, _| [0.3, 0.2, 0.1]);
+    fx.set_all(Channel::Glossiness, |_, _| [0.7; 3]);
+    fx.set_all(Channel::SpecularLevel, |_, _| [0.5; 3]);
+    (fx.project.display.spec_gloss, fx.project.display.ior) = (true, 1.8);
+    let channel = |channel| SourceRef::Channel { channel, component: 0 };
+    let virt = |map| SourceRef::Virtual { map, component: 0 };
+    let specular = MapSpec {
+        file: "specular".into(),
+        format: FileFormat::Png,
+        bit_depth: 16,
+        channels: [Dest::R, Dest::G, Dest::B]
+            .into_iter()
+            .zip(0u8..)
+            .map(|(dest, component)| (dest, SourceRef::Channel { channel: Channel::Specular, component }))
+            .collect(),
+        inverted: Vec::new(),
+    };
+    let preset = ExportPreset {
+        name: "spec gloss".into(),
+        maps: vec![
+            specular,
+            gray_map("gloss", channel(Channel::Glossiness)),
+            gray_map("rough", virt(VirtualMap::Roughness)),
+            gray_map("f0", virt(VirtualMap::F0)),
+        ],
+    };
+    let options = ExportOptions::new(preset);
+
+    let off = fx.render(&options);
+    fx.project.display.ior_specular = true;
+    let on = fx.render(&options);
+
+    assert!(off.iter().any(|file| file.name.starts_with("f0")), "the F0 map is part of the comparison");
+    assert_eq!(on, off, "Specular/Glossiness takes reflectance from the Specular color, not the IOR");
+}

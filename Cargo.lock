@@ -6005,6 +6005,7 @@ dependencies = [
  "texturecraft-bake",
  "texturecraft-compose",
  "texturecraft-core",
+ "texturecraft-formats",
  "texturecraft-geom",
  "texturecraft-texel",
  "wasm-bindgen-futures",

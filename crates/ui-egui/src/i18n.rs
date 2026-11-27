@@ -261,6 +261,9 @@ mod tests {
         keys.extend(BlendMode::all().map(|mode| mode.label()));
         keys.extend(texturecraft_engine::formats::export::VirtualMap::ALL.iter().map(|map| map.label()));
         keys.extend(texturecraft_engine::Tool::ALL.iter().map(|tool| tool.label()));
+        keys.extend(texturecraft_engine::ResourceStatus::ALL.iter().map(|status| status.label()));
+        let notice = crate::toast_action::ToastAction::UpdateResources { project: 0 };
+        keys.extend([notice.label(), notice.accessible_name()]);
         keys.extend(texturecraft_engine::HISTORY_TEMPLATES);
         keys.extend(ProceduralKind::ALL.iter().map(|kind| kind.label()));
         keys.extend(GeneratorKind::ALL.iter().map(|kind| kind.label()));
