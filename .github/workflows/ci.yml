@@ -29,3 +29,9 @@ jobs:
       packages: >-
         libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
         libgtk-3-dev
+      # Main runs on the cluster runner fill the shared WebDAV sccache that every app reads; PR
+      # runs on hosted runners can't reach it, so they leave it off. The hosted Windows leg falls
+      # back to the GitHub Actions cache, which nothing would read, so it only reads and leaves
+      # that space to rust-cache.
+      sccache: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+      windows-env: SCCACHE_GHA_RW_MODE=READ_ONLY
