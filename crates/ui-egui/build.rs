@@ -8,7 +8,7 @@
 
 mod i18n_build;
 
-use skera::{Plan, SubsetFlags, subset_font};
+use skera::{subset_font, Plan, SubsetFlags};
 use skrifa::raw::collections::IntSet;
 use skrifa::raw::types::NameId;
 use skrifa::{FontRef, GlyphId, MetadataProvider, Tag};
@@ -124,9 +124,11 @@ fn without_private_use(font: &[u8]) -> Result<Vec<u8>, String> {
 /// `font` with only the glyphs for the characters the shipped catalogs use, plus ASCII, Latin-1,
 /// general punctuation (numbers, names and punctuation in the shipped strings), CJK punctuation
 /// (U+3000–303F) and the kana blocks (U+3040–30FF), as craft-libs' `craft-fonts-build` keeps when
-/// WordCraft cuts its interface face. The web build has one face per script, so the untranslated
-/// text a browser build still draws is its own strings plus what the user types; the whole
-/// Japanese face would otherwise be 4.5 MB of a download that has to stay under 25 MiB.
+/// WordCraft cuts its interface face. The web build has one face per script. Shipped UI strings
+/// and user-typed ASCII, Latin-1, punctuation and kana still draw; Han ideographs that are not in
+/// the catalogs show as missing glyphs (the desktop build keeps the CJK faces whole, including a
+/// user's Japanese file name). The whole Japanese face would otherwise be 4.5 MB of a download
+/// that has to stay under the 24 MiB web size gate.
 fn cut_to_catalogs(font: &[u8], catalogs: &[char]) -> Result<Vec<u8>, String> {
     let font = FontRef::new(font).map_err(|e| e.to_string())?;
     let mut unicodes = IntSet::<u32>::empty();
