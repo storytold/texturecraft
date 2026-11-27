@@ -111,6 +111,9 @@ fn json_value(s: &str) -> Result<Value, NotJson> {
 pub(crate) struct BatchArgs {
     #[arg(value_name = "SCRIPT.JSON")]
     pub(crate) script: PathBuf,
+    /// Allow `save` to replace the project `open` named
+    #[arg(long)]
+    pub(crate) in_place: bool,
 }
 
 #[derive(Args, Debug)]
@@ -214,7 +217,7 @@ pub(crate) struct McpArgs {
     #[arg(long, value_name = "PORT", value_parser = port)]
     pub(crate) bridge: Option<u16>,
     /// The app's control token (TEXTURECRAFT_CONTROL_TOKEN; else the file the app wrote)
-    #[arg(long, value_name = "TOKEN", env = "TEXTURECRAFT_CONTROL_TOKEN", hide_env_values = true, requires = "bridge")]
+    #[arg(long, value_name = "TOKEN", env = "TEXTURECRAFT_CONTROL_TOKEN", hide_env_values = true)]
     pub(crate) token: Option<String>,
     #[command(flatten)]
     pub(crate) roots: RootArgs,
@@ -291,6 +294,8 @@ pub(crate) enum UsageError {
     BakeInPlace { path: PathBuf },
     #[error("{flag} is for a headless server, and --bridge connects to an app")]
     RootsWithBridge { flag: &'static str },
+    #[error("--token is for --bridge, and this is a headless server")]
+    TokenNeedsBridge,
 }
 
 impl UsageError {
@@ -314,8 +319,54 @@ pub(crate) fn is_project(path: &Path) -> bool {
     path.extension().is_some_and(|e| e.eq_ignore_ascii_case(texturecraft_engine::core::PROJECT_EXT))
 }
 
+/// The path `Headless::save` writes: it appends `.tcraft` when the extension is missing.
+fn project_save_path(path: &Path) -> PathBuf {
+    if is_project(path) {
+        path.to_owned()
+    } else {
+        let mut raw = path.as_os_str().to_os_string();
+        raw.push(".");
+        raw.push(texturecraft_engine::core::PROJECT_EXT);
+        PathBuf::from(raw)
+    }
+}
+
 fn would_replace(output: &'static str, input: &'static str, to: &Path, from: &Path, in_place_helps: bool) -> Result<(), UsageError> {
     if same_file(to, from) { Err(UsageError::WouldReplace { output, input, path: to.to_owned(), in_place_helps }) } else { Ok(()) }
+}
+
+fn would_replace_project(output: &'static str, input: &'static str, to: &Path, from: &Path, in_place_helps: bool) -> Result<(), UsageError> {
+    would_replace(output, input, &project_save_path(to), from, in_place_helps)
+}
+
+fn same_project(output: &Path, input: &Path) -> bool {
+    same_file(&project_save_path(output), input)
+}
+
+/// If a batch script's `save` would replace `open`, it needs `--in-place`. An unreadable or
+/// malformed script is left to the command, which reports that as a failure (exit 1).
+fn batch_would_replace(a: &BatchArgs) -> Result<(), UsageError> {
+    let Ok(text) = std::fs::read_to_string(&a.script) else {
+        return Ok(());
+    };
+    let Ok(script) = serde_json::from_str::<Value>(&text) else {
+        return Ok(());
+    };
+    let field = |name: &str| script.get(name).and_then(Value::as_str);
+    let Some(output) = field("save") else {
+        return Ok(());
+    };
+    let input = field("open").unwrap_or("builtin:material_ball");
+    if input.starts_with("builtin:") {
+        return if a.in_place { Err(UsageError::InPlaceNotUsed) } else { Ok(()) };
+    }
+    let input = Path::new(input);
+    let output = Path::new(output);
+    match (same_project(output, input), a.in_place) {
+        (true, false) => Err(UsageError::WouldReplace { output: "save", input: "open", path: project_save_path(output), in_place_helps: true }),
+        (false, true) => Err(UsageError::InPlaceNotUsed),
+        _ => Ok(()),
+    }
 }
 
 impl Command {
@@ -323,19 +374,20 @@ impl Command {
     fn check(&self) -> Result<(), (&'static str, UsageError)> {
         match self {
             Command::Run(a) => match (&a.output, a.in_place) {
-                (Some(out), false) => would_replace("-o", "INPUT", out, &a.input, true).map_err(|e| ("run", e)),
-                (Some(out), true) if !same_file(out, &a.input) => Err(("run", UsageError::InPlaceNotUsed)),
+                (Some(out), false) => would_replace_project("-o", "INPUT", out, &a.input, true).map_err(|e| ("run", e)),
+                (Some(out), true) if !same_project(out, &a.input) => Err(("run", UsageError::InPlaceNotUsed)),
                 _ => Ok(()),
             },
             Command::Bake(a) => match (&a.output, a.in_place) {
                 (None, false) if is_project(&a.input) => Err(("bake", UsageError::BakeInPlace { path: a.input.clone() })),
                 (None, _) if !is_project(&a.input) => Err(("bake", UsageError::BakeNeedsOutput)),
-                (Some(out), false) => would_replace("-o", "INPUT", out, &a.input, true).map_err(|e| ("bake", e)),
-                (Some(out), true) if !same_file(out, &a.input) => Err(("bake", UsageError::InPlaceNotUsed)),
+                (Some(out), false) => would_replace_project("-o", "INPUT", out, &a.input, true).map_err(|e| ("bake", e)),
+                (Some(out), true) if !same_project(out, &a.input) => Err(("bake", UsageError::InPlaceNotUsed)),
                 _ => Ok(()),
             },
             Command::Render(a) => would_replace("OUT.PNG", "INPUT", &a.output, &a.input, false).map_err(|e| ("render", e)),
-            Command::New(a) => would_replace("OUT.TCRAFT", "INPUT", &a.output, &a.input, false).map_err(|e| ("new", e)),
+            Command::New(a) => would_replace_project("OUT.TCRAFT", "INPUT", &a.output, &a.input, false).map_err(|e| ("new", e)),
+            Command::Batch(a) => batch_would_replace(a).map_err(|e| ("batch", e)),
             Command::Mcp(a) if a.bridge.is_some() => match (&a.roots.read_root, &a.roots.write_root) {
                 (Some(_), _) => Err(("mcp", UsageError::RootsWithBridge { flag: "--read-root" })),
                 (_, Some(_)) => Err(("mcp", UsageError::RootsWithBridge { flag: "--write-root" })),
@@ -351,6 +403,14 @@ impl Command {
 pub(crate) fn parse(args: &[OsString]) -> Result<Cli, clap::Error> {
     let matches = crate::command().try_get_matches_from(std::iter::once(OsString::from("texturecraft-cli")).chain(args.iter().cloned()))?;
     let cli = Cli::from_arg_matches(&matches)?;
+    // An inherited TEXTURECRAFT_CONTROL_TOKEN must not force --bridge: the variable is how a
+    // client authenticates when --bridge is already set. Only an explicit --token flag requires it.
+    let token_flag_without_bridge = matches
+        .subcommand_matches("mcp")
+        .is_some_and(|mcp| mcp.value_source("token") == Some(clap::parser::ValueSource::CommandLine) && mcp.get_one::<u16>("bridge").is_none());
+    if token_flag_without_bridge {
+        return Err(UsageError::TokenNeedsBridge.into_clap("mcp"));
+    }
     cli.command.check().map_err(|(sub, e)| e.into_clap(sub))?;
     Ok(cli)
 }

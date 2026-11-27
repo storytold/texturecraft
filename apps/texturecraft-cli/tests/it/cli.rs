@@ -210,6 +210,15 @@ fn an_output_that_would_replace_an_input_is_refused_without_in_place() {
     assert!(usage_error(&["run", a, "layer.add.fill", "{}", "-o", elsewhere.to_str().unwrap(), "--in-place"]).contains("--in-place"));
     assert!(usage_error(&["bake", a, "-o", elsewhere.to_str().unwrap(), "--in-place"]).contains("--in-place"));
     assert!(!elsewhere.exists());
+    // Headless::save appends .tcraft, so `-o scene` would replace scene.tcraft.
+    let unsuffixed = dir.join("a");
+    let unsuffixed = unsuffixed.to_str().unwrap();
+    let after_in_place = std::fs::read(&source).unwrap();
+    let message = usage_error(&["run", a, "layer.add.fill", "{}", "-o", unsuffixed]);
+    assert!(message.contains("would replace") || message.contains("--in-place"), "{message}");
+    assert_eq!(std::fs::read(&source).unwrap(), after_in_place, "an unsuffixed -o changes nothing");
+    let got = invoke(["run", a, "layer.add.fill", "{}", "-o", unsuffixed, "--in-place"]);
+    assert_eq!(got.code, 0, "{}", got.err);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -235,6 +244,25 @@ fn batch_runs_a_script_and_a_failing_step_fails_the_command() {
     let got = invoke(argv(&[&"batch", &dir.join("missing.json")]));
     assert_eq!(got.code, 1);
     assert!(got.err.contains("missing.json"), "{}", got.err);
+    // A script that saves over the project it opened needs --in-place, and must not have run.
+    let opened = project(&dir, "opened.tcraft");
+    let before = std::fs::read(&opened).unwrap();
+    let overwrite = dir.join("overwrite.json");
+    std::fs::write(
+        &overwrite,
+        serde_json::json!({
+            "open": opened,
+            "save": opened,
+            "steps": [{"id": "layer.add.paint", "params": {"name": "Batch"}}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let message = usage_error(&["batch", overwrite.to_str().unwrap()]);
+    assert!(message.contains("--in-place") || message.contains("would replace"), "{message}");
+    assert_eq!(std::fs::read(&opened).unwrap(), before);
+    let got = invoke(argv(&[&"batch", &overwrite, &"--in-place"]));
+    assert_eq!(got.code, 0, "{}", got.err);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

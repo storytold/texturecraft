@@ -70,7 +70,8 @@ if [[ "$SKIP_BUILD" = 0 ]]; then
   # binaries, its dev-dependencies' features would be unified into them. It is run here, so a
   # cross build builds it for the host.
   if [[ "$IS_NIGHTLY" = 0 ]]; then
-    (cd "$ROOT" && cargo build --release --locked -p texturecraft-cli --example man-and-completions)
+    # Unset CARGO_BUILD_TARGET so a cross package still builds a host example (run below).
+    (cd "$ROOT" && env -u CARGO_BUILD_TARGET cargo build --release --locked -p texturecraft-cli --example man-and-completions)
   fi
 fi
 BIN="$CARGO_TARGET_DIR/${CROSS_TARGET:+$CROSS_TARGET/}release"

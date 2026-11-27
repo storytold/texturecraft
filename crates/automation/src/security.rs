@@ -238,10 +238,19 @@ mod tests {
     #[test]
     fn a_blank_token_counts_as_not_given() {
         // No token anywhere (the port has no token file): the error says what to set, not that a
-        // blank token is invalid.
-        let message = client_token(1, Some("  ".into())).map(drop).unwrap_err().to_string();
-        if std::env::var_os(TOKEN_ENV).is_none() {
-            assert!(message.contains("no control token"), "{message}");
+        // blank token is invalid. A non-blank inherited TOKEN_ENV can still satisfy the client
+        // after a blank supplied value, so do not unwrap_err() first.
+        match client_token(1, Some("  ".into())) {
+            Err(error) => {
+                if std::env::var_os(TOKEN_ENV).is_none() {
+                    let message = error.to_string();
+                    assert!(message.contains("no control token"), "{message}");
+                }
+            }
+            Ok(_) => {
+                let inherited = std::env::var(TOKEN_ENV).unwrap_or_default();
+                assert!(!inherited.trim().is_empty(), "a blank token was accepted with no inherited value");
+            }
         }
     }
 

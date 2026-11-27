@@ -59,7 +59,9 @@ export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 # be unified into them.
 if [[ "$SKIP_BUILD" = 0 ]]; then
   (cd "$ROOT" && cargo build --release --locked -p texturecraft -p texturecraft-cli)
-  (cd "$ROOT" && cargo build --release --locked -p texturecraft-cli --example man-and-completions)
+  # The example is run on this host to write man pages and completions, so it must be a host
+  # binary even when CARGO_BUILD_TARGET is set for a cross package.
+  (cd "$ROOT" && env -u CARGO_BUILD_TARGET cargo build --release --locked -p texturecraft-cli --example man-and-completions)
 fi
 WORK="$CARGO_TARGET_DIR/freebsd-package"
 STAGE="$WORK/$BASENAME"
@@ -105,7 +107,12 @@ copy_docs "$STAGE/share/doc/texturecraft"
 # texturecraft-cli's man pages and shell completions, from its clap definition, written by the
 # example built above (a --skip-build run needs it built too). Under /usr/local, man pages go in
 # man/ and the completions in the directories bash, zsh and fish read there.
-CLI_DOCS="$BIN/examples/man-and-completions"
+if [[ "$DRY_RUN" = 1 ]]; then
+  CLI_DOCS="$BIN/examples/man-and-completions"
+else
+  # Host path: the example is built with CARGO_BUILD_TARGET unset, above.
+  CLI_DOCS="$CARGO_TARGET_DIR/release/examples/man-and-completions"
+fi
 if [[ ! -x "$CLI_DOCS" ]]; then
   echo "error: $CLI_DOCS is not built (cargo build --release -p texturecraft-cli --example man-and-completions)" >&2
   exit 1

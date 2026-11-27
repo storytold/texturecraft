@@ -97,3 +97,19 @@ fn a_variable_alone_grants_no_file_access() {
     let reply: serde_json::Value = serde_json::from_str(String::from_utf8(output.stdout).unwrap().lines().next().unwrap()).unwrap();
     assert_eq!(reply["ok"], false, "{reply}");
 }
+
+#[test]
+fn a_token_in_the_environment_does_not_require_bridge() {
+    // Headless MCP must parse even when TEXTURECRAFT_CONTROL_TOKEN is set; only --token on the
+    // command line requires --bridge.
+    let output = binary().args(["mcp", "--fromat"]).env("TEXTURECRAFT_CONTROL_TOKEN", "env-token-0123456789-secret").output().unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{err}");
+    assert!(err.contains("--fromat"), "{err}");
+    assert!(!err.contains("--bridge") && !err.contains("--token is for"), "{err}");
+
+    let output = binary().args(["mcp", "--token", "flag-token-0123456789"]).output().unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{err}");
+    assert!(err.contains("--token") && err.contains("--bridge"), "{err}");
+}
