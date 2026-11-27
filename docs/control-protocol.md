@@ -360,7 +360,8 @@ A `prefs` object without `language` sets the system language (`""`), the default
   them: `--read-root <dir>` for `project_open` / `mesh_import` / `mesh_reimport` / `bake_mesh_add`,
   `--write-root <dir>` for `project_save` / `material_save` / `textures_export` / `mesh_export`
   (`--automation-read-root` / `--automation-write-root`, as in the other crafting apps, are the
-  same flags). Without roots there is no file access. `..`, absolute
+  same flags). Headless mcp refuses to start unless both roots are set; file access is only
+  below them. `..`, absolute
   paths, drive letters, device names and symlink or junction escapes are refused.
 - **Bridge**: `--bridge <port>` forwards to a running `texturecraft --control <port>` (token from
   `--token`, `TEXTURECRAFT_CONTROL_TOKEN` or the app's token file). The app reads and writes its

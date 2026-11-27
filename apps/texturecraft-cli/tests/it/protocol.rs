@@ -38,7 +38,10 @@ fn serve_ends_quietly_and_mcp_reports_it_when_stdin_is_closed() {
     let output = binary().arg("serve").stdin(Stdio::null()).output().unwrap();
     assert_eq!((output.status.code(), output.stdout.is_empty(), output.stderr.is_empty()), (Some(0), true, true));
     // An MCP client must open with `initialize`; end of input before it is a failed start.
-    let output = binary().arg("mcp").stdin(Stdio::null()).output().unwrap();
+    let dir = std::env::temp_dir().join(format!("tc-mcp-stdio-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let output = binary().args(["mcp", "--read-root", dir.to_str().unwrap(), "--write-root", dir.to_str().unwrap()]).stdin(Stdio::null()).output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
     assert_eq!((output.status.code(), output.stdout.is_empty()), (Some(1), true));
     assert!(String::from_utf8_lossy(&output.stderr).starts_with("error: MCP start: "), "{}", String::from_utf8_lossy(&output.stderr));
 }

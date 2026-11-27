@@ -114,7 +114,7 @@ else
   CLI_DOCS="$CARGO_TARGET_DIR/release/examples/man-and-completions"
 fi
 if [[ ! -x "$CLI_DOCS" ]]; then
-  echo "error: $CLI_DOCS is not built (cargo build --release -p texturecraft-cli --example man-and-completions)" >&2
+  echo "error: $CLI_DOCS is not built (env -u CARGO_BUILD_TARGET cargo build --release -p texturecraft-cli --example man-and-completions)" >&2
   exit 1
 fi
 "$CLI_DOCS" "$WORK/cli-docs"

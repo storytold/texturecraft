@@ -296,6 +296,8 @@ pub(crate) enum UsageError {
     RootsWithBridge { flag: &'static str },
     #[error("--token is for --bridge, and this is a headless server")]
     TokenNeedsBridge,
+    #[error("mcp needs --read-root and --write-root (or their --automation-*-root aliases)")]
+    McpNeedsRoots,
 }
 
 impl UsageError {
@@ -392,6 +394,10 @@ impl Command {
                 (Some(_), _) => Err(("mcp", UsageError::RootsWithBridge { flag: "--read-root" })),
                 (_, Some(_)) => Err(("mcp", UsageError::RootsWithBridge { flag: "--write-root" })),
                 _ => Ok(()),
+            },
+            Command::Mcp(a) if a.bridge.is_none() => match (&a.roots.read_root, &a.roots.write_root) {
+                (Some(_), Some(_)) => Ok(()),
+                _ => Err(("mcp", UsageError::McpNeedsRoots)),
             },
             _ => Ok(()),
         }

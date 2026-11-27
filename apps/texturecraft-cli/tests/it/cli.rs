@@ -315,3 +315,17 @@ fn a_closed_stdout_is_not_an_error() {
     assert_eq!(texturecraft_cli::run(["--help"], &mut Closed, &mut err), 0);
     assert!(err.is_empty());
 }
+
+#[test]
+fn headless_mcp_requires_both_roots() {
+    for args in [
+        vec!["mcp"],
+        vec!["mcp", "--read-root", "."],
+        vec!["mcp", "--write-root", "."],
+        vec!["mcp", "--automation-read-root", "."],
+        vec!["mcp", "--automation-write-root", "."],
+    ] {
+        let message = usage_error(&args);
+        assert!(message.contains("--read-root") && message.contains("--write-root"), "{args:?}: {message}");
+    }
+}
