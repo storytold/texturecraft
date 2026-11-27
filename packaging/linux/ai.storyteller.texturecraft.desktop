@@ -1,14 +1,18 @@
 [Desktop Entry]
 Type=Application
 Name=TextureCraft
+Name[ru]=TextureCraft
 GenericName=3D Texture Painter
+GenericName[ru]=Рисование 3D-текстур
 Comment=Paint PBR textures directly on 3D meshes
+Comment[ru]=Рисование PBR-текстур прямо на 3D-моделях
 Exec=texturecraft %F
 TryExec=texturecraft
 Icon=ai.storyteller.texturecraft
 Terminal=false
 StartupNotify=true
-StartupWMClass=texturecraft
+StartupWMClass=ai.storyteller.texturecraft
 Categories=Graphics;3DGraphics;
 Keywords=texture;paint;pbr;material;3d;mesh;bake;gltf;fbx;usd;
+Keywords[ru]=текстура;рисование;pbr;материал;3d;сетка;меш;запекание;gltf;fbx;usd;
 MimeType=application/x-texturecraft;model/gltf-binary;model/gltf+json;model/x-fbx;model/vnd.collada+xml;model/x-usd;model/vnd.usda;model/vnd.usdz+zip;model/x-alembic;model/obj;model/x-ply;model/stl;

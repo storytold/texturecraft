@@ -2,13 +2,18 @@
 
 use serde_json::{Value, json};
 use texturecraft_core::{
-    BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, CompareSource, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter, Generator,
-    GeneratorKind, LayerId, Levels, Mask, MaskBackground, MicroDetail, Procedural, ProceduralKind, Project, Sampling, Source,
+    AxisBlend, BakedMap, BlendMode, Channel, ChannelKind, ColorSelection, CompareOp, CompareSource, CurvatureDetail, CurvatureMode, Effect, EffectKind, Filter,
+    Generator, GeneratorGrayscale, GeneratorKind, KindControls, LayerId, Levels, LightParameters, Mask, MaskBackground, Procedural, ProceduralKind, Project,
+    Sampling, SectionParameters, Source, TextureBlend, WearParameters,
 };
 
+use crate::anchored_micro_edit::AnchoredMicroEdit;
 use crate::commands::{CommandSpec, always, bad, blend_param, boolp, channel_param, color_param, f32p, has_layer, layer_param, strp, u64p};
+use crate::distance_params::distance_from;
+use crate::generator_input::GeneratorInput;
 use crate::layer_cmds::{projection_from, projection_from_fields};
 use crate::mask_owner::MaskOwner;
+use crate::micro_params::{MICRO_HEIGHT_INPUT, MICRO_NORMAL_INPUT, micro_from, swapped_micro};
 use crate::session::StackTarget;
 use crate::{EngineError, Result, Session, cmd};
 
@@ -28,7 +33,7 @@ pub fn specs() -> Vec<CommandSpec> {
             has_layer,
             add_color_mask
         ),
-        cmd!("mask.toggle", "Toggle mask", ["Layers", "Mask"], None, "{layer?, enabled?}", has_layer, toggle),
+        cmd!("mask.toggle", "Toggle mask", ["Layers", "Mask"], None, "{layer?, enabled?} — defaults to the selected layer", always, toggle),
         cmd!("mask.invertBackground", "Invert mask background", ["Layers", "Mask"], None, "{layer?}", has_layer, invert_background),
         cmd!("mask.invert", "Invert mask", ["Layers", "Mask"], None, "{layer?}", has_layer, invert),
         cmd!("mask.clear", "Clear mask", ["Layers", "Mask"], None, "{layer?}", has_layer, clear),
@@ -53,7 +58,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add generator",
             ["Layers", "Effects"],
             None,
-            "{layer?, name?, generator?: edgeWear|dirt|thinAreas|curvature|ambientOcclusion|position|direction, level?, softness?, noise?, offset?: -1..1 added to the result, invert?, blur?: 0..1, balance?: 0..1 (0.5 unchanged), contrast?: 0..1, resolution?: auto|textureSet|uvTile|custom, customResolution?, resolutionFactor?: -3..3 (1/8..x8), mode?: edges|cavities|both|raw, sizes?: [7 weights 0..1, finest first] (curvature and edgeWear), microAnchor?: anchor effect id below, microAmount?: 0..1 (0.5)}",
+            "{layer?, name?, generator?: edgeWear|dirt|fiberGlassEdgeWear|thinAreas|curvature|ambientOcclusion|position|worldSpaceNormals|direction|3dDistance|3dLinearGradient|uvBorderDistance|grayscaleConversion|drippingRust|uvRandomColor|uvChecker, wearLevel?, wearContrast?, grungeAmount?, grungeScale?: 1..16, triplanar?, triplanarContrast?, edgesSmoothness?: 0..16, aoMasking?, curvatureWeight?, edgesMasking?, useCustomGrunge? (the image: effect.set input: grunge) (wear controls: edgeWear, fiberGlassEdgeWear and dirt), sectionInvert?, sectionBlur?: 0..16 (ambientOcclusion, worldSpaceNormals), sectionBalance? (not curvature), sectionContrast?, sectionBrightness?: -1..1 (not ambientOcclusion), rightLeft|topBottom|frontBack + Invert?|Blend?: normal|add|subtract|multiply|addSub|max|Weight? (position, worldSpaceNormals), useTexture?, textureOpacity?, textureInvert?, textureGrayscale?: desaturation|luma|average|max|min|red|green|blue, textureBlend?: normal|add|subtract|multiply|addSub|max|min|overlay|screen|softLight, textureScale?: 0.01..10, textureContrast?: -1..1, textureBrightness?: -1..1, textureTriplanar?, textureTriplanarContrast? (the texture itself: effect.set input: texture) (section controls: curvature, ambientOcclusion, position, worldSpaceNormals), useMicroDetails? (curvature, ambientOcclusion), microHeight?, microNormal? (the images: effect.set input: microHeight|microNormal, an image or a value; microHeight also an anchor point), microCurvatureType?: standard|sobel|smooth, microCurvatureIntensity?: 0..5 on curvature, 0..1 on the wear kinds, microHeightIntensity?: 0..10 (curvature and the wear kinds), microAoRadius?, microAoDepth? (ambientOcclusion and the wear kinds) (micro details), distanceX?, distanceY?, distanceZ? (the point across the mesh's bounds), distanceRadius?: 0..1.5, distanceOffset? (0 all black, 1 all white), distanceContrast? (3dDistance, which also takes invert), gradientStart?, gradientEnd?: [x, y, z] across the mesh's bounds, gradientBalance?, gradientContrast? (3dLinearGradient, which also takes invert), borderDistance? (1 = half a UV tile), borderSmoothness?, borderBalance?, borderContrast? (uvBorderDistance, which also takes invert), grayscaleType?: desaturation|luma|average|max|min|red|green|blue, grayscaleBalance?, grayscaleContrast?, grayscaleTile?: 1..16, grayscaleRotation?: 0..360, grayscaleSafeRotation? (grayscaleConversion, which also takes invert; its image: effect.set input: image), rustSpreading?, rustContrast?, spreadingSmoothness?, dripsIntensity?, dripsSmoothness?, dripsSamples?: 0..32, dripsAxis?: x|y|z (drippingRust, which also takes seed and invert), colorSourceMode?: random|customGradient, gradientColors?: [[r,g,b], ...], gradientPositions?: [0..1 per color], gradientQuantity?: 2..16 (uvRandomColor, which also takes seed), checkerColorMode?: uniform|random, checkerColor?, checkerGridTile?: 1..24, checkerGridOpacity?, uvBordersColor?, uvBordersWidth? (uvChecker, which also takes seed), lightHorizontal?: 0..360, lightVertical?: 0..360, highlightGlossiness?, highlightLevel?, lightAttenuation? (light controls: direction), level?, softness?, noise?, noiseScale?, offset?: -1..1 added to the result, direction? (instead keep edgeWear, dirt, curvature, ambientOcclusion, position and direction on the earlier model), invert?, blur?: 0..1, balance?: 0..1 (0.5 unchanged), contrast?: 0..1, resolution?: auto|textureSet|uvTile|custom, customResolution?, resolutionFactor?: -3..3 (1/8..x8), mode?: edges|cavities|both|raw, sizes?: [7 weights 0..1, finest first] (curvature and edgeWear), microAnchor?: anchor effect id below (its height as the Micro Height), microAmount?: 0..1 (the Micro Height's intensity, 0.5 = 1)}",
             has_layer,
             add_generator
         ),
@@ -98,7 +103,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit effect",
             [],
             None,
-            "{effect, visible?, blend?, opacity?, channel?: the content channel blend and opacity set (default: every channel), name?, filter?: id from filter.list (a filter effect only: swaps its type, keeping position, blend and opacity; its current id edits it in place; \"none\" empties it), channels?: {channelId: bool} a content effect's channels on or off, divider?: 1|10|100|1000 (warp, slope blur: divides the intensity), generator?: kind (a generator effect only: changes kind in place), level?, softness?, noise?, noiseScale?, offset?, invert?, blur?, balance?, contrast?, resolution?, customResolution?, resolutionFactor?, input?: mesh map id + one of inputImage?, inputValue?, inputAnchor?, inputBaked?: true (a generator), mode?, sizes?, microAnchor?: id|null, microAmount?, value?, uniform?: 0..1 (a mask fill reads that value, whatever its source), procedural?: kind (a mask fill) with scale?, seed?, contrast?, balance?, invert?, resolution?, tile?, tileDefaults? (alone, they edit its pattern), image?: resource name (a fill's source), projection?: uv|triplanar|planar|spherical|cylindrical, scale?, rotation?, offset?, axis?, sharpness? (a fill effect's projection; while it reads a pattern, scale is the pattern's), anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, affects?, clamp? (levels), tolerance?, left?, op?, right?, compareChannel?, hardness? (compare; value is its constant), colors?: [[r,g,b] linear, ...] (a color selection's ID colors, may be empty), output?, background?: transparent | black | white | gray, idMap?: an image resource name read as the ID map, null for the texture set's ID mesh map (a color selection; tolerance and hardness too), filter parameters (see effect.add.filter)}",
+            "{effect, visible?, blend?, opacity?, channel?: the content channel blend and opacity set (default: every channel), name?, filter?: id from filter.list (a filter effect only: swaps its type, keeping position, blend and opacity; its current id edits it in place; \"none\" empties it), channels?: {channelId: bool} a content effect's channels on or off, divider?: 1|10|100|1000 (warp, slope blur: divides the intensity), generator?: kind (a generator effect only: swaps its kind in place, keeping the shared settings and the inputs it reads; its own controls start from that kind's defaults), wear, section and light controls (see effect.add.generator), level?, softness?, noise?, noiseScale?, offset?, invert?, blur?, balance?, contrast?, resolution?, customResolution?, resolutionFactor?, input?: mesh map id, texture, grunge, microHeight, microNormal or image + one of inputImage?, inputValue?, inputAnchor?, inputBaked?: true (a generator), mode?, sizes?, microAnchor?: id|null (the Micro Height reads that anchor point; null empties it), microAmount?, value?, uniform?: 0..1 (a mask fill reads that value, whatever its source), procedural?: kind (a mask fill) with scale?, seed?, contrast?, balance?, invert?, resolution?, tile?, tileDefaults? (alone, they edit its pattern), image?: resource name (a fill's source), projection?: uv|triplanar|planar|spherical|cylindrical, scale?, rotation?, offset?, axis?, sharpness? (a fill effect's projection; while it reads a pattern, scale is the pattern's), anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, affects?, clamp? (levels), tolerance?, left?, op?, right?, compareChannel?, hardness? (compare; value is its constant), colors?: [[r,g,b] linear, ...] (a color selection's ID colors, may be empty), output?, background?: transparent | black | white | gray, idMap?: an image resource name read as the ID map, null for the texture set's ID mesh map (a color selection; tolerance and hardness too), filter parameters (see effect.add.filter)}",
             has_layer,
             set
         ),
@@ -127,6 +132,7 @@ pub fn specs() -> Vec<CommandSpec> {
 
 fn with_mask<T>(s: &mut Session, p: &Value, cmd: &str, label: &str, f: impl FnOnce(&mut Session, LayerId) -> Result<T>) -> Result<T> {
     let id = layer_param(s, cmd, p)?;
+
     s.edit(label, |s| f(s, id))
 }
 
@@ -169,13 +175,14 @@ fn mask_of(s: &mut Session, id: LayerId) -> Result<&mut Mask> {
     l.mask.as_mut().ok_or_else(|| EngineError::Other(format!("\"{name}\" has no mask")))
 }
 
-fn toggle(s: &mut Session, p: &Value) -> Result<Value> {
-    let on = with_mask(s, p, "mask.toggle", "Toggle mask", |s, id| {
-        let m = mask_of(s, id)?;
-        m.enabled = boolp(p, "enabled").unwrap_or(!m.enabled);
-        Ok(m.enabled)
+fn toggle(session: &mut Session, params: &Value) -> Result<Value> {
+    let enabled = with_mask(session, params, "mask.toggle", "Toggle mask", |session, layer| {
+        let mask = mask_of(session, layer)?;
+        mask.enabled = boolp(params, "enabled").unwrap_or(!mask.enabled);
+        Ok(mask.enabled)
     })?;
-    Ok(json!({ "enabled": on }))
+
+    Ok(json!({ "enabled": enabled }))
 }
 
 fn invert_background(s: &mut Session, p: &Value) -> Result<Value> {
@@ -387,8 +394,327 @@ fn add_fill(session: &mut Session, params: &Value) -> Result<Value> {
     push_effect(session, params, EffectKind::Fill { source, projection, sampling }, blend)
 }
 
+/// The parameters that drive the wear generators' earlier model
+const EARLIER_WEAR_KEYS: [&str; 7] = ["level", "softness", "noise", "noiseScale", "offset", "mode", "sizes"];
+
+/// The global adjustments, which the wear kinds don't have
+const GLOBAL_KEYS: [&str; 3] = ["blur", "balance", "contrast"];
+
+/// The wear controls `effect.add.generator` and `effect.set` take
+const WEAR_KEYS: [&str; 11] = [
+    "wearLevel",
+    "wearContrast",
+    "grungeAmount",
+    "grungeScale",
+    "triplanar",
+    "triplanarContrast",
+    "edgesSmoothness",
+    "aoMasking",
+    "curvatureWeight",
+    "edgesMasking",
+    "useCustomGrunge",
+];
+
+/// The input name of a wear generator's custom grunge image, beside the mesh map ids
+const GRUNGE_INPUT: &str = "grunge";
+
+/// The wear controls in `params` (a grunge input counts as one): they move a wear generator onto them, while level, softness, noise or offset keep it on the earlier model
+fn wear_from(command: &str, params: &Value, generator: &mut Generator) -> Result<()> {
+    let given = |keys: &[&str]| keys.iter().any(|key| params.get(*key).is_some());
+    let wear_given = given(&WEAR_KEYS) || strp(params, "input") == Some(GRUNGE_INPUT);
+    let Some(defaults) = WearParameters::defaults(generator.kind) else {
+        return if wear_given { Err(bad(command, format!("{} has no wear controls", generator.kind.label()))) } else { Ok(()) };
+    };
+
+    let earlier_model = given(&EARLIER_WEAR_KEYS) || (generator.wear.is_none() && !wear_given && generator.kind != GeneratorKind::FiberGlassEdgeWear);
+    if given(&GLOBAL_KEYS) && !earlier_model {
+        return Err(bad(command, format!("{} has no global blur, balance or contrast on its wear controls", generator.kind.label())));
+    }
+
+    if let Some(unused) = WEAR_KEYS.iter().find(|key| params.get(**key).is_some() && !wear_key_applies(generator.kind, key)) {
+        return Err(bad(command, format!("{} has no `{unused}`", generator.kind.label())));
+    }
+
+    if given(&EARLIER_WEAR_KEYS) {
+        if wear_given {
+            return Err(bad(command, "level, softness, noise and offset drive the earlier wear model: give them or the wear controls, not both"));
+        }
+
+        if generator.kind == GeneratorKind::FiberGlassEdgeWear {
+            return Err(bad(command, format!("{} requires wear controls such as wearLevel or wearContrast", generator.kind.label())));
+        }
+        generator.wear = None;
+        return Ok(());
+    }
+
+    if !wear_given {
+        return Ok(());
+    }
+
+    // The offset belongs to the earlier model: kept, it would shift the wear controls' result unseen
+    generator.offset = 0.0;
+    let wear = generator.wear.get_or_insert(defaults);
+    for (key, value) in [
+        ("wearLevel", &mut wear.level),
+        ("wearContrast", &mut wear.contrast),
+        ("grungeAmount", &mut wear.grunge_amount),
+        ("grungeScale", &mut wear.grunge_scale),
+        ("triplanarContrast", &mut wear.triplanar_contrast),
+        ("edgesSmoothness", &mut wear.edges_smoothness),
+        ("aoMasking", &mut wear.ao_masking),
+        ("curvatureWeight", &mut wear.curvature_weight),
+        ("edgesMasking", &mut wear.edges_masking),
+    ] {
+        if let Some(given) = f32p(params, key) {
+            *value = given;
+        }
+    }
+    if let Some(triplanar) = boolp(params, "triplanar") {
+        wear.triplanar = triplanar;
+    }
+    if let Some(custom_grunge) = boolp(params, "useCustomGrunge") {
+        wear.custom_grunge = custom_grunge;
+    }
+    *wear = wear.clamped(generator.kind);
+    Ok(())
+}
+
+/// Whether wear control `key` changes a generator of `kind`
+pub fn wear_key_applies(kind: GeneratorKind, key: &str) -> bool {
+    match key {
+        "edgesMasking" => kind == GeneratorKind::Dirt,
+        "edgesSmoothness" | "aoMasking" | "curvatureWeight" => kind != GeneratorKind::Dirt,
+        "grungeScale" => kind != GeneratorKind::FiberGlassEdgeWear,
+        _ => true,
+    }
+}
+
+/// The parameters that drive the earlier model of the kinds with section or light controls
+const EARLIER_SECTION_KEYS: [&str; 6] = ["level", "softness", "noise", "noiseScale", "offset", "direction"];
+
+/// The section controls `effect.add.generator` and `effect.set` take, beside the axis keys made of [`AXIS_NAMES`] and [`AXIS_SUFFIXES`]
+const SECTION_KEYS: [&str; 5] = ["sectionInvert", "sectionBlur", "sectionBalance", "sectionContrast", "sectionBrightness"];
+
+/// The name of each axis in its keys, in the order of [`SectionParameters::axes`], and what follows it
+const AXIS_NAMES: [&str; 3] = ["rightLeft", "topBottom", "frontBack"];
+const AXIS_SUFFIXES: [&str; 3] = ["Invert", "Blend", "Weight"];
+
+/// The Light generator's controls
+const LIGHT_KEYS: [&str; 5] = ["lightHorizontal", "lightVertical", "highlightGlossiness", "highlightLevel", "lightAttenuation"];
+
+/// The texture controls (Use Texture); the texture itself is the `texture` input
+const TEXTURE_KEYS: [&str; 10] = [
+    "useTexture",
+    "textureOpacity",
+    "textureInvert",
+    "textureGrayscale",
+    "textureBlend",
+    "textureScale",
+    "textureContrast",
+    "textureBrightness",
+    "textureTriplanar",
+    "textureTriplanarContrast",
+];
+
+/// The input name of Grayscale Conversion's image, beside the mesh map ids
+const GRAYSCALE_IMAGE_INPUT: &str = "image";
+
+/// The input name of a generator's texture, beside the mesh map ids
+const TEXTURE_INPUT: &str = "texture";
+
+/// The section controls, the axis keys, the texture controls and the light controls `params` gives (a texture input counts as `texture`)
+fn given_new_model_keys(params: &Value) -> Vec<String> {
+    let axis_keys = AXIS_NAMES.iter().flat_map(|axis| AXIS_SUFFIXES.iter().map(move |suffix| format!("{axis}{suffix}")));
+    let mut keys: Vec<String> = SECTION_KEYS
+        .iter()
+        .chain(TEXTURE_KEYS.iter())
+        .chain(LIGHT_KEYS.iter())
+        .map(|key| key.to_string())
+        .chain(axis_keys)
+        .filter(|key| params.get(key).is_some())
+        .collect();
+    if strp(params, "input") == Some(TEXTURE_INPUT) {
+        keys.push(TEXTURE_INPUT.to_string());
+    }
+    keys
+}
+
+/// The section and light controls in `params`: they move a generator onto them, while level, softness, noise, offset or direction keep it on the earlier model
+fn section_from(command: &str, params: &Value, generator: &mut Generator) -> Result<()> {
+    let kind = generator.kind;
+    let new_keys = given_new_model_keys(params);
+    let earlier = EARLIER_SECTION_KEYS.iter().any(|key| params.get(*key).is_some());
+    let section_defaults = SectionParameters::defaults(kind);
+    let light_defaults = LightParameters::defaults(kind);
+    if section_defaults.is_none() && light_defaults.is_none() {
+        return match new_keys.first() {
+            Some(key) => Err(bad(
+                command,
+                format!("{} has no `{key}`: only Curvature, Ambient Occlusion, Position, World Space Normals and Light have them", kind.label()),
+            )),
+            None => Ok(()),
+        };
+    }
+
+    if let Some(unused) = new_keys.iter().find(|key| !section_key_applies(kind, key)) {
+        return Err(bad(command, format!("{} has no `{unused}`", kind.label())));
+    }
+
+    let reads_direction = matches!(kind, GeneratorKind::Position | GeneratorKind::Direction);
+    if params.get("direction").is_some() && !reads_direction {
+        return Err(bad(command, format!("{} has no `direction`: only Position and Light point one way", kind.label())));
+    }
+
+    if earlier {
+        if !new_keys.is_empty() {
+            return Err(bad(
+                command,
+                "level, softness, noise, offset and direction drive the earlier model: give them or the section and light controls, not both",
+            ));
+        }
+        if kind == GeneratorKind::WorldSpaceNormals {
+            return Err(bad(
+                command,
+                "World Space Normals has section controls only (sectionBalance, topBottomWeight…), no level, softness, noise, offset or direction",
+            ));
+        }
+        generator.section = None;
+        generator.light = None;
+        return Ok(());
+    }
+
+    let on_light = generator.light.is_some() || (light_defaults.is_some() && !new_keys.is_empty());
+    if on_light && GLOBAL_KEYS.iter().any(|key| params.get(*key).is_some()) {
+        return Err(bad(command, "Light has no global blur, balance or contrast on its light controls"));
+    }
+
+    if new_keys.is_empty() {
+        return Ok(());
+    }
+
+    // Moving onto the reference's controls starts from the kind's defaults: the earlier model's values no longer apply
+    if generator.on_earlier_model() {
+        let defaults = Generator::new(kind);
+        (generator.level, generator.softness, generator.noise_amount, generator.noise_scale) =
+            (defaults.level, defaults.softness, defaults.noise_amount, defaults.noise_scale);
+        (generator.offset, generator.direction) = (defaults.offset, defaults.direction);
+        if light_defaults.is_some() {
+            generator.global = defaults.global;
+        }
+    }
+
+    if let Some(defaults) = light_defaults {
+        let light = generator.light.get_or_insert(defaults);
+        for (key, value) in [
+            ("lightHorizontal", &mut light.horizontal),
+            ("lightVertical", &mut light.vertical),
+            ("highlightGlossiness", &mut light.glossiness),
+            ("highlightLevel", &mut light.highlight_level),
+            ("lightAttenuation", &mut light.attenuation),
+        ] {
+            if let Some(given) = f32p(params, key) {
+                *value = given;
+            }
+        }
+        *light = light.clamped();
+        return Ok(());
+    }
+
+    let Some(defaults) = section_defaults else { return Ok(()) };
+    let mut section = generator.section_controls().unwrap_or(defaults);
+    for (key, value) in [
+        ("sectionBlur", &mut section.blur),
+        ("sectionBalance", &mut section.balance),
+        ("sectionContrast", &mut section.contrast),
+        ("sectionBrightness", &mut section.brightness),
+    ] {
+        if let Some(given) = f32p(params, key) {
+            *value = given;
+        }
+    }
+
+    if let Some(invert) = boolp(params, "sectionInvert") {
+        section.invert = invert;
+    }
+
+    for (axis, name) in section.axes.iter_mut().zip(AXIS_NAMES) {
+        if let Some(invert) = boolp(params, &format!("{name}Invert")) {
+            axis.invert = invert;
+        }
+        if let Some(weight) = f32p(params, &format!("{name}Weight")) {
+            axis.weight = weight;
+        }
+        let blend_key = format!("{name}Blend");
+        if let Some(blend) = params.get(&blend_key) {
+            let blend_name = blend.as_str().ok_or_else(|| bad(command, format!("`{blend_key}` must be a string")))?;
+            axis.blend = AxisBlend::parse(blend_name).ok_or_else(|| bad(command, format!("unknown blending mode `{blend_name}`")))?;
+        }
+    }
+
+    generator.section = Some(section.clamped(kind));
+    texture_from(command, params, generator)
+}
+
+/// The texture controls in `params` (the generator is on its section controls already)
+fn texture_from(command: &str, params: &Value, generator: &mut Generator) -> Result<()> {
+    if !TEXTURE_KEYS.iter().any(|key| params.get(*key).is_some()) {
+        return Ok(());
+    }
+
+    let mut texture = generator.texture.as_deref().cloned().unwrap_or_default();
+    if let Some(enabled) = boolp(params, "useTexture") {
+        texture.enabled = enabled;
+    }
+    for (key, value) in [
+        ("textureOpacity", &mut texture.opacity),
+        ("textureScale", &mut texture.scale),
+        ("textureContrast", &mut texture.contrast),
+        ("textureBrightness", &mut texture.brightness),
+        ("textureTriplanarContrast", &mut texture.triplanar_contrast),
+    ] {
+        if let Some(given) = f32p(params, key) {
+            *value = given;
+        }
+    }
+    if let Some(invert) = boolp(params, "textureInvert") {
+        texture.invert = invert;
+    }
+    if let Some(triplanar) = boolp(params, "textureTriplanar") {
+        texture.triplanar = triplanar;
+    }
+    if let Some(value) = params.get("textureGrayscale") {
+        let name = value.as_str().ok_or_else(|| bad(command, "`textureGrayscale` must be a string"))?;
+        texture.grayscale = GeneratorGrayscale::parse(name).ok_or_else(|| bad(command, format!("unknown grayscale conversion `{name}`")))?;
+    }
+    if let Some(value) = params.get("textureBlend") {
+        let name = value.as_str().ok_or_else(|| bad(command, "`textureBlend` must be a string"))?;
+        texture.blend = TextureBlend::parse(name).ok_or_else(|| bad(command, format!("unknown blending mode `{name}`")))?;
+    }
+    generator.texture = Some(Box::new(texture.clamped()));
+    Ok(())
+}
+
+/// Whether section or light control `key` changes a generator of `kind`
+pub fn section_key_applies(kind: GeneratorKind, key: &str) -> bool {
+    let axis_key = AXIS_NAMES.iter().any(|axis| key.strip_prefix(axis).is_some_and(|suffix| AXIS_SUFFIXES.contains(&suffix)));
+    match key {
+        "sectionInvert" | "sectionContrast" | TEXTURE_INPUT => SectionParameters::defaults(kind).is_some(),
+        _ if TEXTURE_KEYS.contains(&key) => SectionParameters::defaults(kind).is_some(),
+        "sectionBlur" => SectionParameters::has_blur(kind),
+        "sectionBalance" => SectionParameters::has_balance(kind),
+        "sectionBrightness" => SectionParameters::has_brightness(kind),
+        _ if axis_key => SectionParameters::has_axes(kind),
+        _ => LIGHT_KEYS.contains(&key) && LightParameters::defaults(kind).is_some(),
+    }
+}
+
 /// Apply `params` to `generator`, using `command` in errors
 fn generator_from(command: &str, params: &Value, generator: &mut Generator) -> Result<()> {
+    wear_from(command, params, generator)?;
+    section_from(command, params, generator)?;
+    let earlier_keys: &[&str] = if WearParameters::defaults(generator.kind).is_some() { &EARLIER_WEAR_KEYS } else { &EARLIER_SECTION_KEYS };
+    micro_from(command, params, generator, earlier_keys)?;
+    distance_from(command, params, generator)?;
     if let Some(level) = f32p(params, "level") {
         generator.level = level.clamp(0.0, 1.0);
     }
@@ -478,43 +804,19 @@ fn add_anchor(session: &mut Session, params: &Value) -> Result<Value> {
     push_effect(session, &Value::Object(fields), EffectKind::Anchor, BlendMode::Normal)
 }
 
-/// A generator's micro detail from `microAnchor` / `microAmount` for a generator on layer
-/// `reader` (None: leave it as it is; `Some(None)`: remove it).
-fn micro_param(session: &Session, command: &str, reader: LayerId, params: &Value, current: Option<MicroDetail>) -> Result<Option<Option<MicroDetail>>> {
-    let amount = match params.get("microAmount") {
-        Some(value) => {
-            Some(value.as_f64().filter(|v| v.is_finite()).ok_or_else(|| bad(command, "`microAmount` must be a number 0..1"))?.clamp(0.0, 1.0) as f32)
-        }
-        None => None,
-    };
-    let anchor = match params.get("microAnchor") {
-        None => current.map(|m| m.anchor),
-        Some(Value::Null) => return Ok(Some(None)),
-        Some(value) => Some(LayerId(value.as_u64().ok_or_else(|| bad(command, "`microAnchor` must be an anchor effect id or null"))?)),
-    };
-    let Some(anchor) = anchor else {
-        return match amount {
-            Some(_) => Err(bad(command, "give `microAnchor` before `microAmount`: the generator has no micro detail")),
-            None => Ok(None),
-        };
-    };
-
-    if params.get("microAnchor").is_none() && amount.is_none() {
-        return Ok(None);
-    }
-
-    // The same rule as fills: an anchor below, in the same texture set
-    anchor_source(session, command, reader, anchor, Channel::Height)?;
-    let amount = amount.or(current.map(|m| m.amount)).unwrap_or(MicroDetail::DEFAULT_AMOUNT);
-    Ok(Some(Some(MicroDetail { anchor, amount })))
-}
-
-/// The generator input named by `input` and what replaces it (None: its mesh map again), for a generator on layer `owner`.
-fn generator_input_param(session: &Session, owner: LayerId, params: &Value) -> Result<Option<(BakedMap, Option<Source>)>> {
+/// The generator input named by `input` and what replaces it (None: its mesh map again, or an empty texture or grunge slot), for a generator on layer `owner`
+fn generator_input_param(session: &Session, owner: LayerId, params: &Value) -> Result<Option<(GeneratorInput, Option<Source>)>> {
     const CMD: &str = "effect.set";
     let Some(name) = params.get("input") else { return Ok(None) };
-    let name = name.as_str().ok_or_else(|| bad(CMD, "`input` must be a mesh map id"))?;
-    let map = BakedMap::parse(name).ok_or_else(|| bad(CMD, format!("unknown input `{name}`")))?;
+    let name = name.as_str().ok_or_else(|| bad(CMD, "`input` must be a mesh map id, `texture`, `grunge`, `microHeight`, `microNormal` or `image`"))?;
+    let input = match name {
+        TEXTURE_INPUT => GeneratorInput::Texture,
+        GRUNGE_INPUT => GeneratorInput::Grunge,
+        MICRO_HEIGHT_INPUT => GeneratorInput::MicroHeight,
+        MICRO_NORMAL_INPUT => GeneratorInput::MicroNormal,
+        GRAYSCALE_IMAGE_INPUT => GeneratorInput::Image,
+        _ => GeneratorInput::Map(BakedMap::parse(name).ok_or_else(|| bad(CMD, format!("unknown input `{name}`")))?),
+    };
 
     let image = strp(params, "inputImage");
     let value = f32p(params, "inputValue");
@@ -525,9 +827,13 @@ fn generator_input_param(session: &Session, owner: LayerId, params: &Value) -> R
             if !session.images.contains_key(image) {
                 return Err(bad(CMD, format!("no image resource `{image}`")));
             }
+
             Some(Source::Image { name: image.to_string(), normal_format: Default::default() })
         }
         (None, Some(value), None, false) => Some(Source::Uniform([value.clamp(0.0, 1.0); 3])),
+        (None, None, Some(_), false) if matches!(input, GeneratorInput::MicroNormal) => {
+            return Err(bad(CMD, "the micro normal reads an image or a value, not an anchor point"));
+        }
         (None, None, Some(anchor), false) => {
             let channel = channel_param(CMD, params, "anchorChannel")?.unwrap_or(Channel::Height);
             Some(anchor_source(session, CMD, owner, LayerId(anchor), channel)?)
@@ -535,7 +841,7 @@ fn generator_input_param(session: &Session, owner: LayerId, params: &Value) -> R
         (None, None, None, true) => None,
         _ => return Err(bad(CMD, "`input` takes exactly one of inputImage, inputValue, inputAnchor or inputBaked")),
     };
-    Ok(Some((map, source)))
+    Ok(Some((input, source)))
 }
 
 fn add_generator(session: &mut Session, params: &Value) -> Result<Value> {
@@ -547,8 +853,8 @@ fn add_generator(session: &mut Session, params: &Value) -> Result<Value> {
     generator_from("effect.add.generator", params, &mut generator)?;
     let selected_layer = layer_param(session, "effect.add.generator", params)?;
     let reader = session.doc.project.mask_owner(selected_layer);
-    if let Some(micro) = micro_param(session, "effect.add.generator", reader, params, None)? {
-        generator.micro = micro;
+    if let Some(edit) = AnchoredMicroEdit::parse(session, "effect.add.generator", reader, params)? {
+        edit.apply("effect.add.generator", &mut generator)?;
     }
     let blend = blend_param("effect.add.generator", params, "blend")?.unwrap_or(BlendMode::Normal);
     push_effect(session, params, EffectKind::Generator(generator), blend)
@@ -714,7 +1020,7 @@ fn histogram(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Edit visibility, blending, name, effect parameters, or a filter's type
-fn set(session: &mut Session, params: &Value) -> Result<Value> {
+pub(crate) fn set(session: &mut Session, params: &Value) -> Result<Value> {
     const CMD: &str = "effect.set";
     let effect = effect_id(session, params, CMD)?;
     let blend = blend_param(CMD, params, "blend")?;
@@ -757,7 +1063,7 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
     };
 
     let micro = match session.doc.project.effect(effect) {
-        Some((owner, Effect { kind: EffectKind::Generator(generator), .. })) => micro_param(session, CMD, owner, params, generator.micro)?,
+        Some((owner, Effect { kind: EffectKind::Generator(_), .. })) => AnchoredMicroEdit::parse(session, CMD, owner, params)?,
         _ if params.get("microAnchor").is_some() || params.get("microAmount").is_some() => {
             return Err(bad(CMD, "`microAnchor` and `microAmount` edit generator effects only"));
         }
@@ -785,10 +1091,17 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
     };
     let swaps_filter = swapped.is_some();
     let id_map = crate::color_selection_cmds::id_map_param(session, params)?;
+    let swapped_generator = match strp(params, "generator") {
+        Some(kind) => swapped_generator_kind(session, effect, kind)?,
+        None => None,
+    };
 
     let mesh = session.mesh.clone();
     session.edit("Edit effect", |session| {
         let edited = session.doc.project.effect_mut(effect).ok_or_else(|| bad(CMD, format!("no effect {}", effect.0)))?;
+        if let Some(generator) = swapped_generator {
+            edited.kind = EffectKind::Generator(generator);
+        }
         if let Some((kind, label)) = swapped {
             if let EffectKind::Filter(old) = &edited.kind
                 && (edited.name == old.label() || Some(edited.name.as_str()) == old.former_label())
@@ -823,18 +1136,45 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
                     generator.inputs.retain(|map, _| kind.inputs().contains(map));
                 }
                 generator_from(CMD, params, generator)?;
-                if let Some(micro) = micro {
-                    generator.micro = micro;
-                }
-                if let Some((map, source)) = input {
-                    if !generator.kind.inputs().contains(&map) {
-                        return Err(bad(CMD, format!("this generator has no `{}` input", map.id())));
+                match input {
+                    Some((GeneratorInput::Map(map), source)) => {
+                        if !generator.inputs_in_use().contains(&map) {
+                            return Err(bad(CMD, format!("this generator does not read a `{}` input", map.id())));
+                        }
+                        match source {
+                            Some(source) => generator.inputs.insert(map, source),
+                            None => generator.inputs.remove(&map),
+                        };
                     }
 
-                    match source {
-                        Some(source) => generator.inputs.insert(map, source),
-                        None => generator.inputs.remove(&map),
-                    };
+                    // The generator parser has validated texture support and migrated the section controls
+                    Some((GeneratorInput::Texture, source)) => generator.texture.get_or_insert_default().source = source,
+                    // generator_from refused the grunge on kinds without wear controls and moved the generator onto them
+                    Some((GeneratorInput::Grunge, source)) => generator.grunge = source,
+                    // generator_from refused micro details on kinds without them and created them
+                    Some((GeneratorInput::MicroHeight, source)) => {
+                        if let Some(micro) = generator.micro.as_mut() {
+                            micro.height_source = source;
+                        }
+                    }
+                    Some((GeneratorInput::Image, source)) => {
+                        if generator.kind != GeneratorKind::GrayscaleConversion {
+                            return Err(bad(CMD, "only Grayscale Conversion reads an `image` input"));
+                        }
+
+                        let mut grayscale = generator.grayscale_controls().unwrap_or_default();
+                        grayscale.source = source;
+                        generator.controls = Some(Box::new(KindControls::Grayscale(grayscale)));
+                    }
+                    Some((GeneratorInput::MicroNormal, source)) => {
+                        if let Some(micro) = generator.micro.as_mut() {
+                            micro.normal_source = source;
+                        }
+                    }
+                    None => {}
+                }
+                if let Some(edit) = micro {
+                    edit.apply(CMD, generator)?;
                 }
             }
             _ if generator_kind.is_some() => return Err(bad(CMD, "`generator` requires a generator effect")),
@@ -936,6 +1276,41 @@ fn current_filter_id(s: &Session, effect: LayerId) -> Option<&'static str> {
     match &s.doc.project.effect(effect)?.1.kind {
         EffectKind::Filter(filter) => crate::filter_lib::definition(filter).map(|def| def.id),
         _ => None,
+    }
+}
+
+/// A generator of kind `name` at its defaults to replace generator effect `effect`, or None when it is that kind already
+fn swapped_generator_kind(s: &Session, effect: LayerId, name: &str) -> Result<Option<Generator>> {
+    const CMD: &str = "effect.set";
+    let kind = GeneratorKind::parse(name).ok_or_else(|| bad(CMD, format!("unknown generator `{name}`")))?;
+    match &s.doc.project.effect(effect).ok_or_else(|| bad(CMD, format!("no effect {}", effect.0)))?.1.kind {
+        EffectKind::Generator(current) if current.kind == kind => Ok(None),
+        EffectKind::Generator(current) => Ok(Some(swapped_kind(current, kind))),
+        other => Err(bad(CMD, format!("`generator` changes generator effects only, not {}", other.name().to_ascii_lowercase()))),
+    }
+}
+
+/// `current` as a `kind` generator: the settings every kind shares and the inputs `kind` reads stay, its own controls start from `kind`'s defaults
+fn swapped_kind(current: &Generator, kind: GeneratorKind) -> Generator {
+    let mut inputs = current.inputs.clone();
+    inputs.retain(|map, _| kind.inputs().contains(map));
+    Generator {
+        level: current.level,
+        softness: current.softness,
+        noise_amount: current.noise_amount,
+        noise_scale: current.noise_scale,
+        seed: current.seed,
+        // The offset belongs to the earlier model, which these kinds lack
+        offset: if kind.has_no_earlier_model() { 0.0 } else { current.offset },
+        direction: current.direction,
+        invert: current.invert,
+        global: current.global,
+        resolution: current.resolution,
+        inputs,
+        grunge: current.grunge.clone().filter(|_| WearParameters::defaults(kind).is_some()),
+        texture: current.texture.clone().filter(|_| SectionParameters::defaults(kind).is_some()),
+        micro: swapped_micro(current.micro.as_deref(), kind),
+        ..Generator::new(kind)
     }
 }
 

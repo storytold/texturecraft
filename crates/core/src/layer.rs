@@ -12,45 +12,81 @@ use crate::{
     ShapeCrop, SourceSlopeBlur, SourceWarp, StylizedLighting, SunAndSky, ThresholdMode, TileTransform, finite_unit, lum,
 };
 
+mod anchored_micro_detail;
+mod axis_blend;
+mod axis_layer;
+mod border_distance_parameters;
 mod curvature_detail;
 mod curvature_mode;
 mod decal_flip;
 mod decal_symmetry;
+mod distance_parameters;
+mod dripping_rust_parameters;
 mod filtering;
 mod generator_global;
-mod micro_detail;
+mod generator_grayscale;
+mod grayscale_conversion_parameters;
+mod kind_controls;
+mod light_parameters;
+mod linear_gradient_parameters;
+mod micro_curvature_type;
+mod micro_details;
 mod output_resolution;
 mod resolution_mode;
 mod sampling;
 mod scale_mode;
+mod section_parameters;
+mod texture_blend;
+mod texture_layer;
 mod tile_blending;
 mod tile_generator;
 mod tile_input_distribution;
 mod tile_shape;
 mod tile_size_mode;
 mod tile_symmetry;
+mod uv_checker_parameters;
+mod uv_random_color_parameters;
 mod uv_transform;
 mod uv_wrap;
+mod wear_parameters;
 
+use anchored_micro_detail::AnchoredMicroDetail;
+pub use axis_blend::AxisBlend;
+pub use axis_layer::AxisLayer;
+pub use border_distance_parameters::BorderDistanceParameters;
 pub use curvature_detail::CurvatureDetail;
 pub use curvature_mode::CurvatureMode;
 pub use decal_flip::DecalFlip;
 pub use decal_symmetry::DecalSymmetry;
+pub use distance_parameters::DistanceParameters;
+pub use dripping_rust_parameters::DrippingRustParameters;
 pub use filtering::Filtering;
 pub use generator_global::GeneratorGlobal;
-pub use micro_detail::MicroDetail;
+pub use generator_grayscale::GeneratorGrayscale;
+pub use grayscale_conversion_parameters::GrayscaleConversionParameters;
+pub use kind_controls::KindControls;
+pub use light_parameters::LightParameters;
+pub use linear_gradient_parameters::LinearGradientParameters;
+pub use micro_curvature_type::MicroCurvatureType;
+pub use micro_details::MicroDetails;
 pub use output_resolution::OutputResolution;
 pub use resolution_mode::ResolutionMode;
 pub use sampling::Sampling;
 pub use scale_mode::ScaleMode;
+pub use section_parameters::SectionParameters;
+pub use texture_blend::TextureBlend;
+pub use texture_layer::TextureLayer;
 pub use tile_blending::TileBlending;
 pub use tile_generator::TileGenerator;
 pub use tile_input_distribution::TileInputDistribution;
 pub use tile_shape::TileShape;
 pub use tile_size_mode::TileSizeMode;
 pub use tile_symmetry::TileSymmetry;
+pub use uv_checker_parameters::UvCheckerParameters;
+pub use uv_random_color_parameters::UvRandomColorParameters;
 pub use uv_transform::UvTransform;
 pub use uv_wrap::UvWrap;
+pub use wear_parameters::WearParameters;
 
 /// Id of a layer or effect (one id space per project).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -926,10 +962,28 @@ pub enum GeneratorKind {
     Position,
     /// Surfaces facing a direction (e.g. up for dust).
     Direction,
+    /// Worn edges of a fibreglass-like coating: the edges fade into its grunge
+    FiberGlassEdgeWear,
+    /// The world space normal's axes combined into one gray
+    WorldSpaceNormals,
+    /// White around a point across the mesh's bounds, fading with the distance from it
+    ThreeDDistance,
+    /// A gradient from a start point to an end point across the mesh's bounds
+    ThreeDLinearGradient,
+    /// White at the UV islands' borders, fading towards their insides
+    UvBorderDistance,
+    /// An image turned gray, tiled and rotated across the UV square
+    GrayscaleConversion,
+    /// Rust in the occluded areas, running down the mesh in drips
+    DrippingRust,
+    /// One random value per UV island
+    UvRandomColor,
+    /// A checker and grid over each UV tile with the UV islands' borders drawn in, for checking a layout
+    UvChecker,
 }
 
 impl GeneratorKind {
-    pub const ALL: [GeneratorKind; 7] = [
+    pub const ALL: [GeneratorKind; 16] = [
         GeneratorKind::EdgeWear,
         GeneratorKind::Dirt,
         GeneratorKind::ThinAreas,
@@ -937,36 +991,135 @@ impl GeneratorKind {
         GeneratorKind::AmbientOcclusion,
         GeneratorKind::Position,
         GeneratorKind::Direction,
+        GeneratorKind::FiberGlassEdgeWear,
+        GeneratorKind::WorldSpaceNormals,
+        GeneratorKind::ThreeDDistance,
+        GeneratorKind::ThreeDLinearGradient,
+        GeneratorKind::UvBorderDistance,
+        GeneratorKind::GrayscaleConversion,
+        GeneratorKind::DrippingRust,
+        GeneratorKind::UvRandomColor,
+        GeneratorKind::UvChecker,
     ];
     pub fn label(self) -> &'static str {
         match self {
-            GeneratorKind::EdgeWear => "Mask Editor: Edge wear",
+            GeneratorKind::EdgeWear => "Worn Metal Edges",
             GeneratorKind::Dirt => "Dirt",
             GeneratorKind::ThinAreas => "Thin areas",
             GeneratorKind::Curvature => "Curvature",
-            GeneratorKind::AmbientOcclusion => "Ambient occlusion",
-            GeneratorKind::Position => "Position gradient",
-            GeneratorKind::Direction => "Light / direction",
+            GeneratorKind::AmbientOcclusion => "Ambient Occlusion",
+            GeneratorKind::Position => "Position",
+            GeneratorKind::Direction => "Light",
+            GeneratorKind::FiberGlassEdgeWear => "Exposed Glass Fibers",
+            GeneratorKind::WorldSpaceNormals => "World Space Normals",
+            GeneratorKind::ThreeDDistance => "3D Distance",
+            GeneratorKind::ThreeDLinearGradient => "3D Linear Gradient",
+            GeneratorKind::UvBorderDistance => "UV Border Distance",
+            GeneratorKind::GrayscaleConversion => "Grayscale Conversion",
+            GeneratorKind::DrippingRust => "Rust Runoff",
+            GeneratorKind::UvRandomColor => "UV Random Color",
+            GeneratorKind::UvChecker => "UV Checker",
         }
+    }
+
+    /// The name commands and saved projects use for this kind
+    pub fn id(self) -> &'static str {
+        match self {
+            GeneratorKind::EdgeWear => "EdgeWear",
+            GeneratorKind::Dirt => "Dirt",
+            GeneratorKind::ThinAreas => "ThinAreas",
+            GeneratorKind::Curvature => "Curvature",
+            GeneratorKind::AmbientOcclusion => "AmbientOcclusion",
+            GeneratorKind::Position => "Position",
+            GeneratorKind::Direction => "Direction",
+            GeneratorKind::FiberGlassEdgeWear => "FiberGlassEdgeWear",
+            GeneratorKind::WorldSpaceNormals => "WorldSpaceNormals",
+            GeneratorKind::ThreeDDistance => "ThreeDDistance",
+            GeneratorKind::ThreeDLinearGradient => "ThreeDLinearGradient",
+            GeneratorKind::UvBorderDistance => "UvBorderDistance",
+            GeneratorKind::GrayscaleConversion => "GrayscaleConversion",
+            GeneratorKind::DrippingRust => "DrippingRust",
+            GeneratorKind::UvRandomColor => "UvRandomColor",
+            GeneratorKind::UvChecker => "UvChecker",
+        }
+    }
+
+    /// Whether the generator picker offers this kind (Thin areas only loads from saved projects and smart masks)
+    pub fn in_picker(self) -> bool {
+        self != GeneratorKind::ThinAreas
+    }
+
+    /// Whether the kind's result depends on its seed
+    pub fn includes_randomness(self) -> bool {
+        matches!(
+            self,
+            GeneratorKind::EdgeWear
+                | GeneratorKind::Dirt
+                | GeneratorKind::FiberGlassEdgeWear
+                | GeneratorKind::DrippingRust
+                | GeneratorKind::UvRandomColor
+                | GeneratorKind::UvChecker
+        )
     }
 
     /// The mesh maps this kind reads, each an input that an image, a uniform value or an anchor can replace.
     pub fn inputs(self) -> &'static [BakedMap] {
         match self {
-            GeneratorKind::EdgeWear | GeneratorKind::Curvature => &[BakedMap::Curvature],
-            GeneratorKind::Dirt | GeneratorKind::AmbientOcclusion => &[BakedMap::AmbientOcclusion],
+            GeneratorKind::EdgeWear | GeneratorKind::Dirt | GeneratorKind::FiberGlassEdgeWear => &[BakedMap::Curvature, BakedMap::AmbientOcclusion],
+            GeneratorKind::Curvature => &[BakedMap::Curvature],
+            GeneratorKind::AmbientOcclusion => &[BakedMap::AmbientOcclusion],
             GeneratorKind::ThinAreas => &[BakedMap::Thickness],
-            GeneratorKind::Position | GeneratorKind::Direction => &[],
+            GeneratorKind::Position | GeneratorKind::ThreeDDistance | GeneratorKind::ThreeDLinearGradient => &[BakedMap::Position],
+            GeneratorKind::WorldSpaceNormals => &[BakedMap::WorldNormal],
+            GeneratorKind::Direction => &[BakedMap::WorldNormal, BakedMap::Position],
+            // Dripping Rust reads the baked occlusion and the mesh's bounds whole, so no input replaces them yet
+            GeneratorKind::UvBorderDistance
+            | GeneratorKind::GrayscaleConversion
+            | GeneratorKind::DrippingRust
+            | GeneratorKind::UvRandomColor
+            | GeneratorKind::UvChecker => &[],
         }
     }
 
-    pub fn parse(s: &str) -> Option<GeneratorKind> {
-        let norm = |x: &str| x.to_ascii_lowercase().replace([' ', '_', '-', ':'], "");
-        GeneratorKind::ALL.into_iter().find(|k| norm(&format!("{k:?}")) == norm(s) || norm(k.label()) == norm(s))
+    /// Whether the kind was added with the reference's controls only, so it never computes with level, softness and noise
+    pub fn has_no_earlier_model(self) -> bool {
+        matches!(
+            self,
+            GeneratorKind::FiberGlassEdgeWear
+                | GeneratorKind::ThreeDDistance
+                | GeneratorKind::ThreeDLinearGradient
+                | GeneratorKind::UvBorderDistance
+                | GeneratorKind::GrayscaleConversion
+                | GeneratorKind::DrippingRust
+                | GeneratorKind::UvRandomColor
+                | GeneratorKind::UvChecker
+        )
+    }
+
+    pub fn parse(name: &str) -> Option<GeneratorKind> {
+        let normalised = |text: &str| text.to_ascii_lowercase().replace([' ', '_', '-', ':'], "");
+        let wanted = normalised(name);
+
+        GeneratorKind::ALL.into_iter().find(|kind| {
+            normalised(kind.id()) == wanted || normalised(kind.label()) == wanted || kind.former_labels().iter().any(|label| normalised(label) == wanted)
+        })
+    }
+
+    /// Earlier names accepted by commands and picker search
+    pub fn former_labels(self) -> &'static [&'static str] {
+        match self {
+            GeneratorKind::EdgeWear => &["Mask Editor: Edge wear", "Metal Edge Wear"],
+            GeneratorKind::Position => &["Position gradient"],
+            GeneratorKind::Direction => &["Light / direction"],
+            GeneratorKind::FiberGlassEdgeWear => &["Fiber Glass Edge Wear"],
+            GeneratorKind::DrippingRust => &["Dripping Rust"],
+            _ => &[],
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Generator {
     pub kind: GeneratorKind,
     /// Where the mask starts (0..1, generator specific threshold).
@@ -995,9 +1148,48 @@ pub struct Generator {
     /// What an input reads instead of its mesh map (an image, a uniform value or an anchor); inputs not listed read their mesh map.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<BakedMap, Source>,
-    /// Painted height read from an anchor point below, added as micro detail (None: baked maps only).
+    /// The wear kinds' controls (None: the level, softness and noise above, as saved before they existed)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub micro: Option<MicroDetail>,
+    pub wear: Option<WearParameters>,
+    /// The section controls of Curvature, Ambient Occlusion, Position and World Space Normals (None: the level, softness and noise above, as saved before they existed)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<SectionParameters>,
+    /// The Light generator's controls (None: the level, softness and noise above, as saved before they existed)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light: Option<LightParameters>,
+    /// The texture blended over the signal on the section controls (None: Use Texture never touched, as saved before it existed); boxed, so a generator effect stays small
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub texture: Option<Box<TextureLayer>>,
+    /// The image a wear generator reads as its grunge once Use Custom Grunge is on (None: an empty slot)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grunge: Option<Source>,
+    /// The micro details of Curvature, Ambient Occlusion and the wear kinds (None: never touched, their defaults: off); boxed, so a generator effect stays small
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micro: Option<Box<MicroDetails>>,
+    /// The controls of 3D Distance, 3D Linear Gradient, UV Border Distance or Grayscale Conversion (None on the other kinds); boxed, so a generator effect stays small
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controls: Option<Box<KindControls>>,
+}
+
+impl Serialize for Generator {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Generator::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Generator {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Generator, D::Error> {
+        let mut saved = serde_json::Value::deserialize(deserializer)?;
+
+        // Micro detail saved before Micro Details: an anchor point's height and its amount
+        let anchored = saved.get_mut("micro").filter(|micro| micro.get("anchor").is_some()).map(serde_json::Value::take);
+        let mut generator = Generator::deserialize(saved).map_err(serde::de::Error::custom)?;
+        if let Some(anchored) = anchored {
+            let AnchoredMicroDetail { anchor, amount } = serde_json::from_value(anchored).map_err(serde::de::Error::custom)?;
+            generator.micro = MicroDetails::of_anchor(generator.kind, anchor, amount).map(Box::new);
+        }
+        Ok(generator)
+    }
 }
 
 impl Generator {
@@ -1007,6 +1199,104 @@ impl Generator {
     pub const MAX_NOISE_AMOUNT: f32 = 2.0;
     pub const MIN_NOISE_SCALE: f32 = 0.01;
     pub const MAX_NOISE_SCALE: f32 = 1000.0;
+
+    /// The global blur, balance and contrast the generator applies: none on the wear and light controls, which have no such controls
+    pub fn applied_global(&self) -> GeneratorGlobal {
+        if self.wear.is_some() || self.light.is_some() || self.kind.has_no_earlier_model() { GeneratorGlobal::default() } else { self.global }
+    }
+
+    /// The section controls the generator computes with: its own, World Space Normals' defaults when it has none (it has no earlier model), else None
+    pub fn section_controls(&self) -> Option<SectionParameters> {
+        self.section.or_else(|| SectionParameters::defaults(self.kind).filter(|_| self.kind == GeneratorKind::WorldSpaceNormals))
+    }
+
+    /// The 3D Distance controls the generator computes with: its own, else the defaults on a 3D Distance generator
+    pub fn distance_controls(&self) -> Option<DistanceParameters> {
+        match self.kind_controls() {
+            Some(KindControls::Distance(distance)) => Some(distance),
+            _ => None,
+        }
+    }
+
+    /// The 3D Linear Gradient controls the generator computes with: its own, else the defaults on a 3D Linear Gradient generator
+    pub fn linear_gradient_controls(&self) -> Option<LinearGradientParameters> {
+        match self.kind_controls() {
+            Some(KindControls::LinearGradient(gradient)) => Some(gradient),
+            _ => None,
+        }
+    }
+
+    /// The UV Border Distance controls the generator computes with: its own, else the defaults on a UV Border Distance generator
+    pub fn border_distance_controls(&self) -> Option<BorderDistanceParameters> {
+        match self.kind_controls() {
+            Some(KindControls::BorderDistance(border)) => Some(border),
+            _ => None,
+        }
+    }
+
+    /// The Grayscale Conversion controls the generator computes with: its own, else the defaults on a Grayscale Conversion generator
+    pub fn grayscale_controls(&self) -> Option<GrayscaleConversionParameters> {
+        match self.kind_controls() {
+            Some(KindControls::Grayscale(grayscale)) => Some(grayscale),
+            _ => None,
+        }
+    }
+
+    /// The controls of a kind with only its own controls: its saved ones (brought into range) when they are that kind's, else its defaults
+    pub fn kind_controls(&self) -> Option<KindControls> {
+        let saved = self.controls.as_deref().filter(|controls| controls.kind() == self.kind).cloned().map(KindControls::clamped);
+        saved.or_else(|| KindControls::defaults(self.kind))
+    }
+
+    /// The Grayscale Conversion controls as saved, without a copy
+    fn grayscale_controls_ref(&self) -> Option<&GrayscaleConversionParameters> {
+        match self.controls.as_deref() {
+            Some(KindControls::Grayscale(grayscale)) if self.kind == GeneratorKind::GrayscaleConversion => Some(grayscale),
+            _ => None,
+        }
+    }
+
+    /// The mode and detail sizes the generator reads its curvature with: its own, the defaults on Curvature's section controls, else None
+    pub fn detail_in_use(&self) -> Option<CurvatureDetail> {
+        let on_section = self.kind == GeneratorKind::Curvature && self.section_controls().is_some();
+        self.detail.clone().or_else(|| on_section.then(CurvatureDetail::default))
+    }
+
+    /// The mesh maps the generator reads: none for Position and Light on the earlier model, which read the mesh itself
+    pub fn inputs_in_use(&self) -> &'static [BakedMap] {
+        let reads_geometry = self.on_earlier_model() && matches!(self.kind, GeneratorKind::Position | GeneratorKind::Direction);
+        if reads_geometry { &[] } else { self.kind.inputs() }
+    }
+
+    /// The texture the generator blends over its signal: only on the section controls, turned on with some opacity
+    pub fn texture_in_use(&self) -> Option<&TextureLayer> {
+        self.texture.as_deref().filter(|texture| texture.in_use() && self.section_controls().is_some())
+    }
+
+    /// Everything the generator reads instead of its mesh maps: its inputs, then its texture, its custom grunge, its micro details and its Grayscale Conversion image
+    pub fn sources(&self) -> impl Iterator<Item = &Source> {
+        let micro = self.micro.iter().flat_map(|micro| micro.sources()).chain(self.grayscale_controls_ref().and_then(|grayscale| grayscale.source.as_ref()));
+        self.inputs.values().chain(self.texture.as_ref().and_then(|texture| texture.source.as_ref())).chain(self.grunge.as_ref()).chain(micro)
+    }
+
+    /// The micro details as saved, when the generator computes with them: with a slot switched on, except a micro detail saved before Micro Details on a generator still on the earlier model, which [`Generator::earlier_micro`] reads (bring them into range before use: saved files are not trusted)
+    pub fn micro_in_use(&self) -> Option<&MicroDetails> {
+        self.micro.as_deref().filter(|micro| micro.in_use(self.kind) && !(micro.earlier && self.on_earlier_model()))
+    }
+
+    /// The anchor point and amount (0..1) of a micro detail saved before Micro Details, while the generator is still on the earlier model: its signal adds that anchor's height times the amount, as it did when saved
+    pub fn earlier_micro(&self) -> Option<(LayerId, f32)> {
+        let micro = self.micro.as_deref().filter(|micro| micro.earlier && micro.in_use(self.kind) && micro.height && self.on_earlier_model())?;
+        let Some(Source::Anchor { anchor, .. }) = &micro.height_source else { return None };
+
+        let amount = micro.height_intensity / MicroDetails::HEIGHT_INTENSITY_PER_AMOUNT;
+        Some((*anchor, if amount.is_finite() { amount.clamp(0.0, 1.0) } else { 0.0 }))
+    }
+
+    /// Whether the generator is on the level, softness and noise it had before the reference app's controls
+    pub fn on_earlier_model(&self) -> bool {
+        self.wear.is_none() && self.light.is_none() && self.section_controls().is_none() && !self.kind.has_no_earlier_model()
+    }
 
     pub fn new(kind: GeneratorKind) -> Generator {
         let (level, softness, noise_amount) = match kind {
@@ -1035,7 +1325,13 @@ impl Generator {
             global: GeneratorGlobal::default(),
             resolution: OutputResolution::default(),
             inputs: BTreeMap::new(),
+            wear: WearParameters::defaults(kind),
+            section: SectionParameters::defaults(kind),
+            light: LightParameters::defaults(kind),
+            texture: None,
+            grunge: None,
             micro: None,
+            controls: KindControls::defaults(kind).map(Box::new),
         }
     }
 
@@ -2007,10 +2303,7 @@ impl EffectKind {
         match self {
             EffectKind::Fill { source, .. } => source.reads_anchor(anchor),
             EffectKind::Material(fill) => fill.sources.values().any(|source| source.reads_anchor(anchor)),
-            EffectKind::Generator(generator) => {
-                generator.micro.is_some_and(|micro| anchor.is_none_or(|wanted| wanted == micro.anchor))
-                    || generator.inputs.values().any(|source| source.reads_anchor(anchor))
-            }
+            EffectKind::Generator(generator) => generator.sources().any(|source| source.reads_anchor(anchor)),
             _ => false,
         }
     }
@@ -2020,22 +2313,16 @@ impl EffectKind {
         let sources: Vec<&Source> = match self {
             EffectKind::Fill { source, .. } => vec![source],
             EffectKind::Material(fill) => fill.sources.values().collect(),
-            EffectKind::Generator(generator) => generator.inputs.values().collect(),
+            EffectKind::Generator(generator) => generator.sources().collect(),
             _ => Vec::new(),
         };
-        let mut anchors: Vec<_> = sources
+        sources
             .into_iter()
             .filter_map(|source| match source {
                 Source::Anchor { anchor, channel, .. } => Some((*anchor, *channel)),
                 _ => None,
             })
-            .collect();
-        if let EffectKind::Generator(generator) = self
-            && let Some(micro) = generator.micro
-        {
-            anchors.push((micro.anchor, Channel::Height));
-        }
-        anchors
+            .collect()
     }
 
     /// The image resources this effect's sources read (a fill, its patterns, a material or a generator input, a colour selection's ID map)
@@ -2043,7 +2330,7 @@ impl EffectKind {
         let sources: Vec<&Source> = match self {
             EffectKind::Fill { source, .. } => vec![source],
             EffectKind::Material(fill) => fill.sources.values().collect(),
-            EffectKind::Generator(generator) => generator.inputs.values().collect(),
+            EffectKind::Generator(generator) => generator.sources().collect(),
             _ => Vec::new(),
         };
         let id_map = match self {
@@ -2243,6 +2530,48 @@ mod tests {
         let not_finite = TileGenerator { scale: f32::NAN, rotation: f32::INFINITY, ..TileGenerator::default() }.clamped();
 
         assert_eq!((not_finite.scale, not_finite.rotation), (1.0, 0.0));
+    }
+
+    #[test]
+    fn generator_ids_are_the_saved_names_and_parse_back() {
+        for kind in GeneratorKind::ALL {
+            assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(kind.id()));
+            assert_eq!(GeneratorKind::parse(kind.id()), Some(kind));
+            assert_eq!(GeneratorKind::parse(kind.label()), Some(kind));
+        }
+        assert!(!GeneratorKind::ThinAreas.in_picker(), "Thin areas only loads from saved projects and smart masks");
+        assert_eq!(GeneratorKind::parse("Light / direction"), Some(GeneratorKind::Direction), "earlier labels still parse");
+    }
+
+    #[test]
+    fn wear_generators_saved_before_their_wear_controls_load_on_the_earlier_model() {
+        let mut saved = serde_json::to_value(Generator::new(GeneratorKind::EdgeWear)).unwrap();
+        assert!(saved.get("wear").is_some(), "new wear generators have wear controls");
+
+        saved.as_object_mut().unwrap().remove("wear");
+        let loaded: Generator = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.wear, None, "level, softness and noise keep driving it");
+        let curvature = serde_json::to_value(Generator::new(GeneratorKind::Curvature)).unwrap();
+        assert!(curvature.get("wear").is_none(), "other kinds save no wear controls");
+    }
+
+    #[test]
+    fn generators_saved_before_their_section_or_light_controls_load_on_the_earlier_model() {
+        for kind in [GeneratorKind::Curvature, GeneratorKind::AmbientOcclusion, GeneratorKind::Position, GeneratorKind::Direction] {
+            let mut saved = serde_json::to_value(Generator::new(kind)).unwrap();
+            let key = if kind == GeneratorKind::Direction { "light" } else { "section" };
+            assert!(saved.get(key).is_some(), "new {kind:?} generators have the reference's controls");
+
+            saved.as_object_mut().unwrap().remove(key);
+            let loaded: Generator = serde_json::from_value(saved).unwrap();
+            assert!(loaded.on_earlier_model(), "{kind:?}: level, softness and noise keep driving it");
+            assert_eq!(loaded.applied_global(), loaded.global, "{kind:?} keeps its global adjustments");
+        }
+
+        let mut saved = serde_json::to_value(Generator::new(GeneratorKind::WorldSpaceNormals)).unwrap();
+        saved.as_object_mut().unwrap().remove("section");
+        let loaded: Generator = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.section_controls(), SectionParameters::defaults(GeneratorKind::WorldSpaceNormals), "it has no earlier model");
     }
 
     #[test]
@@ -2481,10 +2810,10 @@ mod tests {
         let reader = fill_layer.mask.as_ref().map(|mask| &mask.effects[0].kind);
         assert!(reader.is_some_and(|reader| reader.reads(Some(LayerId(9))) && reader.reads(None) && !reader.reads(Some(LayerId(8)))));
 
-        // A generator with micro detail reads its anchor too
+        // A generator whose Micro Height reads an anchor reads it too
         let mut generator_layer = Layer::new(LayerId(3), "g", LayerKind::Paint, &[Channel::BaseColor]);
         let mut generator = Generator::new(GeneratorKind::Dirt);
-        generator.micro = Some(MicroDetail { anchor: LayerId(9), amount: 0.5 });
+        generator.micro = MicroDetails::of_anchor(GeneratorKind::Dirt, LayerId(9), 0.5).map(Box::new);
 
         assert_eq!(EffectKind::Generator(generator.clone()).anchors_read(), [(LayerId(9), Channel::Height)]);
         assert!(EffectKind::Generator(generator.clone()).reads(Some(LayerId(9))) && !EffectKind::Generator(generator.clone()).reads(Some(LayerId(8))));
@@ -2492,6 +2821,48 @@ mod tests {
         generator_layer.mask = Some(Mask { effects: vec![Effect::new(LayerId(4), EffectKind::Generator(generator))], ..Mask::new(MaskBackground::Black) });
 
         assert!(generator_layer.reads_anchor());
+    }
+
+    #[test]
+    fn micro_detail_saved_on_an_anchor_loads_as_micro_details_reading_its_height() {
+        let mut saved = serde_json::to_value(Generator::new(GeneratorKind::Curvature)).unwrap();
+        saved["micro"] = serde_json::json!({"anchor": 9, "amount": 0.25});
+
+        let generator: Generator = serde_json::from_value(saved.clone()).unwrap();
+        let micro = generator.micro.as_deref().unwrap();
+        let defaults = MicroDetails::defaults(GeneratorKind::Curvature).unwrap();
+
+        assert!(micro.enabled && micro.height, "{micro:?}");
+        assert_eq!(micro.height_source, Some(Source::Anchor { anchor: LayerId(9), channel: Channel::Height, ramp: Vec::new() }));
+        assert!(micro.height_intensity < defaults.height_intensity, "a weaker amount reads a gentler height");
+        assert_eq!((micro.curvature_type, micro.ao_radius, micro.normal_source.clone()), (defaults.curvature_type, defaults.ao_radius, None));
+        assert!(EffectKind::Generator(generator.clone()).reads(Some(LayerId(9))));
+
+        let reloaded: Generator = serde_json::from_value(serde_json::to_value(&generator).unwrap()).unwrap();
+        assert_eq!(reloaded, generator, "saved again as Micro Details");
+
+        saved["kind"] = serde_json::to_value(GeneratorKind::ThinAreas).unwrap();
+        let without: Generator = serde_json::from_value(saved).unwrap();
+        assert!(without.micro.is_none(), "a kind without micro details drops it");
+    }
+
+    #[test]
+    fn a_micro_detail_saved_on_an_anchor_keeps_its_earlier_reading_until_the_generator_leaves_the_earlier_model() {
+        // Saved before the reference's controls too: on the earlier model
+        let earlier = Generator { section: None, ..Generator::new(GeneratorKind::Curvature) };
+        let mut saved = serde_json::to_value(earlier).unwrap();
+        saved["micro"] = serde_json::json!({"anchor": 9, "amount": 0.25});
+        let generator: Generator = serde_json::from_value(saved).unwrap();
+
+        assert_eq!(generator.earlier_micro(), Some((LayerId(9), 0.25)));
+        assert!(generator.micro_in_use().is_none(), "the earlier reading replaces the Micro Height's curvature");
+
+        let reloaded: Generator = serde_json::from_value(serde_json::to_value(&generator).unwrap()).unwrap();
+        assert_eq!(reloaded.earlier_micro(), Some((LayerId(9), 0.25)), "saving again keeps the earlier reading");
+
+        let on_sections = Generator { section: SectionParameters::defaults(GeneratorKind::Curvature), ..generator };
+        assert_eq!(on_sections.earlier_micro(), None);
+        assert!(on_sections.micro_in_use().is_some(), "on the reference's controls the anchor reads as a Micro Height");
     }
 
     #[test]

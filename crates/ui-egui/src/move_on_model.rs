@@ -292,7 +292,7 @@ mod tests {
     /// Presses the left button on Move on model (the preview square) and holds it; returns the system's pointer, resting there
     fn press_the_button(harness: &mut Harness) -> SystemPointer {
         let at = harness.get_by_label("Move on model").rect().center();
-        let mut pointer = SystemPointer::at(harness, at);
+        let mut pointer = SystemPointer::in_app(harness, at);
         pointer.button(harness, PointerButton::Primary, true, Modifiers::NONE);
         pointer
     }
@@ -439,7 +439,7 @@ mod tests {
         assert!((pad.width() - pad.height()).abs() < 1.0 && pad.width() > 60.0, "Move on model is the preview square, no row of its own: {pad:?}");
 
         let before = projection(&harness, layer);
-        let mut pointer = SystemPointer::at(&mut harness, pad.left_top() + vec2(4.0, 4.0));
+        let mut pointer = SystemPointer::in_app(&mut harness, pad.left_top() + vec2(4.0, 4.0));
         pointer.button(&mut harness, PointerButton::Primary, true, Modifiers::NONE);
 
         assert_eq!(harness.state().moving_on_model, Some(MoveOnModel::layer(layer)), "a press at its corner starts the hold");

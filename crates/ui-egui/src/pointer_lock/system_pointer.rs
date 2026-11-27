@@ -12,12 +12,25 @@ pub(crate) struct SystemPointer {
     pub(crate) put_backs: usize,
     /// The system folds a put-back into the next move, as Windows does, instead of reporting it as a move of its own
     pub(crate) folds: bool,
+    /// The harness has no eframe app, so the test runs the app's raw input rewrite itself; an app harness runs the
+    /// app's `raw_input_hook` before every pass, as eframe does
+    rewrites: bool,
 }
 
 impl SystemPointer {
-    /// The pointer resting at `at` over the window
+    /// The pointer resting at `at` over a window that shows a bare UI, whose raw input the test rewrites as the
+    /// app's hook would
     pub(crate) fn at<S>(harness: &mut Harness<'_, S>, at: Pos2) -> SystemPointer {
-        let mut pointer = SystemPointer { at, locked: false, hidden: false, put_backs: 0, folds: false };
+        Self::start(harness, at, true)
+    }
+
+    /// The pointer resting at `at` over the app's window, whose own raw input hook rewrites the input
+    pub(crate) fn in_app<S>(harness: &mut Harness<'_, S>, at: Pos2) -> SystemPointer {
+        Self::start(harness, at, false)
+    }
+
+    fn start<S>(harness: &mut Harness<'_, S>, at: Pos2, rewrites: bool) -> SystemPointer {
+        let mut pointer = SystemPointer { at, locked: false, hidden: false, put_backs: 0, folds: false, rewrites };
         harness.input_mut().events.push(Event::PointerMoved(at));
         pointer.frame(harness);
         pointer
@@ -52,8 +65,10 @@ impl SystemPointer {
 
     /// One frame of everything the system sent since the last: the app's raw input hook rewrites it, the app runs, and the pointer does what the app asked
     pub(crate) fn frame<S>(&mut self, harness: &mut Harness<'_, S>) {
-        let ctx = harness.ctx.clone();
-        super::rewrite(&ctx, harness.input_mut());
+        if self.rewrites {
+            let ctx = harness.ctx.clone();
+            super::rewrite(&ctx, harness.input_mut());
+        }
         harness.step();
         let output = harness.output();
         self.hidden = output.platform_output.cursor_icon == CursorIcon::None;

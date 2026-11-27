@@ -32,6 +32,7 @@ fn sample() -> Sample {
         pixels,
         baked: [(0, baked)].into(),
         mesh: Some(("glb".into(), vec![1, 2, 3, 4, 5])),
+        mesh_uvs: None,
         high_poly: vec![("b_high.obj".into(), vec![7; 9]), ("a_high.ply".into(), vec![6])],
         cage: Some(("cage.obj".into(), vec![5, 5])),
         bake_paint: [((0, texturecraft_core::BakePaintTarget::Skew), BakePaintData { width: 3, height: 2, values: vec![0.0, 0.25, 0.5, 0.75, 1.0, 0.125] })]
@@ -55,6 +56,7 @@ fn assert_same(a: &ProjectFile, b: &ProjectFile) {
     }
     assert_eq!(a.baked, b.baked);
     assert_eq!(a.mesh, b.mesh);
+    assert_eq!(a.mesh_uvs, b.mesh_uvs);
     assert_eq!((&a.high_poly, &a.cage), (&b.high_poly, &b.cage), "bake meshes keep their order");
     assert_eq!(a.bake_paint, b.bake_paint);
     assert_eq!(a.thumbnail, b.thumbnail);
@@ -104,7 +106,7 @@ fn legacy_bakes_load_as_is_without_layout_conversion() {
     sample.pf.baked.insert(0, BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(pixels))].into() });
 
     let loaded = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
-    assert_eq!(loaded.project.format_version, FORMAT_VERSION);
+    assert_eq!(loaded.project.format_version, TANGENT_BENT_NORMAL_VERSION);
     assert_eq!(loaded.baked, sample.pf.baked, "old bake pixels are accepted without preserving their former layout");
     assert_eq!(loaded.bake_paint, sample.pf.bake_paint, "correction paint remains in the working layout");
     let reopened = load_project_bytes(&save_project_bytes(&loaded).unwrap()).unwrap();
@@ -918,5 +920,87 @@ fn zip64_entry_counts_remain_supported_and_bounded() {
         } else {
             assert!(matches!(result, Err(FormatError::TooLarge(_))), "{result:?}");
         }
+    }
+}
+
+fn rebuilt_uvs_sample() -> ProjectFile {
+    let mut project_file = sample().pf;
+    project_file.project.mesh_rebuild_uvs = true;
+    project_file.mesh_uvs = Some(vec![Vec2::new(0.25, 0.75), Vec2::new(1.0, 0.0), Vec2::new(0.5, 0.125)]);
+    project_file
+}
+
+#[test]
+fn a_saved_uv_layout_round_trips_in_format_4() {
+    const ADDITIONAL_CORNERS: usize = 3000;
+
+    let mut project_file = rebuilt_uvs_sample();
+    let layout = project_file.mesh_uvs.as_mut().unwrap();
+
+    // Exercise full batches and a partial final batch with distinct UVs
+    layout.extend((0..ADDITIONAL_CORNERS).map(|corner| Vec2::new(corner as f32 / ADDITIONAL_CORNERS as f32, 0.5)));
+
+    let loaded = load_project_bytes(&save_project_bytes(&project_file).unwrap()).unwrap();
+
+    assert_eq!(loaded.mesh_uvs, project_file.mesh_uvs);
+    assert_eq!(loaded.project.format_version, REBUILT_MESH_UVS_VERSION);
+}
+
+#[test]
+fn a_saved_uv_layout_requires_format_4_and_the_rebuild_setting() {
+    let project_file = rebuilt_uvs_sample();
+    let older_version = edit_project_json(&project_file, |json| json["format_version"] = TANGENT_BENT_NORMAL_VERSION.into());
+    let disabled_rebuild = edit_project_json(&project_file, |json| json["mesh_rebuild_uvs"] = false.into());
+
+    for archive in [older_version, disabled_rebuild] {
+        let error = load_project_bytes(&archive).map(|_| ()).expect_err("the archive has inconsistent UV layout metadata");
+
+        assert!(error.to_string().contains(UV_LAYOUT_ENTRY), "{error}");
+    }
+}
+
+#[test]
+fn a_rebuilt_project_cannot_be_saved_without_its_layout() {
+    let mut project_file = rebuilt_uvs_sample();
+    project_file.mesh_uvs = None;
+
+    let error = save_project_bytes(&project_file).map(|_| ()).expect_err("the snapshot is missing the rebuilt UV layout");
+
+    assert!(error.to_string().contains(UV_LAYOUT_ENTRY), "{error}");
+}
+
+#[test]
+fn rebuilt_uvs_without_a_valid_saved_layout_are_refused() {
+    let project_file = rebuilt_uvs_sample();
+    let without_layout = edit_archive(&project_file, |name, _| {
+        if name == UV_LAYOUT_ENTRY {
+            *name = "ignored.bin".into();
+        }
+    });
+    let edited_layout = |edit: fn(&mut Vec<u8>)| {
+        edit_archive(&project_file, |name, data| {
+            if name == UV_LAYOUT_ENTRY {
+                edit(data);
+            }
+        })
+    };
+    let truncated = edited_layout(|data| data.truncate(data.len() - 1));
+    let trailing_bytes = edited_layout(|data| data.push(0));
+    let short_header = edited_layout(|data| data.truncate(8));
+    let wrong_count = edited_layout(|data| data[8] = 9);
+    let non_finite = edited_layout(|data| data[12..16].copy_from_slice(&f32::NAN.to_le_bytes()));
+    let bad_magic = edited_layout(|data| data[0] = b'X');
+
+    for (case, bytes) in [
+        ("missing", without_layout),
+        ("truncated", truncated),
+        ("trailing bytes", trailing_bytes),
+        ("short header", short_header),
+        ("wrong count", wrong_count),
+        ("non-finite", non_finite),
+        ("bad magic", bad_magic),
+    ] {
+        let error = load_project_bytes(&bytes).unwrap_err();
+        assert!(!is_guard_error(&error), "{case}: {error}");
     }
 }

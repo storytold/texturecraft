@@ -13,8 +13,8 @@ use texturecraft_engine::template_cmds::template_label;
 use crate::TextureCraftApp;
 use crate::i18n::{tr, trf};
 use crate::project_form::{
-    FIELD_WIDTH_POINTS, ROW_INDENT_POINTS, auto_unwrap_row, check_row, collapsible, color_management, note, physical_size, row, sub_title, tangent_space_row,
-    unavailable, uv_tile_radios,
+    FIELD_WIDTH_POINTS, ROW_INDENT_POINTS, check_row, collapsible, color_management, note, physical_size, row, sub_title, tangent_space_row, unavailable,
+    uv_tile_radios,
 };
 use crate::state::{Mode, NewProject};
 use crate::theme::{Tokens, caption};
@@ -151,6 +151,7 @@ pub fn create_command(new_project: &NewProject) -> Option<Value> {
         "uvTiles": new_project.uv_tiles == Some(true),
         "template": new_project.template,
         "importCameras": new_project.import_cameras,
+        "rebuildUvs": new_project.rebuild_uvs,
     }))
 }
 
@@ -169,7 +170,14 @@ fn create_project(app: &mut TextureCraftApp) -> bool {
 
     let stem = std::path::Path::new(name).file_stem().and_then(|stem| stem.to_str()).unwrap_or("Untitled").to_string();
     let template = app.session.template(&new_project.template);
-    match texturecraft_engine::Session::from_mesh_bytes_tiled(name, bytes, new_project.resolution, &stem, Some(new_project.uv_tiles == Some(true))) {
+    match texturecraft_engine::Session::from_mesh_bytes_with_uvs(
+        name,
+        bytes,
+        new_project.resolution,
+        &stem,
+        Some(new_project.uv_tiles == Some(true)),
+        new_project.rebuild_uvs,
+    ) {
         Ok(mut next) => {
             if !new_project.import_cameras {
                 next.doc.project.cameras.clear();
@@ -259,12 +267,18 @@ fn advanced_settings(app: &mut TextureCraftApp, ui: &mut Ui) {
         if check_row(ui, None, |ui| ui.checkbox(&mut uv_tiles, tr("Use UV Tile workflow")), |_| {}).changed() {
             new_project.uv_tiles = Some(uv_tiles);
         }
+
         uv_tile_radios(ui, uv_tiles, tr("Tick Use UV Tile workflow first"));
 
         ui.add_space(4.0);
         sub_title(ui, tr("Import settings"), None);
         check_row(ui, Some(tr("Keep the cameras stored in the mesh file")), |ui| ui.checkbox(&mut new_project.import_cameras, tr("Import cameras")), |_| {});
-        auto_unwrap_row(ui);
+        check_row(
+            ui,
+            Some(tr("Generate a fresh UV layout even when the mesh already has UVs. Meshes without UVs are always unwrapped.")),
+            |ui| ui.checkbox(&mut new_project.rebuild_uvs, tr("Rebuild mesh UVs")),
+            |_| {},
+        );
 
         ui.add_space(4.0);
         collapsible(ui, "np_import_baked_maps", tr("Import baked maps"), true, None, |ui| {

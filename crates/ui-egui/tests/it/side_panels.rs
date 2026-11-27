@@ -24,7 +24,10 @@ const TOOLTIP_FRAMES: usize = 30;
 
 fn app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(STARTUP_FRAMES);
     harness
@@ -52,7 +55,7 @@ fn button_left_of_rail<'h>(harness: &'h Harness<'_, TextureCraftApp>, label: &st
 }
 
 fn is_floating(harness: &Harness<'_, TextureCraftApp>, panel: Panel) -> bool {
-    harness.state().ui.dock.workspace().layout.floating.iter().any(|window| window.contains(&panel))
+    harness.state().ui.dock.workspace().layout().floating.iter().any(|window| window.contains(&panel))
 }
 
 /// Hover the control labelled `label` until its tooltip shows, and tell whether that says it is not available yet
@@ -83,7 +86,7 @@ fn undock_floats_the_panel_dock_returns_it_to_the_rail_and_the_float_persists() 
     let saved = serde_json::to_value(&harness.state().ui).unwrap();
     let restored: UiState = serde_json::from_value(saved).unwrap();
     assert_eq!(restored.dock, harness.state().ui.dock);
-    assert!(restored.dock.workspace().layout.floating.iter().any(|window| window.contains(&Panel::History)));
+    assert!(restored.dock.workspace().layout().floating.iter().any(|window| window.contains(&Panel::History)));
 
     button_left_of_rail(&harness, "Dock").click();
     harness.run_steps(SETTLE_FRAMES);
@@ -101,10 +104,12 @@ fn the_export_panel_leads_to_export_textures_and_the_mesh_options() {
 
     assert_eq!(harness.state().ui.rail_panel, Some(Panel::Export));
     assert!(!harness.state().ui.windows.export, "the rail opens the Export panel, not a window");
-    for label in ["SEND TO", "EXPORT", "Export to image editor", "Send to compositing app", "Send to 3D staging app"] {
-        assert!(harness.query_all_by_label(label).next().is_some(), "{label}");
+    assert!(harness.query_all_by_label("EXPORT").next().is_some(), "the EXPORT caption");
+    for label in ["SEND TO", "Export to image editor", "Send to compositing app", "Send to 3D staging app"] {
+        assert!(harness.query_all_by_label(label).next().is_none(), "the dock has no {label} row");
     }
-    assert!(says_not_available(&mut harness, "Send to compositing app"));
+    assert!(harness.query_all_by_label_contains("Send to").next().is_none(), "no SEND TO text at all");
+    button_left_of_rail(&harness, "Export Mesh...");
 
     button_left_of_rail(&harness, "Export Textures...").click();
     harness.run_steps(SETTLE_FRAMES);
@@ -170,6 +175,31 @@ fn export_mesh_asks_the_options_then_the_file() {
     assert!(harness.query_by_label("Mesh Export Options").is_none(), "Export closes the options");
     assert!(file.exists(), "the mesh went to the picked file");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn recompute_normals_is_an_enabled_keyboard_operable_checkbox() {
+    let mut harness = app();
+    let context = harness.ctx.clone();
+    texturecraft_ui_egui::menus::invoke(harness.state_mut(), &context, "file.exportMesh");
+    harness.run_steps(SETTLE_FRAMES);
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, "Recompute vertex normals");
+    assert!(!checkbox.accesskit_node().is_disabled(), "the option is really available");
+    assert!(!is_on(&checkbox), "stored normals are kept until the user opts in");
+    assert!(!harness.state().ui.mesh_recompute_normals);
+
+    checkbox.focus();
+    harness.key_press(egui::Key::Space);
+    harness.run_steps(SETTLE_FRAMES);
+    assert!(harness.state().ui.mesh_recompute_normals, "Space changes the setting used by export");
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, "Recompute vertex normals");
+    assert!(is_on(&checkbox), "the accessibility tree reports the checked state");
+    assert_eq!(checkbox.accesskit_node().label().as_deref(), Some("Recompute vertex normals"));
+
+    checkbox.click();
+    harness.run_steps(SETTLE_FRAMES);
+    assert!(!harness.state().ui.mesh_recompute_normals, "a pointer click turns it back off");
+    assert!(!is_on(&harness.get_by_role_and_label(Role::CheckBox, "Recompute vertex normals")));
 }
 
 /// Whether the Log lists `line` (the status bar under it repeats the last message)
@@ -282,6 +312,70 @@ fn shader_settings_show_the_reference_rows_and_the_shader_choice() {
     let open_pbr = harness.get_by_label(&tiles[4]);
     assert!(!open_pbr.accesskit_node().is_disabled() && is_on(&open_pbr), "open-pbr is the current shader");
     assert!(harness.get_by_label(&tiles[1]).accesskit_node().is_disabled(), "the others are not available yet");
+}
+
+#[test]
+fn the_unchecked_ior_control_is_visible_at_each_brightness() {
+    use craft_theme::{Contrast, Rgba, contrast_ratio, non_text_contrast_min};
+    use texturecraft_ui_egui::theme::{Brightness, Tokens};
+
+    let mut harness = app();
+    click_rail(&mut harness, "Shader Settings");
+    let minimum_contrast = non_text_contrast_min(Contrast::Standard);
+
+    for brightness in Brightness::ALL {
+        harness.state_mut().ui.prefs.brightness = brightness;
+        harness.run_steps(SETTLE_FRAMES);
+
+        let checkbox = harness.get_by_role_and_label(Role::CheckBox, "Use IOR for specular reflection");
+        let bounds = checkbox.rect();
+        let panel = Tokens::get(&harness.ctx).panel;
+        let indicator = harness
+            .output()
+            .shapes
+            .iter()
+            .filter_map(|painted| match &painted.shape {
+                egui::Shape::Rect(frame) if painted.clip_rect.contains_rect(frame.rect) && bounds.contains_rect(frame.rect) => Some(frame),
+                _ => None,
+            })
+            .find(|frame| frame.fill.a() > 0 || !frame.stroke.is_empty())
+            .expect("the unchecked indicator is painted inside its accessibility bounds");
+        let fill = panel.blend(indicator.fill);
+        let outline = if indicator.stroke.width > 0.0 { fill.blend(indicator.stroke.color) } else { fill };
+        let contrast = |color: egui::Color32| contrast_ratio(Rgba(color.to_array()), Rgba(panel.to_array()));
+        let ratio = contrast(fill).max(contrast(outline));
+
+        assert!(ratio >= minimum_contrast, "{brightness:?}: the unchecked box has {ratio:.2}:1 contrast against the panel");
+    }
+}
+
+#[test]
+fn keyboard_toggles_ior_reflectance_only_in_metallic_roughness() {
+    let mut harness = app();
+    let label = "Use IOR for specular reflection";
+    harness.state_mut().ui.dock.focus(Panel::Shader);
+    harness.state_mut().session.modified = false;
+    harness.run_steps(SETTLE_FRAMES);
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, label);
+    assert_eq!(checkbox.accesskit_node().toggled(), Some(egui::accesskit::Toggled::False));
+    checkbox.focus();
+    harness.run_steps(SETTLE_FRAMES);
+
+    harness.key_press(egui::Key::Space);
+    harness.run_steps(SETTLE_FRAMES);
+
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, label);
+    assert!(checkbox.is_focused());
+    assert!(is_on(&checkbox));
+    assert!(harness.state().session.doc.project.display.ior_specular);
+    assert!(harness.state().session.modified);
+
+    harness.state_mut().run("display.set", serde_json::json!({"specGloss": true})).unwrap();
+    harness.run_steps(SETTLE_FRAMES);
+
+    let checkbox = harness.get_by_role_and_label(Role::CheckBox, label);
+    assert!(checkbox.accesskit_node().is_disabled());
+    assert!(is_on(&checkbox), "the current preference is retained");
 }
 
 #[test]

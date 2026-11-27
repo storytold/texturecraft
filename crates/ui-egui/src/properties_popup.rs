@@ -38,6 +38,7 @@ pub(crate) fn open_on_right_click(app: &mut TextureCraftApp, ui: &Ui, response: 
         && app.moving_on_model.is_none()
         && !gesture_key_held
         && !crate::viewport::focus_picking(ui.ctx())
+        && crate::generator_point_pick::armed(ui.ctx()).is_none()
         && ui.input(|input| input.modifiers.is_none());
 
     if !free || !response.clicked_by(PointerButton::Secondary) {

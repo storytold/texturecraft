@@ -15,10 +15,12 @@ texturecraft-render = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "persistence"] }
 egui = { workspace = true }
 craft-ui = { workspace = true }
+craft-behavior = { workspace = true }
 craft-i18n = { workspace = true }
 craft-window = { workspace = true }
 craft-keymap = { workspace = true }
-craft-quit = { workspace = true }
+craft-host = { workspace = true }
+craft-theme = { workspace = true }
 egui-phosphor = { version = "0.14", features = ["regular", "fill"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -31,12 +33,11 @@ craft-image-codecs = { workspace = true }
 # The OS UI language for the first run (MIT OR Apache-2.0; the browser asks `navigator.language`).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 sys-locale = "0.3"
-# Floating panels open as OS windows.
-craft-ui = { workspace = true, features = ["native-windows"] }
 # Help > Check for Updates and the check at start (updates_ui.rs).
 craft-update = { workspace = true }
 # Native file dialogs (file_dialogs.rs); the browser build has none.
 craft-dialogs = { workspace = true }
+tempfile = "3"
 # Whether the app runs in a real window, where an eyedropper pick may take clicks outside it (screen_pick).
 raw-window-handle = "0.6"
 

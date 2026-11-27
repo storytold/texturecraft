@@ -1,11 +1,10 @@
 //! Edit, viewport and display commands.
 
 use serde_json::{Value, json};
-use texturecraft_core::project::ENVIRONMENTS;
+use texturecraft_core::project::{ENVIRONMENTS, MAX_INDEX_OF_REFRACTION, MIN_INDEX_OF_REFRACTION};
 use texturecraft_core::{BakedMap, Channel, EffectKind, EnvAlignment, Filter, Project, ShadowMode, ToneMapping};
-use texturecraft_geom::glam::Vec3;
 
-use crate::commands::{CommandSpec, always, bad, boolp, can_redo, can_undo, color_param, f32p, strp, u64p};
+use crate::commands::{CommandSpec, always, bad, boolp, can_redo, can_undo, color_param, f32p, strp, u64p, vec3};
 use crate::frame_target::FrameTarget;
 use crate::session::ViewMode;
 use crate::{Result, Session, cmd};
@@ -52,7 +51,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set camera",
             [],
             None,
-            "{yaw?, pitch? (degrees), distance?, fov?, target?: [x,y,z], ortho?, rotation?: constrained|free (a free camera also rolls and turns over)}",
+            "{yaw?, pitch? (degrees), distance?, fov?, target?: [x,y,z] (three finite numbers, null keeps the current target), ortho?, rotation?: constrained|free (a free camera also rolls and turns over)}",
             always,
             camera_set
         ),
@@ -71,7 +70,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Display settings",
             [],
             None,
-            "{environment?: <built-in>|resource:<image resource>, exposure?, blur?, rotation?, opacity?, toneMapping?: linear|aces, fov?, shadows?, shadowMode? (intensive|average|lightweight: the shadow map resolution), shadowOpacity? (0..1: how dark the shadows are), alignment? (world|camera: what the environment turns with), soloUnlit? (single-channel views flat; off: lit), aoIntensity?, bloom?, vignette?, sharpen?, grain?, postEffects?, taa?, specGloss?, parallax?, displacement? (the viewport moves the surface by the height channel), scatterColor?: [r,g,b] linear or \"#rrggbb\" sRGB, scatterRadius? (0..1 of the mesh radius), ior? (1..3, transmission), dof?: {enabled?, focusDistance? (view depth, world units; 0 = the orbit target), aperture? (lens radius, 0..1 of the mesh radius)}, projectionGizmos? (the selected fill's projection gizmos show in the 3D view)}",
+            "{environment?: <built-in>|resource:<image resource>, exposure?, blur?, rotation?, opacity?, toneMapping?: linear|aces, fov?, shadows?, shadowMode? (intensive|average|lightweight: the shadow map resolution), shadowOpacity? (0..1: how dark the shadows are), alignment? (world|camera: what the environment turns with), soloUnlit? (single-channel views flat; off: lit), aoIntensity?, bloom?, vignette?, sharpen?, grain?, postEffects?, taa?, specGloss?, parallax?, displacement? (the viewport moves the surface by the height channel), scatterColor?: [r,g,b] linear or \"#rrggbb\" sRGB, scatterRadius? (0..1 of the mesh radius), ior? (1..3, transmission), iorSpecular? (use IOR for dielectric reflectance at normal incidence in Metallic Roughness), dof?: {enabled?, focusDistance? (view depth, world units; 0 = the orbit target), aperture? (lens radius, 0..1 of the mesh radius)}, projectionGizmos? (the selected fill's projection gizmos show in the 3D view)}",
             always,
             display
         ),
@@ -233,37 +232,49 @@ pub(crate) fn camera_json(s: &Session) -> Value {
     })
 }
 
-fn camera_set(s: &mut Session, p: &Value) -> Result<Value> {
-    let c = &mut s.camera;
-    match strp(p, "rotation") {
-        Some("free") => c.set_free(true),
-        Some("constrained") => c.set_free(false),
-        Some(o) => return Err(bad("camera.set", format!("unknown rotation `{o}`: constrained or free"))),
+fn camera_set(session: &mut Session, params: &Value) -> Result<Value> {
+    const MAX_PITCH_DEGREES: f32 = 89.0;
+    const MIN_DISTANCE_RADII: f32 = 0.05;
+    const MAX_DISTANCE_RADII: f32 = 200.0;
+    const MIN_FOV_DEGREES: f32 = 5.0;
+    const MAX_FOV_DEGREES: f32 = 150.0;
+
+    let target = vec3(params, "target");
+    if target.is_none() && params.get("target").is_some_and(|value| !value.is_null()) {
+        return Err(bad("camera.set", "`target` must be an array of three finite numbers"));
+    }
+
+    let camera = &mut session.camera;
+    match strp(params, "rotation") {
+        Some("free") => camera.set_free(true),
+        Some("constrained") => camera.set_free(false),
+        Some(other) => return Err(bad("camera.set", format!("unknown rotation `{other}`: constrained or free"))),
         None => {}
     }
-    if f32p(p, "yaw").is_some() || f32p(p, "pitch").is_some() {
-        // A free camera is put level at the angles
-        let yaw = f32p(p, "yaw").map_or(c.yaw, f32::to_radians);
-        let pitch = f32p(p, "pitch").map_or(c.pitch, |v| v.clamp(-89.0, 89.0).to_radians());
-        c.set_angles(yaw, pitch);
+
+    let yaw_degrees = f32p(params, "yaw");
+    let pitch_degrees = f32p(params, "pitch");
+    if yaw_degrees.is_some() || pitch_degrees.is_some() {
+        // Setting either angle levels a free camera
+        let yaw = yaw_degrees.map_or(camera.yaw, f32::to_radians);
+        let pitch = pitch_degrees.map_or(camera.pitch, |degrees| degrees.clamp(-MAX_PITCH_DEGREES, MAX_PITCH_DEGREES).to_radians());
+        camera.set_angles(yaw, pitch);
     }
-    if let Some(v) = f32p(p, "distance") {
-        c.distance = v.clamp(c.scene_radius * 0.05, c.scene_radius * 200.0);
+    if let Some(distance) = f32p(params, "distance") {
+        camera.distance = distance.clamp(camera.scene_radius * MIN_DISTANCE_RADII, camera.scene_radius * MAX_DISTANCE_RADII);
     }
-    if let Some(v) = f32p(p, "fov") {
-        c.fov = v.clamp(5.0, 150.0);
+    if let Some(fov_degrees) = f32p(params, "fov") {
+        camera.fov = fov_degrees.clamp(MIN_FOV_DEGREES, MAX_FOV_DEGREES);
     }
-    if let Some(t) = p.get("target").and_then(Value::as_array) {
-        let v: Vec<f32> = t.iter().filter_map(Value::as_f64).map(|x| x as f32).collect();
-        if v.len() == 3 && v.iter().all(|x| x.is_finite()) {
-            c.target = Vec3::new(v[0], v[1], v[2]);
-        }
+    if let Some(target) = target {
+        camera.target = target;
     }
-    if let Some(o) = boolp(p, "ortho") {
-        c.ortho = o;
+    if let Some(ortho) = boolp(params, "ortho") {
+        camera.ortho = ortho;
     }
-    s.revision = s.revision.wrapping_add(1);
-    Ok(camera_json(s))
+
+    session.revision = session.revision.wrapping_add(1);
+    Ok(camera_json(session))
 }
 
 fn orbit(s: &mut Session, p: &Value) -> Result<Value> {
@@ -303,6 +314,8 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
     let scatter_color = color_param("display.set", p, "scatterColor")?;
     let (environment_before, rotation_before) = (s.doc.project.display.environment.clone(), s.doc.project.display.env_rotation);
     let settings = &mut s.doc.project.display;
+    let (ior_before, ior_specular_before, spec_gloss_before) = (settings.ior, settings.ior_specular, settings.spec_gloss);
+
     if let Some(picked) = environment {
         settings.environment = picked;
     }
@@ -318,7 +331,7 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
         ("sharpen", &mut settings.sharpen, 0.0, 1.0),
         ("grain", &mut settings.grain, 0.0, 1.0),
         ("scatterRadius", &mut settings.scatter_radius, 0.0, 1.0),
-        ("ior", &mut settings.ior, 1.0, 3.0),
+        ("ior", &mut settings.ior, MIN_INDEX_OF_REFRACTION, MAX_INDEX_OF_REFRACTION),
         ("shadowOpacity", &mut settings.shadow_opacity, 0.0, 1.0),
     ] {
         if let Some(value) = f32p(p, key) {
@@ -355,6 +368,7 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
         ("postEffects", &mut settings.post_effects),
         ("taa", &mut settings.taa),
         ("specGloss", &mut settings.spec_gloss),
+        ("iorSpecular", &mut settings.ior_specular),
         ("parallax", &mut settings.parallax),
         ("displacement", &mut settings.displacement),
         ("soloUnlit", &mut settings.solo_unlit),
@@ -364,6 +378,9 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
             *slot = on;
         }
     }
+
+    let saved_settings_changed =
+        settings.ior_specular != ior_specular_before || (settings.ior_specular && (settings.ior != ior_before || settings.spec_gloss != spec_gloss_before));
 
     // The field of view applies to the view only when set (a saved camera keeps its own)
     if f32p(p, "fov").is_some() {
@@ -377,7 +394,12 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
             cache.invalidate_all();
         }
     }
-    s.revision = s.revision.wrapping_add(1);
+    if saved_settings_changed {
+        s.mark_modified();
+    } else {
+        s.revision = s.revision.wrapping_add(1);
+    }
+
     Ok(serde_json::to_value(&s.doc.project.display).unwrap_or(Value::Null))
 }
 
@@ -397,6 +419,40 @@ mod tests {
 
     fn sphere_session() -> Session {
         Session::new_project("t", texturecraft_geom::primitives::sphere(1.0, 16, 8), "builtin:sphere", None, 128).unwrap()
+    }
+
+    #[test]
+    fn camera_set_rejects_an_invalid_target_without_changing_the_camera() {
+        let mut session = sphere_session();
+        execute(&mut session, "camera.set", &json!({"target": [1.0, 2.0, 3.0], "fov": 40.0})).unwrap();
+        let before = session.camera;
+        let revision = session.revision;
+
+        for target in [json!([10, "typo", 20, 30]), json!([1, 2]), json!([1, "typo", 3]), json!([1, 2, 1e300]), json!({"x": 1})] {
+            let params = json!({"target": target, "yaw": 35.0, "fov": 90.0, "rotation": "free"});
+
+            let result = execute(&mut session, "camera.set", &params);
+
+            assert!(matches!(result, Err(crate::EngineError::BadParams { cmd, .. }) if cmd == "camera.set"), "{params}");
+            assert_eq!(session.camera, before);
+            assert_eq!(session.revision, revision);
+        }
+    }
+
+    #[test]
+    fn camera_set_keeps_the_target_when_it_is_omitted_or_null() {
+        let mut session = sphere_session();
+        let target = json!([1.0, 2.0, 3.0]);
+
+        let initial = execute(&mut session, "camera.set", &json!({"target": target, "fov": 40.0})).unwrap();
+        let omitted = execute(&mut session, "camera.set", &json!({"fov": 60.0})).unwrap();
+        let explicit_null = execute(&mut session, "camera.set", &json!({"target": null, "fov": 80.0})).unwrap();
+
+        assert_eq!(initial["target"], target);
+        assert_eq!(omitted["target"], target);
+        assert_eq!(explicit_null["target"], target);
+        assert_ne!(omitted["fov"], initial["fov"]);
+        assert_ne!(explicit_null["fov"], omitted["fov"]);
     }
 
     fn pressed(s: &mut Session, command: &str) -> ViewMode {

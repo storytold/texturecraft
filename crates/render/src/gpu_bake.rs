@@ -18,6 +18,10 @@ use texturecraft_geom::glam::Vec3;
 use crate::gpu_trace::{STACK, buffer, bvh_depth, bvh_rows, entry, scoped, storage};
 
 const WORKGROUP: u32 = 64;
+// The shader binds BVH nodes, triangles, input queries and results
+const RAY_STORAGE_BUFFERS: u32 = 4;
+// The hemisphere reduction stores one vec4 and one count per lane
+const WORKGROUP_STORAGE_BYTES: u32 = WORKGROUP * (size_of::<[f32; 4]>() + size_of::<u32>()) as u32;
 /// Rays per dispatch: short dispatches keep slow GPUs clear of driver watchdogs.
 const RAYS_PER_DISPATCH: usize = 1 << 24;
 const NONE: u32 = u32::MAX;
@@ -66,23 +70,11 @@ fn err(e: impl std::fmt::Display) -> BakeError {
 
 impl Gpu {
     fn new() -> Result<Gpu, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let options = wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() };
-        let adapter = pollster::block_on(instance.request_adapter(&options)).map_err(|e| format!("no GPU adapter: {e}"))?;
-        let info = adapter.get_info();
-        if info.device_type == wgpu::DeviceType::Cpu {
-            return Err(format!("{} is a software renderer", info.name));
-        }
-        let limits = adapter.limits();
-        if limits.max_storage_buffers_per_shader_stage < 3
-            || limits.max_compute_invocations_per_workgroup < WORKGROUP
-            || limits.max_compute_workgroup_size_x < WORKGROUP
-        {
-            return Err(format!("{} has no usable compute shaders", info.name));
-        }
+        let (adapter, name, limits) = bake_adapter()?;
         let desc = wgpu::DeviceDescriptor { label: Some("tc_bake"), required_limits: limits, ..Default::default() };
         let (device, queue) = pollster::block_on(adapter.request_device(&desc)).map_err(|e| format!("no GPU device: {e}"))?;
-        // Errors are caught by the scopes around every call; never let wgpu's default handler panic.
+
+        // Each GPU call has an error scope so the default handler should leave failures to those scopes
         device.on_uncaptured_error(Arc::new(|_| {}));
         let (layout, transfer, hemisphere) = scoped(&device, "GPU baking: pipelines", || {
             let params = wgpu::BindingType::Buffer {
@@ -112,7 +104,7 @@ impl Gpu {
             (layout, pipe("transfer_main"), pipe("hemisphere_main"))
         })?;
         let stride = size_of::<Params>().next_multiple_of(device.limits().min_uniform_buffer_offset_alignment.max(1) as usize);
-        Ok(Gpu { device, queue, name: info.name, layout, transfer, hemisphere, stride })
+        Ok(Gpu { device, queue, name, layout, transfer, hemisphere, stride })
     }
 
     /// The largest storage buffer this device binds.
@@ -120,6 +112,43 @@ impl Gpu {
         let l = self.device.limits();
         l.max_storage_buffer_binding_size.min(l.max_buffer_size)
     }
+}
+
+/// Whether the adapter selected for mesh-map baking supports its compute shaders.
+pub fn raytracing_available() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| bake_adapter().is_ok())
+}
+
+fn bake_adapter() -> Result<(wgpu::Adapter, String, wgpu::Limits), String> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let options = wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() };
+    let adapter = pollster::block_on(instance.request_adapter(&options)).map_err(|e| format!("no GPU adapter: {e}"))?;
+    let info = adapter.get_info();
+    let limits = adapter.limits();
+    let flags = adapter.get_downlevel_capabilities().flags;
+    if let Some(reason) = unsupported_adapter(info.device_type, flags, &limits) {
+        return Err(format!("{} {reason}", info.name));
+    }
+
+    Ok((adapter, info.name, limits))
+}
+
+fn unsupported_adapter(device_type: wgpu::DeviceType, flags: wgpu::DownlevelFlags, limits: &wgpu::Limits) -> Option<&'static str> {
+    if device_type == wgpu::DeviceType::Cpu {
+        return Some("is a software renderer");
+    }
+
+    if !flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+        || limits.max_storage_buffers_per_shader_stage < RAY_STORAGE_BUFFERS
+        || limits.max_compute_invocations_per_workgroup < WORKGROUP
+        || limits.max_compute_workgroup_size_x < WORKGROUP
+        || limits.max_compute_workgroup_storage_size < WORKGROUP_STORAGE_BYTES
+    {
+        return Some("has no usable compute shaders");
+    }
+
+    None
 }
 
 /// The GPU [`Tracer`]. Its device is created on the first bake; without a hardware adapter
@@ -382,6 +411,22 @@ mod tests {
     use texturecraft_geom::{Bvh, Mesh, primitives};
 
     use super::*;
+
+    #[test]
+    fn raytracing_requires_hardware_and_compute_support() {
+        let limits = wgpu::Limits::default();
+        let compute = wgpu::DownlevelFlags::COMPUTE_SHADERS;
+        let no_compute = wgpu::Limits { max_compute_workgroup_size_x: 0, ..limits.clone() };
+        let three_buffers = wgpu::Limits { max_storage_buffers_per_shader_stage: 3, ..limits.clone() };
+        let no_shared_memory = wgpu::Limits { max_compute_workgroup_storage_size: 0, ..limits.clone() };
+
+        assert!(unsupported_adapter(wgpu::DeviceType::DiscreteGpu, compute, &limits).is_none());
+        assert!(unsupported_adapter(wgpu::DeviceType::Cpu, compute, &limits).is_some());
+        assert!(unsupported_adapter(wgpu::DeviceType::IntegratedGpu, wgpu::DownlevelFlags::empty(), &limits).is_some());
+        assert!(unsupported_adapter(wgpu::DeviceType::IntegratedGpu, compute, &no_compute).is_some());
+        assert!(unsupported_adapter(wgpu::DeviceType::IntegratedGpu, compute, &three_buffers).is_some(), "the bind group requires four storage buffers");
+        assert!(unsupported_adapter(wgpu::DeviceType::IntegratedGpu, compute, &no_shared_memory).is_some());
+    }
 
     /// The GPU baker, or None (test skipped) without a hardware adapter.
     fn gpu() -> Option<GpuBaker> {

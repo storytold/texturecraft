@@ -7,16 +7,17 @@ mod evaluation_inputs;
 pub(crate) mod thumbnail;
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use rayon::prelude::*;
 use texturecraft_core::{
     AnisotropicKuwahara, BakedMap, Bevel, BevelSmooth, BlendMode, BlockScales, Channel, ChannelKind, ColorMatch, CompareSource, ContentsOffset,
-    CurvatureDetail, CurvatureMode, Effect, EffectKind, FLAT_CURVATURE, Fill, Filter, Filtering, Generator, GeneratorKind, HeightMask, HeightToNormal,
-    HighpassSpace, ImageInput, Layer, LayerId, LayerKind, Mask, MaskBackground, MaskOutline, MicroDetail, Mirror, NormalFormat, PreparedColorMatch,
-    PreparedGradient, Project, Projection, RepeatMode, Sampling, ShapeCrop, Source, SourceColorMode, SourceSlopeBlur, SourceWarp, StylizedShading,
-    TargetColorMode, TextureSet, TileGrid, TileTransform, WarpSourceMode, blend1, blend3, lum, mix3, per_unit, posterize, udim_at,
+    CurvatureDetail, CurvatureMode, Effect, EffectKind, FLAT_CURVATURE, Fill, Filter, Filtering, Generator, GeneratorGlobal, GeneratorKind,
+    GrayscaleConversionParameters, HeightMask, HeightToNormal, HighpassSpace, ImageInput, KindControls, Layer, LayerId, LayerKind, Mask, MaskBackground,
+    MaskOutline, Mirror, NormalFormat, PreparedColorMatch, PreparedGradient, Project, Projection, RepeatMode, Sampling, SectionParameters, ShapeCrop, Source,
+    SourceColorMode, SourceSlopeBlur, SourceWarp, StylizedShading, TargetColorMode, TextureSet, TileGrid, TileTransform, WarpSourceMode, WearParameters,
+    blend1, blend3, lum, mix3, per_unit, posterize, udim_at,
 };
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, NO_TRI, Surface, UvGBuffer};
@@ -24,22 +25,31 @@ use texturecraft_texel::{DilationMap, TILE, TILE_AREA, TileImage, from_u16, nois
 
 use crate::ProjectorDepthCache;
 use crate::below::{Band, BelowCache, Level, StackKey};
-use crate::curvature_sizes::CurvatureSizes;
+use crate::curvature_sizes::{CurvatureSizes, LEVEL_RADII};
+use crate::dripping_rust;
 use crate::effect_histogram::EffectHistogram;
 use crate::environment_sh::EnvironmentSh;
 use crate::fill_copies::FillCopies;
 use crate::fill_copy::FillCopy;
 use crate::fill_depth::FillDepth;
 use crate::fill_place::FillPlace;
+use crate::generator_maps::GeneratorMaps;
 use crate::held_fields::HeldFields;
 use crate::mask_gray::MaskGray;
+use crate::micro_detail::AnchorHeights;
 use crate::pattern::{Coords, image_samples, mesh_frame, pattern_pixels, placement, procedural_in, world_noise};
 use crate::pattern_context::PatternContext;
 use crate::projector_cover::{framed_cover, projector_cover, projector_covers_all};
+use crate::sections;
 use crate::shape_distance::distance_filter;
 use crate::slope_texel::slope_texel;
 use crate::store::{BakedMaps, ImageRes, ImageStore, PixelStore, decode};
+use crate::texture_layer;
+use crate::three_d_distance;
+use crate::uv_border_distance;
 use crate::warp_texel::{Input, MIN_READ_WEIGHT, Sample, warp_texel};
+use crate::wear;
+use crate::wear_inputs::WearInputs;
 use draw_placement::DrawPlacement;
 use evaluation_inputs::EvaluationInputs;
 
@@ -50,6 +60,9 @@ const COVERED: f32 = 0.9999;
 
 /// Largest projected step as a share of the image's longer side for non-UV projections
 const SEAM_JUMP_SHARE: f32 = 0.25;
+
+/// Narrowest extent of the mesh's bounds a position is normalised across
+const MIN_BOUNDS_EXTENT: f32 = 1e-6;
 
 /// Stack values being composited, per channel.
 type Acc = [[f32; 3]; NCH];
@@ -285,8 +298,8 @@ struct EffectPlan<'a> {
     opacity: f32,
     data: Option<Cow<'a, [u16]>>,
     preview: bool,
-    /// The curvature detail sizes a generator with detail reads.
-    curvature_sizes: Option<Arc<CurvatureSizes>>,
+    /// The detail sizes and micro details a generator reads
+    maps: GeneratorMaps,
     /// A filtered mask stage retained because an anchor above it records that stage.
     filtered_mask: Option<&'a Field>,
     /// The projector's depth map of a fill or material effect that culls by depth
@@ -506,8 +519,13 @@ fn neighbourhood_filters(effects: &[Effect], res: u32, channel: Option<Channel>)
             }
 
             // Use reference-resolution reach so all callers classify the same filters as stages
-            EffectKind::Generator(generator) if generator.global.blur > 0.0 || generator.resolution.can_reduce() => {
-                Some((index, texels(generator.global.blur_radius()) + generator.resolution.largest_cell(res) as f32, Op::Blur(None)))
+            EffectKind::Generator(generator)
+                if generator.applied_global().blur > 0.0 || generator.resolution.can_reduce() || sections::generator_blur_sigma(generator) > 0.0 =>
+            {
+                let section_blur = sections::generator_blur_sigma(generator);
+                let section_reach = if section_blur > 0.0 { texels(section_blur) } else { 0.0 };
+                let reach = texels(generator.applied_global().blur_radius()) + section_reach + generator.resolution.largest_cell(res) as f32;
+                Some((index, reach, Op::Blur(None)))
             }
 
             // A mirror reads anywhere in its UV tile
@@ -1440,15 +1458,19 @@ fn layer_mask(p: &Project, id: LayerId) -> Option<&Mask> {
 
 /// Layers of `list` in drawing order (bottom → top, folder and instanced folder contents after
 /// their folder).
-fn draw_order(inp: &EvaluationInputs, list: &[LayerId], depth: usize, place: DrawPlacement, out: &mut Vec<(LayerId, DrawPlacement)>) {
+fn draw_order(inp: &EvaluationInputs, list: &[LayerId], depth: usize, place: DrawPlacement, visible_only: bool, out: &mut Vec<(LayerId, DrawPlacement)>) {
     if depth > texturecraft_core::project::MAX_DEPTH {
         return;
     }
 
     for id in list {
         out.push((*id, place));
+        if visible_only && !inp.project.layers.get(id).is_some_and(|layer| layer.visible) {
+            continue;
+        }
+
         if let Some(layer) = inp.project.content_layer(*id).filter(|layer| !layer.children().is_empty()) {
-            draw_order(inp, layer.children(), depth + 1, place.children(inp, *id, layer), out);
+            draw_order(inp, layer.children(), depth + 1, place.children(inp, *id, layer), visible_only, out);
         }
     }
 }
@@ -1646,7 +1668,7 @@ fn filter_region(
         _ => None,
     };
     let components = match job {
-        Job::Mask(_) if generator.is_some() => 2,
+        Job::Mask(_) if generator.is_some() => GENERATOR_STAGE_COMPONENTS,
         Job::Mask(_) => 1,
         Job::Content(_) => 4,
     };
@@ -1682,15 +1704,13 @@ fn filter_region(
             let height_nodes = if heights { plan_in(inputs, &[id], &[Channel::Height], tile_x, tile_y, 0, Some(below), place, None) } else { Vec::new() };
             let mut mask = None;
             let mut nodes = Vec::new();
-            let mut generator_sizes = None;
+            let mut generator_maps = GeneratorMaps::default();
             match job {
                 Job::Mask(layer_mask) => {
                     // The layer's own filtered content, for a compare of it (this mask's field is not built yet)
-                    let Some(mut mask_stack) = mask_plan(inputs, id, layer_mask, tile_x, tile_y, Some(below), place) else {
-                        continue;
-                    };
+                    let mut mask_stack = mask_plan(inputs, id, layer_mask, tile_x, tile_y, Some(below), place);
 
-                    generator_sizes = mask_stack.effects.get(index).and_then(|effect| effect.curvature_sizes.clone());
+                    generator_maps = mask_stack.effects.get(index).map(|effect| effect.maps.clone()).unwrap_or_default();
                     mask_stack.effects.truncate(index);
                     mask_stack.start = start;
                     mask = Some(mask_stack);
@@ -1715,8 +1735,9 @@ fn filter_region(
 
                 let value = match (&mask, nodes.first()) {
                     (Some(mask_stack), _) => {
-                        let ramp = generator.map_or(0.0, |(generator, _)| texel.generator_ramp(generator, generator_sizes.as_deref()));
-                        [texel.mask(mask_stack), ramp, 0.0, 0.0]
+                        let ramp = generator.map_or(0.0, |(generator, _)| texel.generator_ramp(generator, &generator_maps));
+                        let texture = generator.and_then(|(generator, _)| texel.generator_texture(generator)).unwrap_or(0.0);
+                        [texel.mask(mask_stack), ramp, texture, 0.0]
                     }
                     (None, Some(node)) => match node.chans.first().and_then(|channel_plan| texel.content(&node.content, channel_plan)) {
                         Some((color, coverage)) => [color[0] * coverage, color[1] * coverage, color[2] * coverage, coverage],
@@ -1932,7 +1953,36 @@ fn filter_region(
     Some(Field { x0: region_x, y0: region_y, w: width, h: height, comps: field_components, data: result, anchor_stages: Vec::new() })
 }
 
-/// The mask over a region after a generator at its own resolution and blur: `stack` is (stack below, generator ramp) per texel, sizes in texels per side.
+/// Where working texel (`x`, `y`) of `inp` is, for pattern evaluation (as [`Texel::coords`] sees it outside a fill copy)
+pub(crate) fn texel_coords(inp: &Inputs, x: u32, y: u32) -> Coords {
+    let gbuf = inp.gbuf;
+    let mut coords = match gbuf.surface(inp.mesh, (y * gbuf.width + x) as usize) {
+        Some(surface) => {
+            let (center, radius) = mesh_frame(inp.bounds);
+            Coords { uv: surface.uv, pos: (surface.pos - center) / radius, nrm: surface.nrm }
+        }
+        None => Coords { uv: Vec2::new((x as f32 + 0.5) / gbuf.width as f32, (y as f32 + 0.5) / gbuf.height as f32), pos: Vec3::ZERO, nrm: Vec3::Y },
+    };
+
+    // UV-tiled sets: projections see the mesh's own UVs (patterns repeat per tile)
+    if let Ok(set) = inp.project.texture_set(inp.ts)
+        && let Some(grid) = set.tile_grid()
+    {
+        coords.uv = Vec2::from(set.from_atlas(&grid, coords.uv.to_array()));
+    }
+    coords
+}
+
+/// What a generator's texture or custom grunge reads with nothing in its slot
+const EMPTY_IMAGE_SLOT: Source = Source::Uniform([0.0; 3]);
+
+/// The step Safe Rotation turns a Grayscale Conversion image by, so it keeps tiling seamlessly
+const QUARTER_TURN_DEGREES: f32 = 90.0;
+
+/// Values per texel of a generator stage's region: the stack below, the generator's ramp and its texture's gray
+const GENERATOR_STAGE_COMPONENTS: usize = 3;
+
+/// The mask over a region after a generator at its own resolution and blur: `stack` is (stack below, generator ramp, texture gray) per texel, sizes in texels per side
 fn generator_region(
     generator: &Generator,
     blend: BlendMode,
@@ -1943,7 +1993,7 @@ fn generator_region(
     (uv_tile, texture_set): (u32, u32),
 ) -> Vec<f32> {
     let (columns, rows) = (width as usize, height as usize);
-    let mut ramps: Vec<f32> = stack.par_chunks(2).map(|texel| texel.get(1).copied().unwrap_or(0.0)).collect();
+    let mut ramps: Vec<f32> = stack.par_chunks(GENERATOR_STAGE_COMPONENTS).map(|texel| texel.get(1).copied().unwrap_or(0.0)).collect();
 
     // Coarser than the UV tile: averaged over cells, then the blur around them
     let cell = generator.resolution.cell(uv_tile, texture_set) as usize;
@@ -1951,22 +2001,24 @@ fn generator_region(
         ramps = resampled_by_cells(&ramps, cover, (region_x as usize, region_y as usize, columns, rows), cell);
     }
 
-    let blur_radius = generator.global.blur_radius_at(uv_tile).round() as usize;
-    if blur_radius > 0 {
-        let mut weights = cover.to_vec();
-        blur(&mut weights, columns, rows, blur_radius);
-        let mut sums: Vec<f32> = ramps.iter().zip(cover).map(|(ramp, covered)| ramp * covered).collect();
-        blur(&mut sums, columns, rows, blur_radius);
-        ramps.par_iter_mut().zip(sums.par_iter().zip(weights.par_iter())).for_each(|(ramp, (sum, weight))| {
-            if *weight > MIN_READ_WEIGHT {
-                *ramp = sum / weight;
-            }
+    // The section controls act on the signal before the global blur, their own blur first
+    if let Some(section) = generator.section_controls() {
+        blur_over_cover(&mut ramps, cover, (columns, rows), sections::blur_radius_at(generator.kind, &section, uv_tile));
+        ramps.par_iter_mut().for_each(|signal| *signal = sections::adjusted(generator.kind, &section, *signal));
+    }
+
+    // The texture blends over the adjusted signal, before the global blur
+    if let Some(texture) = generator.texture_in_use() {
+        ramps.par_iter_mut().zip(stack.par_chunks(GENERATOR_STAGE_COMPONENTS)).for_each(|(signal, texel)| {
+            *signal = texture_layer::blended_over(texture, *signal, texel.get(2).copied().unwrap_or(0.0));
         });
     }
 
+    blur_over_cover(&mut ramps, cover, (columns, rows), generator.applied_global().blur_radius_at(uv_tile).round() as usize);
+
     // Finished and blended over the stack below, like the generator effect itself
     stack
-        .par_chunks(2)
+        .par_chunks(GENERATOR_STAGE_COMPONENTS)
         .zip(ramps.par_iter())
         .map(|(texel, ramp)| {
             let below = texel.first().copied().unwrap_or(0.0);
@@ -1974,6 +2026,23 @@ fn generator_region(
             below + (blend1(blend, below, generated) - below) * opacity
         })
         .collect()
+}
+
+/// `values` blurred by three box passes of `radius`, weighted by `cover` so uncovered texels don't bleed in
+fn blur_over_cover(values: &mut [f32], cover: &[f32], (columns, rows): (usize, usize), radius: usize) {
+    if radius == 0 {
+        return;
+    }
+
+    let mut weights = cover.to_vec();
+    blur(&mut weights, columns, rows, radius);
+    let mut sums: Vec<f32> = values.iter().zip(cover).map(|(value, covered)| value * covered).collect();
+    blur(&mut sums, columns, rows, radius);
+    values.par_iter_mut().zip(sums.par_iter().zip(weights.par_iter())).for_each(|(value, (sum, weight))| {
+        if *weight > MIN_READ_WEIGHT {
+            *value = sum / weight;
+        }
+    });
 }
 
 /// `values` averaged over `cell` × `cell` texel cells on the mesh (`cover`), read back bilinearly between cell centers.
@@ -2035,10 +2104,10 @@ fn resampled_by_cells(values: &[f32], cover: &[f32], (region_x, region_y, width,
         .collect()
 }
 
-/// A generator's (possibly blurred) ramp after balance, contrast, invert and offset
+/// A generator's (possibly blurred) ramp after balance, contrast, invert and offset (the light controls invert their shading themselves)
 fn finish_generator(generator: &Generator, ramp: f32) -> f32 {
-    let value = generator.global.apply(ramp);
-    let value = if generator.invert { 1.0 - value } else { value };
+    let value = generator.applied_global().apply(ramp);
+    let value = if generator.invert && generator.light.is_none() { 1.0 - value } else { value };
     let offset = if generator.offset.is_finite() { generator.offset } else { 0.0 };
     (value + offset).clamp(0.0, 1.0)
 }
@@ -2240,7 +2309,8 @@ fn unpremultiply(data: &mut [f32], comps: usize) {
 /// (and anchors) below it. Cheap when no layer has a blur or sharpen.
 pub fn neighbourhood_fields(inputs: &Inputs, channels: &[Channel], tiles: &[(u32, u32)]) -> Fields {
     let projectors = ProjectorDepthCache::default();
-    let inputs = EvaluationInputs::new(inputs, &projectors);
+    let mut inputs = EvaluationInputs::new(inputs, &projectors);
+    prepare_generators(&mut inputs, None);
     evaluation_fields(&inputs, &evaluation_channels(&inputs, channels.to_vec()), tiles)
 }
 
@@ -2258,18 +2328,21 @@ fn fields_of(inp: &EvaluationInputs, channels: &[Channel], (list, around): (&[La
 
     let working_width = inp.gbuf.width;
     let mut order = Vec::new();
-    draw_order(inp, list, 0, around.into(), &mut order);
+    draw_order(inp, list, 0, around.into(), false, &mut order);
     let ids: Vec<LayerId> = order.iter().map(|(id, _)| *id).collect();
     prepare_curvature_sizes(inp, &ids);
+
+    let field_mask =
+        |id, place: DrawPlacement| layer_mask(inp.project, id).filter(|mask| mask.enabled || (place.instance == 0 && inp.sampled_disabled_mask == Some(id)));
 
     // Walk backwards to find the region each Compare needs below its position in the stack
     let mut below_margin = (0u32, false);
     let margins: Vec<_> = order
         .iter()
         .rev()
-        .map(|&(id, _)| {
+        .map(|&(id, place)| {
             let mask_margin = below_margin;
-            let effects = layer_mask(inp.project, id).filter(|mask| mask.enabled).map(|mask| mask.effects.as_slice()).unwrap_or_default();
+            let effects = field_mask(id, place).map(|mask| mask.effects.as_slice()).unwrap_or_default();
             let first_reader = effects.iter().filter(|effect| effect.visible).position(|effect| effect.kind.reads_stack());
             if let Some(first_reader) = first_reader {
                 for (index, radius, op) in neighbourhood_filters(effects, inp.tile_res(), None).filter(|(index, _, _)| *index > first_reader) {
@@ -2285,7 +2358,7 @@ fn fields_of(inp: &EvaluationInputs, channels: &[Channel], (list, around): (&[La
 
     for ((id, place), (mask_margin, content_margin)) in order.into_iter().zip(margins.into_iter().rev()) {
         let Some(layer) = inp.project.content_layer(id) else { continue };
-        let mask = layer_mask(inp.project, id).filter(|mask| mask.enabled && neighbourhood(&mask.effects, working_width).is_some());
+        let mask = field_mask(id, place).filter(|mask| neighbourhood(&mask.effects, working_width).is_some());
 
         // A mask comparing its own layer needs that layer's filtered content first
         let compares_content = mask.is_some_and(|mask| mask.effects.iter().any(|effect| effect.visible && compares_this_layer(&effect.kind)));
@@ -2351,19 +2424,193 @@ fn compares_this_layer(kind: &EffectKind) -> bool {
     matches!(kind, EffectKind::Compare { left, right, .. } if *left == CompareSource::ThisLayer || *right == CompareSource::ThisLayer)
 }
 
-/// Build the curvature detail sizes every visible generator of `layers` reads, once, before tiles composite in parallel.
-fn prepare_curvature_sizes(inp: &Inputs, layers: &[LayerId]) {
+/// Build the curvature detail sizes every visible generator of `layers` reads, once, before tiles composite in parallel
+fn prepare_curvature_sizes(inp: &EvaluationInputs, layers: &[LayerId]) {
     let visible = layers.iter().filter(|id| inp.project.layers.get(id).is_some_and(|layer| layer.visible));
     let masks = visible.filter_map(|id| layer_mask(inp.project, *id)).filter(|mask| mask.enabled);
     prepare_mask_curvature_sizes(inp, masks);
 }
 
-/// Build the curvature detail sizes the visible generators of `masks` read, once, before tiles composite in parallel.
-fn prepare_mask_curvature_sizes<'a>(inp: &Inputs, masks: impl Iterator<Item = &'a Mask>) {
-    let mut needed = [false; CurvatureDetail::BLURRED_SIZES];
+/// Retain up to this many bytes of whole-map fields while planning tiles
+const EVALUATION_FIELD_BYTES: usize = 256 << 20;
+
+/// Generators whose fitted signal depends on a precomputed whole-atlas field
+fn whole_map_generator(kind: GeneratorKind) -> bool {
+    matches!(kind, GeneratorKind::UvBorderDistance | GeneratorKind::DrippingRust | GeneratorKind::UvRandomColor | GeneratorKind::UvChecker)
+}
+
+/// A requested mask beneath a hidden folder probes the visible stack before that folder
+fn requested_mask_stop(inp: &EvaluationInputs, id: LayerId) -> LayerId {
+    let mut stop = id;
+    let mut current = id;
+    for _ in 0..texturecraft_core::project::MAX_DEPTH {
+        let Some((_, Some(parent), _)) = inp.project.locate(current) else { break };
+        if inp.project.layers.get(&parent).is_some_and(|layer| !layer.visible) {
+            stop = parent;
+        }
+        current = parent;
+    }
+    stop
+}
+
+/// Prepare whole-map fields and build Micro Height maps from bottom to top
+fn prepare_generators(inp: &mut EvaluationInputs, requested_mask: Option<LayerId>) {
+    let Ok(set) = inp.project.texture_set(inp.ts) else { return };
+    let requested_stop = requested_mask.map(|id| requested_mask_stop(inp, id));
+    let mut order = Vec::new();
+    draw_order(inp, &set.stack, 0, ContentsOffset::NONE.into(), true, &mut order);
+
+    let mut anchors_below = HashMap::new();
+    let mut first_readers = HashMap::new();
+    let mut generators_by_anchor = HashMap::<_, BTreeMap<_, _>>::new();
+    let mut considered_fields = HashSet::new();
+    let mut retained_fields = HashSet::new();
+    let field_bytes = (inp.gbuf.width as usize).saturating_mul(inp.gbuf.height as usize).saturating_mul(size_of::<f32>());
+    let mut retained_bytes = 0usize;
+
+    for (index, &(id, place)) in order.iter().enumerate() {
+        let visible = inp.project.layers.get(&id).is_some_and(|layer| layer.visible);
+        let draw = (id, place.instance);
+        let masks = visible
+            .then_some((draw, id))
+            .into_iter()
+            .chain(requested_mask.filter(|_| requested_stop == Some(id) && place.instance == 0 && !visible).map(|reader| ((reader, 0), reader)));
+        for (reader_draw, reader) in masks {
+            // Clone and smudge explicitly sample disabled masks
+            let requested = reader_draw.1 == 0 && requested_mask == Some(reader);
+            let effects = layer_mask(inp.project, reader).filter(|mask| mask.enabled || requested).into_iter().flat_map(|mask| &mask.effects);
+            for effect in effects.filter(|effect| effect.visible) {
+                let EffectKind::Generator(generator) = &effect.kind else { continue };
+
+                if let Some(anchor) = micro_height_anchor(generator)
+                    && let Some(anchor_index) = anchors_below.get(&anchor)
+                {
+                    inp.anchor_readers.insert((reader_draw, anchor), *anchor_index);
+                    first_readers.entry((anchor, *anchor_index)).or_insert(draw);
+                    generators_by_anchor.entry((anchor, *anchor_index)).or_default().insert(effect.id, generator);
+                }
+
+                if whole_map_generator(generator.kind)
+                    && retained_bytes.saturating_add(field_bytes) <= EVALUATION_FIELD_BYTES
+                    && considered_fields.insert(effect.id)
+                {
+                    let maps = GeneratorMaps::of(inp, generator, &curvature_sizes_in_use(generator), None, || inp.field_identity());
+                    if let Some(field) = &maps.field
+                        && retained_fields.insert(Arc::as_ptr(field))
+                    {
+                        retained_bytes += field_bytes;
+                    }
+                    inp.whole_maps.insert(effect.id, maps);
+                }
+            }
+        }
+
+        if visible {
+            let mask_effects = layer_mask(inp.project, id).filter(|mask| mask.enabled).into_iter().flat_map(|mask| &mask.effects);
+            let content_effects = inp.project.content_layer(id).filter(|layer| !layer.is_group()).into_iter().flat_map(|layer| &layer.content_effects);
+            for effect in content_effects.chain(mask_effects).filter(|effect| effect.visible && matches!(effect.kind, EffectKind::Anchor)) {
+                anchors_below.insert(effect.id, index);
+            }
+        }
+    }
+
+    if inp.is_session_stack() {
+        inp.projectors.micro_heights.retain_readers(inp.ts, &first_readers.keys().copied().collect::<Vec<_>>());
+    }
+
+    if first_readers.is_empty() {
+        return;
+    }
+
+    let mut readers: Vec<_> = first_readers.into_iter().collect();
+    readers.sort_unstable_by_key(|((anchor, index), _)| (*index, *anchor));
+    let stack = (inp.is_session_stack() && inp.preview.is_none())
+        .then(|| StackKey::new(inp.project, inp.pixels, inp.baked, inp.images, inp.ts, &set.stack).map(Arc::new))
+        .flatten();
+
+    for ((anchor, index), draw) in readers {
+        let build = || anchor_heights(inp, draw, anchor);
+        let heights = match &stack {
+            Some(stack) => inp.projectors.micro_heights.get_or_build(inp, (anchor, index), stack, build),
+            None => Arc::new(build()),
+        };
+        if let Some(generators) = generators_by_anchor.remove(&(anchor, index)) {
+            for (id, generator) in generators {
+                let maps = GeneratorMaps::of(inp, generator, &curvature_sizes_in_use(generator), Some(heights.clone()), || inp.field_identity());
+                inp.anchor_maps.insert((id, index), maps);
+            }
+        }
+    }
+}
+
+fn micro_height_anchor(generator: &Generator) -> Option<LayerId> {
+    let micro = generator.micro_in_use().filter(|micro| micro.height)?;
+    match &micro.height_source {
+        Some(Source::Anchor { anchor, .. }) => Some(*anchor),
+        _ => None,
+    }
+}
+
+/// Anchor point `anchor`'s height over the whole texture set as layer `reader` reads it, in the working atlas's layout
+fn anchor_heights(inp: &EvaluationInputs, reader: (LayerId, usize), anchor: LayerId) -> AnchorHeights {
+    let (width, height) = (inp.gbuf.width, inp.gbuf.height);
+    let channels = evaluation_channels(inp, vec![Channel::Height]);
+    let fields = evaluation_fields(inp, &channels, &all_tiles(width, height));
+    let width_usize = width as usize;
+    let tile_side = TILE as usize;
+    let mut data = vec![0.0f32; width_usize * height as usize];
+
+    // Each tile row writes its own atlas rows
+    data.par_chunks_mut(width_usize.max(1) * tile_side).enumerate().for_each(|(tile_y, rows)| {
+        for tile_x in 0..width.div_ceil(TILE) {
+            let nodes = below_plan(inp, reader, &channels, (tile_x, tile_y as u32), Some(&fields), true);
+            let preview = inp.preview.and_then(|preview| preview.alpha.tile(tile_x, tile_y as u32));
+            for (x, y, offset) in tile_texels(inp.gbuf, tile_x, tile_y as u32) {
+                let mut texel = Texel::new(inp, x, y, offset, stroke_at(preview, offset));
+                texel.anchors_below(&nodes, reader);
+                if let Some(destination) = rows.get_mut((y as usize % tile_side) * width_usize + x as usize) {
+                    *destination = texel.anchored(anchor, Channel::Height)[0];
+                }
+            }
+        }
+    });
+    AnchorHeights::new(data, (width, height), inp.block_scales.clone())
+}
+
+/// The blurred curvature levels `generator` reads: its wear's smoothing, else its detail sizes (a replaced curvature input reads none)
+fn curvature_sizes_in_use(generator: &Generator) -> [bool; LEVEL_RADII.len()] {
+    if generator.inputs.contains_key(&BakedMap::Curvature) {
+        return [false; LEVEL_RADII.len()];
+    }
+
+    if let Some(wear) = wear_parameters(generator) {
+        return wear::levels_in_use(generator.kind, &wear);
+    }
+
+    let detail = generator.detail_in_use().as_ref().map(CurvatureDetail::blurred_sizes_in_use).unwrap_or_default();
+    std::array::from_fn(|level| detail.get(level).copied().unwrap_or(false))
+}
+
+/// The wear controls `generator` computes with: its own, Fiber Glass Edge Wear's defaults when it has none (it has no earlier model), else None
+fn wear_parameters(generator: &Generator) -> Option<WearParameters> {
+    generator.wear.or_else(|| WearParameters::defaults(generator.kind).filter(|_| generator.kind == GeneratorKind::FiberGlassEdgeWear))
+}
+
+/// Build the curvature detail sizes the visible generators of `masks` read, once, before tiles composite in parallel
+fn prepare_mask_curvature_sizes<'a>(inp: &EvaluationInputs, masks: impl Iterator<Item = &'a Mask>) {
+    let mut needed = [false; LEVEL_RADII.len()];
     for effect in masks.flat_map(|mask| &mask.effects).filter(|effect| effect.visible) {
-        if let EffectKind::Generator(Generator { detail: Some(detail), .. }) = &effect.kind {
-            for (slot, in_use) in needed.iter_mut().zip(detail.blurred_sizes_in_use()) {
+        if let EffectKind::Generator(generator) = &effect.kind {
+            if micro_height_anchor(generator).is_some() || inp.whole_maps.contains_key(&effect.id) {
+                continue;
+            }
+
+            if generator.micro_in_use().is_some() || whole_map_generator(generator.kind) {
+                GeneratorMaps::of(inp, generator, &curvature_sizes_in_use(generator), None, || inp.field_identity());
+                continue;
+            }
+
+            for (slot, in_use) in needed.iter_mut().zip(curvature_sizes_in_use(generator)) {
                 *slot |= in_use;
             }
         }
@@ -2395,7 +2642,8 @@ fn effect_plans<'a>(
     tile_x: u32,
     tile_y: u32,
     channel: Option<Channel>,
-    around: ContentsOffset,
+    place: DrawPlacement,
+    id: LayerId,
 ) -> Vec<EffectPlan<'a>> {
     effects
         .iter()
@@ -2405,14 +2653,20 @@ fn effect_plans<'a>(
                 Some(channel) => (inp.pixels.layer(effect.id, channel), PaintTarget::Layer(effect.id)),
                 None => (inp.pixels.masks.get(&effect.id), PaintTarget::Mask(effect.id)),
             };
-            let curvature_sizes = match &effect.kind {
-                EffectKind::Generator(Generator { detail: Some(detail), .. }) => CurvatureSizes::of(inp, &detail.blurred_sizes_in_use()),
-                _ => None,
+            let maps = match &effect.kind {
+                EffectKind::Generator(generator) => {
+                    let maps = micro_height_anchor(generator)
+                        .and_then(|anchor| inp.anchor_readers.get(&((id, place.instance), anchor)))
+                        .and_then(|index| inp.anchor_maps.get(&(effect.id, *index)))
+                        .or_else(|| inp.whole_maps.get(&effect.id));
+                    maps.cloned().unwrap_or_else(|| GeneratorMaps::of(inp, generator, &curvature_sizes_in_use(generator), None, || inp.field_identity()))
+                }
+                _ => GeneratorMaps::default(),
             };
             let (depth, covers_all, projection) = match &effect.kind {
                 EffectKind::Fill { projection, sampling, .. } | EffectKind::Material(Fill { projection, sampling, .. }) => {
                     let (depth, covers_all) = fill_coverage(inp, projection, *sampling);
-                    (depth, covers_all, (!around.is_none()).then(|| around.apply(projection)))
+                    (depth, covers_all, (!place.offset.is_none()).then(|| place.offset.apply(projection)))
                 }
                 _ => (None, false, None),
             };
@@ -2437,7 +2691,7 @@ fn effect_plans<'a>(
                 opacity: blend.opacity,
                 data: if effect.kind.painted() { tile_of(inp, image, tile_x, tile_y, channel) } else { None },
                 preview: previews(inp, target),
-                curvature_sizes,
+                maps,
                 filtered_mask: None,
                 depth,
                 covers_all,
@@ -2481,21 +2735,9 @@ fn tile_of<'a>(inp: &Inputs, img: Option<&'a TileImage>, tx: u32, ty: u32, chann
 }
 
 /// The plan of layer `id`'s `mask` for tile (tx, ty), its fills under the Scale and Rotation `around` of the folders holding the layer
-fn mask_plan<'a>(
-    inp: &EvaluationInputs<'a>,
-    id: LayerId,
-    mask: &'a Mask,
-    tx: u32,
-    ty: u32,
-    fields: Option<&'a Fields>,
-    place: DrawPlacement,
-) -> Option<MaskPlan<'a>> {
-    if !mask.enabled {
-        return None;
-    }
-
+fn mask_plan<'a>(inp: &EvaluationInputs<'a>, id: LayerId, mask: &'a Mask, tx: u32, ty: u32, fields: Option<&'a Fields>, place: DrawPlacement) -> MaskPlan<'a> {
     let background = if mask.background == MaskBackground::White { 1.0 } else { 0.0 };
-    let mut effects = effect_plans(inp, &mask.effects, tx, ty, None, place.offset);
+    let mut effects = effect_plans(inp, &mask.effects, tx, ty, None, place, id);
     let filtered = fields.and_then(|fields| FieldKey::mask(id, place.offset).field(fields, place.instance));
     for (index, effect) in effects.iter_mut().enumerate() {
         effect.filtered_mask = filtered.and_then(|field| field.anchor_stages.iter().find(|(stage, _)| *stage == index).map(|(_, field)| field));
@@ -2510,7 +2752,7 @@ fn mask_plan<'a>(
     } else {
         inp.project.content_layer(id).and_then(|l| plan_content(inp, id, l, &compared, tx, ty, 0, fields, false, place, None))
     };
-    Some(MaskPlan { background, effects, layer, start })
+    MaskPlan { background, effects, layer, start }
 }
 
 /// The plans of sibling layers `list` (under the Scale and Rotation of the folders holding them)
@@ -2577,7 +2819,7 @@ fn plan_node<'a>(
     }
 
     let (content, chans) = plan_content(inp, id, layer, channels, tx, ty, depth, fields, kids, place, stop)?;
-    let mask = layer_mask(inp.project, id).and_then(|m| mask_plan(inp, id, m, tx, ty, fields, place));
+    let mask = layer_mask(inp.project, id).filter(|mask| mask.enabled).map(|mask| mask_plan(inp, id, mask, tx, ty, fields, place));
 
     // Anchors in the mask record even where the layer draws nothing
     let mask_anchor = mask.as_ref().is_some_and(|m| m.effects.iter().any(|e| matches!(*e.kind, EffectKind::Anchor)));
@@ -2641,7 +2883,7 @@ fn plan_content<'a>(
             }
 
             let data = if paint { tile_of(inp, inp.pixels.layer(layer.id, *c), tx, ty, Some(*c)) } else { None };
-            let effects = if has_content_effects { effect_plans(inp, &layer.content_effects, tx, ty, Some(*c), place.offset) } else { Vec::new() };
+            let effects = if has_content_effects { effect_plans(inp, &layer.content_effects, tx, ty, Some(*c), place, id) } else { Vec::new() };
             let start = fields
                 .and_then(|fields| FieldKey::content(id, *c, place.offset).field(fields, place.instance))
                 .and_then(|field| neighbourhood_filters(&layer.content_effects, inp.tile_res(), Some(*c)).last().map(|(index, _, _)| (index, field)));
@@ -3276,26 +3518,84 @@ impl<'a, 'b> Texel<'a, 'b> {
         if needs_gray { [lum(value); 3] } else { value }
     }
 
-    fn generator_ramp(&mut self, generator: &Generator, curvature_sizes: Option<&CurvatureSizes>) -> f32 {
+    /// The generator's ramp at this texel, before its global blur, balance, contrast and invert (on the section controls, before those too).
+    fn generator_ramp(&mut self, generator: &Generator, maps: &GeneratorMaps) -> f32 {
+        if let Some(wear) = wear_parameters(generator) {
+            return self.wear_ramp(generator, &wear, maps);
+        }
+
+        if let Some(light) = &generator.light {
+            let normal =
+                self.generator_input_color(generator, BakedMap::WorldNormal).map_or_else(|| self.coords().nrm, |encoded| Vec3::from(encoded) * 2.0 - 1.0);
+            let position = Vec3::from(self.position_input(generator));
+            return sections::light_value(light, normal, position, generator.invert);
+        }
+
+        if let Some(section) = generator.section_controls() {
+            return self.section_signal(generator, &section, maps);
+        }
+
+        // The kinds with only their own controls: resolved once per plan, not per texel
+        let resolved;
+        let controls = match maps.controls.as_deref() {
+            Some(controls) => Some(controls),
+            None => {
+                resolved = generator.kind_controls();
+                resolved.as_ref()
+            }
+        };
+        match controls {
+            Some(KindControls::Distance(distance)) => {
+                let position = self.uniform_position_input(generator);
+                return three_d_distance::distance_value(distance, position);
+            }
+            Some(KindControls::LinearGradient(gradient)) => {
+                let position = self.uniform_position_input(generator);
+                return three_d_distance::linear_gradient_value(gradient, position);
+            }
+            Some(KindControls::BorderDistance(border)) => return uv_border_distance::border_value(border, self.field_value(maps)),
+            Some(KindControls::Grayscale(grayscale)) => return self.grayscale_conversion(grayscale),
+            Some(KindControls::DrippingRust(rust)) => return dripping_rust::rust_value(rust, self.field_value(maps)),
+            Some(KindControls::UvRandomColor(_) | KindControls::UvChecker(_)) => return self.field_value(maps),
+            None => {}
+        }
+
         let coords = self.coords();
-        let micro = generator.micro.map_or(0.0, |micro| self.micro_detail(generator.kind, micro));
+        let earlier_micro = generator.earlier_micro().map_or(0.0, |(anchor, amount)| self.earlier_micro_detail(generator.kind, anchor, amount));
+
+        // Micro details saved on the earlier model add to its curvature and occlusion inputs too
         let signal = match (generator.kind, &generator.detail) {
             (GeneratorKind::Curvature | GeneratorKind::EdgeWear, Some(detail)) => {
                 // Detail sizes are blurred copies of the mesh map, so a replaced curvature input reads at its own size only
-                let sizes = if generator.inputs.contains_key(&BakedMap::Curvature) { None } else { curvature_sizes };
-                let curvature = self.generator_input(generator, BakedMap::Curvature);
-                self.curvature_detail(detail, sizes, curvature, micro)
+                let sizes = if generator.inputs.contains_key(&BakedMap::Curvature) { None } else { maps.sizes.as_deref() };
+                let curvature = self.curvature_input(generator, maps);
+                self.curvature_detail(detail, sizes, curvature, earlier_micro)
             }
-            (GeneratorKind::EdgeWear, None) => (self.generator_input(generator, BakedMap::Curvature).unwrap_or(0.5) - 0.5) * 2.0,
-            (GeneratorKind::Curvature, None) => self.generator_input(generator, BakedMap::Curvature).unwrap_or(0.5),
-            (GeneratorKind::Dirt, _) => 1.0 - self.generator_input(generator, BakedMap::AmbientOcclusion).unwrap_or(1.0),
-            (GeneratorKind::AmbientOcclusion, _) => self.generator_input(generator, BakedMap::AmbientOcclusion).unwrap_or(1.0),
+            (GeneratorKind::EdgeWear, None) | (GeneratorKind::FiberGlassEdgeWear, _) => (self.curvature_input(generator, maps).unwrap_or(0.5) - 0.5) * 2.0,
+            (GeneratorKind::Curvature, None) => self.curvature_input(generator, maps).unwrap_or(0.5),
+            (GeneratorKind::Dirt, _) => 1.0 - self.occlusion_input(generator, maps).unwrap_or(1.0),
+            (GeneratorKind::AmbientOcclusion, _) => self.occlusion_input(generator, maps).unwrap_or(1.0),
             (GeneratorKind::ThinAreas, _) => 1.0 - self.generator_input(generator, BakedMap::Thickness).unwrap_or(1.0),
             (GeneratorKind::Position, _) => coords.pos.dot(Vec3::from(generator.direction).try_normalize().unwrap_or(Vec3::Y)) * 0.5 + 0.5,
             (GeneratorKind::Direction, _) => coords.nrm.dot(Vec3::from(generator.direction).try_normalize().unwrap_or(Vec3::Y)) * 0.5 + 0.5,
+            // World Space Normals and 3D Distance always compute with their own controls: these arms only keep the match whole
+            (GeneratorKind::WorldSpaceNormals, _) => coords.nrm.y * 0.5 + 0.5,
+            (
+                GeneratorKind::ThreeDDistance
+                | GeneratorKind::ThreeDLinearGradient
+                | GeneratorKind::UvBorderDistance
+                | GeneratorKind::GrayscaleConversion
+                | GeneratorKind::DrippingRust
+                | GeneratorKind::UvRandomColor
+                | GeneratorKind::UvChecker,
+                _,
+            ) => 0.0,
         };
-        let signal =
-            if matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear) && generator.detail.is_some() { signal } else { signal + micro };
+        let signal = if matches!(generator.kind, GeneratorKind::Curvature | GeneratorKind::EdgeWear) && generator.detail.is_some() {
+            signal
+        } else {
+            signal + earlier_micro
+        };
         let signal = if generator.noise_amount > 0.0 {
             let noise = world_noise(coords.pos, generator.noise_scale, generator.seed);
             if let (GeneratorKind::Curvature | GeneratorKind::EdgeWear, Some(detail)) = (generator.kind, &generator.detail) {
@@ -3316,26 +3616,218 @@ impl<'a, 'b> Texel<'a, 'b> {
         ramp * ramp * (3.0 - 2.0 * ramp)
     }
 
-    /// How a generator's micro detail moves its signal at this texel: the anchor's height (0 where
-    /// the anchor is not evaluated yet) as an edge where raised and a cavity where recessed.
-    fn micro_detail(&self, kind: GeneratorKind, micro: MicroDetail) -> f32 {
-        let height = self.anchor_value(micro.anchor, Channel::Height, ChannelKind::Signed)[0];
-        let amount = if micro.amount.is_finite() { micro.amount.clamp(0.0, 1.0) } else { 0.0 };
-        let response = height.clamp(-1.0, 1.0) * amount;
-        match kind {
-            GeneratorKind::Curvature | GeneratorKind::EdgeWear => response,
+    /// The signal a generator on its section controls adjusts at this texel: the axes of its map, its curvature or its occlusion
+    fn section_signal(&mut self, generator: &Generator, section: &SectionParameters, maps: &GeneratorMaps) -> f32 {
+        match generator.kind {
+            GeneratorKind::Curvature => {
+                let detail = generator.detail_in_use().unwrap_or_default();
+                let sizes = if generator.inputs.contains_key(&BakedMap::Curvature) { None } else { maps.sizes.as_deref() };
+                let curvature = self.curvature_input(generator, maps);
+                self.curvature_detail(&detail, sizes, curvature, 0.0)
+            }
+            GeneratorKind::AmbientOcclusion => self.occlusion_input(generator, maps).unwrap_or(1.0),
+            GeneratorKind::Position => {
+                let position = self.position_input(generator);
+                sections::axes_signal(position, &section.axes)
+            }
+            GeneratorKind::WorldSpaceNormals => {
+                let normal = self.generator_input_color(generator, BakedMap::WorldNormal).unwrap_or_else(|| (self.coords().nrm * 0.5 + 0.5).to_array());
+                sections::axes_signal(normal, &section.axes)
+            }
 
-            // Dirt gathers in dents; dents are occluded
-            GeneratorKind::Dirt => -response,
-            GeneratorKind::AmbientOcclusion => response,
-            GeneratorKind::ThinAreas | GeneratorKind::Position | GeneratorKind::Direction => 0.0,
+            // Other kinds use their own evaluator
+            GeneratorKind::EdgeWear
+            | GeneratorKind::Dirt
+            | GeneratorKind::ThinAreas
+            | GeneratorKind::Direction
+            | GeneratorKind::FiberGlassEdgeWear
+            | GeneratorKind::ThreeDDistance
+            | GeneratorKind::ThreeDLinearGradient
+            | GeneratorKind::UvBorderDistance
+            | GeneratorKind::GrayscaleConversion
+            | GeneratorKind::DrippingRust
+            | GeneratorKind::UvRandomColor
+            | GeneratorKind::UvChecker => 0.0,
         }
     }
 
-    /// The generator's value at this texel: its ramp finished by balance, contrast, invert and offset (its blur and resolution need neighbours: see [`generator_region`]).
-    fn generator(&mut self, generator: &Generator, curvature_sizes: Option<&CurvatureSizes>) -> f32 {
-        let ramp = self.generator_ramp(generator, curvature_sizes);
-        finish_generator(generator, ramp)
+    /// The image in `generator`'s Position input, else this texel's position across the mesh's bounds: the baked Position map is not read, its normalisation is a bake setting
+    fn position_input(&mut self, generator: &Generator) -> [f32; 3] {
+        match generator.inputs.get(&BakedMap::Position) {
+            Some(source) => self.source(source, &Projection::default(), Sampling::default(), ChannelKind::NormalMap),
+            None => self.bounds_position().to_array(),
+        }
+    }
+
+    /// A generator's whole-map field at this texel (0 without one)
+    fn field_value(&self, maps: &GeneratorMaps) -> f32 {
+        let texel = (self.y * self.inp.gbuf.width + self.x) as usize;
+        maps.field.as_ref().and_then(|field| field.get(texel)).copied().unwrap_or(0.0)
+    }
+
+    /// The Grayscale Conversion generator at this texel: its image tiled and turned about the UV square's centre, made gray, balanced and contrasted
+    fn grayscale_conversion(&mut self, grayscale: &GrayscaleConversionParameters) -> f32 {
+        let degrees = if grayscale.safe_rotation { (grayscale.rotation / QUARTER_TURN_DEGREES).round() * QUARTER_TURN_DEGREES } else { grayscale.rotation };
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        let centred = self.coords().uv - Vec2::splat(0.5);
+        let at = Vec2::new(centred.x * cos - centred.y * sin, centred.x * sin + centred.y * cos) * grayscale.tile + Vec2::splat(0.5);
+        let rgb = match grayscale.source.as_ref().unwrap_or(&EMPTY_IMAGE_SLOT) {
+            Source::Image { name, .. } => self.inp.images.get(name).map_or([0.0; 3], |image| {
+                let [red, green, blue, _] = image.sample(at.x, at.y);
+                [red, green, blue]
+            }),
+            other => self.source(other, &Projection::default(), Sampling::default(), ChannelKind::NormalMap),
+        };
+        let gray = grayscale.grayscale.gray(rgb).clamp(0.0, 1.0);
+        GeneratorGlobal { balance: grayscale.balance, contrast: grayscale.contrast, ..GeneratorGlobal::default() }.apply(gray)
+    }
+
+    /// The image in `generator`'s Position input, else this texel's position across the mesh's bounds scaled evenly: the longest side spans 0..1, the others centred on 0.5
+    fn uniform_position_input(&mut self, generator: &Generator) -> Vec3 {
+        if let Some(source) = generator.inputs.get(&BakedMap::Position) {
+            return Vec3::from(self.source(source, &Projection::default(), Sampling::default(), ChannelKind::NormalMap));
+        }
+
+        let (low, high) = self.inp.bounds;
+        let longest = (high - low).max_element().max(MIN_BOUNDS_EXTENT);
+        self.world().map_or(Vec3::splat(0.5), |position| (position - (low + high) * 0.5) / longest + Vec3::splat(0.5))
+    }
+
+    /// This texel's world position across the mesh's bounds, 0..1 on each axis (0 where uncovered)
+    fn bounds_position(&self) -> Vec3 {
+        let (low, high) = self.inp.bounds;
+        self.world().map_or(Vec3::ZERO, |position| ((position - low) / (high - low).max(Vec3::splat(MIN_BOUNDS_EXTENT))).clamp(Vec3::ZERO, Vec3::ONE))
+    }
+
+    /// A wear generator's value at this texel from its curvature, occlusion and grunge, before its global adjustments and invert
+    fn wear_ramp(&mut self, generator: &Generator, wear: &WearParameters, maps: &GeneratorMaps) -> f32 {
+        let curvature = self.curvature_input(generator, maps).map_or(0.0, |curvature| curvature - 0.5);
+
+        // Blurred levels are copies of the mesh map, so a replaced curvature input is read at its own size only
+        let sizes = if generator.inputs.contains_key(&BakedMap::Curvature) { None } else { maps.sizes.as_deref() };
+        let blurred_curvature = self.blurred_curvature(wear::blur_sigma(generator.kind, wear), sizes, curvature);
+
+        let occlusion = self.occlusion_input(generator, maps).unwrap_or(1.0);
+        let grunge = if wear.custom_grunge {
+            // An image not loaded yet reads mid gray, which leaves the wear as without grunge
+            let gray = self.slot_color(generator, generator.grunge.as_ref(), &wear::custom_grunge_placement(wear)).map_or(0.5, lum);
+            wear::custom_grunge(generator.kind, gray)
+        } else {
+            wear::grunge(generator.kind, wear, generator.seed, &self.coords())
+        };
+        wear::wear_value(generator.kind, wear, &WearInputs { curvature, blurred_curvature, occlusion, grunge })
+    }
+
+    /// The curvature deviation at this texel blurred to `sigma` (texels at 2K) between the two built levels around it; `curvature` without them
+    fn blurred_curvature(&self, sigma: f32, curvature_sizes: Option<&CurvatureSizes>, curvature: f32) -> f32 {
+        let Some((sizes, (baked_x, baked_y))) = curvature_sizes.zip(self.baked_curvature_texel()) else { return curvature };
+
+        let level = |index: usize| sizes.levels.get(index).and_then(Option::as_deref).map(|level| level.sample(baked_x, baked_y));
+        let (narrower, wider, weight) = wear::levels_around(sigma);
+        let narrower = narrower.map_or(Some(curvature), level);
+        match (narrower, level(wider)) {
+            (Some(narrower), Some(wider)) => narrower + (wider - narrower) * weight,
+            _ => curvature,
+        }
+    }
+
+    /// The baked curvature map's texel under this texel (None outside the baked layout)
+    fn baked_curvature_texel(&self) -> Option<(u32, u32)> {
+        let working_size = (self.res, self.inp.gbuf.height);
+        let texel_uv = [(self.x as f32 + 0.5) / working_size.0.max(1) as f32, (self.y as f32 + 0.5) / working_size.1.max(1) as f32];
+        let baked_uv = self.inp.block_scales.bake_uv(texel_uv, working_size)?;
+        let baked_size = (self.inp.baked.resolution, self.inp.baked.height(BakedMap::Curvature));
+        Some(((baked_uv[0] * baked_size.0 as f32) as u32, (baked_uv[1] * baked_size.1 as f32) as u32))
+    }
+
+    /// The generator's value at this texel: its ramp finished by balance, contrast, invert and offset (its blur and resolution need neighbours: see [`generator_region`])
+    fn generator(&mut self, generator: &Generator, maps: &GeneratorMaps) -> f32 {
+        let ramp = self.generator_ramp(generator, maps);
+        let adjusted = generator.section_controls().map_or(ramp, |section| sections::adjusted(generator.kind, &section, ramp));
+
+        // An image still loading reads black, as it does where blur or resolution compute the generator over a region
+        let textured = match generator.texture_in_use() {
+            Some(texture) => texture_layer::blended_over(texture, adjusted, self.generator_texture(generator).unwrap_or(0.0)),
+            None => adjusted,
+        };
+
+        finish_generator(generator, textured)
+    }
+
+    /// The gray of the generator's texture at this texel (None when it blends no texture)
+    fn generator_texture(&mut self, generator: &Generator) -> Option<f32> {
+        let texture = generator.texture_in_use()?;
+        let rgb = self.slot_color(generator, texture.source.as_ref(), &texture_layer::texture_placement(texture))?;
+        Some(texture_layer::texture_gray(texture, rgb))
+    }
+
+    /// The color of a generator's image slot holding `source` (None: empty, read as black) at this texel, read where `placement` puts it (None when its image isn't loaded)
+    fn slot_color(&mut self, generator: &Generator, source: Option<&Source>, placement: &texture_layer::SlotPlacement) -> Option<[f32; 3]> {
+        match source.unwrap_or(&EMPTY_IMAGE_SLOT) {
+            Source::Image { name, .. } => {
+                let image = self.inp.images.get(name)?.clone();
+                let read = |coordinates: Vec2| {
+                    let [red, green, blue, _] = image.sample(coordinates.x, coordinates.y);
+                    Vec3::new(red, green, blue)
+                };
+                let color = match placement.triplanar_contrast {
+                    Some(contrast) => {
+                        let normal = self
+                            .generator_input_color(generator, BakedMap::WorldNormal)
+                            .map_or_else(|| self.coords().nrm, |encoded| Vec3::from(encoded) * 2.0 - 1.0);
+                        let weights = texture_layer::triplanar_weights(contrast, normal);
+                        let coordinates = texture_layer::triplanar_coordinates(placement, self.bounds_position());
+                        weights.iter().zip(coordinates).fold(Vec3::ZERO, |sum, (weight, at)| sum + read(at) * *weight)
+                    }
+                    None => read(texture_layer::uv_coordinates(placement, self.coords().uv)),
+                };
+                Some(color.to_array())
+            }
+
+            // A value or an anchor reads the same wherever it is projected
+            other => Some(self.source(other, &Projection::default(), Sampling::default(), ChannelKind::NormalMap)),
+        }
+    }
+
+    /// How a micro detail saved before Micro Details moves an earlier-model generator's signal at this texel: anchor point `anchor`'s height times `amount` (0 where the anchor is not evaluated yet), an edge where raised and a cavity where recessed
+    fn earlier_micro_detail(&self, kind: GeneratorKind, anchor: LayerId, amount: f32) -> f32 {
+        let response = self.anchor_value(anchor, Channel::Height, ChannelKind::Signed)[0].clamp(-1.0, 1.0) * amount;
+        match kind {
+            GeneratorKind::Curvature | GeneratorKind::EdgeWear | GeneratorKind::AmbientOcclusion => response,
+
+            // Dirt gathers in dents
+            GeneratorKind::Dirt => -response,
+
+            // Kinds the micro detail never moved, or without an earlier model
+            GeneratorKind::FiberGlassEdgeWear
+            | GeneratorKind::ThinAreas
+            | GeneratorKind::Position
+            | GeneratorKind::Direction
+            | GeneratorKind::WorldSpaceNormals
+            | GeneratorKind::ThreeDDistance
+            | GeneratorKind::ThreeDLinearGradient
+            | GeneratorKind::UvBorderDistance
+            | GeneratorKind::GrayscaleConversion
+            | GeneratorKind::DrippingRust
+            | GeneratorKind::UvRandomColor
+            | GeneratorKind::UvChecker => 0.0,
+        }
+    }
+
+    /// The generator's curvature input at this texel with what its micro details add
+    fn curvature_input(&mut self, generator: &Generator, maps: &GeneratorMaps) -> Option<f32> {
+        let curvature = self.generator_input(generator, BakedMap::Curvature)?;
+        let working_size = (self.res, self.inp.gbuf.height);
+        let micro = maps.micro_curvature.as_ref().and_then(|micro| micro.term.at((self.x, self.y), working_size, &self.inp.block_scales));
+        Some(curvature + micro.unwrap_or(0.0))
+    }
+
+    /// The generator's occlusion input at this texel, darkened by its micro details
+    fn occlusion_input(&mut self, generator: &Generator, maps: &GeneratorMaps) -> Option<f32> {
+        let occlusion = self.generator_input(generator, BakedMap::AmbientOcclusion)?;
+        let working_size = (self.res, self.inp.gbuf.height);
+        let micro = maps.micro_occlusion.as_ref().and_then(|micro| micro.at((self.x, self.y), working_size, &self.inp.block_scales));
+        Some(occlusion * micro.unwrap_or(1.0))
     }
 
     /// Generator input `map` at this texel: what replaces the mesh map in the generator's inputs, else the mesh map (None when not baked).
@@ -3347,11 +3839,19 @@ impl<'a, 'b> Texel<'a, 'b> {
         }
     }
 
-    /// The curvature of `detail`'s mode at this texel from `curvature` (None: nothing to read), with its blurred detail sizes when given.
-    fn curvature_detail(&self, detail: &CurvatureDetail, curvature_sizes: Option<&CurvatureSizes>, curvature: Option<f32>, micro: f32) -> f32 {
+    /// Generator input `map` at this texel as three channels (an encoded normal or position): what replaces the mesh map, else the mesh map (None when not baked)
+    fn generator_input_color(&mut self, generator: &Generator, map: BakedMap) -> Option<[f32; 3]> {
+        match generator.inputs.get(&map) {
+            Some(source) => Some(self.source(source, &Projection::default(), Sampling::default(), ChannelKind::NormalMap)),
+            None => self.baked_color(map),
+        }
+    }
+
+    /// The curvature of `detail`'s mode at this texel from `curvature` (None: nothing to read), with its blurred detail sizes when given and an earlier micro detail's term (see [`Texel::earlier_micro_detail`]) as an edge where positive and a cavity where negative
+    fn curvature_detail(&self, detail: &CurvatureDetail, curvature_sizes: Option<&CurvatureSizes>, curvature: Option<f32>, earlier_micro: f32) -> f32 {
         let combine = |edges: f32, cavities: f32| {
-            let edges = 1.0 - (1.0 - edges) * (1.0 - micro.max(0.0));
-            let cavities = 1.0 - (1.0 - cavities) * (1.0 + micro.min(0.0));
+            let edges = 1.0 - (1.0 - edges) * (1.0 - earlier_micro.max(0.0));
+            let cavities = 1.0 - (1.0 - cavities) * (1.0 + earlier_micro.min(0.0));
             match detail.mode {
                 CurvatureMode::Edges => edges,
                 CurvatureMode::Cavities => cavities,
@@ -3360,15 +3860,10 @@ impl<'a, 'b> Texel<'a, 'b> {
             }
         };
 
-        // Without baked curvature, only painted micro height supplies edges or cavities
+        // Without curvature to read only an earlier micro detail supplies edges or cavities
         let Some(curvature) = curvature else { return combine(0.0, 0.0) };
+        let Some((baked_x, baked_y)) = self.baked_curvature_texel() else { return combine(0.0, 0.0) };
 
-        let working_size = (self.res, self.inp.gbuf.height);
-        let texel_uv = [(self.x as f32 + 0.5) / working_size.0.max(1) as f32, (self.y as f32 + 0.5) / working_size.1.max(1) as f32];
-        let Some(baked_uv) = self.inp.block_scales.bake_uv(texel_uv, working_size) else { return combine(0.0, 0.0) };
-
-        let baked_size = (self.inp.baked.resolution, self.inp.baked.height(BakedMap::Curvature));
-        let (baked_x, baked_y) = ((baked_uv[0] * baked_size.0 as f32) as u32, (baked_uv[1] * baked_size.1 as f32) as u32);
         let blurred = |index: usize| {
             curvature_sizes.and_then(|sizes| sizes.levels.get(index)).and_then(Option::as_deref).map_or(0.0, |level| level.sample(baked_x, baked_y))
         };
@@ -3455,7 +3950,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                     value += (blend1(effect.blend, value, fill) - value) * opacity * cover;
                 }
                 EffectKind::Generator(generator) => {
-                    let generated = self.generator(generator, effect.curvature_sizes.as_deref());
+                    let generated = self.generator(generator, &effect.maps);
                     value += (blend1(effect.blend, value, generated) - value) * opacity;
                 }
                 EffectKind::Levels(levels) => value += (levels.apply(value) - value) * opacity,
@@ -3974,8 +4469,8 @@ pub fn composite_tiles_cached(inputs: &Inputs, out: &mut Composite, tiles: &[(u3
     }
 
     let projectors = ProjectorDepthCache::default();
-    let inputs = EvaluationInputs::new(inputs, &projectors);
-    composite_evaluation_tiles(&inputs, out, tiles, below);
+    let mut inputs = EvaluationInputs::new(inputs, &projectors);
+    composite_evaluation_tiles(&mut inputs, out, tiles, below);
 }
 
 /// Composite tile batches with a reusable cache for the mesh owned by the caller.
@@ -3997,14 +4492,18 @@ pub fn composite_tiles_with_projectors(
         cache.bind_mesh(mesh);
     }
 
-    let inputs = EvaluationInputs::new(inputs, projectors);
-    composite_evaluation_tiles(&inputs, out, tiles, below);
+    let mut inputs = EvaluationInputs::new(inputs, projectors).of_the_session_stack();
+    composite_evaluation_tiles(&mut inputs, out, tiles, below);
 }
 
-fn composite_evaluation_tiles(inp: &EvaluationInputs, out: &mut Composite, tiles: &[(u32, u32)], mut below: Option<&mut BelowCache>) {
+fn composite_evaluation_tiles(inp: &mut EvaluationInputs, out: &mut Composite, tiles: &[(u32, u32)], mut below: Option<&mut BelowCache>) {
     let Ok(set) = inp.project.texture_set(inp.ts) else { return };
     if (inp.gbuf.width, inp.gbuf.height) != (out.resolution, out.height) {
         return;
+    }
+
+    if !tiles.is_empty() {
+        prepare_generators(inp, None);
     }
 
     let split = below.as_deref_mut().and_then(|b| b.prepare(inp));
@@ -4124,7 +4623,7 @@ fn uses_environment(project: &Project, stack: &[LayerId], depth: usize) -> bool 
 fn has_neighbourhood(inp: &EvaluationInputs, stack: &[LayerId]) -> bool {
     let working_width = inp.gbuf.width;
     let mut order = Vec::new();
-    draw_order(inp, stack, 0, DrawPlacement::default(), &mut order);
+    draw_order(inp, stack, 0, DrawPlacement::default(), false, &mut order);
     order.into_iter().any(|(id, _)| {
         let masked = layer_mask(inp.project, id).is_some_and(|mask| mask.enabled && neighbourhood(&mask.effects, working_width).is_some());
         masked || inp.project.content_layer(id).is_some_and(|layer| !layer.is_group() && neighbourhood(&layer.content_effects, working_width).is_some())
@@ -4442,13 +4941,14 @@ pub fn pad_tiles(out: &mut Composite, dmap: &DilationMap, tiles: &[(u32, u32)]) 
 /// Returns None without an enabled mask
 pub fn mask_texels(inputs: &Inputs, id: LayerId) -> Option<Vec<f32>> {
     let projectors = ProjectorDepthCache::default();
-    let inputs = &EvaluationInputs::new(inputs, &projectors);
+    let inputs = &mut EvaluationInputs::new(inputs, &projectors);
     let mask = layer_mask(inputs.project, id).filter(|mask| mask.enabled)?;
     let channels = evaluation_channels(inputs, inputs.project.texture_set(inputs.ts).map(|set| set.channel_list()).unwrap_or_default());
     let (width, height) = (inputs.gbuf.width, inputs.gbuf.height);
     let coordinates = all_tiles(width, height);
 
     // A hidden layer's mask is left out of the stack's preparation
+    prepare_generators(inputs, Some(id));
     prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
 
     let fields = evaluation_fields(inputs, &channels, &coordinates);
@@ -4479,13 +4979,14 @@ pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
     let size = size.max(1);
     let pixel_count = usize::try_from(size.checked_mul(size)?).ok()?;
     let projectors = ProjectorDepthCache::default();
-    let inputs = &EvaluationInputs::new(inputs, &projectors);
+    let inputs = &mut EvaluationInputs::new(inputs, &projectors);
     let mask = layer_mask(inputs.project, id).filter(|mask| mask.enabled)?;
     let channels = evaluation_channels(inputs, inputs.project.texture_set(inputs.ts).map(|set| set.channel_list()).unwrap_or_default());
     let (width, height) = (inputs.gbuf.width, inputs.gbuf.height);
     let coordinates = all_tiles(width, height);
 
     // A hidden layer's mask is left out of the stack's preparation
+    prepare_generators(inputs, Some(id));
     prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
 
     let fields = evaluation_fields(inputs, &channels, &coordinates);
@@ -4587,9 +5088,16 @@ pub fn mask_values(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Option
 /// Evaluate requested tiles directly into the stroke's mask image.
 pub fn mask_values_into(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)], image: &mut TileImage) -> Option<()> {
     let projectors = ProjectorDepthCache::default();
-    let inputs = &EvaluationInputs::new(inputs, &projectors);
+    let inputs = &mut EvaluationInputs::new(inputs, &projectors);
     let mask = layer_mask(inputs.project, id)?;
-    let channels = evaluation_channels(inputs, inputs.project.texture_set(inputs.ts).ok()?.channel_list());
+    inputs.sampled_disabled_mask = (!mask.enabled).then_some(id);
+    let mut channels = inputs.project.texture_set(inputs.ts).ok()?.channel_list();
+    if !mask.enabled {
+        channels = compared_channels(mask.effects.iter().filter(|effect| effect.visible && effect.kind.reads_stack()), channels);
+    }
+
+    let channels = evaluation_channels(inputs, channels);
+    prepare_generators(inputs, Some(id));
     prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
 
     let fields = evaluation_fields(inputs, &channels, tiles);
@@ -4616,7 +5124,7 @@ pub fn mask_values_into(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)], imag
 /// Uncovered and out-of-range texels read zero; neighbourhood filters also evaluate surrounding texels
 pub fn mask_at(inputs: &Inputs, id: LayerId, texels: &[(u32, u32)]) -> Option<Vec<f32>> {
     let projectors = ProjectorDepthCache::default();
-    let inputs = &EvaluationInputs::new(inputs, &projectors);
+    let inputs = &mut EvaluationInputs::new(inputs, &projectors);
     let mask = layer_mask(inputs.project, id).filter(|mask| mask.enabled)?;
     let mut output = vec![0.0; texels.len()];
 
@@ -4638,6 +5146,7 @@ pub fn mask_at(inputs: &Inputs, id: LayerId, texels: &[(u32, u32)]) -> Option<Ve
     let channels = evaluation_channels(inputs, inputs.project.texture_set(inputs.ts).map(|set| set.channel_list()).unwrap_or_default());
 
     // A hidden layer's mask is left out of the stack's preparation
+    prepare_generators(inputs, Some(id));
     prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
 
     // Filters and anchors can depend on texels outside the requested tiles
@@ -4675,8 +5184,6 @@ fn mask_tile<'a>(
     let plan = mask_plan(inputs, id, mask, tile_x, tile_y, Some(fields), inputs.project.contents_around(id).into());
     let anchor_stack = anchor_plan(inputs, (id, 0), channels, tile_x, tile_y, Some(fields));
     offsets.map(move |offset| {
-        let Some(plan) = plan.as_ref() else { return (offset, 0.0) };
-
         let x = tile_x * TILE + (offset % TILE as usize) as u32;
         let y = tile_y * TILE + (offset / TILE as usize) as u32;
         if x >= inputs.gbuf.width || y >= inputs.gbuf.height || inputs.gbuf.tri.get((y * inputs.gbuf.width + x) as usize).is_none_or(|tri| *tri == NO_TRI) {
@@ -4687,7 +5194,7 @@ fn mask_tile<'a>(
         if !anchor_stack.is_empty() {
             texel.anchors_below(&anchor_stack, (id, 0));
         }
-        (offset, texel.mask(plan))
+        (offset, texel.mask(&plan))
     })
 }
 
@@ -4708,7 +5215,8 @@ pub fn effect_histogram(inp: &Inputs, effect: LayerId, channel: Channel, bins: u
     let (cut, in_mask) = cut_below(inp.project, owner, effect)?;
     let cut_inp = Inputs { project: &cut, preview: None, block_scales: inp.block_scales.clone(), ..*inp };
     let projectors = ProjectorDepthCache::default();
-    let cut_inp = EvaluationInputs::new(&cut_inp, &projectors);
+    let mut cut_inp = EvaluationInputs::new(&cut_inp, &projectors);
+    prepare_generators(&mut cut_inp, in_mask.then_some(owner));
     let channels = evaluation_channels(&cut_inp, cut.texture_set(inp.ts).map(|set| set.channel_list()).unwrap_or_default());
     let tiles = histogram_tiles(inp.gbuf.width, inp.gbuf.height);
     let shared = shared_histogram_fields(&cut_inp, &channels, &tiles);
@@ -4723,7 +5231,9 @@ pub fn effect_histogram(inp: &Inputs, effect: LayerId, channel: Channel, bins: u
 
             // The mask is planned on its own: a layer with nothing drawn plans no node
             let mask = if in_mask {
-                layer_mask(&cut, owner).and_then(|mask| mask_plan(&cut_inp, owner, mask, tx, ty, Some(fields), cut.contents_around(owner).into()))
+                layer_mask(&cut, owner)
+                    .filter(|mask| mask.enabled)
+                    .map(|mask| mask_plan(&cut_inp, owner, mask, tx, ty, Some(fields), cut.contents_around(owner).into()))
             } else {
                 None
             };
@@ -4832,7 +5342,8 @@ pub fn compare_histograms(inp: &Inputs, effect: LayerId, bins: usize) -> Option<
 
     let cut_inp = Inputs { project: &cut, preview: None, block_scales: inp.block_scales.clone(), ..*inp };
     let projectors = ProjectorDepthCache::default();
-    let cut_inp = EvaluationInputs::new(&cut_inp, &projectors);
+    let mut cut_inp = EvaluationInputs::new(&cut_inp, &projectors);
+    prepare_generators(&mut cut_inp, in_mask.then_some(owner));
     let mut channels = evaluation_channels(&cut_inp, set.channel_list());
     if !channels.contains(&channel) {
         channels.push(channel);
@@ -4850,8 +5361,9 @@ pub fn compare_histograms(inp: &Inputs, effect: LayerId, bins: usize) -> Option<
             let mut sides = empty();
 
             // The mask under the compare, and (sides reading layers) the layer's content and the stack below it
-            let Some(mut mask) =
-                layer_mask(&cut, owner).and_then(|mask| mask_plan(&cut_inp, owner, mask, tx, ty, Some(fields), cut.contents_around(owner).into()))
+            let Some(mut mask) = layer_mask(&cut, owner)
+                .filter(|mask| mask.enabled)
+                .map(|mask| mask_plan(&cut_inp, owner, mask, tx, ty, Some(fields), cut.contents_around(owner).into()))
             else {
                 return sides;
             };
@@ -4906,7 +5418,8 @@ pub fn flatten_layer(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Opti
     }
     let visible_inputs = Inputs { project: &solo, preview: None, block_scales: inputs.block_scales.clone(), ..*inputs };
     let projectors = ProjectorDepthCache::default();
-    let visible_inputs = EvaluationInputs::new(&visible_inputs, &projectors);
+    let mut visible_inputs = EvaluationInputs::new(&visible_inputs, &projectors);
+    prepare_generators(&mut visible_inputs, Some(id));
     let planned_channels = evaluation_channels(&visible_inputs, channels.clone());
     let fields = evaluation_fields(&visible_inputs, &planned_channels, tiles);
 
@@ -4965,7 +5478,8 @@ pub fn flatten_layer(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Opti
 mod tests {
     use super::*;
     use texturecraft_core::{
-        ChannelBlend, CompareOp, Effect, Layer, OutputResolution, PbrValidate, Procedural, ProceduralKind, ResolutionMode, StylizedLighting, TextureSet,
+        ChannelBlend, CompareOp, Effect, Layer, MicroDetails, OutputResolution, PbrValidate, Procedural, ProceduralKind, ResolutionMode, StylizedLighting,
+        TextureSet,
     };
     use texturecraft_geom::primitives;
 
@@ -5656,7 +6170,7 @@ mod tests {
 
     /// An edge wear generator that marks exactly the curvature ridge (the map as baked, a hard step).
     fn ridge_generator() -> Generator {
-        Generator { level: 0.5, softness: 0.01, noise_amount: 0.0, detail: None, ..Generator::new(GeneratorKind::EdgeWear) }
+        Generator { level: 0.5, softness: 0.01, noise_amount: 0.0, detail: None, wear: None, ..Generator::new(GeneratorKind::EdgeWear) }
     }
 
     #[test]
@@ -5755,7 +6269,7 @@ mod tests {
         fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![1.0; 64 * 64]))].into() };
         let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
         let value_with = |fixture: &mut Fixture, input: Option<f32>| -> f32 {
-            let mut generator = Generator { level: 0.5, softness: 0.1, noise_amount: 0.0, ..Generator::new(GeneratorKind::Dirt) };
+            let mut generator = Generator { level: 0.5, softness: 0.1, noise_amount: 0.0, wear: None, ..Generator::new(GeneratorKind::Dirt) };
             if let Some(value) = input {
                 generator.inputs.insert(BakedMap::AmbientOcclusion, Source::Uniform([value; 3]));
             }
@@ -5796,7 +6310,8 @@ mod tests {
         for kind in [GeneratorKind::Curvature, GeneratorKind::EdgeWear] {
             for mode in CurvatureMode::ALL {
                 let detail = CurvatureDetail { mode, weights: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] };
-                let generator = Generator { level: 0.5, softness: 0.5, noise_amount: 2.0, detail: Some(detail), ..Generator::new(kind) };
+                let generator =
+                    Generator { level: 0.5, softness: 0.5, noise_amount: 2.0, detail: Some(detail), wear: None, section: None, ..Generator::new(kind) };
                 let mut mask = Mask::new(MaskBackground::Black);
                 mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Generator(generator)));
                 fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
@@ -6804,85 +7319,483 @@ soft {soft:?}"
     }
 
     #[test]
-    fn generator_micro_detail_follows_the_anchor_height() {
+    fn a_micro_height_read_from_an_anchor_follows_its_raised_region() {
         let mut fixture = fixture();
+        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![0.5; 64 * 64]))].into() };
+        let disc = (0..64 * 64)
+            .map(|index| {
+                let (x, y) = ((index % 64) as f32 - 31.5, (index / 64) as f32 - 31.5);
+                if x * x + y * y < 100.0 { [1.0; 4] } else { [0.0, 0.0, 0.0, 1.0] }
+            })
+            .collect();
+        let images: ImageStore = [("disc".to_string(), Arc::new(ImageRes::new(64, 64, disc, false)))].into();
         let low = fixture.project.alloc_id();
         let mut fill = Fill::default();
-        fill.sources.insert(Channel::Height, Source::Uniform([0.5; 3]));
+        fill.sources.insert(Channel::Height, Source::image("disc"));
         fixture.project.insert_layer(0, Layer::new(low, "Bumps", LayerKind::Fill(fill), &[Channel::Height]), None, false).unwrap();
         let anchor = content_fx(&mut fixture, low, EffectKind::Anchor);
         let top = fill_layer(&mut fixture.project, [1.0; 3], 0.5);
-        let mut generator = Generator { level: 0.5, softness: 0.5, noise_amount: 0.0, detail: None, ..Generator::new(GeneratorKind::Curvature) };
-        let with = |fixture: &mut Fixture, generator: &Generator| {
+        let colors = |fixture: &mut Fixture, generator: &Generator| -> Vec<f32> {
             let mut mask = Mask::new(MaskBackground::Black);
             mask.effects.push(Effect::new(LayerId(900), EffectKind::Generator(generator.clone())));
             fixture.project.layer_mut(top).unwrap().mask = Some(mask);
-            run(fixture, None).value(Channel::BaseColor, 5, 5)[0]
+            let composite = run_with_images(fixture, None, &images);
+            (0..64 * 64).map(|index| composite.value(Channel::BaseColor, index % 64, index / 64)[0]).collect()
         };
+        let largest_change = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
 
-        // No curvature map: flat mid gray, so the mask is 0.5 and the base color 0.75
-        let flat = with(&mut fixture, &generator);
-        assert!((flat - 0.75).abs() < 0.02, "{flat}");
+        // Curvature on its section controls, then on the earlier model a project saved before Micro Details keeps
+        let section = Generator::new(GeneratorKind::Curvature);
+        let earlier = Generator { section: None, level: 0.5, softness: 0.5, noise_amount: 0.0, ..section.clone() };
+        for plain in [section, earlier] {
+            let off = colors(&mut fixture, &plain);
+            let read = Generator { micro: MicroDetails::of_anchor(GeneratorKind::Curvature, anchor, 1.0).map(Box::new), ..plain.clone() };
 
-        // Raised height reads as an edge
-        generator.micro = Some(MicroDetail { anchor, amount: 1.0 });
-        assert!(with(&mut fixture, &generator) > flat + 0.2);
+            let raised = colors(&mut fixture, &read);
+            assert!(largest_change(&raised, &off) > 0.05, "the raised disc's rim reads as curvature");
 
-        // Recessed height reads as a cavity; dirt gathers there
-        if let LayerKind::Fill(fill) = &mut fixture.project.layer_mut(low).unwrap().kind {
-            fill.sources.insert(Channel::Height, Source::Uniform([-0.5; 3]));
+            let mut emptied = read.clone();
+            if let Some(micro) = emptied.micro.as_mut() {
+                micro.height_source = None;
+            }
+            assert_eq!(colors(&mut fixture, &emptied), off, "without an anchor the micro details change nothing");
         }
-        assert!(with(&mut fixture, &generator) < flat - 0.2);
-        let dirt =
-            Generator { level: 0.5, softness: 0.5, noise_amount: 0.0, micro: Some(MicroDetail { anchor, amount: 1.0 }), ..Generator::new(GeneratorKind::Dirt) };
-        let plain = Generator { micro: None, ..dirt.clone() };
-        assert!(with(&mut fixture, &dirt) > with(&mut fixture, &plain) + 0.2);
+    }
 
-        // A hostile amount does nothing
-        generator.micro = Some(MicroDetail { anchor, amount: f32::NAN });
-        assert!((with(&mut fixture, &generator) - flat).abs() < 0.02);
+    /// A 64 × 64 disc of raised height in an image named "disc", and a fixture with a flat baked curvature for micro details to read beside
+    fn micro_height_fixture() -> (Fixture, ImageStore) {
+        let mut fixture = fixture();
+        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![0.5; 64 * 64]))].into() };
+        let disc = (0..64 * 64)
+            .map(|index| {
+                let (x, y) = ((index % 64) as f32 - 31.5, (index / 64) as f32 - 31.5);
+                if x * x + y * y < 100.0 { [1.0; 4] } else { [0.0, 0.0, 0.0, 1.0] }
+            })
+            .collect();
+        (fixture, [("disc".to_string(), Arc::new(ImageRes::new(64, 64, disc, false)))].into())
+    }
+
+    /// A Curvature generator whose Micro Height reads anchor point `anchor`
+    fn reading_micro_height(anchor: LayerId) -> Generator {
+        Generator { micro: MicroDetails::of_anchor(GeneratorKind::Curvature, anchor, 1.0).map(Box::new), ..Generator::new(GeneratorKind::Curvature) }
+    }
+
+    /// A height fill of `source`, with an anchor point after it: the layer's id and the anchor's
+    fn anchored_height(fixture: &mut Fixture, id: LayerId, source: Source) -> (LayerId, LayerId) {
+        let mut fill = Fill::default();
+        fill.sources.insert(Channel::Height, source);
+        let layer = fixture.project.insert_layer(0, Layer::new(id, "Height", LayerKind::Fill(fill), &[Channel::Height]), None, false).unwrap();
+        (layer, content_fx(fixture, layer, EffectKind::Anchor))
+    }
+
+    fn base_color_reds(composite: &Composite) -> Vec<f32> {
+        (0..64 * 64).map(|index| composite.value(Channel::BaseColor, index % 64, index / 64)[0]).collect()
     }
 
     #[test]
-    fn curvature_modes_classify_raised_and_recessed_micro_height() {
-        let mut fixture = fixture();
-        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![0.5; 64 * 64]))].into() };
-        let lower = fixture.project.alloc_id();
-        let mut fill = Fill::default();
-        fill.sources.insert(Channel::Height, Source::Uniform([0.5; 3]));
-        fixture.project.insert_layer(0, Layer::new(lower, "Bumps", LayerKind::Fill(fill), &[Channel::Height]), None, false).unwrap();
-        let anchor = content_fx(&mut fixture, lower, EffectKind::Anchor);
+    fn micro_height_anchor_is_read_when_its_mask_is_requested_on_a_hidden_layer() {
+        let (mut fixture, images) = micro_height_fixture();
+        let height_layer = fixture.project.alloc_id();
+        let (_, anchor) = anchored_height(&mut fixture, height_layer, Source::image("disc"));
         let top = fill_layer(&mut fixture.project, [1.0; 3], 0.5);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(LayerId(900), EffectKind::Generator(reading_micro_height(anchor))));
+        let layer = fixture.project.layer_mut(top).unwrap();
+        layer.mask = Some(mask);
+        layer.visible = false;
+        let sample = (28, 23);
 
-        for kind in [GeneratorKind::Curvature, GeneratorKind::EdgeWear] {
-            for (height, mode, responds) in [
-                (0.5, CurvatureMode::Edges, true),
-                (-0.5, CurvatureMode::Edges, false),
-                (0.5, CurvatureMode::Cavities, false),
-                (-0.5, CurvatureMode::Cavities, true),
-                (0.5, CurvatureMode::Both, true),
-                (-0.5, CurvatureMode::Both, true),
-            ] {
-                if let LayerKind::Fill(fill) = &mut fixture.project.layer_mut(lower).unwrap().kind {
-                    fill.sources.insert(Channel::Height, Source::Uniform([height; 3]));
-                }
-                let detail = CurvatureDetail { mode, weights: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] };
-                let generator = Generator {
-                    level: 0.5,
-                    softness: 0.5,
-                    noise_amount: 0.0,
-                    detail: Some(detail),
-                    micro: Some(MicroDetail { anchor, amount: 1.0 }),
-                    ..Generator::new(kind)
-                };
-                let mut mask = Mask::new(MaskBackground::Black);
-                mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Generator(generator)));
-                fixture.project.layer_mut(top).unwrap().mask = Some(mask);
+        let hidden = mask_at(&inputs(&fixture, &images, None), top, &[sample]).unwrap();
+        fixture.project.layer_mut(top).unwrap().visible = true;
+        let visible = mask_at(&inputs(&fixture, &images, None), top, &[sample]).unwrap();
 
-                let value = run(&fixture, None).value(Channel::BaseColor, 5, 5)[0];
-                let expected = if responds { 0.75 } else { 0.5 };
-                assert!((value - expected).abs() < 0.02, "{kind:?} {mode:?} height {height}: {value}");
+        assert_eq!(hidden, visible, "requested masks read their anchors whether or not their layer is displayed");
+    }
+
+    #[test]
+    fn sampling_a_disabled_mask_for_painting_keeps_its_micro_height() {
+        let (mut fixture, images) = micro_height_fixture();
+        let height = fixture.project.alloc_id();
+        let (_, anchor) = anchored_height(&mut fixture, height, Source::image("disc"));
+        let reader = fill_layer(&mut fixture.project, [1.0; 3], 0.5);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Generator(reading_micro_height(anchor))));
+        fixture.project.layer_mut(reader).unwrap().mask = Some(mask);
+
+        let sample = |fixture: &Fixture| mask_values(&inputs(fixture, &images, None), reader, &[(0, 0)]).unwrap();
+        let unfiltered = sample(&fixture);
+        let blur = Effect::new(fixture.project.alloc_id(), EffectKind::Filter(Filter::Blur { radius: 8.0, wrap: false }));
+        fixture.project.layer_mut(reader).unwrap().mask.as_mut().unwrap().effects.push(blur);
+        let enabled = sample(&fixture);
+        fixture.project.layer_mut(reader).unwrap().mask.as_mut().unwrap().enabled = false;
+        let disabled = sample(&fixture);
+
+        assert!(enabled.tile(0, 0) != unfiltered.tile(0, 0), "the blur changes the anchored mask");
+        assert!(enabled.tile(0, 0).unwrap().windows(2).any(|pair| pair[0] != pair[1]));
+        assert!(enabled.tile(0, 0) == disabled.tile(0, 0), "direct sampling must read the anchored mask in either state");
+    }
+
+    #[test]
+    fn explicit_micro_height_mask_reads_lower_anchors_under_a_hidden_folder() {
+        let (mut fixture, images) = micro_height_fixture();
+        let height = fixture.project.alloc_id();
+        let (_, anchor) = anchored_height(&mut fixture, height, Source::image("disc"));
+        let folder = fixture.project.alloc_id();
+        let reader = fixture.project.alloc_id();
+        let group = LayerKind::Group { children: Vec::new(), collapsed: false, contents: Default::default(), randomized: Vec::new() };
+        fixture.project.insert_layer(0, Layer::new(folder, "Folder", group, &[Channel::BaseColor]), None, false).unwrap();
+        fixture.project.insert_layer(0, Layer::new(reader, "Reader", LayerKind::Fill(Fill::default()), &[Channel::BaseColor]), Some(folder), true).unwrap();
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(LayerId(900), EffectKind::Generator(reading_micro_height(anchor))));
+        fixture.project.layer_mut(reader).unwrap().mask = Some(mask);
+        let read = |fixture: &Fixture| mask_texels(&inputs(fixture, &images, None), reader).unwrap();
+
+        assert_eq!(fixture.project.locate(reader).and_then(|(_, parent, _)| parent), Some(folder));
+        let visible = read(&fixture);
+        fixture.project.layer_mut(folder).unwrap().visible = false;
+        let hidden = read(&fixture);
+
+        assert!(hidden.iter().zip(&visible).all(|(hidden, visible)| hidden == visible), "hiding a parent preserves the requested mask's lower external anchor");
+    }
+
+    #[test]
+    fn micro_height_anchor_changes_when_its_input_image_changes() {
+        let (mut fixture, mut images) = micro_height_fixture();
+        let height_layer = fixture.project.alloc_id();
+        let (_, anchor) = anchored_height(&mut fixture, height_layer, Source::image("disc"));
+        let top = fill_layer(&mut fixture.project, [1.0; 3], 0.5);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(LayerId(900), EffectKind::Generator(reading_micro_height(anchor))));
+        fixture.project.layer_mut(top).unwrap().mask = Some(mask);
+
+        let raised = mask_texels(&inputs(&fixture, &images, None), top).unwrap();
+        images.insert("disc".to_owned(), Arc::new(ImageRes::new(1, 1, vec![[0.0, 0.0, 0.0, 1.0]], false)));
+        let flattened = mask_texels(&inputs(&fixture, &images, None), top).unwrap();
+
+        assert!(raised.iter().zip(flattened).any(|(raised, flat)| (*raised - flat).abs() > 1e-4));
+    }
+
+    #[test]
+    fn micro_height_uses_the_live_stroke_and_restores_the_committed_anchor_after_cancel() {
+        let (mut fixture, images) = micro_height_fixture();
+        let painted = fixture.project.alloc_id();
+        fixture.project.insert_layer(0, Layer::new(painted, "Height paint", LayerKind::Paint, &[Channel::Height]), None, false).unwrap();
+        let anchor = content_fx(&mut fixture, painted, EffectKind::Anchor);
+        let reader = fill_layer(&mut fixture.project, [1.0; 3], 0.5);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(LayerId(900), EffectKind::Generator(reading_micro_height(anchor))));
+        fixture.project.layer_mut(reader).unwrap().mask = Some(mask);
+
+        let mut alpha = TileImage::new(64, 64, 1);
+        for y in 24..40 {
+            for x in 24..40 {
+                alpha.set(x, y, &[u16::MAX]);
             }
+        }
+
+        let preview = StrokePreview {
+            target: PaintTarget::Layer(painted),
+            alpha,
+            opacity: 1.0,
+            erase: false,
+            values: [(Channel::Height, [1.0; 3])].into_iter().collect(),
+            mask_gray: MaskGray::Value(1.0),
+            stencil: None,
+            carried: BTreeMap::new(),
+            carried_mask: None,
+        };
+        let mut projectors = ProjectorDepthCache::default();
+        let mesh = Arc::new(fixture.mesh.clone());
+        let composite = |preview, projectors: &mut ProjectorDepthCache| {
+            let mut out = Composite::new(&[Channel::BaseColor], 64);
+            let inputs = Inputs { mesh: &mesh, ..inputs(&fixture, &images, preview) };
+            composite_tiles_with_projectors(&inputs, &mesh, projectors, &mut out, &[(0, 0)], None);
+            base_color_reds(&out)
+        };
+
+        let original = composite(None, &mut projectors);
+        let painted = composite(Some(&preview), &mut projectors);
+        let cancelled = composite(None, &mut projectors);
+
+        assert!(painted.iter().zip(&original).any(|(now, before)| (now - before).abs() > 0.05));
+        assert_eq!(cancelled, original);
+    }
+
+    #[test]
+    fn anchor_cache_releases_distinct_heights_when_readers_and_documents_go_away() {
+        let mut projectors = ProjectorDepthCache::default();
+        let (mut fixture, images) = micro_height_fixture();
+        let lower = fixture.project.alloc_id();
+        let (lower, first) = anchored_height(&mut fixture, lower, Source::image("disc"));
+        let second = content_fx(&mut fixture, lower, EffectKind::Anchor);
+        let third = content_fx(&mut fixture, lower, EffectKind::Anchor);
+        let reader = fill_layer(&mut fixture.project, [1.0; 3], 0.5);
+        let mut mask = Mask::new(MaskBackground::Black);
+        for anchor in [first, second, third] {
+            mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Generator(reading_micro_height(anchor))));
+        }
+        fixture.project.layer_mut(reader).unwrap().mask = Some(mask);
+
+        let inputs = inputs(&fixture, &images, None);
+        let stack = Arc::new(StackKey::new(inputs.project, inputs.pixels, inputs.baked, inputs.images, 0, &inputs.project.texture_sets[0].stack).unwrap());
+        let build = || AnchorHeights::new(vec![0.0; 64 * 64], (64, 64), inputs.block_scales.clone());
+        let first_mesh = Arc::new(fixture.mesh.clone());
+        projectors.bind(&first_mesh);
+
+        // Keep one active evaluation alive through deletion
+        let active = projectors.micro_heights.get_or_build(&inputs, (first, 0), &stack, build);
+        let removed = Arc::downgrade(&projectors.micro_heights.get_or_build(&inputs, (second, 0), &stack, build));
+        let retained = Arc::downgrade(&projectors.micro_heights.get_or_build(&inputs, (third, 0), &stack, build));
+        projectors.micro_heights.retain_readers(0, &[(third, 0)]);
+
+        assert!(removed.upgrade().is_none());
+        assert!(retained.upgrade().is_some());
+        assert_eq!(Arc::strong_count(&active), 1);
+
+        let replacement = Arc::new(fixture.mesh.clone());
+        projectors.bind(&replacement);
+        assert!(retained.upgrade().is_none());
+
+        let closed = Arc::downgrade(&projectors.micro_heights.get_or_build(&inputs, (third, 0), &stack, build));
+        drop(projectors);
+        assert!(closed.upgrade().is_none());
+    }
+
+    #[test]
+    fn every_anchor_height_a_render_reads_stays_prepared_however_many_it_reads() {
+        const OTHER_READERS: usize = 8;
+        let colors = |others_read: bool| {
+            let (mut fixture, images) = micro_height_fixture();
+            let id = fixture.project.alloc_id();
+            let (low, first) = anchored_height(&mut fixture, id, Source::image("disc"));
+            let others: Vec<LayerId> = (0..OTHER_READERS).map(|_| content_fx(&mut fixture, low, EffectKind::Anchor)).collect();
+            let top = fill_layer(&mut fixture.project, [1.0; 3], 0.5);
+            let mut mask = Mask::new(MaskBackground::Black);
+            mask.effects.push(Effect::new(LayerId(900), EffectKind::Generator(reading_micro_height(first))));
+            fixture.project.layer_mut(top).unwrap().mask = Some(mask);
+
+            // Readers of eight more anchors on a layer of height only, drawn above
+            let id = fixture.project.alloc_id();
+            let readers =
+                fixture.project.insert_layer(0, Layer::new(id, "Readers", LayerKind::Fill(Fill::default()), &[Channel::Height]), None, false).unwrap();
+            let mut mask = Mask::new(MaskBackground::Black);
+            for (index, anchor) in others.iter().enumerate().filter(|_| others_read) {
+                mask.effects.push(Effect::new(LayerId(901 + index as u64), EffectKind::Generator(reading_micro_height(*anchor))));
+            }
+            fixture.project.layer_mut(readers).unwrap().mask = Some(mask);
+            base_color_reds(&run_with_images(&fixture, None, &images))
+        };
+
+        assert_eq!(colors(true), colors(false), "a ninth anchor read keeps the first one's height");
+    }
+
+    #[test]
+    fn an_anchor_height_holding_a_reader_of_a_lower_anchor_is_built_after_it_whatever_the_layer_ids() {
+        let colors = |top_id_first: bool, connected: bool| {
+            let (mut fixture, images) = micro_height_fixture();
+            let early = fixture.project.alloc_id();
+            let late = fixture.project.alloc_id();
+            let (top_id, middle_id) = if top_id_first { (early, late) } else { (late, early) };
+            let id = fixture.project.alloc_id();
+            let (_, lower) = anchored_height(&mut fixture, id, Source::image("disc"));
+
+            // The upper anchor records the middle layer's mask: a reader of the lower anchor
+            let middle =
+                fixture.project.insert_layer(0, Layer::new(middle_id, "Middle", LayerKind::Fill(Fill::default()), &[Channel::Height]), None, false).unwrap();
+            let upper = fixture.project.alloc_id();
+            let mut mask = Mask::new(MaskBackground::Black);
+            let generator = if connected { reading_micro_height(lower) } else { Generator::new(GeneratorKind::Curvature) };
+            mask.effects.push(Effect::new(LayerId(900), EffectKind::Generator(generator)));
+            mask.effects.push(Effect::new(upper, EffectKind::Anchor));
+            fixture.project.layer_mut(middle).unwrap().mask = Some(mask);
+
+            let mut fill = Fill::default();
+            fill.sources.insert(Channel::BaseColor, Source::Uniform([1.0; 3]));
+            let top = fixture.project.insert_layer(0, Layer::new(top_id, "Top", LayerKind::Fill(fill), &[Channel::BaseColor]), None, false).unwrap();
+            let mut mask = Mask::new(MaskBackground::Black);
+            mask.effects.push(Effect::new(LayerId(901), EffectKind::Generator(reading_micro_height(upper))));
+            fixture.project.layer_mut(top).unwrap().mask = Some(mask);
+            base_color_reds(&run_with_images(&fixture, None, &images))
+        };
+
+        let (by_draw_order, against_it) = (colors(false, true), colors(true, true));
+        let disconnected = colors(false, false);
+        let largest_change = by_draw_order.iter().zip(&against_it).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(largest_change < 1e-4, "{largest_change}");
+        assert!(by_draw_order.iter().zip(disconnected).any(|(connected, disconnected)| (*connected - disconnected).abs() > 1e-4));
+    }
+
+    #[test]
+    fn a_histogram_below_a_reader_leaves_the_anchor_heights_it_reads() {
+        let (mut fixture, images) = micro_height_fixture();
+        let id = fixture.project.alloc_id();
+        let (low, anchor) = anchored_height(&mut fixture, id, Source::image("disc"));
+        let levels = content_fx(&mut fixture, low, EffectKind::Levels(Default::default()));
+        let top = fill_layer(&mut fixture.project, [1.0; 3], 0.5);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(LayerId(900), EffectKind::Generator(reading_micro_height(anchor))));
+        fixture.project.layer_mut(top).unwrap().mask = Some(mask);
+        let anchors = ProjectorDepthCache::default();
+        let evaluation = inputs(&fixture, &images, None);
+        let mut session = EvaluationInputs::new(&evaluation, &anchors).of_the_session_stack();
+        prepare_generators(&mut session, None);
+
+        // The histogram evaluates the stack cut below the levels
+        effect_histogram(&inputs(&fixture, &images, None), levels, Channel::Height, 16);
+
+        let stack = StackKey::new(&fixture.project, &fixture.pixels, &fixture.baked, &images, 0, &fixture.project.texture_sets[0].stack)
+            .expect("the plane's stack has a key");
+        let builds = std::cell::Cell::new(0);
+        anchors.micro_heights.get_or_build(&evaluation, (anchor, 0), &Arc::new(stack), || {
+            builds.set(builds.get() + 1);
+            AnchorHeights::new(vec![0.0; 64 * 64], (64, 64), fixture.project.texture_sets[0].block_scales())
+        });
+        assert_eq!(builds.get(), 0, "the render's heights are still prepared");
+    }
+
+    #[test]
+    fn anchor_heights_are_built_again_at_another_working_size() {
+        let (mut fixture, images) = micro_height_fixture();
+        let id = fixture.project.alloc_id();
+        let (_, anchor) = anchored_height(&mut fixture, id, Source::image("disc"));
+        let stack = Arc::new(
+            StackKey::new(&fixture.project, &fixture.pixels, &fixture.baked, &images, 0, &fixture.project.texture_sets[0].stack)
+                .expect("the plane's stack has a key"),
+        );
+        let cache = ProjectorDepthCache::default();
+        let cache = &cache.micro_heights;
+        let builds = std::cell::Cell::new(0);
+        let build = |size: (u32, u32)| {
+            builds.set(builds.get() + 1);
+            AnchorHeights::new(vec![0.0; (size.0 * size.1) as usize], size, fixture.project.texture_sets[0].block_scales())
+        };
+        let half = UvGBuffer::new(&fixture.mesh, 0, 32, 32);
+        let inputs_at = |gbuf| Inputs { gbuf, ..inputs(&fixture, &images, None) };
+
+        cache.get_or_build(&inputs_at(&fixture.gbuf), (anchor, 0), &stack, || build((64, 64)));
+        cache.get_or_build(&inputs_at(&fixture.gbuf), (anchor, 0), &stack, || build((64, 64)));
+        assert_eq!(builds.get(), 1, "the same stack and size reuse them");
+
+        cache.get_or_build(&inputs_at(&half), (anchor, 0), &stack, || build((32, 32)));
+        assert_eq!(builds.get(), 2, "a smaller working atlas builds them again");
+    }
+
+    /// A field build that counts each call in `builds`
+    fn counted_build(builds: &std::cell::Cell<usize>) -> impl FnOnce((u32, u32)) -> Vec<f32> + '_ {
+        move |_| {
+            builds.set(builds.get() + 1);
+            vec![0.0; 4]
+        }
+    }
+
+    #[test]
+    fn a_whole_map_field_is_built_again_when_its_mesh_map_is_read_at_another_bake_size() {
+        let cache = crate::field_cache::FieldCache::new();
+        let builds = std::cell::Cell::new(0);
+        let mut fixture = fixture();
+        let occlusion = Arc::new(vec![0.5; 16]);
+        let images = ImageStore::default();
+        for resolution in [4, 4, 8] {
+            fixture.baked = BakedMaps { resolution, maps: [(BakedMap::AmbientOcclusion, occlusion.clone())].into() };
+            let inputs = inputs(&fixture, &images, None);
+            cache.get_or_build(&inputs, crate::field_cache::field_identity(&inputs), &[BakedMap::AmbientOcclusion], Vec::new(), counted_build(&builds));
+        }
+
+        assert_eq!(builds.get(), 2, "4 × 4 reuses its field; the same map read as 8 × 2 builds another");
+    }
+
+    #[test]
+    fn a_whole_map_field_is_built_again_after_any_texel_of_its_coverage_changes() {
+        let cache = crate::field_cache::FieldCache::new();
+        let builds = std::cell::Cell::new(0);
+        let mut fixture = fixture();
+        let images = ImageStore::default();
+        let build_on = |fixture: &Fixture| {
+            let inputs = inputs(fixture, &images, None);
+            cache.get_or_build(&inputs, crate::field_cache::field_identity(&inputs), &[], Vec::new(), counted_build(&builds));
+        };
+        build_on(&fixture);
+        build_on(&fixture);
+
+        // The second texel, in place: the same allocation, one triangle different
+        fixture.gbuf.tri[1] = if fixture.gbuf.tri[1] == NO_TRI { 0 } else { NO_TRI };
+        build_on(&fixture);
+
+        assert_eq!(builds.get(), 2);
+    }
+
+    #[test]
+    fn uv_checkers_follow_in_place_mesh_edits() {
+        let mut fixture = fixture();
+        let images = ImageStore::default();
+        let checker = texturecraft_core::UvCheckerParameters { random_colors: false, border_width: 0.0, grid_tile: 1, grid_opacity: 0.0, ..Default::default() };
+        let render = |fixture: &Fixture| {
+            let inputs = inputs(fixture, &images, None);
+            let projectors = ProjectorDepthCache::default();
+            let evaluation = EvaluationInputs::new(&inputs, &projectors);
+            crate::uv_islands::checker_field(&evaluation, evaluation.field_identity(), &checker, 42)
+        };
+        let first = render(&fixture);
+
+        for uv in &mut fixture.mesh.uvs {
+            uv.x += 0.25;
+        }
+        let edited = render(&fixture);
+
+        let fresh = crate::uv_islands::checker_field(&inputs(&fixture, &images, None), 0, &checker, 42);
+        assert_eq!(edited.as_slice(), fresh.as_slice(), "the edited pixels match a cold build");
+
+        assert!(first.iter().zip(edited.iter()).any(|(first, edited)| first != edited), "moving UVs changes the checker pattern");
+    }
+
+    #[test]
+    fn a_whole_map_field_read_again_outlives_fields_built_before_it() {
+        let fields_kept = crate::field_cache::CACHE_ENTRIES as u32;
+        let cache = crate::field_cache::FieldCache::new();
+        let builds = std::cell::Cell::new(0);
+        let fixture = fixture();
+        let images = ImageStore::default();
+        let inputs = inputs(&fixture, &images, None);
+        let coverage = crate::field_cache::field_identity(&inputs);
+        let field = |settings: u32| {
+            cache.get_or_build(&inputs, coverage, &[], vec![settings], counted_build(&builds));
+        };
+        (0..fields_kept).for_each(field);
+        field(0);
+        field(fields_kept);
+        let built = builds.get();
+        field(0);
+
+        assert_eq!(builds.get(), built, "the field read again stays when a newer one pushes the oldest out");
+    }
+
+    #[test]
+    fn a_micro_detail_saved_before_micro_details_renders_as_saved_on_the_earlier_model() {
+        const SAVED_AMOUNT: f32 = 0.25;
+        const FLAT_CURVATURE: f32 = 0.4;
+        let colors = |height: f32, curvature: f32, micro: bool| -> Vec<f32> {
+            let mut fixture = fixture();
+            fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![curvature; 64 * 64]))].into() };
+            let low = fixture.project.alloc_id();
+            let mut fill = Fill::default();
+            fill.sources.insert(Channel::Height, Source::Uniform([height; 3]));
+            fixture.project.insert_layer(0, Layer::new(low, "Flat", LayerKind::Fill(fill), &[Channel::Height]), None, false).unwrap();
+            let anchor = content_fx(&mut fixture, low, EffectKind::Anchor);
+            let top = fill_layer(&mut fixture.project, [1.0; 3], 0.5);
+            let earlier = Generator { section: None, detail: None, level: 0.5, softness: 0.5, noise_amount: 0.0, ..Generator::new(GeneratorKind::Curvature) };
+            let micro = MicroDetails::of_anchor(GeneratorKind::Curvature, anchor, SAVED_AMOUNT).filter(|_| micro).map(Box::new);
+            let mut mask = Mask::new(MaskBackground::Black);
+            mask.effects.push(Effect::new(LayerId(900), EffectKind::Generator(Generator { micro, ..earlier })));
+            fixture.project.layer_mut(top).unwrap().mask = Some(mask);
+            base_color_reds(&run(&fixture, None))
+        };
+
+        // The saved micro detail added the anchor's height times its amount to the curvature signal, even where the height is flat
+        for height in [0.0, 0.3, 0.6, 1.0] {
+            let saved = colors(0.0, FLAT_CURVATURE + height * SAVED_AMOUNT, false);
+            let loaded = colors(height, FLAT_CURVATURE, true);
+            let largest_change = saved.iter().zip(&loaded).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            assert!(largest_change < 1e-3, "height {height}: {largest_change}");
         }
     }
 

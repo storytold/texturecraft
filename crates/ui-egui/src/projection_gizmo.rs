@@ -29,12 +29,14 @@ pub(crate) fn let_go<G: Gizmo>(ctx: &egui::Context) {
 
 /// Drags on `gizmo`'s handles (one undo step per drag, the projection updates live); returns whether a drag owns the pointer. The cursor shows what the handle under it, or the one dragged, does (only while the gizmo takes input: an Alt orbit or a held Move on model keeps its own)
 pub(crate) fn input<G: Gizmo>(app: &mut TextureCraftApp, ctx: &egui::Context, response: &egui::Response, rect: Rect, gizmo: Option<&G>) -> bool {
-    let mut drag = dragging::<G>(ctx).filter(|drag| gizmo.is_some_and(|gizmo| gizmo.same_projection(&drag.start)));
+    let mesh_id = app.session.mesh_id;
+    let mut drag = dragging::<G>(ctx).filter(|drag| drag.mesh_id == mesh_id && gizmo.is_some_and(|gizmo| gizmo.same_projection(&drag.start)));
+
     if response.drag_started_by(PointerButton::Primary)
         && let (Some(gizmo), Some(from)) = (gizmo, ctx.input(|input| input.pointer.press_origin()))
         && let Some(grab) = gizmo.grab(from)
     {
-        drag = Some(GizmoDrag { grab, from, start: Arc::new(gizmo.clone()), edited_revision: None });
+        drag = Some(GizmoDrag { grab, from, mesh_id, start: Arc::new(gizmo.clone()), edited_revision: None });
     }
 
     // Apply a final move on release and let focus loss end a drag without one
@@ -51,19 +53,23 @@ pub(crate) fn input<G: Gizmo>(app: &mut TextureCraftApp, ctx: &egui::Context, re
     // A drag lives only while its gizmo shows, so the gizmo drawn this frame names the cursor
     ctx.set_cursor_icon(gizmo.unwrap_or(&drag.start).cursor(drag.grab, true));
 
-    if let Some(pointer) = response.interact_pointer_pos().filter(|_| ctx.input(|input| input.pointer.delta() != egui::Vec2::ZERO))
-        && let Some((command, params)) = drag.start.edit(app, rect, drag.grab, drag.from, pointer)
+    let (moved, snapping) = ctx.input(|input| (input.pointer.delta() != egui::Vec2::ZERO, input.modifiers.ctrl || input.modifiers.command));
+    if moved
+        && let Some(pointer) = response.interact_pointer_pos()
+        && let Some((command, params)) = drag.start.edit_with_snap(app, rect, drag.grab, drag.from, pointer, snapping)
     {
         edit_in_one_step(&mut app.session, command, params, &mut drag.edited_revision);
 
         // The panel drew before this edit: one more frame shows its fields and preview where the projection is now
         ctx.request_repaint();
     }
+
     if released {
         let_go::<G>(ctx);
     } else {
         ctx.data_mut(|data| data.insert_temp(G::drag_id(), drag));
     }
+
     true
 }
 

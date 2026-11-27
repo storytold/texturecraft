@@ -58,6 +58,7 @@ async fn run(canvas: web_sys::HtmlCanvasElement) -> Result<(), String> {
             canvas,
             options,
             Box::new(|cc| {
+                texturecraft_ui_egui::framework::install_headless(&cc.egui_ctx);
                 let mut app = TextureCraftApp::new(cc, session);
                 if let Some(rs) = &cc.wgpu_render_state {
                     let backend = rs.adapter.get_info().backend;

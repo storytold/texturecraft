@@ -4,8 +4,12 @@
 mod alpha_parameters;
 mod anchor_point;
 mod bake_job_mesh;
+mod bake_live_preview;
+mod bake_map_rows;
 mod bake_mode;
 mod bake_presets;
+mod bake_reset_menus;
+mod bake_sync;
 mod brush_drag;
 mod brush_section_reset;
 mod camera_views;
@@ -26,6 +30,7 @@ mod export_map_overrides;
 mod export_materialx;
 mod export_overrides;
 mod export_progress;
+mod export_reference_texts;
 mod export_settings;
 mod export_template_guards;
 mod export_usd_asset;
@@ -39,7 +44,9 @@ mod filter_picker;
 mod folder_properties;
 mod frame_selection;
 mod generator_panel;
+mod generator_picker;
 mod help_menu_664;
+mod high_poly_loading;
 mod history_panel;
 mod import_resources;
 mod inactive_set_hint;
@@ -76,6 +83,8 @@ mod rail;
 mod reference_order;
 mod rename_anchor;
 mod reset_ui;
+mod resources_updater;
+mod sample_project;
 mod settings_window;
 mod shelf_click;
 mod shelf_drop;
@@ -101,6 +110,7 @@ mod user_smart_mask;
 mod view2d_navigation;
 mod view2d_tiles;
 mod view_mode_picker;
+mod viewport_focus;
 mod window_menu_684;
 
 mod filter_card;
@@ -201,13 +211,13 @@ fn click_widget(harness: &mut Harness<'_, TextureCraftApp>, role: egui::Role, la
     click_at(harness, at);
 }
 
-/// The close button nearest the right of a docked panel's `title` (its tab or header title), on the same row
+/// The close button of a docked panel's tab `title`: in the tab's right half, on its row
 fn panel_close_button(harness: &Harness<'_, TextureCraftApp>, title: egui::Rect) -> egui::Rect {
     harness
         .get_all_by_role(egui::Role::Button)
-        .filter(|button| button.accesskit_node().label().as_deref() == Some("Close Panel"))
+        .filter(|button| button.accesskit_node().label().is_some_and(|label| label.starts_with("Close ")))
         .map(|button| button.rect())
-        .filter(|close| close.min.x > title.max.x && title.y_range().contains(close.center().y))
+        .filter(|close| close.center().x > title.center().x && title.y_range().contains(close.center().y))
         .min_by(|a, b| a.min.x.total_cmp(&b.min.x))
         .expect("a close button right of the title")
 }

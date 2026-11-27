@@ -2,7 +2,7 @@
 //! without a screenshot.
 
 use serde_json::{Value, json};
-use texturecraft_core::{Effect, EffectKind, Fill, Filter, Generator, Layer, LayerKind, NormalFormat, Projection, Sampling, Source};
+use texturecraft_core::{Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, Layer, LayerKind, NormalFormat, Projection, Sampling, Source};
 
 use crate::Session;
 use crate::session::StackTarget;
@@ -153,12 +153,33 @@ fn generator_json(generator: &Generator) -> Value {
     if !generator.inputs.is_empty() {
         out["inputs"] = generator.inputs.iter().map(|(map, source)| (map.id().to_string(), source_json(source))).collect::<serde_json::Map<_, _>>().into();
     }
+    if let Some(wear) = &generator.wear {
+        out["wear"] = json!(wear);
+    }
+    if let Some(section) = &generator.section {
+        out["section"] = json!(section);
+    }
+    if let Some(light) = &generator.light {
+        out["light"] = json!(light);
+    }
+    if generator.on_earlier_model() && matches!(generator.kind, GeneratorKind::Position | GeneratorKind::Direction) {
+        out["direction"] = json!(generator.direction);
+    }
+    if let Some(texture) = &generator.texture {
+        out["texture"] = json!(texture);
+    }
+    if let Some(grunge) = &generator.grunge {
+        out["grunge"] = source_json(grunge);
+    }
+    if let Some(micro) = &generator.micro {
+        out["micro"] = json!(micro);
+    }
+    if let Some(controls) = &generator.controls {
+        out["controls"] = json!(controls);
+    }
     if let Some(detail) = &generator.detail {
         out["mode"] = json!(format!("{:?}", detail.mode));
         out["sizes"] = json!(detail.weights);
-    }
-    if let Some(micro) = &generator.micro {
-        out["micro"] = json!({ "anchor": micro.anchor.0, "amount": micro.amount });
     }
     out
 }

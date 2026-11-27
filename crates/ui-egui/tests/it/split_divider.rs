@@ -1,12 +1,10 @@
 //! The divider between the 3D and 2D views in the split layout resizes them and keeps the pointer from the views
 
-use egui::{Event, Modifiers, PointerButton, Pos2, Role, pos2};
+use egui::{Event, Modifiers, PointerButton, Pos2, pos2};
 use egui_kittest::Harness;
-use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_engine::core::Channel;
 use texturecraft_ui_egui::TextureCraftApp;
-use texturecraft_ui_egui::state::UiState;
-use texturecraft_ui_egui::theme::GUTTER;
+use texturecraft_ui_egui::state::{UiState, ViewLayout};
 use texturecraft_ui_egui::ui_state_store::UiStateStore;
 
 /// Narrowest a split view may get, as in `viewport.rs`
@@ -38,7 +36,10 @@ impl eframe::Storage for MemoryStorage {
 /// The sample project in the default split layout at 1600 x 960
 fn split_app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
 
     // The Layers tab is found by its English name, whatever the OS language is
     harness.state_mut().ui.prefs.language = "en".into();
@@ -62,15 +63,15 @@ fn drag(harness: &mut Harness<'_, TextureCraftApp>, button: PointerButton, from:
     harness.run_steps(3);
 }
 
-/// The views' right edge: a gutter left of the right column, whose Layers header starts at the column's left edge
-fn views_right(harness: &Harness<'_, TextureCraftApp>) -> f32 {
-    let column_left = harness
-        .get_all_by_role(Role::Tab)
-        .filter(|tab| tab.accesskit_node().label().is_some_and(|label| label.starts_with("Layers")))
-        .map(|tab| tab.rect().left())
-        .next()
-        .expect("the right column's Layers header");
-    column_left - f32::from(GUTTER)
+/// The views' right edge: where the 3D view ends when it is the only view, filling the views' area
+fn views_right(harness: &mut Harness<'_, TextureCraftApp>) -> f32 {
+    let layout = harness.state().ui.layout;
+    harness.state_mut().ui.layout = ViewLayout::Only3D;
+    harness.run_steps(2);
+    let right = harness.state().viewport_rect.right();
+    harness.state_mut().ui.layout = layout;
+    harness.run_steps(2);
+    right
 }
 
 /// The divider's x position: the 3D view ends 1 point left of it
@@ -127,7 +128,7 @@ fn dragging_the_divider_resizes_the_views_within_their_minimum_width() {
     let mut harness = split_app();
     let views_left = harness.state().viewport_rect.left();
     let start_x = divider_x(&harness);
-    let views_right = views_right(&harness);
+    let views_right = views_right(&mut harness);
     let views_width = views_right - views_left;
     let y = harness.state().viewport_rect.center().y;
     assert_eq!(harness.state().ui.split_ratio, 0.5);
@@ -224,7 +225,7 @@ fn dragging_the_divider_keeps_the_uv_texture_size_and_offset_on_screen() {
         harness.run_steps(2);
 
         let views_left = harness.state().viewport_rect.left();
-        let views_right = views_right(&harness);
+        let views_right = views_right(&mut harness);
         let y = harness.state().viewport_rect.center().y;
         let before = uv_texture_on_screen(&harness, views_right);
 

@@ -31,7 +31,7 @@ impl CommandSpec {
     /// that only return data or do nothing without parameters, and the ones that replace the
     /// open project (the menu asks to save first).
     pub fn bindable(&self) -> bool {
-        const NOT_FROM_A_KEY: [&str; 13] = [
+        const NOT_FROM_A_KEY: [&str; 14] = [
             "project.inspect",
             "project.templates",
             "project.new",
@@ -45,6 +45,7 @@ impl CommandSpec {
             "bake.preview",
             "camera.set",
             "textureSet.settings",
+            "resource.status",
         ];
         const NOTHING_WITHOUT_PARAMS: [&str; 4] = ["layer.blend", "tool.stencil", "tool.fillSelection", "tool.path"];
         !(self.id.ends_with(".list") || NOT_FROM_A_KEY.contains(&self.id) || NOTHING_WITHOUT_PARAMS.contains(&self.id)) && params_all_optional(self.params)
@@ -117,6 +118,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::layer_ops::specs());
         v.extend(crate::instance_cmds::specs());
         v.extend(crate::mask_cmds::specs());
+        v.extend(crate::generator_pick::specs());
         v.extend(crate::mask_export::specs());
         v.extend(crate::add_mask_cmds::specs());
         v.extend(crate::color_selection_cmds::specs());
@@ -143,6 +145,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::file_cmds::specs());
         v.extend(crate::preset_cmds::specs());
         v.extend(crate::resource_cmds::specs());
+        v.extend(crate::resource_update_cmds::specs());
         v.extend(crate::material_lib::specs());
         v.extend(crate::link_cmds::specs());
         v.extend(crate::smart_masks::specs());

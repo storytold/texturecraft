@@ -111,7 +111,7 @@ pub(crate) fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     x += channel_width + CHANNEL_GAP;
 
     let selected = app.session.selected_layer().filter(|id| app.session.doc.project.layers.contains_key(id));
-    let effects = || effect_items(app, layer_of(app, selected));
+    let effects = || effect_items(app, layer_of(app, selected), false);
     let mut pick = menu_button(ui, control(x, top, MENU_BUTTON_WIDTH), tr("Add effect"), MenuIcon::Glyph(ic::MAGIC_WAND), tr("Add effect"), effects, &tokens);
     x += MENU_BUTTON_WIDTH + MENU_GAP;
     let masks = || mask_items(layer_of(app, selected));
@@ -362,9 +362,10 @@ fn run_on(app: &mut TextureCraftApp, ui: &Ui, layer: LayerId, command: &str, par
     }
 }
 
-/// The Add effect items for `layer`: on its content when the content is the selected target, else in its mask; an item that can't go there is greyed, not sent elsewhere (all of them without a layer)
-fn effect_items(app: &TextureCraftApp, layer: Option<&Layer>) -> Vec<AddItem> {
-    let content = layer.is_some_and(|layer| !layer.is_group() && app.session.selected_layer() == Some(layer.id) && crate::dock::targets_content(app));
+/// The Add effect items for `layer`: on its content when the content is the selected target (or `content_thumbnail`: the menu of the layer's content thumbnail, whatever is selected), else in its mask; an item that can't go there is greyed, not sent elsewhere (all of them without a layer)
+fn effect_items(app: &TextureCraftApp, layer: Option<&Layer>, content_thumbnail: bool) -> Vec<AddItem> {
+    let content = layer
+        .is_some_and(|layer| content_thumbnail || (!layer.is_group() && app.session.selected_layer() == Some(layer.id) && crate::dock::targets_content(app)));
     let target = if content { "content" } else { "mask" };
 
     // Generators, compare masks and colour selections go in masks only
@@ -399,9 +400,9 @@ fn mask_items(layer: Option<&Layer>) -> Vec<AddItem> {
     ]
 }
 
-/// The layer context menu's Add effect items (its own buttons, the long names)
-pub(crate) fn effect_menu_items(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer) {
-    for item in effect_items(app, Some(layer)) {
+/// The layer context menu's Add effect items (its own buttons, the long names); `content_thumbnail`: the menu of the layer's content thumbnail, which adds to the content
+pub(crate) fn effect_menu_items(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, content_thumbnail: bool) {
+    for item in effect_items(app, Some(layer), content_thumbnail) {
         let text = format!("{}  {}", icon_of(item.icon), tr(item.long));
         if ui.add_enabled(item.enabled, egui::Button::new(text)).clicked() {
             run_on(app, ui, layer.id, item.command, item.params);

@@ -1,8 +1,8 @@
 //! UI text lookup over the optional shared craft-i18n catalogs.
 //! Missing translations and builds without catalogs use the English source text.
 
+use std::cell::Cell;
 use std::fmt::Display;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
 
 include!(concat!(env!("OUT_DIR"), "/craft_i18n.rs"));
@@ -37,7 +37,7 @@ pub struct Language {
     pub english: &'static str,
 }
 
-const COUNT: usize = 10;
+const COUNT: usize = 11;
 
 pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "en", name: "English", english: "English" },
@@ -46,13 +46,17 @@ pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "es", name: "Español", english: "Spanish" },
     Language { code: "pt-BR", name: "Português (Brasil)", english: "Portuguese (Brazil)" },
     Language { code: "it", name: "Italiano", english: "Italian" },
+    Language { code: "ru", name: "Русский", english: "Russian" },
     Language { code: "ja", name: "日本語", english: "Japanese" },
     Language { code: "zh-Hans", name: "简体中文", english: "Chinese (Simplified)" },
     Language { code: "ko", name: "한국어", english: "Korean" },
     Language { code: "ar", name: "العربية", english: "Arabic" },
 ];
 
-static CURRENT: AtomicUsize = AtomicUsize::new(0);
+// Rendering and preferences use the UI thread, including independent test harnesses.
+thread_local! {
+    static CURRENT: Cell<usize> = const { Cell::new(0) };
+}
 
 /// How a fill reads its images, as the Filtering combo names it
 pub(crate) fn filtering_label(filtering: texturecraft_engine::core::Filtering) -> &'static str {
@@ -96,20 +100,20 @@ pub(crate) fn baked_map_label(map: texturecraft_engine::core::BakedMap) -> &'sta
 /// The saved language that follows the operating system's (Settings > Language > Default (System Language)).
 pub const SYSTEM_LANGUAGE: &str = "";
 
-/// Switch the UI language ([`SYSTEM_LANGUAGE`] follows the system; unknown codes fall back to English).
+/// Switch the calling UI thread's language. [`SYSTEM_LANGUAGE`] follows the system.
 pub fn set_language(code: &str) {
     let code = if code == SYSTEM_LANGUAGE { system_language() } else { code };
-    CURRENT.store(LANGUAGES.iter().position(|l| l.code.eq_ignore_ascii_case(code) && available(l.code)).unwrap_or(0), Ordering::Relaxed);
+    CURRENT.set(LANGUAGES.iter().position(|l| l.code.eq_ignore_ascii_case(code) && available(l.code)).unwrap_or(0));
 }
 
 /// The current UI language.
 pub fn current() -> &'static Language {
-    LANGUAGES.get(CURRENT.load(Ordering::Relaxed)).unwrap_or(&LANGUAGES[0])
+    LANGUAGES.get(CURRENT.get()).unwrap_or(&LANGUAGES[0])
 }
 
 /// `text` in the current language (unchanged when it has no translation).
 pub fn tr(text: &str) -> &str {
-    let lang = shared_languages().get(CURRENT.load(Ordering::Relaxed)).copied().unwrap_or(craft_i18n::Lang::EN);
+    let lang = shared_languages().get(CURRENT.get()).copied().unwrap_or(craft_i18n::Lang::EN);
     I18N.t(lang, text)
 }
 
@@ -182,7 +186,7 @@ fn system_language() -> &'static str {
     SYSTEM.get_or_init(os_language)
 }
 
-/// Tests that switch the global UI language, or draw the UI under it, run one at a time.
+/// Shared guard used by language fixture tests.
 #[cfg(test)]
 pub(crate) static TEST_LANGUAGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -191,6 +195,27 @@ mod tests {
     use super::TEST_LANGUAGE as LANGUAGE;
     use super::*;
     use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn a_parallel_ui_language_context_keeps_its_own_language() {
+        set_language("en");
+        let french = LANGUAGES.iter().position(|language| language.code == "fr").unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let (first, second) = std::thread::scope(|scope| {
+            let other = scope.spawn(|| {
+                // Exercise the resolved language selection even when the French catalog is absent.
+                CURRENT.set(french);
+                barrier.wait();
+                barrier.wait();
+                current().code
+            });
+            barrier.wait();
+            let first = current().code;
+            barrier.wait();
+            (first, other.join().unwrap())
+        });
+        assert_eq!((first, second), ("en", "fr"));
+    }
 
     /// Every key the UI looks up: `tr("…")` / `trf("…"` literals in the sources, plus the
     /// static catalogs whose labels are translated where they are shown.
@@ -237,6 +262,9 @@ mod tests {
         keys.extend(BlendMode::all().map(|mode| mode.label()));
         keys.extend(texturecraft_engine::formats::export::VirtualMap::ALL.iter().map(|map| map.label()));
         keys.extend(texturecraft_engine::Tool::ALL.iter().map(|tool| tool.label()));
+        keys.extend(texturecraft_engine::ResourceStatus::ALL.iter().map(|status| status.label()));
+        let notice = crate::toast_action::ToastAction::UpdateResources { project: 0 };
+        keys.extend([notice.label(), notice.accessible_name()]);
         keys.extend(texturecraft_engine::HISTORY_TEMPLATES);
         keys.extend(ProceduralKind::ALL.iter().map(|kind| kind.label()));
         keys.extend(GeneratorKind::ALL.iter().map(|kind| kind.label()));
@@ -410,9 +438,18 @@ mod tests",
         assert_eq!(trf("Saved {path}", &[("path", &"a.tcraft")]), "Saved a.tcraft");
         assert_eq!(trf("{a} of {b} {c}", &[("a", &1), ("b", &2)]), "1 of 2 {c}");
         assert_eq!(trf("{unclosed", &[]), "{unclosed");
-        for (locale, code) in
-            [("de-AT", "de"), ("pt_PT.UTF-8", "pt-BR"), ("zh-Hant-TW", "zh-Hans"), ("ja", "ja"), ("ko_KR", "ko"), ("ar-EG", "ar"), ("nl-NL", "en"), ("", "en")]
-        {
+        for (locale, code) in [
+            ("de-AT", "de"),
+            ("pt_PT.UTF-8", "pt-BR"),
+            ("zh-Hant-TW", "zh-Hans"),
+            ("ja", "ja"),
+            ("ko_KR", "ko"),
+            ("ar-EG", "ar"),
+            ("ru-SK", "ru"),
+            ("ru_RU.UTF-8", "ru"),
+            ("nl-NL", "en"),
+            ("", "en"),
+        ] {
             assert_eq!(language_for_locale(locale), code, "{locale}");
         }
         set_language("de");

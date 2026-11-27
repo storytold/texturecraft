@@ -119,7 +119,11 @@ pub fn preset_to_json(preset: &ExportPreset) -> Result<String>;
   the normal channel, then with the baked normal map, by Reoriented Normal Mapping. DirectX
   flips green.
 
-Built-in presets:
+File names may hold folders: `/` separates folder names inside the output directory (each one
+sanitized; a backslash, `..`, a leading `/` and empty folder names are refused), and the folders
+are created when the files are written.
+
+Built-in presets (each one lists the public specification its packing follows in `src/presets.rs`):
 
 | Preset | Files (`$mesh_$textureSet_…`) |
 |---|---|
@@ -131,6 +135,8 @@ Built-in presets:
 | Blender (Principled BSDF) | `BaseColor`, `Metallic`, `Roughness`, `Normal` (OpenGL), `Height` (16-bit), `Emission`, `Specular` |
 | Godot 4 (ORM) | `albedo` (A = opacity), `orm` (R AO, G roughness, B metal), `normal` (OpenGL), `emission` |
 | OpenPBR (separate maps) | one map per OpenPBR Surface input the set has: `base_color`, `base_metalness`, `specular_roughness`, `specular_roughness_anisotropy`, `coat_weight`, `coat_roughness`, `fuzz_weight`, `fuzz_color`, `fuzz_roughness`, `transmission_weight`, `subsurface_weight`, `emission_color`, `geometry_opacity`, `geometry_normal` (OpenGL), `height` (16-bit) |
+| Unity URP Lit (Metallic Smoothness) | `BaseMap`, `MetallicMap` (R metal, A smoothness), `NormalMap` (OpenGL), `OcclusionMap`, `EmissionMap` |
+| USD Preview Surface (separate maps) | one map per UsdPreviewSurface input the set has, named like it: `diffuseColor`, `emissiveColor`, `metallic`, `roughness`, `normal` (OpenGL), `occlusion`, `opacity`, `clearcoat`, `clearcoatRoughness` |
 | Separate maps | one file per channel, gray where scalar, height 16-bit |
 | Mesh maps | every baked map (`$channel` = map id), 16-bit |
 
@@ -139,7 +145,8 @@ Built-in presets:
 ```rust
 pub struct ProjectFile {
     pub project: Project, pub pixels: PixelStore, pub baked: BTreeMap<usize, BakedMaps>,
-    pub mesh: Option<(String /* ext */, Vec<u8>)>, pub thumbnail: Option<Vec<u8>>,
+    pub mesh: Option<(String /* ext */, Vec<u8>)>, pub mesh_uvs: Option<Vec<Vec2>>,
+    pub thumbnail: Option<Vec<u8>>,
     pub warnings: Vec<String>, // Import warnings, never saved
 }
 pub fn save_project_bytes(pf: &ProjectFile) -> Result<Vec<u8>>;
@@ -156,12 +163,14 @@ pub fn project_open_limit_gib() -> u32;
 |---|---|
 | `project.json` | serde JSON of `Project` |
 | `mesh.<ext>` | the original mesh file bytes (absent for `builtin:<id>` meshes) |
+| `uv_layout.bin` | generated UVs for an explicitly rebuilt mesh (format 4) |
 | `pixels/layer_<id>_<channelId>.bin` | painted layer (or content paint effect) channel |
 | `pixels/mask_<id>.bin` | painted mask effect |
 | `baked/<ts>_<mapId>.bin` | baked mesh map of texture set `<ts>` |
 | `thumbnail.png` | optional, stored |
 
-`.bin`: header `TCTX`, version, width, height, components, tile count (u32 LE each), then per
+Paint and bake `.bin` entries use a `TCTX` header with version, width, height, components and tile
+count (u32 LE each), then per
 allocated 64×64 tile `tx`, `ty` (u32 LE) and the raw `u16` LE components (sparse, lossless).
 Baked maps: the same header with 0 tiles, then `width × height × components` f32 LE.
 
@@ -173,6 +182,10 @@ maps retain their working atlas layout.
 Project format version 3 stores baked bent normal maps in tangent space (OpenGL green, like the
 normal map). Version 2 and older files held them in world space: loading drops those maps, keeps
 the bake settings and warns that the Bent Normals map needs a re-bake.
+
+Project format version 4 saves rebuilt mesh UVs so reopening can use the same layout. The
+`uv_layout.bin` entry starts with `TCUV`, followed by the layout version and corner count (u32 LE).
+Each triangle corner has one little-endian f32 pair in imported index order.
 
 Loading runs `Project::validate`, refuses a newer `format_version` (`FormatError::NewerVersion`),
 checks every tile against its texture set's resolution and component count, rejects repeated or

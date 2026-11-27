@@ -72,11 +72,6 @@ const BOX_AXIS_BITS: [usize; 3] = [1, 2, 4];
 const STEP_PROBE_RADII: f32 = 0.5;
 
 impl RoundGizmo {
-    /// The projector as the 3D view shows it: none while the Projection row's eye hides the projection gizmos
-    pub(crate) fn shown(app: &TextureCraftApp, rect: Rect) -> Option<RoundGizmo> {
-        RoundGizmo::of(app, rect).filter(|_| app.session.doc.project.display.projection_gizmos)
-    }
-
     /// The projector of the selected tri-planar, spherical or cylindrical fill
     pub(crate) fn of(app: &TextureCraftApp, rect: Rect) -> Option<RoundGizmo> {
         if app.ui.mode != crate::state::Mode::Painting {
@@ -153,7 +148,7 @@ impl RoundGizmo {
         let pixels = (project(app, rect, origin + right * reach)? - center).length() / reach;
         let ring = TURN_RING / pixels.max(f32::MIN_POSITIVE);
         self.rings = directions.map(|direction| {
-            if !ring_open(app, rect, center, direction) {
+            if !ring_open(app, rect, center, direction, TURN_RING) {
                 return Vec::new();
             }
 

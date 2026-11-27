@@ -1,7 +1,7 @@
 //! Warp projections: the frame a new warp starts from, and Reset frame, which puts a warp's frame and corners back there
 
 use serde_json::Value;
-use texturecraft_core::{Decal, Projection};
+use texturecraft_core::{Decal, Projection, Projector};
 use texturecraft_geom::Mesh;
 
 use crate::commands::{CommandSpec, bad, has_layer};
@@ -17,7 +17,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Reset frame",
         [],
         None,
-        "{layer? | effect?: content or mask fill effect id} — a warp projection's frame back around the mesh, seen from the front, with its corners unpulled (Projection Depth and the other settings stay)",
+        "{layer? | effect?: content or mask fill effect id, keepCorners?: bool} — refit the warp's frame around the mesh. With `keepCorners: true`, also reset the projector's rotation and scale and keep the corners; otherwise reset the corners. Projection Depth, crop, and culling stay",
         has_layer,
         reset_frame
     )]
@@ -44,26 +44,39 @@ pub(crate) fn fitted_frame(mesh: &Mesh) -> Decal {
 /// A fitted frame's smallest side, relative to the mesh diagonal (a flat mesh still gets a frame)
 const SMALLEST_SIDE: f32 = 1e-3;
 
-fn reset_frame(s: &mut Session, p: &Value) -> Result<Value> {
-    let target = fill_target(s, p, RESET_FRAME)?;
-    let fitted = fitted_frame(&s.mesh);
-    let (Projection::Warp { frame, corners, .. }, _) = placement_mut(s, target)? else {
+fn reset_frame(session: &mut Session, params: &Value) -> Result<Value> {
+    let target = fill_target(session, params, RESET_FRAME)?;
+    let keep_corners = match params.get("keepCorners") {
+        Some(value) => value.as_bool().ok_or_else(|| bad(RESET_FRAME, "`keepCorners` must be a boolean"))?,
+        None => false,
+    };
+    let fitted = fitted_frame(&session.mesh);
+    let (projection, _) = placement_mut(session, target)?;
+    let mut reset = projection.clone();
+    let Projection::Warp { frame, corners, projector, .. } = &mut reset else {
         return Err(bad(RESET_FRAME, "the fill's projection is not a warp projection"));
     };
 
-    // A frame already fitted with unpulled corners adds no undo step
-    if *frame == fitted && *corners == Projection::FRAME_CORNERS {
+    *frame = fitted;
+    if keep_corners {
+        // Older warps may still carry a transform separate from the frame
+        let defaults = Projector::default();
+        projector.rotation = defaults.rotation;
+        projector.scale = defaults.scale;
+    } else {
+        *corners = Projection::FRAME_CORNERS;
+    }
+
+    // An unchanged projection adds no undo step
+    if reset == *projection {
         return Ok(Value::Null);
     }
 
-    s.edit("Reset frame", |s| {
-        let (Projection::Warp { frame, corners, .. }, _) = placement_mut(s, target)? else {
-            return Err(bad(RESET_FRAME, "the fill's projection is not a warp projection"));
-        };
-
-        *frame = fitted;
-        *corners = Projection::FRAME_CORNERS;
+    let label = if keep_corners { "Reset warp transform" } else { "Reset frame" };
+    session.edit(label, |session| {
+        *placement_mut(session, target)?.0 = reset;
         Ok(())
     })?;
+
     Ok(Value::Null)
 }

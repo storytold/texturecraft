@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use texturecraft_engine::core::BakeResolution;
 use texturecraft_render::{BakeOverlay, BakeVisualization, NeutralMaterial};
 
 /// Opacity of the cage's surface and wireframe until changed
@@ -20,6 +21,10 @@ pub struct BakeVisualizationToggles {
     /// Show the project mesh with [`Self::neutral`] instead of its painted material
     pub neutral_shown: bool,
     pub neutral: NeutralMaterial,
+    /// Show the selected map on the model while Mesh Map Settings shows its settings
+    pub map_preview: bool,
+    /// The size the map preview bakes at once a change settles
+    pub map_preview_size: BakeResolution,
 }
 
 impl Default for BakeVisualizationToggles {
@@ -37,6 +42,9 @@ impl Default for BakeVisualizationToggles {
             project_mesh: shown(parts.low_poly),
             neutral_shown: true,
             neutral: NeutralMaterial::default(),
+            // Web builds bake on the UI thread, so the preview there is opt-in
+            map_preview: !cfg!(target_arch = "wasm32"),
+            map_preview_size: BakeResolution::R256,
         }
     }
 }
@@ -83,6 +91,12 @@ impl BakeVisualizationToggles {
     /// Put the UV Seams section back to its defaults
     pub fn reset_seams(&mut self) {
         self.missing_seams = Self::default().missing_seams;
+    }
+
+    /// Put the Map Preview section back to its defaults
+    pub fn reset_map_preview(&mut self) {
+        let defaults = Self::default();
+        (self.map_preview, self.map_preview_size) = (defaults.map_preview, defaults.map_preview_size);
     }
 
     /// Put the Project Mesh section back to its defaults

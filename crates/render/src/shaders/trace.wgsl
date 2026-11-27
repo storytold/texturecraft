@@ -17,7 +17,7 @@ struct Params {
     env: vec4<f32>,     // sin and cos of the environment rotation
     sigma: vec4<f32>,   // subsurface extinction per color channel
     eye: vec4<f32>,     // camera position
-    lens: vec4<f32>,    // focus depth along the view axis, lens radius (0: pinhole), transmission IOR
+    lens: vec4<f32>,    // focus depth along the view axis, lens radius (0: pinhole), transmission IOR, dielectric F0 scale
     // Per texture set (array layer): width, height, bit mask of 1×1 placeholder kinds, height strength.
     sets: array<vec4<f32>, MAX_SETS>,
 };
@@ -332,7 +332,7 @@ fn surface(hit: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
         metallic = clamp(orm.b, 0.0, 1.0);
         let level = clamp(orm.a, 0.0, 1.0);
         diffuse = base * (1.0 - metallic);
-        f0 = mix(vec3<f32>(0.08 * level), base, metallic);
+        f0 = mix(vec3<f32>(P.lens.w * level), base, metallic);
     }
 
     // The coat normal packs x and y around 128 so flat stays exact

@@ -21,8 +21,8 @@ impl Default for CommonBakeSettings {
             resolution: BakeResolution::R2048,
             resolution_height: None,
             antialiasing: BakeAntialiasing::None,
-            dilation: 1,
-            apply_diffusion: true,
+            dilation: 32,
+            apply_diffusion: false,
         }
     }
 }

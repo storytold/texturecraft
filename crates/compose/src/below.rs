@@ -165,7 +165,7 @@ impl StackKey {
                     match &effect.kind {
                         EffectKind::Fill { source, .. } => source.images().into_iter().for_each(&mut record_image_name),
                         EffectKind::Material(fill) => fill.sources.values().flat_map(Source::images).for_each(&mut record_image_name),
-                        EffectKind::Generator(generator) => generator.inputs.values().flat_map(Source::images).for_each(&mut record_image_name),
+                        EffectKind::Generator(generator) => generator.sources().flat_map(Source::images).for_each(&mut record_image_name),
                         EffectKind::ColorSelection(selection) => selection.id_map.iter().for_each(|name| record_image_name(name)),
                         _ => {}
                     }

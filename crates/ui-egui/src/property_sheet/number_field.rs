@@ -51,9 +51,25 @@ impl PropertySheet<'_> {
     pub(crate) fn number_fields(&mut self, label: &str, fields: &mut [NumberField], link: Option<&mut bool>, keep_link_slot: bool) -> Option<(usize, bool)> {
         let (control, center_y) = self.row(label);
         let slot = if link.is_some() || keep_link_slot { LINK_SLOT } else { 0.0 };
+        let edited = self.fields_in(control, slot, label, fields);
+        if let Some(linked) = link {
+            self.link_button(pos2(self.right - LINK_SIZE / 2.0, center_y), linked);
+        }
+        edited
+    }
+
+    /// A point in 3D: `label` on its own line, then its fields across the card and the pick-on-mesh button in the link slot, lit while `picking`; returns the edited index with whether it continues a drag, and whether the button was clicked
+    pub(crate) fn point_fields(&mut self, label: &str, fields: &mut [NumberField], picking: bool) -> (Option<(usize, bool)>, bool) {
+        let (control, center_y) = self.row_with(super::RowLead::Label { text: label, stack: true });
+        let edited = self.fields_in(control, LINK_SLOT, label, fields);
+        let clicked = self.pick_button(pos2(self.right - LINK_SIZE / 2.0, center_y), label, picking);
+        (edited, clicked)
+    }
+
+    /// `fields` side by side across `control`, leaving `slot` at its end
+    fn fields_in(&mut self, control: Rect, slot: f32, label: &str, fields: &mut [NumberField]) -> Option<(usize, bool)> {
         let count = fields.len().max(1) as f32;
         let width = (control.width() - slot - (count - 1.0) * FIELD_GAP) / count;
-
         let mut edited = None;
         for (index, field) in fields.iter_mut().enumerate() {
             let left = control.left() + index as f32 * (width + FIELD_GAP);
@@ -62,11 +78,25 @@ impl PropertySheet<'_> {
                 edited = Some((index, edited.is_none_or(|(_, previous_merge)| previous_merge) && merge));
             }
         }
-
-        if let Some(linked) = link {
-            self.link_button(pos2(self.right - LINK_SIZE / 2.0, center_y), linked);
-        }
         edited
+    }
+
+    /// The button that arms picking the point of row `label` on the mesh; returns whether it was clicked
+    fn pick_button(&mut self, center: egui::Pos2, label: &str, picking: bool) -> bool {
+        let rect = Rect::from_center_size(center, vec2(LINK_SIZE, LINK_SIZE));
+        let id = self.named_id("pick_on_mesh", label);
+        let response = self.ui.interact(rect, id, Sense::click());
+        let name = crate::i18n::trf("Pick {name} on the mesh", &[("name", &label)]);
+        response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, picking, &name));
+        let response = self.tip(response, crate::i18n::tr("Pick on the mesh"));
+
+        let tokens = self.tokens;
+        let (fill, border) = if picking { (tokens.accent_dim, tokens.accent) } else { (tokens.button, tokens.button_border) };
+        let painter = self.ui.painter();
+        painter.rect(rect, CornerRadius::same(CONTROL_RADIUS), fill, Stroke::new(1.0, border), StrokeKind::Inside);
+        painter.text(rect.center(), Align2::CENTER_CENTER, ic::CROSSHAIR_SIMPLE, FontId::proportional(ICON_SIZE), tokens.text);
+        self.paint_control_focus(&response);
+        response.clicked()
     }
 
     /// The link that keeps two values together; returns whether it was clicked
@@ -124,7 +154,7 @@ impl PropertySheet<'_> {
 
             let untouched = self.end_typing(typing_id, &draft);
             let text = draft.text.trim();
-            if self.ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            if self.escape_pressed() {
                 return None;
             }
 

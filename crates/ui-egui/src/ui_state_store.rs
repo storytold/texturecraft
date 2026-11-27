@@ -300,7 +300,7 @@ pub(crate) mod tests {
     use super::memory_storage::MemoryStorage;
     use super::*;
     use crate::docking::{Dock, Panel, default_workspace, permissions};
-    use craft_ui::docking::{Action, Placement};
+    use craft_behavior::dock::{Action, DockPlacement};
 
     /// Save `ui` and load it back, as closing and reopening the app does
     pub(crate) fn restart(ui: &UiState) -> UiState {
@@ -321,10 +321,10 @@ pub(crate) mod tests {
     fn moved_panels() -> Dock {
         let mut workspace = default_workspace();
         let actions = [
-            Action::Move { panel: Panel::Layers, anchor: Panel::Assets, placement: Placement::Tab { before: None } },
-            Action::Float { panel: Panel::Properties, rect: [900.0, 120.0, 320.0, 400.0] },
+            Action::move_beside(Panel::Layers, Panel::Assets, DockPlacement::tab(None)),
+            Action::float(Panel::Properties, egui::Rect::from_min_size(egui::pos2(900.0, 120.0), egui::vec2(320.0, 400.0))),
         ];
-        workspace.apply_all(actions, permissions).unwrap();
+        workspace.apply_all(actions, false, permissions).unwrap();
 
         let dock = Dock::from_value(serde_json::to_value(&workspace).unwrap());
         assert!(!dock.replaced_unreadable(), "the moved layout is valid");
@@ -385,13 +385,14 @@ pub(crate) mod tests {
         let mut storage = MemoryStorage::default();
         UiStateStore::new(Some(file.clone())).save(&ui, &mut storage);
         let saved = std::fs::read_to_string(&file).unwrap();
-        assert!(saved.contains("\"Assets\"") && saved.contains("\"version\": 2"), "{saved}");
+        let version = format!("\"version\": {}", crate::docking::Workspace::VERSION);
+        assert!(saved.contains("\"Assets\"") && saved.contains(&version), "{saved}");
 
         let unreadable = [
             // A panel this build does not know
             saved.replacen("\"Assets\"", "\"Bogus\"", 1),
             // A layout from a newer format
-            saved.replacen("\"version\": 2", "\"version\": 99", 1),
+            saved.replacen(&version, "\"version\": 99", 1),
             // Not a saved state
             "not json".to_owned(),
         ];

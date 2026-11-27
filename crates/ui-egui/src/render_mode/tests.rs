@@ -39,7 +39,10 @@ fn environment_cache_retains_source_identity_until_replaced() {
 
     // The harness draws once; parallel translation tests must not change its language mid-frame
     let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut app = egui_kittest::Harness::builder().build_eframe(|context| crate::TextureCraftApp::new(context, session())).into_state();
+    let mut app = egui_kittest::Harness::builder()
+        .with_context_setup(crate::framework::install_headless)
+        .build_eframe(|context| crate::TextureCraftApp::new(context, session()))
+        .into_state();
     app.session.doc.project.display.environment = "resource:environment".into();
     let source = Arc::new(ImageRes::new(2, 1, vec![[1.0, 0.0, 0.0, 1.0]; 2], false));
     let original_source = Arc::downgrade(&source);
@@ -71,7 +74,10 @@ fn environment_cache_retains_source_identity_until_replaced() {
 #[test]
 fn a_new_display_background_restarts_the_render() {
     let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut app = egui_kittest::Harness::builder().build_eframe(|context| crate::TextureCraftApp::new(context, session())).into_state();
+    let mut app = egui_kittest::Harness::builder()
+        .with_context_setup(crate::framework::install_headless)
+        .build_eframe(|context| crate::TextureCraftApp::new(context, session()))
+        .into_state();
     let before = super::key(&app, "scene", (64, 64));
     assert_eq!(super::key(&app, "scene", (64, 64)), before);
 
@@ -109,6 +115,7 @@ fn gpu_app() -> Option<crate::TextureCraftApp> {
     let mut app = egui_kittest::Harness::builder()
         .with_size(egui::vec2(800.0, 600.0))
         .renderer(WgpuTestRenderer::from_render_state(render_state))
+        .with_context_setup(crate::framework::install_headless)
         .build_eframe(|context| crate::TextureCraftApp::new(context, session()))
         .into_state();
     app.session.update();

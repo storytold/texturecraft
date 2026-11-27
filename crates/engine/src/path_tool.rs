@@ -925,28 +925,28 @@ impl Session {
     }
 
     /// [`Session::put_path`] recompositing only the tiles it changed, with no undo step: returns the paint report and the document before
-    fn repaint_path(&mut self, eid: LayerId, index: usize, shape: PathShape) -> Result<(Value, Document)> {
+    fn repaint_path(&mut self, effect_id: LayerId, index: usize, shape: PathShape) -> Result<(Value, Document)> {
         let before = self.doc.clone();
-        let painted = match self.put_path(eid, index, shape) {
-            Ok(v) => v,
-            Err(e) => {
+        let painted = match self.put_path(effect_id, index, shape) {
+            Ok(report) => report,
+            Err(error) => {
                 self.doc = before;
-                return Err(e);
+                return Err(error);
             }
         };
 
         // Paths paint into the active set; a sublayer in another set recomposites in full
         let project = &self.doc.project;
-        let set = project.effect(eid).and_then(|(owner, _)| project.locate(owner)).map(|(ts, _, _)| ts);
+        let set = project.effect(effect_id).and_then(|(owner, _)| project.locate(owner)).map(|(ts, _, _)| ts);
         if set == Some(self.ts()) {
             // Content or mask, the sublayer's owner decides which sets redraw
-            let tiles = changed_tiles(&before.pixels, &self.doc.pixels, eid);
-            self.mark_painted(self.ts(), Some(PaintTarget::Layer(eid)), tiles);
+            let tiles = changed_tiles(&before.pixels, &self.doc.pixels, effect_id);
+            self.mark_painted(self.ts(), Some(PaintTarget::Layer(effect_id)), tiles);
         } else {
             self.invalidate_changed(&before);
         }
-        self.revision = self.revision.wrapping_add(1);
-        self.modified = true;
+
+        self.mark_modified();
         Ok((painted, before))
     }
 

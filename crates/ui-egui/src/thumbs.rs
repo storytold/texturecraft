@@ -9,7 +9,7 @@ use std::sync::{Arc, Weak};
 use egui::{Color32, ColorImage, Painter, Pos2, Rect, TextureHandle, TextureOptions};
 use texturecraft_engine::Session;
 use texturecraft_engine::compose::{ImageRes, ImageStore};
-use texturecraft_engine::core::{BakedMap, ProceduralKind};
+use texturecraft_engine::core::{BakedMap, GeneratorKind, ProceduralKind};
 use texturecraft_engine::paint::presets::BrushPreset;
 use texturecraft_engine::paint::{BrushAlpha, BrushSettings, alphas};
 use texturecraft_engine::texel::linear_to_srgb;
@@ -30,6 +30,8 @@ const PROCEDURAL_PX: usize = 64;
 const SWATCH_PX: usize = 64;
 /// Image resource preview size in pixels
 const IMAGE_PX: usize = 64;
+/// The [`ShelfPreview::key`] prefix of a project generator preview
+const GENERATOR_SET_KEY_PREFIX: &str = "generator-set:";
 /// The [`ShelfPreview::key`] prefix of the user's saved files
 const SAVED_FILE_KEY_PREFIX: &str = "saved-";
 /// Largest stencil preview dimension in pixels
@@ -52,6 +54,10 @@ pub struct Thumbs {
     images: HashMap<String, (Weak<ImageRes>, TextureHandle)>,
     images_revision: Option<u64>,
     preview_session: Option<(u64, u64)>,
+    /// Weak identities for images read by configured generator previews
+    generator_images: HashMap<String, Weak<ImageRes>>,
+    /// Separates cached pixels and late completions when an image allocation is replaced
+    generator_images_epoch: u64,
     /// Each texture set's ID mesh map preview, with the map it shows (a rebake's new map replaces it)
     id_maps: HashMap<usize, (Weak<Vec<f32>>, TextureHandle)>,
     /// (frame, thumbnails rendered in it)
@@ -64,6 +70,8 @@ pub struct Thumbs {
     big_shown: VecDeque<String>,
     /// The frame that last took in the worker's results
     received_in_pass: u64,
+    /// Per active generator picture size: the current effect, pending key and last finished picture
+    set_pictures: HashMap<(u64, usize), (Option<String>, Option<TextureHandle>)>,
 }
 
 impl Thumbs {
@@ -146,17 +154,32 @@ impl Thumbs {
     }
 
     /// Keep project previews only while they refer to current resources or bake maps.
-    pub(crate) fn sync_project_previews(&mut self, session: &Session) {
+    pub(crate) fn sync_project_previews(&mut self, session: &Session) -> bool {
         let current = (session.project_id, session.revision);
         let previous = self.preview_session.replace(current);
         if previous == Some(current) {
-            return;
+            return false;
         }
 
-        // Two projects can have the same revision
-        if previous.is_none_or(|(project, _)| project != session.project_id) {
+        let project_changed = previous.is_some_and(|(project, _)| project != session.project_id);
+        if project_changed || previous.is_none() {
             self.images_revision = None;
             self.id_maps.clear();
+            self.set_pictures.clear();
+            self.rendered.retain(|key, _| {
+                let keep = !key.starts_with(GENERATOR_SET_KEY_PREFIX);
+                if !keep {
+                    self.worker.cancel(key);
+                }
+                keep
+            });
+            self.big_shown.retain(|key| !key.starts_with(GENERATOR_SET_KEY_PREFIX));
+        }
+
+        let previous_inputs = self.generator_images.len();
+        self.generator_images.retain(|name, identity| session.images.get(name).is_some_and(|image| std::ptr::eq(identity.as_ptr(), Arc::as_ptr(image))));
+        if self.generator_images.len() != previous_inputs {
+            self.generator_images_epoch = self.generator_images_epoch.wrapping_add(1);
         }
 
         self.sync_images(&session.images, session.revision);
@@ -164,6 +187,7 @@ impl Thumbs {
             set < session.doc.project.texture_sets.len()
                 && session.baked(set).and_then(|baked| baked.maps.get(&BakedMap::Id)).is_some_and(|map| std::ptr::eq(shown.as_ptr(), Arc::as_ptr(map)))
         });
+        project_changed
     }
 
     /// Render within the frame budget; deferred thumbnails request a repaint
@@ -260,6 +284,7 @@ impl Thumbs {
         while self.big_shown.len() > BIG_PREVIEWS_KEPT {
             if let Some(oldest) = self.big_shown.pop_front() {
                 self.rendered.remove(&oldest);
+                self.worker.cancel(&oldest);
             }
         }
 
@@ -269,7 +294,8 @@ impl Thumbs {
     /// The big preview of `preview` if the worker already rendered it (requests nothing)
     pub fn rendered_big(&mut self, ctx: &egui::Context, preview: &ShelfPreview, size_px: usize) -> Option<TextureHandle> {
         self.receive(ctx);
-        self.ready(&self.worker_key(preview, size_px))
+        let key = self.worker_key(preview, size_px);
+        self.ready(&key)
     }
 
     /// Material thumbnail: smart materials come from the worker's orb, plain ones are spheres
@@ -293,6 +319,47 @@ impl Thumbs {
     /// Smart mask thumbnail; None until the worker returns it
     pub fn smart_mask(&mut self, ctx: &egui::Context, id: &'static str) -> Option<TextureHandle> {
         self.worker_rendered(ctx, ShelfPreview::SmartMask(id), SPHERE_PX, false)
+    }
+
+    /// Generator thumbnail on the smart masks' orb; None until the worker returns it
+    pub fn generator(&mut self, ctx: &egui::Context, kind: GeneratorKind) -> Option<TextureHandle> {
+        self.worker_rendered(ctx, ShelfPreview::Generator(kind), SPHERE_PX, false)
+    }
+
+    /// A generator orb (`preview` a [`ShelfPreview::Generator`] or [`ShelfPreview::Curvature`]) rendered `size_px` wide, kept like a thumbnail; None until the worker returns it
+    pub fn generator_picture(&mut self, ctx: &egui::Context, preview: ShelfPreview, size_px: usize) -> Option<TextureHandle> {
+        self.worker_rendered(ctx, preview, size_px.clamp(1, texturecraft_engine::orb_preview::MAX_PREVIEW_SIZE_PX), false)
+    }
+
+    /// Generator `effect`'s picture as set (`preview` a [`ShelfPreview::GeneratorSet`]): one render at a time, the last finished one shown while the next renders, so a drag renders only as fast as the worker keeps up
+    pub fn generator_set_picture(&mut self, ctx: &egui::Context, effect: u64, preview: ShelfPreview, size_px: usize) -> Option<TextureHandle> {
+        self.receive(ctx);
+        let size_px = size_px.clamp(1, texturecraft_engine::orb_preview::MAX_PREVIEW_SIZE_PX);
+        let key = self.worker_key(&preview, size_px);
+        let (in_flight, last) = self.set_pictures.get(&(effect, size_px)).cloned().unwrap_or_default();
+
+        // Use a completed render as the fallback for the next request
+        let last = match in_flight.as_ref().map(|key| self.rendered.get(key)) {
+            Some(Some(WorkerPreview::Ready(texture))) => Some(texture.clone()),
+            _ => last,
+        };
+        let busy = in_flight.as_ref().is_some_and(|key| matches!(self.rendered.get(key), Some(WorkerPreview::Rendering)));
+        let shown = match self.ready(&key) {
+            Some(texture) => Some(texture),
+            None if busy => last.clone(),
+            None => self.big(ctx, preview, size_px).or_else(|| last.clone()),
+        };
+        let in_flight = if busy { in_flight } else { Some(key) };
+
+        // Only the displayed effect at this size needs a fallback beyond the shared LRU
+        self.set_pictures.retain(|&(owner, size), _| size != size_px || owner == effect);
+        self.set_pictures.insert((effect, size_px), (in_flight, shown.clone().or(last)));
+        shown
+    }
+
+    /// Keeps the generator pictures only of the effects `exists` still finds
+    pub fn keep_generator_pictures(&mut self, exists: impl Fn(u64) -> bool) {
+        self.set_pictures.retain(|(effect, _), _| exists(*effect));
     }
 
     /// Sphere thumbnail of library filter `id` applied to a sample material
@@ -378,12 +445,29 @@ impl Thumbs {
         ShelfPreview::SavedBrush { path: path.to_path_buf(), settings: settings.clone(), image: image.cloned() }
     }
 
-    /// A saved-brush key also identifies the refresh and image version of its request
-    fn worker_key(&self, preview: &ShelfPreview, size_px: usize) -> String {
+    /// Project generator and saved-brush keys include the identity of the request owner
+    fn worker_key(&mut self, preview: &ShelfPreview, size_px: usize) -> String {
         let key = format!("{}@{size_px}", preview.key());
         if let ShelfPreview::SavedBrush { path, .. } = preview {
             let revision = self.saved_brush_previews.get(path).map_or(0, |(_, _, revision)| *revision);
             format!("{key}#{}:{revision}", self.saved_files_epoch)
+        } else if let ShelfPreview::GeneratorSet { images, .. } = preview {
+            let project = self.preview_session.map(|(project, _)| project);
+            if images.is_empty() {
+                return format!("{key}#{project:?}");
+            }
+
+            for (name, image) in images {
+                if self.generator_images.get(name).is_some_and(|seen| std::ptr::eq(seen.as_ptr(), Arc::as_ptr(image))) {
+                    continue;
+                }
+
+                if self.generator_images.insert(name.clone(), Arc::downgrade(image)).is_some() {
+                    self.generator_images_epoch = self.generator_images_epoch.wrapping_add(1);
+                }
+            }
+
+            format!("{key}#{project:?}:{}", self.generator_images_epoch)
         } else {
             key
         }
@@ -456,10 +540,115 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use texturecraft_engine::compose::BakedMaps;
+    use texturecraft_engine::core::Generator;
 
     use crate::orb_shape::OrbShape;
 
     static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn the_pictures_of_a_removed_generator_go() {
+        let mut thumbs = Thumbs::default();
+        thumbs.set_pictures.insert((1, 8), (None, None));
+        thumbs.set_pictures.insert((2, 8), (None, None));
+
+        thumbs.keep_generator_pictures(|effect| effect == 2);
+
+        assert!(!thumbs.set_pictures.contains_key(&(1, 8)) && thumbs.set_pictures.contains_key(&(2, 8)));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn evicting_generator_requests_releases_images_before_the_worker_resumes() {
+        use std::sync::mpsc;
+        use texturecraft_engine::geom::primitives;
+
+        let ctx = egui::Context::default();
+        let (requests, _paused_worker) = mpsc::channel();
+        let (_sender, results) = mpsc::channel();
+        let mut thumbs = Thumbs { worker: PreviewWorker::Running { requests, pending: Default::default(), results }, ..Thumbs::default() };
+        let mut images = Vec::new();
+        let project = || Session::new_project("Preview", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        thumbs.sync_project_previews(&project());
+
+        for index in 0..BIG_PREVIEWS_KEPT + 3 {
+            let image = Arc::new(ImageRes::new(1, 1, vec![[0.2; 4]], false));
+            images.push(Arc::downgrade(&image));
+            let generator = Generator { seed: index as u32, ..Generator::new(GeneratorKind::Dirt) };
+            let preview = ShelfPreview::GeneratorSet { generator: Box::new(generator), images: vec![("input".into(), image)] };
+            thumbs.generator_set_picture(&ctx, index as u64, preview, 8);
+        }
+
+        assert_eq!(images.iter().filter(|image| image.strong_count() > 0).count(), BIG_PREVIEWS_KEPT);
+        thumbs.sync_project_previews(&project());
+        assert!(images.iter().all(|image| image.strong_count() == 0));
+    }
+
+    #[test]
+    fn editing_an_image_invalidates_its_finished_generator_picture() {
+        let context = egui::Context::default();
+        let mut thumbs = Thumbs::default();
+        let mut image = Arc::new(ImageRes::new(1, 1, vec![[0.0; 4]], false));
+        let preview = |image: &Arc<ImageRes>| ShelfPreview::GeneratorSet {
+            generator: Box::new(Generator::new(GeneratorKind::GrayscaleConversion)),
+            images: vec![("input".into(), image.clone())],
+        };
+        let key = thumbs.worker_key(&preview(&image), 8);
+        let texture = context.load_texture("old", ColorImage::filled([8, 8], Color32::BLACK), TextureOptions::LINEAR);
+        thumbs.rendered.insert(key, WorkerPreview::Ready(texture));
+        assert!(thumbs.rendered_big(&context, &preview(&image), 8).is_some());
+
+        Arc::make_mut(&mut image).rgba[0] = [1.0; 4];
+
+        assert!(thumbs.rendered_big(&context, &preview(&image), 8).is_none(), "the previous pixels cannot serve the edited image");
+    }
+
+    #[test]
+    fn a_generator_picture_shows_the_last_one_while_the_next_renders() {
+        let ctx = egui::Context::default();
+        let mut thumbs = Thumbs { worker: PreviewWorker::Inline { shape: OrbShape::default(), results: Vec::new() }, ..Thumbs::default() };
+        let set = |invert| ShelfPreview::GeneratorSet { generator: Box::new(Generator { invert, ..Generator::new(GeneratorKind::Dirt) }), images: Vec::new() };
+        let last = ctx.load_texture("last", ColorImage::filled([1, 1], Color32::RED), TextureOptions::LINEAR);
+        let rendering = thumbs.worker_key(&set(false), 8);
+        thumbs.rendered.insert(rendering.clone(), WorkerPreview::Rendering);
+        thumbs.set_pictures.insert((1, 8), (Some(rendering), Some(last.clone())));
+
+        let shown = thumbs.generator_set_picture(&ctx, 1, set(true), 8);
+
+        assert_eq!(shown.map(|texture| texture.id()), Some(last.id()), "the last picture stays up");
+        let next_key = thumbs.worker_key(&set(true), 8);
+        assert!(!thumbs.rendered.contains_key(&next_key), "the newer settings wait for the render in flight");
+    }
+
+    #[test]
+    fn replacement_projects_release_the_previous_generators_and_discard_their_worker_results() {
+        use texturecraft_engine::geom::primitives;
+
+        let ctx = egui::Context::default();
+        let mut thumbs = Thumbs { worker: PreviewWorker::Inline { shape: OrbShape::default(), results: Vec::new() }, ..Thumbs::default() };
+        let preview = ShelfPreview::GeneratorSet { generator: Box::new(Generator::new(GeneratorKind::Dirt)), images: Vec::new() };
+        let mut previous = None;
+
+        for name in ["First", "Second", "Third"] {
+            let project = Session::new_project(name, primitives::plane(2.0, 2), "builtin:plane", None, 128).unwrap();
+            thumbs.sync_project_previews(&project);
+
+            if let Some((_, previous_id)) = &previous {
+                assert!(ctx.tex_manager().read().meta(*previous_id).is_none(), "the previous project's picture has been released");
+            }
+            let current_key = thumbs.worker_key(&preview, 8);
+            assert!(thumbs.generator_set_picture(&ctx, 1, preview.clone(), 8).is_none(), "start with an empty preview for the reused effect ID");
+            if let Some((key, _)) = previous.take() {
+                let PreviewWorker::Inline { results, .. } = &mut thumbs.worker else { panic!("test worker must render inline") };
+                results.push((key, None));
+            }
+
+            let mut frame = ctx.run_pass(Default::default(), |_| {});
+            frame.textures_delta.clear();
+            let shown = thumbs.generator_set_picture(&ctx, 1, preview.clone(), 8).expect("the new project rendered");
+            previous = Some((current_key, shown.id()));
+        }
+    }
 
     #[test]
     fn saved_brush_refresh_discards_old_worker_result() {

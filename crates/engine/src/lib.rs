@@ -9,6 +9,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod add_mask_cmds;
+mod anchored_micro_edit;
 pub mod bake;
 pub mod bake_preview;
 pub mod brush_preset_cmds;
@@ -16,6 +17,7 @@ pub mod camera_cmds;
 pub mod color_selection_cmds;
 pub mod commands;
 pub mod decal_cmds;
+pub mod distance_params;
 pub mod effect_blending_cmds;
 pub mod effect_clipboard;
 pub mod file_cmds;
@@ -28,6 +30,8 @@ pub mod filter_about;
 pub mod filter_lib;
 pub mod folder_cmds;
 mod frame_target;
+mod generator_input;
+pub mod generator_pick;
 pub mod id_mask_view;
 pub mod inspect;
 pub mod instance_cmds;
@@ -47,9 +51,11 @@ pub mod material_lib;
 mod material_preview_pixel;
 pub mod materials;
 pub mod materialx_cmds;
+mod mesh_map_sampler;
 pub mod meshmap_cmds;
 mod meshmap_file_name;
 pub mod meshmap_import_cmds;
+pub mod micro_params;
 mod orb_camera;
 pub mod orb_preview;
 pub mod painting;
@@ -68,7 +74,16 @@ pub mod preview;
 mod procedural_params;
 pub mod project_cmds;
 pub mod quick_mask;
+// Reloading resource files reads paths on native targets only
+#[cfg(not(target_arch = "wasm32"))]
+mod reloaded_file;
+// Remembered file comparisons exist on native targets only
+#[cfg(not(target_arch = "wasm32"))]
+mod resource_check;
 pub mod resource_cmds;
+pub mod resource_state;
+pub mod resource_status;
+pub mod resource_update_cmds;
 pub mod session;
 mod session_log;
 pub mod set_cmds;
@@ -83,14 +98,13 @@ mod tile_transform_params;
 mod tool_availability;
 pub mod tool_cmds;
 pub mod tool_settings;
-mod triangle_partition;
 mod uv_stroke_state;
 mod uv_symmetry;
 pub mod uv_tile_cmds;
 pub mod view_cmds;
 pub mod warp_cmds;
 
-pub use bake::{BakeMesh, BakeMeshes, BakeTask, StreamedBake, StreamedMap};
+pub use bake::{BakeMesh, BakeMeshes, BakeTask, HighPolyLoad, StreamedBake, StreamedMap};
 pub use bake_preview::{BakePreview, PreviewShow};
 pub use commands::{CommandSpec, check_enabled, command_specs, execute, find};
 pub use fill_hit_test::FillHitTest;
@@ -98,6 +112,8 @@ pub use fill_mode::FillMode;
 pub use log::{LogEntry, LogLevel, SessionLog};
 pub use path_tool::PathState;
 pub use project_cmds::sample_session;
+pub use resource_state::ResourceState;
+pub use resource_status::ResourceStatus;
 pub use session::{
     CloneFrom, CloneSource, Document, HISTORY_TEMPLATES, NORMAL_HEIGHT_MESH_LABEL, Session, SetCache, StackTarget, StencilLook, StencilState, Tool, ToolState,
     ViewMode, history_label, stroke_template,

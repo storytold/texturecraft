@@ -150,42 +150,87 @@ fn anchor_points_in_masks_record_the_mask_for_layers_above() {
     assert!(close(center(&mut s, Channel::BaseColor), [expected; 3]), "{:?}", center(&mut s, Channel::BaseColor));
 }
 
+/// The composited base color over the whole texture set, row by row
+fn base_colors(s: &mut Session) -> Vec<[f32; 3]> {
+    s.update();
+    let composite = &s.caches[0].composite;
+    (0..composite.height).flat_map(|y| (0..composite.resolution).map(move |x| (x, y))).map(|(x, y)| composite.value(Channel::BaseColor, x, y)).collect()
+}
+
+fn largest_change(a: &[[f32; 3]], b: &[[f32; 3]]) -> f32 {
+    a.iter().zip(b).flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| (a - b).abs())).fold(0.0, f32::max)
+}
+
 #[test]
-fn generators_read_an_anchor_height_as_micro_detail() {
-    let mut s = session();
-    let low = id(execute(&mut s, "layer.add.fill", &json!({"height": 0.5})).unwrap(), "layer");
-    let anchor = id(execute(&mut s, "effect.add.anchor", &Value::Null).unwrap(), "effect");
-    let top = id(execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap(), "layer");
+fn generators_read_an_anchor_height_as_their_micro_height() {
+    let mut session = texturecraft_engine::sample_session(128, 64).unwrap();
+
+    // A checker of raised height below, recorded by an anchor point
+    let low = id(execute(&mut session, "layer.add.fill", &json!({"height": 1.0})).unwrap(), "layer");
+    execute(&mut session, "mask.add.black", &json!({"layer": low})).unwrap();
+    execute(&mut session, "effect.add.fill", &json!({"layer": low, "procedural": "checker", "scale": 4.0})).unwrap();
+    let anchor = id(execute(&mut session, "effect.add.anchor", &json!({"layer": low})).unwrap(), "effect");
+    let top = id(execute(&mut session, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap(), "layer");
+    execute(&mut session, "mask.add.black", &json!({"layer": top})).unwrap();
 
     // The anchor must be below; `microAmount` needs an anchor; ids must be numbers
-    assert!(execute(&mut s, "effect.add.generator", &json!({"layer": low, "microAnchor": anchor})).is_err());
-    assert!(execute(&mut s, "effect.add.generator", &json!({"microAmount": 0.5})).is_err());
-    assert!(execute(&mut s, "effect.add.generator", &json!({"microAnchor": "x"})).is_err());
-    assert!(execute(&mut s, "effect.add.generator", &json!({"microAnchor": low})).is_err(), "not an anchor point");
+    assert!(execute(&mut session, "effect.add.generator", &json!({"layer": low, "microAnchor": anchor})).is_err());
+    assert!(execute(&mut session, "effect.add.generator", &json!({"layer": top, "microAmount": 0.5})).is_err());
+    assert!(execute(&mut session, "effect.add.generator", &json!({"layer": top, "microAnchor": "x"})).is_err());
+    assert!(execute(&mut session, "effect.add.generator", &json!({"layer": top, "microAnchor": low})).is_err(), "not an anchor point");
 
-    let generator = id(execute(&mut s, "effect.add.generator", &json!({"generator": "curvature", "noise": 0.0})).unwrap(), "effect");
-    let plain = center(&mut s, Channel::BaseColor);
-    execute(&mut s, "effect.set", &json!({"effect": generator, "microAnchor": anchor, "microAmount": 1.0})).unwrap();
-    let raised = center(&mut s, Channel::BaseColor);
-    assert!(raised[0] > plain[0] + 0.1, "{plain:?} -> {raised:?}");
-    let inspect = execute(&mut s, "project.inspect", &Value::Null).unwrap();
-    assert!(inspect.to_string().contains(&format!("\"micro\":{{\"amount\":1.0,\"anchor\":{anchor}}}")), "{inspect}");
+    let generator = id(execute(&mut session, "effect.add.generator", &json!({"layer": top, "generator": "curvature"})).unwrap(), "effect");
+    let plain = base_colors(&mut session);
+    execute(&mut session, "effect.set", &json!({"effect": generator, "microAnchor": anchor, "microAmount": 1.0})).unwrap();
+    let raised = base_colors(&mut session);
+    assert!(largest_change(&raised, &plain) > 0.05, "the checker's raised edges read as curvature");
+    let inspect = execute(&mut session, "project.inspect", &Value::Null).unwrap();
+    let inspected = inspect.to_string();
+    assert!(inspected.contains("\"heightSource\"") && inspected.contains(&format!("\"anchor\":{anchor}")), "{inspect}");
 
-    // The amount alone keeps the anchor; null removes the micro detail
-    execute(&mut s, "effect.set", &json!({"effect": generator, "microAmount": 0.0})).unwrap();
-    assert!(close(center(&mut s, Channel::BaseColor), plain));
-    execute(&mut s, "effect.set", &json!({"effect": generator, "microAnchor": null})).unwrap();
-    assert!(s.doc.project.effect(LayerId(generator)).map(|(_, e)| matches!(&e.kind, EffectKind::Generator(g) if g.micro.is_none())).unwrap());
-    assert!(execute(&mut s, "effect.set", &json!({"effect": anchor, "microAmount": 0.5})).is_err(), "generators only");
+    // The amount alone keeps the anchor; null empties the Micro Height
+    execute(&mut session, "effect.set", &json!({"effect": generator, "microAmount": 0.0})).unwrap();
+    assert!(largest_change(&base_colors(&mut session), &plain) < 1e-3, "no amount, no micro height");
+    execute(&mut session, "effect.set", &json!({"effect": generator, "microAnchor": null})).unwrap();
+    let emptied = session
+        .doc
+        .project
+        .effect(LayerId(generator))
+        .map(|(_, effect)| matches!(&effect.kind, EffectKind::Generator(made) if made.micro.as_ref().is_some_and(|micro| micro.height_source.is_none())));
+    assert_eq!(emptied, Some(true));
+    assert!(largest_change(&base_colors(&mut session), &plain) < 1e-3, "without an anchor, as without micro details");
+    assert!(execute(&mut session, "effect.set", &json!({"effect": anchor, "microAmount": 0.5})).is_err(), "generators only");
 
-    // A copied generator with micro detail needs the anchor below its new layer
-    execute(&mut s, "effect.set", &json!({"effect": generator, "microAnchor": anchor})).unwrap();
-    execute(&mut s, "layer.select", &json!({"layer": top, "target": generator})).unwrap();
-    execute(&mut s, "effect.copy", &json!({"effect": generator})).unwrap();
-    execute(&mut s, "layer.select", &json!({"layer": low})).unwrap();
-    assert!(execute(&mut s, "effect.paste", &json!({"target": "mask"})).is_err());
-    let back = Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap();
-    assert_eq!(back.doc.project, s.doc.project);
+    // A copied generator reading an anchor needs the anchor below its new layer
+    execute(&mut session, "effect.set", &json!({"effect": generator, "microAnchor": anchor})).unwrap();
+    execute(&mut session, "layer.select", &json!({"layer": top, "target": generator})).unwrap();
+    execute(&mut session, "effect.copy", &json!({"effect": generator})).unwrap();
+    execute(&mut session, "layer.select", &json!({"layer": low})).unwrap();
+    assert!(execute(&mut session, "effect.paste", &json!({"target": "mask"})).is_err());
+    let back = Session::from_project_bytes(&session.to_project_bytes().unwrap()).unwrap();
+    assert_eq!(back.doc.project, session.doc.project);
+}
+
+#[test]
+fn the_earlier_micro_keys_keep_an_earlier_model_generator_on_the_earlier_micro_detail() {
+    let mut session = session();
+    let low = id(execute(&mut session, "layer.add.fill", &json!({"height": 0.5})).unwrap(), "layer");
+    let anchor = id(execute(&mut session, "effect.add.anchor", &json!({"layer": low})).unwrap(), "effect");
+    let top = id(execute(&mut session, "layer.add.fill", &json!({"color": [1.0, 1.0, 1.0]})).unwrap(), "layer");
+    execute(&mut session, "mask.add.black", &json!({"layer": top})).unwrap();
+    let earlier_micro = |session: &Session, generator: u64| match session.doc.project.effect(LayerId(generator)).map(|(_, effect)| &effect.kind) {
+        Some(EffectKind::Generator(generator)) => generator.earlier_micro(),
+        _ => None,
+    };
+
+    // `level` keeps the generator on the earlier model, where these keys read the anchor's height as before Micro Details
+    let generator = id(execute(&mut session, "effect.add.generator", &json!({"layer": top, "generator": "curvature", "level": 0.5})).unwrap(), "effect");
+    execute(&mut session, "effect.set", &json!({"effect": generator, "microAnchor": anchor, "microAmount": 0.25})).unwrap();
+    assert_eq!(earlier_micro(&session, generator), Some((LayerId(anchor), 0.25)));
+
+    // A Micro Details control moves it onto the reference's controls and the anchor's curvature
+    execute(&mut session, "effect.set", &json!({"effect": generator, "microHeightIntensity": 1.0})).unwrap();
+    assert_eq!(earlier_micro(&session, generator), None);
 }
 
 #[test]
@@ -199,6 +244,42 @@ fn anchor_effects_added_through_instance_validate_against_source() {
     assert!(execute(&mut session, "effect.add.generator", &json!({"layer": instance, "microAnchor": anchor})).is_err());
     assert!(execute(&mut session, "effect.add.fill", &json!({"layer": instance, "anchor": anchor})).is_err());
     assert!(session.doc.project.layer(LayerId(source)).unwrap().mask.is_none());
+}
+
+#[test]
+fn an_instance_selects_the_effects_of_the_mask_it_draws_with() {
+    let mut s = session();
+    let source = id(execute(&mut s, "layer.add.fill", &json!({"height": 0.5})).unwrap(), "layer");
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let source_mask = id(execute(&mut s, "effect.add.generator", &json!({"generator": "position", "level": 0.5})).unwrap(), "effect");
+    let source_content = id(execute(&mut s, "effect.add.filter", &json!({"target": "content", "filter": "invert"})).unwrap(), "effect");
+    let other = id(execute(&mut s, "layer.add.fill", &Value::Null).unwrap(), "layer");
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let other_mask = id(execute(&mut s, "effect.add.generator", &json!({"generator": "position", "level": 0.5})).unwrap(), "effect");
+    let instance = id(execute(&mut s, "layer.instance", &json!({"layer": source})).unwrap(), "layer");
+    let select = |s: &mut Session, effect: u64| execute(s, "layer.select", &json!({"layer": instance, "target": effect}));
+
+    // The instance inherits its source mask
+    select(&mut s, source_mask).unwrap();
+
+    assert_eq!(s.selected_layer(), Some(LayerId(instance)));
+    assert_eq!(s.target, StackTarget::Effect(LayerId(source_mask)));
+
+    // The source's content and unrelated layers remain outside the selection
+    for effect in [source_content, other_mask] {
+        let error = select(&mut s, effect).unwrap_err().to_string();
+        assert!(error.contains("an effect id of this layer or of the mask it draws with"), "{error}");
+    }
+    assert_ne!(other, instance);
+
+    // A local mask overrides the source mask
+    execute(&mut s, "layer.select", &json!({"layer": instance})).unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let own = id(execute(&mut s, "effect.add.generator", &json!({"generator": "position", "level": 0.5})).unwrap(), "effect");
+
+    assert!(select(&mut s, source_mask).is_err());
+    select(&mut s, own).unwrap();
+    assert_eq!(s.target, StackTarget::Effect(LayerId(own)));
 }
 
 #[test]

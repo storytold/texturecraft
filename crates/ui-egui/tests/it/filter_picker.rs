@@ -185,10 +185,14 @@ fn filter_picker_snapshots_and_frame_timings() {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     execute(&mut session, "layer.add.fill", &Value::Null).unwrap();
     execute(&mut session, "effect.add.filter", &json!({"target": "content", "filter": "invert"})).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(WINDOW_WIDTH, SNAPSHOT_HEIGHT)).wgpu().build_eframe(|cc| {
-        eprintln!("selected graphics adapter: {:?}", cc.wgpu_render_state.as_ref().unwrap().adapter.get_info());
-        TextureCraftApp::new(cc, session)
-    });
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(WINDOW_WIDTH, SNAPSHOT_HEIGHT))
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| {
+            eprintln!("selected graphics adapter: {:?}", cc.wgpu_render_state.as_ref().unwrap().adapter.get_info());
+            TextureCraftApp::new(cc, session)
+        });
     harness.run_steps(20);
     let start = std::time::Instant::now();
     open_picker(&mut harness);

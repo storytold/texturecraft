@@ -26,7 +26,10 @@ fn app_with_mask_fill(projection: &str) -> (Harness<'static, TextureCraftApp>, L
     let added = texturecraft_engine::execute(&mut session, "effect.add.fill", &json!({"layer": layer.0, "target": "mask", "projection": projection})).unwrap();
     let effect = LayerId(added["effect"].as_u64().unwrap());
     texturecraft_engine::execute(&mut session, "layer.select", &json!({"layer": layer.0, "target": effect.0})).unwrap();
-    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
 
     // The labels below are English; a first run would speak the system's language
     harness.state_mut().ui.prefs.language = "en".into();
@@ -146,7 +149,10 @@ fn a_mask_fill_reading_a_content_anchor_picks_its_channel() {
     let added = texturecraft_engine::execute(&mut session, "effect.add.fill", &json!({"layer": top, "target": "mask", "anchor": anchor})).unwrap();
     let effect = LayerId(added["effect"].as_u64().unwrap());
     texturecraft_engine::execute(&mut session, "layer.select", &json!({"layer": top, "target": effect.0})).unwrap();
-    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(STARTUP_FRAMES);
     let Source::Anchor { channel, .. } = mask_fill(&harness, effect).0 else { panic!("an anchor source") };
@@ -176,7 +182,10 @@ fn an_inherited_mask_fill_lists_only_anchors_below_its_owner() {
     let instance = texturecraft_engine::execute(&mut session, "layer.instance", &json!({"layer": source})).unwrap()["layer"].clone();
     texturecraft_engine::execute(&mut session, "layer.select", &json!({"layer": instance})).unwrap();
     session.target = texturecraft_engine::StackTarget::Effect(effect);
-    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(WINDOW_SIZE)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(STARTUP_FRAMES);
 

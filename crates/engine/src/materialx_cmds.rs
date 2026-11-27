@@ -34,17 +34,25 @@ pub fn specs() -> Vec<CommandSpec> {
 /// Loads an image file named in the document (relative to it): its bytes, or why not.
 pub type Loader<'a> = &'a dyn Fn(&str) -> std::result::Result<Vec<u8>, String>;
 
+type LocatedImage = (Vec<u8>, Option<texturecraft_core::ResourceSource>);
+type LocatedLoader<'a> = &'a dyn Fn(&str) -> std::result::Result<LocatedImage, String>;
+
 impl Session {
     /// Add `material` as a fill layer on the active texture set, loading its images with `load`.
     /// Returns the reply of `file.importMaterialX`.
     pub fn import_material(&mut self, material: Material, name: Option<&str>, load: Loader) -> Result<Value> {
+        self.import_material_with_sources(material, name, &|file| load(file).map(|bytes| (bytes, None)))
+    }
+
+    fn import_material_with_sources(&mut self, material: Material, name: Option<&str>, load: LocatedLoader) -> Result<Value> {
         let mut warnings = material.warnings.clone();
         let ts = self.ts();
         let available = self.doc.project.texture_set(ts).map(|t| t.channel_list()).unwrap_or_default();
         let mut fill = Fill { projection: Projection::Uv { scale: material.uv_tiling, rotation: 0.0, offset: [0.0, 0.0] }, ..Fill::default() };
-        // Resources to add (name and encoded bytes), and their decoded images for the session.
+
         let mut added: Vec<(String, Arc<Vec<u8>>)> = Vec::new();
         let mut decoded = Vec::new();
+        let mut sources = Vec::new();
         let mut names: BTreeMap<String, String> = BTreeMap::new();
         let mut channels: Vec<Channel> = Vec::new();
         for (channel, value) in &material.channels {
@@ -52,15 +60,17 @@ impl Session {
                 warnings.push(format!("{} was skipped: this texture set has no such channel", channel.id()));
                 continue;
             }
+
             let source = match value {
                 Mtlx::Constant(c) => Source::Uniform(*c),
                 Mtlx::Image(file) => {
                     let resource = match names.get(file) {
                         Some(n) => n.clone(),
                         None => {
-                            let loaded =
-                                load(file).and_then(|bytes| texturecraft_formats::decode_image(&bytes).map(|image| (bytes, image)).map_err(|e| e.to_string()));
-                            let (bytes, image) = match loaded {
+                            let loaded = load(file).and_then(|(bytes, source)| {
+                                texturecraft_formats::decode_image(&bytes).map(|image| (bytes, image, source)).map_err(|e| e.to_string())
+                            });
+                            let (bytes, image, source) = match loaded {
                                 Ok(v) => v,
                                 Err(e) => {
                                     warnings.push(format!("{} was skipped: {file}: {e}", channel.id()));
@@ -69,11 +79,11 @@ impl Session {
                             };
                             let leaf = file.rsplit(['/', '\\']).next().unwrap_or(file);
                             let base = texturecraft_formats::sanitize_resource_name(leaf);
-                            let (mut unique, mut n) = (base.clone(), 2);
-                            while self.doc.resources.contains_key(&unique) || added.iter().any(|(a, _)| *a == unique) {
-                                unique = format!("{n}_{base}");
-                                n += 1;
-                            }
+                            let unique = crate::resource_cmds::unique_resource_name(base, |name| {
+                                self.doc.resources.contains_key(name) || added.iter().any(|(added_name, _)| added_name == name)
+                            });
+
+                            sources.extend(source.map(|source| (unique.clone(), source)));
                             added.push((unique.clone(), Arc::new(bytes)));
                             decoded.push((unique.clone(), crate::resource_cmds::decoded(image)));
                             names.insert(file.clone(), unique.clone());
@@ -90,12 +100,14 @@ impl Session {
             let why = if warnings.is_empty() { String::new() } else { format!(" ({})", warnings.join("; ")) };
             return Err(EngineError::Other(format!("file.importMaterialX: nothing to import from {:?}{why}", material.name)));
         }
+
         let layer_name = name.map(str::to_string).unwrap_or_else(|| self.doc.project.next_layer_name(ts, &material.name));
         let resource_names: Vec<String> = added.iter().map(|(n, _)| n.clone()).collect();
         let id = self.edit("Import MaterialX material", |s| {
             for (n, bytes) in &added {
                 s.doc.resources.insert(n.clone(), bytes.clone());
             }
+            s.doc.project.resource_sources.extend(sources);
             let id = s.doc.project.alloc_id();
             crate::layer_cmds::insert_selected(s, Layer::new(id, layer_name, LayerKind::Fill(fill), &channels))
         })?;
@@ -119,34 +131,42 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     if !meta.is_file() || meta.len() > texturecraft_formats::materialx_read::MAX_BYTES as u64 {
         return Err(bad(cmd, format!("{path} is not a MaterialX file of a readable size")));
     }
+
     let bytes = std::fs::read(path).map_err(|e| bad(cmd, format!("cannot read {path}: {e}")))?;
     let material = texturecraft_formats::materialx_read::read_materialx(&bytes, strp(p, "material")).map_err(|e| bad(cmd, format!("{path}: {e}")))?;
     let folder = Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let dir = folder.canonicalize().map_err(|e| bad(cmd, format!("cannot read the folder of {path}: {e}")))?;
-    let load = |file: &str| -> std::result::Result<Vec<u8>, String> {
-        // `<UDIM>` stands for a tile number; the first tile is read.
+    let load = |file: &str| -> std::result::Result<LocatedImage, String> {
+        // Import the first tile of a UDIM image
         let file = file.replace("<UDIM>", "1001");
         let rel = Path::new(&file);
         let outside = "the file is outside the material's folder";
         if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_) | Component::RootDir)) {
             return Err(outside.into());
         }
+
         let full = dir.join(rel).canonicalize().map_err(|e| e.to_string())?;
         if !full.starts_with(&dir) {
             return Err(outside.into());
         }
+
         let meta = std::fs::metadata(&full).map_err(|e| e.to_string())?;
-        // A pipe or device in the folder would block the read (a pipe reports no length).
+
+        // Avoid blocking on pipes and devices
         if !meta.is_file() {
             return Err("it is not a regular file".into());
         }
+
         let len = meta.len();
         if len > crate::resource_cmds::MAX_BYTES as u64 {
             return Err(format!("the file is over {} MB", crate::resource_cmds::MAX_BYTES >> 20));
         }
-        std::fs::read(&full).map_err(|e| e.to_string())
+
+        let source = full.to_str().map(crate::resource_update_cmds::file_source);
+        let bytes = std::fs::read(&full).map_err(|e| e.to_string())?;
+        Ok((bytes, source))
     };
-    s.import_material(material, strp(p, "name"), &load)
+    s.import_material_with_sources(material, strp(p, "name"), &load)
 }
 
 #[cfg(target_arch = "wasm32")]

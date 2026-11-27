@@ -2,6 +2,7 @@ use egui::{Align2, CornerRadius, FontId, Rect, Sense, Shape, Stroke, pos2, vec2}
 use egui_phosphor::regular as ic;
 
 use super::row::{EDGE_GLYPH_INSET, RESET_ICON_SIZE};
+use super::switch_control::PILL_SIZE;
 use super::{BandResponse, GROUP_GAP, PropertySheet, ROW_HEIGHT, TEXT_SIZE, open_card::OpenCard};
 use crate::theme::semibold;
 
@@ -171,6 +172,22 @@ impl PropertySheet<'_> {
         }
         self.drawn(center_y + TITLE_HALF_LINE);
         open
+    }
+
+    /// A card headed by its on/off switch: the bold name, the switch at the right edge; its settings follow while on, then [`Self::close_card`]. Returns whether the switch was clicked
+    pub(crate) fn switch_card(&mut self, title: &str, on: &mut bool) -> bool {
+        self.open_card();
+        self.scope = self.named_id("card", title);
+        let rect = self.take(CARD_NAME_CENTER + ROW_HEIGHT / 2.0);
+        let center_y = rect.top() + CARD_NAME_CENTER;
+        let hit = Rect::from_x_y_ranges(self.left..=self.right, (center_y - CARD_HIT_HALF_HEIGHT)..=(center_y + CARD_HIT_HALF_HEIGHT));
+        let clicked = self.toggle_hit(hit, title, on);
+
+        let tokens = self.tokens;
+        self.ui.painter().text(pos2(self.left, center_y), Align2::LEFT_CENTER, title, semibold(TEXT_SIZE), tokens.text);
+        self.pill(pos2(self.right - PILL_SIZE.x / 2.0, center_y), *on, true);
+        self.drawn(center_y + TITLE_HALF_LINE);
+        clicked
     }
 
     /// A sub-group inside the held card: its bold name on a hairline (no card in a card), a caret when it folds

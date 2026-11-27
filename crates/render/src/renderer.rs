@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use texturecraft_compose::{DisplayKind, ImageRes};
+use texturecraft_core::project::LEGACY_DIELECTRIC_F0_SCALE;
 use texturecraft_core::{Channel, DisplaySettings, EnvAlignment, Project, ToneMapping};
 use texturecraft_geom::glam::{Mat4, Vec3};
 use texturecraft_geom::{Mesh, OrbitCamera};
@@ -100,6 +101,7 @@ struct GlobalsRaw {
     refr: [f32; 4],
     highlight: [f32; 4],
     highlight_shift: [f32; 4],
+    set_hover: [f32; 4],
     bake_high: [f32; 4],
     bake_matching_error: [f32; 4],
     bake_cage: [f32; 4],
@@ -136,6 +138,9 @@ const HIGHLIGHT_WIDTH_PX: f32 = 1.5;
 
 /// Opacity of the highlighted set's edge lines
 const HIGHLIGHT_OPACITY: f32 = 0.9;
+
+/// Opacity of the texture-set hover tint over the shaded material.
+const SET_HOVER_OPACITY: f32 = 0.35;
 
 /// Copies of each highlight line, shifted diagonally to the four corners of its extra width (`vs_wire_highlight`)
 const HIGHLIGHT_SHIFTS: u32 = 4;
@@ -194,6 +199,8 @@ pub struct Shade {
     pub wireframe_opacity: f32,
     /// One texture set's mesh edges in a highlight color over the 3D view (the set under a shelf drag)
     pub highlight: Option<SetHighlight>,
+    /// The texture set whose visible surfaces are tinted in the 3D view.
+    pub set_hover: Option<SetHighlight>,
     /// Specular/glossiness shading: base color is the diffuse color and the Specular channel the
     /// F0 color (roughness arrives as 1 - glossiness from the display conversion).
     pub spec_gloss: bool,
@@ -206,6 +213,8 @@ pub struct Shade {
     pub scatter: [f32; 3],
     /// Index of refraction of the Transmission channel.
     pub ior: f32,
+    /// Multiplier for Specular Level when shading a dielectric in Metallic/Roughness.
+    pub dielectric_f0_scale: f32,
     /// Depth of field (3D material view): focus depth along the view axis (0: the orbit
     /// target) and lens radius as a fraction of the mesh's bounding radius.
     pub dof: Option<[f32; 2]>,
@@ -258,6 +267,7 @@ impl Shade {
             taa: d.taa,
             scatter: scatter_wrap(d),
             ior: d.ior,
+            dielectric_f0_scale: d.dielectric_f0_scale(),
             dof: d.dof.enabled.then_some([d.dof.focus_distance, d.dof.aperture]),
             displacement: d.displacement,
             solo_lit: !d.solo_unlit,
@@ -308,11 +318,13 @@ impl Default for Shade {
             wireframe_3d: false,
             wireframe_opacity: 0.4,
             highlight: None,
+            set_hover: None,
             spec_gloss: false,
             parallax: false,
             taa: false,
             scatter: scatter_wrap(&DisplaySettings::default()),
             ior: 1.5,
+            dielectric_f0_scale: LEGACY_DIELECTRIC_F0_SCALE,
             dof: None,
             sss_blur: None,
             refraction: false,
@@ -1941,8 +1953,8 @@ impl Renderer {
         ranges: &'a [(u32, u32, usize)],
         visible: &'a [bool],
         only: Option<usize>,
-    ) -> impl Iterator<Item = (std::ops::Range<u32>, &'a SetGpu)> + 'a {
-        drawable_ranges(ranges, &self.material_sets, visible, only).filter_map(|(range, ts)| Some((range, self.sets.get(ts)?)))
+    ) -> impl Iterator<Item = (std::ops::Range<u32>, usize, &'a SetGpu)> + 'a {
+        drawable_ranges(ranges, &self.material_sets, visible, only).filter_map(|(range, texture_set)| Some((range, texture_set, self.sets.get(texture_set)?)))
     }
 
     /// Keep the key-light shadow map current; returns its view-projection. `light` points to
@@ -2003,7 +2015,7 @@ impl Renderer {
             let geo = m.dense.as_ref().filter(|_| displacing).unwrap_or(&m.geo);
             pass.set_vertex_buffer(0, geo.vb.slice(..));
             pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&geo.draws, visible, None) {
+            for (range, _, set) in self.drawable(&geo.draws, visible, None) {
                 pass.set_bind_group(1, &set.bind_group, &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
@@ -2124,9 +2136,10 @@ impl Renderer {
             scatter: [s.scatter[0], s.scatter[1], s.scatter[2], if sss.is_some() { 1.0 } else { 0.0 }],
             fwd: [fwd.x, fwd.y, fwd.z, 0.0],
             disp,
-            refr: [if refraction { 1.0 } else { 0.0 }, (BEHIND_LEVELS - 1) as f32, REFRACTION_DEPTH * radius, 0.0],
-            highlight: highlight_globals(s, data),
+            refr: [if refraction { 1.0 } else { 0.0 }, (BEHIND_LEVELS - 1) as f32, REFRACTION_DEPTH * radius, s.dielectric_f0_scale],
+            highlight: highlight_globals(s.highlight, HIGHLIGHT_OPACITY, s, data),
             highlight_shift: highlight_shift(frame.size),
+            set_hover: highlight_globals(s.set_hover, SET_HOVER_OPACITY, s, data),
             ..bake_globals(s.bake)
         };
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
@@ -2135,11 +2148,12 @@ impl Renderer {
             b: [fx(s.vignette), fx(s.sharpen), fx(s.grain), BLOOM_THRESHOLD],
             c: dof_c,
             d: sss_d,
-            e: [flag(cam.ortho), sample as f32, 0.0, 0.0],
+            e: [flag(cam.ortho), sample as f32, raw.set_hover[3], 0.0],
             back_top: [s.background[0][0], s.background[0][1], s.background[0][2], 0.0],
             back_bottom: [s.background[1][0], s.background[1][1], s.background[1][2], 0.0],
         };
         let Some(v) = self.targets(device, frame.view_id, frame.size, bloom, fx_on, refraction) else { return };
+
         queue.write_buffer(&v.globals, 0, bytemuck::bytes_of(&raw));
         queue.write_buffer(&v.post_buf, 0, bytemuck::bytes_of(&post));
         upload_overlay(device, queue, v, &frame.overlay, (!data).then_some(s.exposure_ev));
@@ -2214,9 +2228,13 @@ impl Renderer {
         let geo = self.geometry(m, frame);
         pass.set_vertex_buffer(0, geo.vb.slice(..));
         pass.set_index_buffer(geo.ib.slice(..), wgpu::IndexFormat::Uint32);
-        for (range, set) in self.drawable(&geo.draws, &frame.visible, None) {
+
+        // Instance index 1 lets the G-buffer mark the hovered set for the scattering composite
+        let hover_set = frame.shade.set_hover.filter(|_| frame.kind == ViewKind::Scene).map(|hover| hover.set);
+        for (range, texture_set, set) in self.drawable(&geo.draws, &frame.visible, None) {
             pass.set_bind_group(1, &set.bind_group, &[]);
-            pass.draw_indexed(range, 0, 0..1);
+            let first_instance = u32::from(hover_set == Some(texture_set));
+            pass.draw_indexed(range, 0, first_instance..first_instance + 1);
         }
     }
 
@@ -2341,22 +2359,25 @@ impl Renderer {
         let bake = frame.shade.bake.filter(|_| uv_set.is_none());
         let low_poly_shown = bake.is_none_or(|bake| bake.low_poly.shown);
         let (highlight, highlight_set) = highlight.filter(|(_, set)| low_poly_shown && uv_set.is_none_or(|only| only == *set)).unzip();
+        let hover_set = frame.shade.set_hover.filter(|_| uv_set.is_none()).map(|hover| hover.set);
 
         // The wireframe and the highlight draw the mesh's own edges (displaced in the vertex shader too)
         let passes = [
-            (low_poly_shown.then_some(mesh_pipeline), &geometry.vb, &geometry.ib, &geometry.draws, uv_set, 1),
-            (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, uv_set, 1),
-            (highlight, &mesh.geo.vb, &mesh.lines, &mesh.line_draws, highlight_set, HIGHLIGHT_SHIFTS),
+            (low_poly_shown.then_some(mesh_pipeline), &geometry.vb, &geometry.ib, &geometry.draws, uv_set, 1, hover_set),
+            (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, uv_set, 1, None),
+            (highlight, &mesh.geo.vb, &mesh.lines, &mesh.line_draws, highlight_set, HIGHLIGHT_SHIFTS, None),
         ];
-        for (pipeline, vertices, indices, ranges, only_set, instances) in passes {
+        for (pipeline, vertices, indices, ranges, only_set, instances, hover_set) in passes {
             let Some(pipeline) = pipeline else { continue };
 
             pass.set_pipeline(pipeline);
             pass.set_vertex_buffer(0, vertices.slice(..));
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(ranges, &frame.visible, only_set) {
+            for (range, texture_set, set) in self.drawable(ranges, &frame.visible, only_set) {
+                // Instance index 1 lets the mesh shader tint the hovered draw
+                let first_instance = u32::from(hover_set == Some(texture_set));
                 pass.set_bind_group(1, &set.bind_group, &[]);
-                pass.draw_indexed(range, 0, 0..instances);
+                pass.draw_indexed(range, 0, first_instance..first_instance + instances);
             }
         }
 
@@ -2370,7 +2391,7 @@ impl Renderer {
             pass.set_pipeline(&self.uv_missing_seam_pipeline);
             pass.set_vertex_buffer(0, mesh.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, Some(texture_set)) {
+            for (range, _, set) in self.drawable(&seams.line_draws, &frame.visible, Some(texture_set)) {
                 pass.set_bind_group(1, &set.bind_group, &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
@@ -2404,7 +2425,7 @@ impl Renderer {
             pass.set_pipeline(&self.missing_seam_pipeline);
             pass.set_vertex_buffer(0, low_poly.geo.vb.slice(..));
             pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, None) {
+            for (range, _, set) in self.drawable(&seams.line_draws, &frame.visible, None) {
                 pass.set_bind_group(1, &set.bind_group, &[]);
                 pass.draw_indexed(range, 0, 0..1);
             }
@@ -2541,12 +2562,12 @@ fn upload_overlay(device: &wgpu::Device, queue: &wgpu::Queue, view: &mut ViewTar
     }
 }
 
-/// Globals `highlight`: the highlight's color and opacity, all zero without one. Data views skip exposure and tone mapping, so they take the color as it is
-fn highlight_globals(shade: &Shade, data: bool) -> [f32; 4] {
-    let Some(highlight) = shade.highlight else { return [0.0; 4] };
+/// The highlight's color and opacity. Data views take the color as it is.
+fn highlight_globals(highlight: Option<SetHighlight>, opacity: f32, shade: &Shade, data: bool) -> [f32; 4] {
+    let Some(highlight) = highlight else { return [0.0; 4] };
 
     let [r, g, b] = if data { highlight.color } else { highlight.scene_color(shade.exposure_ev, shade.aces) };
-    [r, g, b, HIGHLIGHT_OPACITY]
+    [r, g, b, opacity]
 }
 
 /// The globals of bake mode's overlays and neutral material for `bake` (all zero without it)
@@ -2678,8 +2699,8 @@ mod tests {
         let color = [0.8, 0.25, 0.08];
         let shade = Shade { highlight: Some(SetHighlight { set: 0, color }), exposure_ev: 1.0, ..Shade::default() };
 
-        assert_eq!(highlight_globals(&shade, true), [0.8, 0.25, 0.08, HIGHLIGHT_OPACITY]);
-        assert_ne!(highlight_globals(&shade, false)[..3], color, "the material view undoes exposure and tone mapping");
+        assert_eq!(highlight_globals(shade.highlight, HIGHLIGHT_OPACITY, &shade, true), [0.8, 0.25, 0.08, HIGHLIGHT_OPACITY]);
+        assert_ne!(highlight_globals(shade.highlight, HIGHLIGHT_OPACITY, &shade, false)[..3], color, "the material view undoes exposure and tone mapping");
     }
 
     #[test]

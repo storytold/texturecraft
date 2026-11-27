@@ -5,12 +5,14 @@
 <mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
   <mime-type type="application/x-texturecraft">
     <comment>TextureCraft project</comment>
+    <comment xml:lang="ru">Проект TextureCraft</comment>
     <sub-class-of type="application/zip"/>
     <icon name="ai.storyteller.texturecraft"/>
     <glob pattern="*.tcraft" weight="60"/>
   </mime-type>
   <mime-type type="model/gltf-binary">
     <comment>glTF binary model</comment>
+    <comment xml:lang="ru">Двоичная модель glTF</comment>
     <magic priority="50">
       <match type="string" value="glTF" offset="0"/>
     </magic>
@@ -18,11 +20,13 @@
   </mime-type>
   <mime-type type="model/gltf+json">
     <comment>glTF model</comment>
+    <comment xml:lang="ru">Модель glTF</comment>
     <sub-class-of type="application/json"/>
     <glob pattern="*.gltf"/>
   </mime-type>
   <mime-type type="model/x-fbx">
     <comment>FBX model</comment>
+    <comment xml:lang="ru">Модель FBX</comment>
     <magic priority="50">
       <match type="string" value="Kaydara FBX Binary" offset="0"/>
     </magic>
@@ -30,11 +34,13 @@
   </mime-type>
   <mime-type type="model/vnd.collada+xml">
     <comment>COLLADA model</comment>
+    <comment xml:lang="ru">Модель COLLADA</comment>
     <sub-class-of type="application/xml"/>
     <glob pattern="*.dae"/>
   </mime-type>
   <mime-type type="model/x-usd">
     <comment>Universal Scene Description</comment>
+    <comment xml:lang="ru">Universal Scene Description</comment>
     <magic priority="50">
       <match type="string" value="PXR-USDC" offset="0"/>
       <match type="string" value="#usda" offset="0"/>
@@ -44,17 +50,20 @@
   </mime-type>
   <mime-type type="model/vnd.usda">
     <comment>Universal Scene Description (text)</comment>
+    <comment xml:lang="ru">Universal Scene Description (текст)</comment>
     <sub-class-of type="text/plain"/>
     <glob pattern="*.usda"/>
   </mime-type>
   <mime-type type="model/vnd.usdz+zip">
     <comment>Universal Scene Description package</comment>
+    <comment xml:lang="ru">Пакет Universal Scene Description</comment>
     <sub-class-of type="application/zip"/>
     <glob pattern="*.usdz"/>
   </mime-type>
   <!-- *.abc is also ABC music notation; the Ogawa magic tells Alembic caches apart. -->
   <mime-type type="model/x-alembic">
     <comment>Alembic model</comment>
+    <comment xml:lang="ru">Модель Alembic</comment>
     <magic priority="60">
       <match type="string" value="Ogawa" offset="0"/>
     </magic>
@@ -62,11 +71,13 @@
   </mime-type>
   <mime-type type="model/obj">
     <comment>Wavefront OBJ model</comment>
+    <comment xml:lang="ru">Модель Wavefront OBJ</comment>
     <sub-class-of type="text/plain"/>
     <glob pattern="*.obj"/>
   </mime-type>
   <mime-type type="model/x-ply">
     <comment>PLY model</comment>
+    <comment xml:lang="ru">Модель PLY</comment>
     <magic priority="50">
       <match type="string" value="ply\n" offset="0"/>
       <match type="string" value="ply\r\n" offset="0"/>
@@ -75,6 +86,7 @@
   </mime-type>
   <mime-type type="model/stl">
     <comment>STL model</comment>
+    <comment xml:lang="ru">Модель STL</comment>
     <glob pattern="*.stl"/>
   </mime-type>
 </mime-info>

@@ -55,7 +55,10 @@ fn color_selection_session(with_id_map: bool) -> (texturecraft_engine::Session, 
 
 fn app_with_color_selection(with_id_map: bool) -> (Harness<'static, TextureCraftApp>, LayerId) {
     let (session, effect) = color_selection_session(with_id_map);
-    let mut harness = Harness::builder().with_size(PROPERTIES_WINDOW).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(STARTUP_FRAMES);
     (harness, effect)
 }
@@ -294,11 +297,16 @@ fn removing_an_image_during_id_picking_falls_back_to_material() {
 #[ignore = "requires a GPU adapter; set TC_UI_SNAPSHOTS to save the rendered views"]
 fn color_selection_snapshots_and_quick_mask_pick() {
     let (session, _) = color_selection_session(true);
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|context| {
-        let mut app = TextureCraftApp::new(context, session);
-        app.ui.layout = texturecraft_ui_egui::state::ViewLayout::Only3D;
-        app
-    });
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| {
+            let mut app = TextureCraftApp::new(context, session);
+            app.ui.layout = texturecraft_ui_egui::state::ViewLayout::Only3D;
+            app
+        });
     let adapter = harness.state().render_state.as_ref().unwrap().adapter.get_info();
     eprintln!("Offscreen adapter: {adapter:?}");
 
@@ -393,7 +401,10 @@ fn the_background_list_leaves_the_view_its_wheel_and_closes_on_escape_or_a_click
 fn the_id_mask_slot_picks_a_texture_and_its_x_goes_back_to_the_mesh_map() {
     let (mut session, effect) = color_selection_session(true);
     let texture = session.import_resource_bytes("parts.png", id_map_png()).unwrap();
-    let mut harness = Harness::builder().with_size(PROPERTIES_WINDOW).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(STARTUP_FRAMES);
 
     harness.get_by_role_and_label(Role::ComboBox, "ID Mask").click();
@@ -419,7 +430,10 @@ fn tile_is_current(harness: &Harness<'_, TextureCraftApp>, label: &str) -> bool 
 fn reading_the_mesh_map_shows_no_tile_as_the_current_id_mask() {
     let (mut session, effect) = color_selection_session(true);
     let texture = session.import_resource_bytes("parts.png", id_map_png()).unwrap();
-    let mut harness = Harness::builder().with_size(PROPERTIES_WINDOW).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(STARTUP_FRAMES);
 
     assert_eq!(selection(&harness, effect).id_map, None, "the selection reads the ID mesh map");
@@ -456,8 +470,12 @@ fn the_invert_tooltip_shows_right_above_its_button() {
 #[ignore = "requires a GPU adapter; set TC_UI_SNAPSHOTS to save the rendered view"]
 fn invert_tooltip_snapshot() {
     let (session, _) = color_selection_session(true);
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(STARTUP_FRAMES);
     let invert = harness.get_by_role_and_label(Role::Button, "Invert").rect();
     harness.hover_at(invert.center());
@@ -474,7 +492,10 @@ fn a_hand_picked_id_mask_picks_without_a_bake() {
     session.doc.baked.clear();
     let texture = session.import_resource_bytes("parts.png", id_map_png()).unwrap();
     execute(&mut session, "effect.set", &json!({"effect": effect.0, "idMap": texture})).unwrap();
-    let mut harness = Harness::builder().with_size(PROPERTIES_WINDOW).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(STARTUP_FRAMES);
 
     harness.get_by_label(PICK_COLOR).click();
@@ -496,7 +517,10 @@ fn clearing_the_only_id_mask_ends_a_waiting_pick() {
     session.doc.baked.clear();
     let texture = session.import_resource_bytes("parts.png", id_map_png()).unwrap();
     execute(&mut session, "effect.set", &json!({"effect": effect.0, "idMap": texture})).unwrap();
-    let mut harness = Harness::builder().with_size(PROPERTIES_WINDOW).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(STARTUP_FRAMES);
     harness.get_by_label(PICK_COLOR).click();
     harness.run_steps(SETTLE_FRAMES);

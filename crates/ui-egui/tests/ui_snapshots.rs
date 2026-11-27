@@ -30,6 +30,7 @@ fn lowest_list<'a>(harness: &'a Harness<'_, TextureCraftApp>, label: &'a str) ->
 
 fn save(harness: &mut Harness<'_, TextureCraftApp>, dir: &Path, name: &str) {
     harness.run_steps(6);
+
     // Material orbs render off the UI thread: wait for their full pictures
     let start = std::time::Instant::now();
     while !texturecraft_ui_egui::orb_previews::OrbPreviews::settled(&harness.ctx) && start.elapsed() < std::time::Duration::from_secs(20) {
@@ -40,16 +41,18 @@ fn save(harness: &mut Harness<'_, TextureCraftApp>, dir: &Path, name: &str) {
     let img = harness.render().unwrap_or_else(|e| panic!("{name}: {e}"));
     let path = dir.join(format!("{name}.png"));
     img.save(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let tree = [egui::Role::Button, egui::Role::SpinButton, egui::Role::CheckBox]
+
+    let control_roles = [egui::Role::Button, egui::Role::CheckBox, egui::Role::ComboBox, egui::Role::Slider, egui::Role::SpinButton, egui::Role::TextInput];
+    let control_tree = control_roles
         .into_iter()
-        .flat_map(|role| harness.get_all_by_role(role))
-        .filter_map(|button| {
-            let node = button.accesskit_node();
-            node.label().map(|label| format!("{label}: disabled={}, checked={:?}", node.is_disabled(), node.toggled()))
+        .flat_map(|role| harness.query_all_by_role(role).map(move |control| (role, control)))
+        .filter_map(|(role, control)| {
+            let node = control.accesskit_node();
+            node.label().map(|label| format!("{role:?} {label}: disabled={}, checked={:?}", node.is_disabled(), node.toggled()))
         })
         .collect::<Vec<_>>()
         .join("\n");
-    std::fs::write(dir.join(format!("{name}.txt")), tree).unwrap();
+    std::fs::write(dir.join(format!("{name}.txt")), control_tree).unwrap();
     eprintln!("wrote {}", path.display());
 }
 
@@ -59,7 +62,10 @@ fn empty_start_snapshot() {
     let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
     std::fs::create_dir_all(&output_dir).unwrap();
     let session = texturecraft_engine::Session::closed().unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.prefs.language = "en".into();
 
     save(&mut harness, &output_dir, "empty-start");
@@ -83,6 +89,9 @@ fn empty_start_snapshot() {
     harness.get_by_label("Edit").click();
     harness.run_steps(3);
     harness.get_by_label("Settings").click();
+    harness.run_steps(3);
+    harness.get_by_label("Recent projects limit").scroll_to_me();
+    harness.run_steps(3);
     save(&mut harness, &output_dir, "settings-recent-project-limit");
     assert!(!harness.get_by_label("Recent projects limit").accesskit_node().is_disabled());
 }
@@ -92,7 +101,11 @@ fn empty_start_snapshot() {
 #[ignore]
 fn close_releases_view_targets_and_rejects_immediate_capture() {
     let session = texturecraft_engine::Session::closed().unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(960.0, 640.0)).wgpu().build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(960.0, 640.0))
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.prefs.language = "en".into();
 
     for mesh in ["cube", "plane"] {
@@ -154,8 +167,11 @@ fn brush_presets_popover_snapshot() {
 
     std::fs::create_dir_all(&output_dir).unwrap();
     let session = texturecraft_engine::sample_session(128, 32).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_pixels_per_point(1.0).build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1280.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     let brush = harness.state().session.tool.brush.clone();
     harness.state_mut().session.brush_presets.list.clear();
     harness.state_mut().ui.prefs.language = "en".into();
@@ -192,6 +208,7 @@ fn pbr_import_dialog_keeps_choices_after_error() {
         .with_size(egui::vec2(1280.0, 800.0))
         .with_pixels_per_point(1.0)
         .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
         .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.prefs.language = "en".into();
     texturecraft_ui_egui::pbr_import::begin(harness.state_mut(), serde_json::json!({"path": source_dir.display().to_string()}));
@@ -227,6 +244,7 @@ fn pbr_import_uses_displayed_default_after_folder_changes() {
         .with_size(egui::vec2(1280.0, 800.0))
         .with_pixels_per_point(1.0)
         .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
         .build_eframe(|context| TextureCraftApp::new(context, session));
     texturecraft_ui_egui::pbr_import::begin(harness.state_mut(), serde_json::json!({"path": source_dir.display().to_string()}));
     std::fs::write(source_dir.join("tile_albedo_8k.png"), &bytes).unwrap();
@@ -261,6 +279,7 @@ fn pbr_drop_candidates_and_project_replacement() {
         .with_size(egui::vec2(1280.0, 800.0))
         .with_pixels_per_point(1.0)
         .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
         .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.input_mut().dropped_files = files.iter().cloned().map(dropped_path::handle).collect();
     harness.run_steps(1);
@@ -295,6 +314,7 @@ fn pbr_dialog_is_cleared_when_project_changes() {
         .with_size(egui::vec2(1280.0, 800.0))
         .with_pixels_per_point(1.0)
         .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
         .build_eframe(|context| TextureCraftApp::new(context, session));
     texturecraft_ui_egui::pbr_import::begin(harness.state_mut(), serde_json::json!({"path": source_dir.display().to_string()}));
     assert!(harness.state().pbr_import.is_some());
@@ -316,6 +336,7 @@ fn rendering_mode_snapshots() {
         .with_size(egui::vec2(1280.0, 800.0))
         .with_pixels_per_point(1.0)
         .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
         .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.mode = Mode::Rendering;
     harness.state_mut().ui.render.max_samples = 16;
@@ -345,8 +366,12 @@ fn symmetry_snapshots() {
 
     std::fs::create_dir_all(&output_dir).unwrap();
     let session = texturecraft_engine::sample_session(1024, 256).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().run("tool.brush", serde_json::json!({"symmetryY": true, "symmetryOffset": [0, 0.1, 0]})).unwrap();
     harness.state_mut().ui.symmetry.show_plane = true;
@@ -381,8 +406,12 @@ fn window_snapshots() {
 
     std::fs::create_dir_all(&output_dir).unwrap();
     let session = texturecraft_engine::sample_session(1024, 256).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     for (brightness, name) in [(Brightness::MediumDark, "main"), (Brightness::Dark, "brightness-dark"), (Brightness::Light, "brightness-light")] {
         harness.state_mut().ui.prefs.brightness = brightness;
         save(&mut harness, &output_dir, name);
@@ -424,7 +453,11 @@ fn window_snapshots() {
     save(&mut harness, &output_dir, "bake-settings-cage-skew");
     harness.get_by_label("Edge Contrast").scroll_to_me();
     save(&mut harness, &output_dir, "bake-settings-skew");
-    harness.get_by_label("Output Size").scroll_to_me();
+    let output_width = harness
+        .get_all_by_role_and_label(egui::Role::ComboBox, "Output Size")
+        .find(|choice| !choice.accesskit_node().is_disabled())
+        .expect("the linked output size has an enabled width control");
+    output_width.scroll_to_me();
     harness.state_mut().session.doc.project.texture_sets[0].bake.common.resolution_height = Some(BakeResolution::R1024);
     save(&mut harness, &output_dir, "bake-settings-unlocked");
     harness.set_pixels_per_point(1.5);
@@ -441,7 +474,7 @@ fn window_snapshots() {
     save(&mut harness, &output_dir, "bake-curvature-mesh");
     select_map(&mut harness, "Height");
     save(&mut harness, &output_dir, "bake-height-manual");
-    harness.state_mut().session.bake_meshes.high.clear();
+    harness.state_mut().session.doc.bake_meshes.high.clear();
     harness.state_mut().ui.mode = Mode::Painting;
     save(&mut harness, &output_dir, "painting-restored");
 
@@ -561,6 +594,7 @@ fn bake_uv_tiles_snapshot() {
         .with_size(egui::vec2(1600.0, 960.0))
         .with_pixels_per_point(1.0)
         .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
         .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.mode = Mode::Baking;
     save(&mut harness, &output_dir, "bake-uv-tiles");
@@ -600,8 +634,12 @@ fn smart_mask_shelf_snapshot() {
     std::fs::create_dir_all(&output_dir).unwrap();
     let session =
         texturecraft_engine::Session::new_project("Mask previews", texturecraft_engine::geom::primitives::cube(2.0), "builtin:cube", None, 128).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.shelf_tab = 2;
     let context = harness.ctx.clone();
     let started = std::time::Instant::now();
@@ -649,11 +687,16 @@ fn smart_material_shelf_snapshot() {
     let session =
         texturecraft_engine::Session::new_project("Smart material previews", texturecraft_engine::geom::primitives::cube(2.0), "builtin:cube", None, 128)
             .unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|context| {
-        let render_state = context.wgpu_render_state.as_ref().expect("the snapshot uses wgpu");
-        eprintln!("snapshot adapter: {:?}", render_state.adapter.get_info());
-        TextureCraftApp::new(context, session)
-    });
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| {
+            let render_state = context.wgpu_render_state.as_ref().expect("the snapshot uses wgpu");
+            eprintln!("snapshot adapter: {:?}", render_state.adapter.get_info());
+            TextureCraftApp::new(context, session)
+        });
     harness.state_mut().ui.shelf_tab = 1;
     let context = harness.ctx.clone();
     let started = std::time::Instant::now();
@@ -690,8 +733,8 @@ fn smart_material_shelf_snapshot() {
 #[test]
 #[ignore]
 fn nested_layers_snapshot() {
-    use craft_ui::docking::Node;
-    use craft_ui::layout::SplitSize;
+    use craft_behavior::dock::Node;
+    use craft_behavior::dock::SplitSize;
     use serde_json::{Value, json};
     use texturecraft_engine::execute;
     use texturecraft_ui_egui::docking::Dock;
@@ -705,13 +748,19 @@ fn nested_layers_snapshot() {
     for _ in 0..6 {
         execute(&mut session, "layer.group", &Value::Null).unwrap();
     }
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1600.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1600.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(4);
-    let mut workspace = harness.state().ui.dock.workspace().clone();
-    let Some(Node::Split { second, .. }) = workspace.layout.root.as_mut() else { panic!("default columns") };
+    let workspace = harness.state().ui.dock.workspace().clone();
+    let mut layout = workspace.layout().clone();
+    let Some(Node::Split { second, .. }) = layout.root.as_mut() else { panic!("default columns") };
     let Node::Split { size, .. } = second.as_mut() else { panic!("viewport and right column") };
     *size = SplitSize::Ratio(0.99);
+    let workspace = texturecraft_ui_egui::docking::Workspace::from_parts(layout, workspace.hidden().to_vec(), workspace.floated().to_vec());
     harness.state_mut().ui.dock = Dock::from_value(serde_json::to_value(workspace).unwrap());
     for _ in 0..100 {
         harness.run_steps(1);
@@ -747,10 +796,18 @@ fn mask_anchor_micro_detail_snapshot() {
         .with_size(egui::vec2(1600.0, 1200.0))
         .with_pixels_per_point(1.0)
         .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
         .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.dock.focus(Panel::Properties);
     harness.run_steps(6);
-    harness.get_by_label("Micro detail").scroll_to_me();
+    harness.get_by_role_and_label(egui::Role::Button, "Micro Details").scroll_to_me();
+    harness.run_steps(3);
+    harness.get_by_role_and_label(egui::Role::Button, "Micro Details").click();
+    harness.run_steps(3);
+
+    let height = harness.get_by_role_and_label(egui::Role::ComboBox, "Micro Height");
+    assert!(height.accesskit_node().value().is_some_and(|value| value.contains("Wear")));
+    height.scroll_to_me();
     save(&mut harness, &output_dir, "mask-anchor-micro-detail");
 }
 
@@ -763,8 +820,12 @@ fn path_tool_snapshots() {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     texturecraft_engine::execute(&mut session, "layer.add.paint", &serde_json::Value::Null).unwrap();
     texturecraft_engine::execute(&mut session, "tool.path", &serde_json::json!({"uvPoints": [[0.25, 0.5], [0.5, 0.3], [0.75, 0.5]]})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.layout = texturecraft_ui_egui::state::ViewLayout::Only2D;
     harness.state_mut().session.select_path_point(1);
     harness.hover_at(egui::pos2(800.0, 600.0));
@@ -784,8 +845,12 @@ fn rail_window_snapshots() {
 
     std::fs::create_dir_all(&output_dir).unwrap();
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.dock.close(Panel::TextureSetSettings);
     let context = harness.ctx.clone();
@@ -821,8 +886,12 @@ fn i18n_snapshots() {
     for code in ["en", "es", "ar"] {
         assert!(texturecraft_ui_egui::i18n::available(code), "build with migrated catalogs for {code}");
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
-        let mut harness =
-            Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1600.0, 960.0))
+            .with_pixels_per_point(1.0)
+            .wgpu()
+            .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+            .build_eframe(|cc| TextureCraftApp::new(cc, session));
         harness.state_mut().ui.prefs.language = code.into();
         harness.state_mut().ui.windows.settings = true;
         save(&mut harness, &output_dir, &format!("i18n-{code}"));
@@ -856,7 +925,11 @@ fn mask_fill_image_snapshot() {
     execute(&mut session, "mask.add.black", &json!({})).unwrap();
     let effect = execute(&mut session, "effect.add.fill", &json!({"target": "mask", "value": 1.0})).unwrap()["effect"].as_u64().unwrap();
     execute(&mut session, "layer.select", &json!({"layer": layer, "target": effect})).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1100.0)).wgpu().build_eframe(|context| TextureCraftApp::new(context, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1100.0))
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
 
@@ -896,8 +969,12 @@ fn panel_header_snapshots() {
     std::fs::create_dir_all(&output_dir).unwrap();
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     execute(&mut session, "layer.add.fill", &json!({"color": [0.8, 0.3, 0.1]})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     for (brightness, name) in [(Brightness::MediumDark, "medium"), (Brightness::Dark, "dark"), (Brightness::Light, "light")] {
         harness.state_mut().ui.prefs.brightness = brightness;
@@ -923,8 +1000,12 @@ fn settings_pages_snapshot() {
     let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
     std::fs::create_dir_all(&output_dir).unwrap();
     let session = texturecraft_engine::sample_session(128, 32).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.windows.settings = true;
     save(&mut harness, &output_dir, "settings-general");
@@ -967,8 +1048,12 @@ fn default_layout_snapshots() {
     for color in [[0.2, 0.4, 0.7], [0.5, 0.5, 0.5], [0.8, 0.3, 0.1]] {
         execute(&mut session, "layer.add.fill", &json!({ "color": color })).unwrap();
     }
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     for (brightness, name) in [(Brightness::MediumDark, "medium"), (Brightness::Dark, "dark"), (Brightness::Light, "light")] {
         harness.state_mut().ui.prefs.brightness = brightness;
@@ -996,8 +1081,12 @@ fn fill_reset_snapshots() {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     let layer = execute(&mut session, "layer.add.fill", &json!({"color": [0.8, 0.3, 0.1]})).unwrap()["layer"].clone();
     execute(&mut session, "layer.fill.projection", &json!({"layer": layer, "tiling": [2.0, 2.0], "filtering": "nearest"})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     for (brightness, name) in [(Brightness::MediumDark, "medium"), (Brightness::Dark, "dark"), (Brightness::Light, "light")] {
         harness.state_mut().ui.prefs.brightness = brightness;
@@ -1050,8 +1139,12 @@ fn fill_properties_snapshots() {
         &json!({"layer": layer, "tiling": [2.0, 2.0], "rotation": 30.0, "offset": [0.25, 0.0], "wrap": "repeat", "filtering": "bilinearHq"}),
     )
     .unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1500.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1500.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     for (brightness, name) in [(Brightness::MediumDark, "medium"), (Brightness::Dark, "dark"), (Brightness::Light, "light")] {
         harness.state_mut().ui.prefs.brightness = brightness;
@@ -1181,8 +1274,12 @@ fn fill_symmetry_snapshots() {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     let layer = execute(&mut session, "layer.add.fill", &json!({"color": [0.8, 0.3, 0.1]})).unwrap()["layer"].clone();
     execute(&mut session, "layer.fill.projection", &json!({"layer": layer, "projection": "planar"})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1500.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1500.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     harness.get_by_role_and_label(egui::Role::Tab, "Symmetry").click();
@@ -1265,8 +1362,12 @@ fn fill_color_picker_snapshots() {
     for swatch in ["#E58A4E", "#BEBEBE", "#3C4046", "#7A7AF5", "#B0623A"] {
         execute(&mut session, "swatch.add", &json!({"color": swatch})).unwrap();
     }
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 2000.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 2000.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     harness.get_by_role_and_label(egui::Role::Tab, "Material").click();
@@ -1361,8 +1462,12 @@ fn fill_material_snapshots() {
         settings["layer"] = json!(layer);
         execute(&mut session, "layer.fill.set", &settings).unwrap();
     }
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1500.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1500.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     harness.get_by_role_and_label(egui::Role::Tab, "Material").click();
@@ -1513,8 +1618,12 @@ fn eyedropper_pointer_snapshots() {
     for (name, color) in [("light", [0.92, 0.92, 0.9]), ("dark", [0.01, 0.01, 0.012])] {
         let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
         execute(&mut session, "layer.add.fill", &json!({"color": color})).unwrap();
-        let mut harness =
-            Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1600.0, 960.0))
+            .with_pixels_per_point(1.0)
+            .wgpu()
+            .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+            .build_eframe(|cc| TextureCraftApp::new(cc, session));
         harness.state_mut().ui.prefs.language = "en".into();
 
         // Only the app's own pointer shows, not the test's stand-in arrow
@@ -1569,8 +1678,12 @@ fn source_picker_snapshots() {
     let below = execute(&mut session, "layer.add.fill", &json!({})).unwrap()["layer"].clone();
     execute(&mut session, "effect.add.anchor", &json!({"layer": below, "name": "Edge wear"})).unwrap();
     let layer = execute(&mut session, "layer.add.fill", &json!({"color": [0.45, 0.13, 0.05]})).unwrap()["layer"].clone();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     harness.get_by_role_and_label(egui::Role::Tab, "Material").click();
@@ -1656,8 +1769,12 @@ fn info_icon_snapshots() {
     let layer = execute(&mut session, "layer.add.fill", &json!({"color": [0.8, 0.3, 0.1]})).unwrap()["layer"].clone();
     execute(&mut session, "layer.fill.projection", &json!({"layer": layer, "projection": "planar"})).unwrap();
     execute(&mut session, "layer.fill.projection", &json!({"layer": layer, "scaleMode": "physicalSize", "backfaceCulling": true})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1500.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1500.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
 
     // The test's stand-in arrow would hide the hovered i
@@ -1695,8 +1812,12 @@ fn popup_tabs_snapshots() {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     let layer = execute(&mut session, "layer.add.fill", &json!({"color": [0.8, 0.3, 0.1]})).unwrap()["layer"].clone();
     execute(&mut session, "layer.fill.projection", &json!({"layer": layer, "projection": "uv"})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.set_render_cursor(false);
     harness.run_steps(4);
@@ -1768,8 +1889,12 @@ fn mask_fill_snapshots() {
     let layer = execute(&mut session, "layer.add.paint", &json!({})).unwrap()["layer"].clone();
     let effect = execute(&mut session, "effect.add.fill", &json!({"layer": layer, "target": "mask"})).unwrap()["effect"].clone();
     execute(&mut session, "layer.select", &json!({"layer": layer, "target": effect})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     save(&mut harness, &output_dir, "mask-fill-fill");
@@ -1845,8 +1970,12 @@ fn compare_snapshots() {
     }
     let compare = execute(&mut session, "effect.add.compare", &json!({"layer": layer})).unwrap()["effect"].clone();
     execute(&mut session, "layer.select", &json!({"layer": layer, "target": compare})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     save(&mut harness, &output_dir, "compare-default");
@@ -1896,8 +2025,12 @@ fn anchor_snapshots() {
     let fresh = execute(&mut session, "layer.add.fill", &json!({})).unwrap()["layer"].clone();
     let content = execute(&mut session, "effect.add.anchor", &json!({"layer": fresh})).unwrap()["effect"].clone();
     execute(&mut session, "layer.select", &json!({"layer": fresh, "target": content})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     harness.get_by_role_and_label(egui::Role::TextInput, "Anchor point name").click();
@@ -1935,8 +2068,12 @@ fn folder_snapshots() {
     execute(&mut session, "layer.fill.set", &json!({"layer": fill, "channel": "baseColor", "procedural": "Clouds"})).unwrap();
     let folder = execute(&mut session, "layer.group", &json!({"layer": fill})).unwrap()["layer"].clone();
     execute(&mut session, "layer.select", &json!({"layer": folder, "target": "content"})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     save(&mut harness, &output_dir, "folder-rest");
@@ -1975,8 +2112,12 @@ fn instance_snapshots() {
     execute(&mut session, "layer.fill.set", &json!({"layer": source, "channel": "baseColor", "color": [0.78, 0.29, 0.09]})).unwrap();
     let instance = execute(&mut session, "layer.instance", &json!({"layer": source})).unwrap()["layer"].clone();
     execute(&mut session, "layer.select", &json!({"layer": instance, "target": "content"})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     save(&mut harness, &output_dir, "instance-rest");
@@ -2018,8 +2159,12 @@ fn folder_mask_snapshots() {
     let folder = execute(&mut session, "layer.add.group", &json!({})).unwrap()["layer"].clone();
     execute(&mut session, "mask.add.white", &json!({"layer": folder})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": folder, "target": "mask"})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.state_mut().ui.props_tab = texturecraft_ui_egui::state::PropsTab::Material;
     harness.run_steps(6);
@@ -2064,8 +2209,12 @@ fn color_selection_snapshots() {
             execute(&mut session, "effect.set", &json!({"effect": effect.0, "colors": colors})).unwrap();
         }
         execute(&mut session, "layer.select", &json!({"layer": layer, "target": effect.0})).unwrap();
-        let mut harness =
-            Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1600.0, 1200.0))
+            .with_pixels_per_point(2.0)
+            .wgpu()
+            .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+            .build_eframe(|cc| TextureCraftApp::new(cc, session));
         harness.state_mut().ui.prefs.language = "en".into();
         harness.run_steps(6);
         harness
@@ -2147,8 +2296,12 @@ fn levels_snapshots() {
     let mask_levels = execute(&mut session, "effect.add.levels", &json!({"layer": layer, "target": "mask"})).unwrap()["effect"].clone();
     let content_levels = execute(&mut session, "effect.add.levels", &json!({"layer": layer, "target": "content"})).unwrap()["effect"].clone();
     execute(&mut session, "layer.select", &json!({"layer": layer, "target": mask_levels})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     save(&mut harness, &output_dir, "levels-mask");
@@ -2204,8 +2357,12 @@ fn layer_toolbar_snapshots() {
     execute(&mut session, "effect.add.generator", &json!({"layer": dirt, "generator": "dirt"})).unwrap();
     let fill = execute(&mut session, "layer.add.fill", &json!({})).unwrap()["layer"].clone();
     execute(&mut session, "layer.select", &json!({"layer": fill})).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     harness.state_mut().ui.dock.focus(Panel::Layers);
@@ -2272,8 +2429,12 @@ fn filter_card_snapshots() {
     let invert = add(&mut session, json!({"layer": layer, "target": "content", "filter": "invert"}));
     execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
     session.target = StackTarget::Effect(empty);
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
 
@@ -2326,8 +2487,12 @@ fn material_picker_snapshots() {
     execute(&mut session, "layer.fill.material", &json!({"layer": layer, "material": "copper"})).unwrap();
     execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
     session.target = StackTarget::Content;
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 2000.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 2000.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(4);
     harness.get_by_role_and_label(egui::Role::Tab, "Material").click();
@@ -2380,8 +2545,12 @@ fn colour_filter_snapshots() {
     ];
     execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
     session.target = StackTarget::Effect(effects[0].1);
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     for (name, effect) in effects {
@@ -2431,8 +2600,12 @@ fn gradient_filter_snapshots() {
     ];
     execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
     session.target = StackTarget::Effect(effects[0].1);
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     for (name, effect) in effects {
@@ -2481,8 +2654,12 @@ fn light_filter_snapshots() {
     let effects = [("glow", add("glow")), ("drop-shadow", add("dropShadow"))];
     execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
     session.target = StackTarget::Effect(effects[0].1);
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     for (name, effect) in effects {
@@ -2515,8 +2692,12 @@ fn light_filter_snapshots() {
     let environment = LayerId(execute(&mut session, "effect.add.filter", &params).unwrap()["effect"].as_u64().unwrap());
     execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
     session.target = StackTarget::Effect(lighting);
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 2600.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 2600.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(8);
     save(&mut harness, &output_dir, "filter-baked-lighting-stylized");
@@ -2588,8 +2769,12 @@ fn shape_filter_snapshots() {
     ];
     execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
     session.target = StackTarget::Effect(effects[0].1);
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     for (name, effect) in effects {
@@ -2709,8 +2894,12 @@ fn simple_filter_snapshots() {
     let replace = LayerId(execute(&mut session, "effect.add.filter", &params).unwrap()["effect"].as_u64().unwrap());
     execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
     session.target = StackTarget::Effect(effects[0].1);
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1400.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     for (name, effect) in effects {
@@ -2833,8 +3022,12 @@ fn image_input_snapshots() {
     ];
     execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
     session.target = StackTarget::Effect(effects[0].1);
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 2200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 2200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     for (name, effect) in effects {
@@ -2906,8 +3099,12 @@ fn filter_picker_snapshots() {
     let masked = add(&mut session, json!({"layer": layer, "target": "mask", "filter": "none"}));
     execute(&mut session, "layer.select", &json!({"layer": layer})).unwrap();
     session.target = StackTarget::Effect(empty);
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1200.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1200.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(6);
     let open = |harness: &mut Harness<'_, TextureCraftApp>, card: &str, hover: &str| {
@@ -2937,8 +3134,8 @@ fn filter_picker_snapshots() {
 #[test]
 #[ignore]
 fn properties_min_width_snapshot() {
-    use craft_ui::docking::Node;
-    use craft_ui::layout::SplitSize;
+    use craft_behavior::dock::Node;
+    use craft_behavior::dock::SplitSize;
     use serde_json::json;
     use texturecraft_engine::execute;
     use texturecraft_ui_egui::docking::Dock;
@@ -2949,13 +3146,19 @@ fn properties_min_width_snapshot() {
     let layer = execute(&mut session, "layer.add.fill", &json!({"color": [0.8, 0.3, 0.1]})).unwrap()["layer"].clone();
     let settings = json!({"layer": layer, "projection": "planar", "scaleMode": "physicalSize", "backfaceCulling": true, "shapeCrop": "cropped"});
     execute(&mut session, "layer.fill.projection", &settings).unwrap();
-    let mut harness =
-        Harness::builder().with_size(egui::vec2(1600.0, 1500.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1500.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.run_steps(4);
-    let mut workspace = harness.state().ui.dock.workspace().clone();
-    let Some(Node::Split { second, .. }) = workspace.layout.root.as_mut() else { panic!("default columns") };
+    let workspace = harness.state().ui.dock.workspace().clone();
+    let mut layout = workspace.layout().clone();
+    let Some(Node::Split { second, .. }) = layout.root.as_mut() else { panic!("default columns") };
     let Node::Split { size, .. } = second.as_mut() else { panic!("viewport and right column") };
     *size = SplitSize::FixedSecond(0.0);
+    let workspace = texturecraft_ui_egui::docking::Workspace::from_parts(layout, workspace.hidden().to_vec(), workspace.floated().to_vec());
     harness.state_mut().ui.dock = Dock::from_value(serde_json::to_value(workspace).unwrap());
     for (brightness, name) in [(Brightness::MediumDark, "medium"), (Brightness::Dark, "dark"), (Brightness::Light, "light")] {
         harness.state_mut().ui.prefs.brightness = brightness;
@@ -2979,7 +3182,11 @@ fn sheet_scroll_end_snapshots() {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     let layer = execute(&mut session, "layer.add.fill", &json!({"color": [0.8, 0.3, 0.1]})).unwrap()["layer"].clone();
     execute(&mut session, "layer.fill.projection", &json!({"layer": layer, "projection": "uv"})).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 2000.0)).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 2000.0))
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.set_render_cursor(false);
     harness.run_steps(4);

@@ -22,7 +22,10 @@ fn harness(mask: bool) -> Harness<'static, TextureCraftApp> {
         execute(&mut session, "mask.add.black", &Value::Null).unwrap();
         execute(&mut session, "effect.add.fill", &json!({"value": 0.5})).unwrap();
     }
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     h.run_steps(4);
     h
 }

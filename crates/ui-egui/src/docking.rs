@@ -1,29 +1,28 @@
 //! The dock host: every side panel (assets, texture set list, layers, texture set settings,
 //! properties, display/shader settings, history, log) is a tab that can be docked, tabbed,
-//! resized, floated and closed around the viewport. craft-ui's shared docking
-//! (`craft_ui::docking`) draws the frames, tab strips, floating windows and drop previews and
-//! owns the gestures; this module names the panels, builds the default arrangement, applies
-//! the dock's changes and hosts the panel bodies. The bodies live in `dock.rs`, `shelf.rs` and
-//! `windows.rs`.
+//! resized, floated and closed around the viewport. craft-ui's `DockArea` draws the frames, tab
+//! strips, floating windows and drop previews and owns the gestures; this module names the
+//! panels, builds the default arrangement, applies the dock's changes and hosts the panel bodies.
+//! The bodies live in `dock.rs`, `shelf.rs` and `windows.rs`.
 //!
 //! The viewport is the central canvas: it stays docked, never takes tabs and is the only panel
-//! that cannot close or float. The layout persists with `UiState` as a craft-ui `Workspace`;
-//! a layout that does not load or validate becomes the default.
+//! that cannot close or float. The layout persists with `UiState` as a craft-behavior
+//! `Workspace`; a layout that does not load or validate becomes the default.
 
-use craft_ui::docking::{Action, DockArea, DockContent, DockStyle, Layout, Location, Node, PanelLimits, PanelState, Permissions, Placement};
-use craft_ui::layout::{SplitAxis, SplitSize};
-use egui::{Id, Margin, RichText, Ui, Vec2, vec2};
+use std::sync::Arc;
+
+use craft_behavior::dock::{Action, DockPlacement, Layout, Location, Node, PanelState, Permissions, SplitSize};
+use craft_behavior::flow::Axis;
+use craft_ui::contract::{Bind, BodyCx, PlainData, SizeLimits, Tracked};
+use craft_ui::docking::{DockConfig, DockPanels, GroupAt, PanelSpec, PanelSpecs};
+use craft_ui::patterns::dock::DockArea;
+use egui::{Margin, Rect, Ui, Vec2, ViewportId, vec2};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::TextureCraftApp;
 use crate::i18n::tr;
 use crate::theme::Tokens;
-
-mod header_band;
-mod shown_group_tab;
-
-pub(crate) use shown_group_tab::HEADER_TITLE_LEFT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Panel {
@@ -130,8 +129,8 @@ impl Panel {
         }
     }
 
-    /// Where the panel floats when it has never been laid out: `[x, y, width, height]`, cascaded.
-    fn float_rect(self) -> Option<[f32; 4]> {
+    /// Where the panel floats when it has never been laid out, cascaded.
+    fn float_rect(self) -> Option<Rect> {
         let slot = match self {
             Panel::Display => 0.0,
             Panel::Shader => 1.0,
@@ -142,24 +141,24 @@ impl Panel {
             Panel::BakingLog => 6.0,
             _ => return None,
         };
-        Some([960.0, 90.0 + 50.0 * slot, 300.0, 380.0])
+        Some(Rect::from_min_size(egui::pos2(960.0, 90.0 + 50.0 * slot), vec2(300.0, 380.0)))
     }
 }
 
-/// The saved panel arrangement: craft-ui's workspace over TextureCraft's panels.
-pub type Workspace = craft_ui::docking::Workspace<Panel>;
+/// The saved panel arrangement: craft-behavior's workspace over TextureCraft's panels.
+pub type Workspace = craft_behavior::dock::Workspace<Panel>;
 
 /// The viewport never moves, floats, closes or takes tabs; panels dock beside it.
 pub fn permissions(panel: &Panel) -> Permissions {
-    if *panel == Panel::Viewport { Permissions { accepts_splits: true, ..Permissions::PROTECTED } } else { Permissions::default() }
+    if *panel == Panel::Viewport { Permissions::PROTECTED.accepts_splits(true) } else { Permissions::default() }
 }
 
 fn tabs(panels: &[Panel]) -> Node<Panel> {
-    Node::Tabs { panels: panels.to_vec(), active: 0 }
+    Node::tabs(panels.to_vec(), 0)
 }
 
-fn split(axis: SplitAxis, size: SplitSize, first: Node<Panel>, second: Node<Panel>) -> Node<Panel> {
-    Node::Split { axis, size, first: Box::new(first), second: Box::new(second) }
+fn split(axis: Axis, size: SplitSize, first: Node<Panel>, second: Node<Panel>) -> Node<Panel> {
+    Node::split(axis, size, first, second)
 }
 
 /// The default: assets (4 tile columns at 1920 px) left of the viewport, then texture sets, layers (tabbed with texture set settings) and properties
@@ -175,57 +174,41 @@ pub fn default_workspace() -> Workspace {
     const LAYERS_SPLIT_RATIO: f32 = 0.31;
 
     let column = split(
-        SplitAxis::Vertical,
+        Axis::Y,
         SplitSize::Ratio(TEXTURE_SET_SPLIT_RATIO),
         tabs(&[TextureSetList]),
-        split(SplitAxis::Vertical, SplitSize::Ratio(LAYERS_SPLIT_RATIO), tabs(&[Layers, TextureSetSettings]), tabs(&[Properties])),
+        split(Axis::Y, SplitSize::Ratio(LAYERS_SPLIT_RATIO), tabs(&[Layers, TextureSetSettings]), tabs(&[Properties])),
     );
     let root = split(
-        SplitAxis::Horizontal,
+        Axis::X,
         SplitSize::Ratio(ASSETS_SPLIT_RATIO),
         tabs(&[Assets]),
-        split(SplitAxis::Horizontal, SplitSize::Ratio(VIEWPORT_SPLIT_RATIO), tabs(&[Viewport]), column),
+        split(Axis::X, SplitSize::Ratio(VIEWPORT_SPLIT_RATIO), tabs(&[Viewport]), column),
     );
-    let mut workspace = Workspace::new(Layout { root: Some(root), floating: Vec::new() });
-
-    for panel in Panel::ALL {
-        if let Some(rect) = panel.float_rect() {
-            workspace.hidden.push((panel, floating_location(rect)));
-        }
-    }
-
+    let mut hidden: Vec<(Panel, Location<Panel>)> = Panel::ALL.into_iter().filter_map(|panel| Some((panel, floating_location(panel.float_rect()?)))).collect();
     for panel in [MeshMapSettings, CommonSettings, MeshMapBakers] {
-        workspace.hidden.push((
-            panel,
-            Location {
-                floating: None,
-                anchor: Some(TextureSetList),
-                placement: Placement::Tab { before: None },
-                size: None,
-                stack: None,
-                sibling: Vec::new(),
-                group: None,
-            },
-        ));
+        hidden.push((panel, Location::new(Some(TextureSetList), DockPlacement::tab(None))));
     }
 
-    workspace
+    Workspace::from_parts(Layout::new(Some(root), Vec::new()), hidden, Vec::new())
 }
 
-/// Where a closed panel reopens as its own floating window at `rect` (`[x, y, width, height]`)
-fn floating_location(rect: [f32; 4]) -> Location<Panel> {
-    Location { floating: Some(rect), anchor: None, placement: Placement::Tab { before: None }, size: None, stack: None, sibling: Vec::new(), group: None }
+/// Where a closed panel reopens as its own floating window at `rect`
+fn floating_location(rect: Rect) -> Location<Panel> {
+    let mut location = Location::new(None, DockPlacement::tab(None));
+    location.floating = Some(rect);
+    location
 }
 
 /// craft-ui's checks plus the viewport's: a saved or hand-edited file cannot hide, float, group
 /// or collapse it.
 pub fn validate(workspace: &Workspace) -> Result<(), String> {
     workspace.validate().map_err(|error| error.to_string())?;
-    let layout = &workspace.layout;
+    let layout = workspace.layout();
     if layout.floating.iter().any(|window| window.contains(&Panel::Viewport)) {
         return Err("The viewport cannot float".into());
     }
-    if workspace.hidden.iter().any(|(panel, _)| *panel == Panel::Viewport) {
+    if workspace.hidden().iter().any(|(panel, _)| *panel == Panel::Viewport) {
         return Err("The viewport cannot be hidden".into());
     }
     let mut found = false;
@@ -242,7 +225,7 @@ pub fn validate(workspace: &Workspace) -> Result<(), String> {
                 }
                 found = true;
             }
-            Node::Stack { entries } if entries.iter().any(|entry| entry.panel == Panel::Viewport) => {
+            Node::Stack { entries, .. } if entries.iter().any(|entry| entry.panel == Panel::Viewport) => {
                 return Err("The viewport cannot be collapsed".into());
             }
             Node::Dock { columns, .. } if columns.iter().flat_map(|column| &column.groups).any(|group| group.panels.contains(&Panel::Viewport)) => {
@@ -262,14 +245,14 @@ pub(crate) const TAB_HEIGHT: f32 = 30.0;
 
 /// Width of the bake layout's texture set and mesh map bakers column in points: the reference's scaled to our larger font
 const BAKERS_COLUMN_WIDTH: f32 = 232.0;
-/// Width of the bake layout's common and mesh map settings column, in points
-const SETTINGS_COLUMN_WIDTH: f32 = 330.0;
+/// Width of the bake layout's common and mesh map settings column, in points: both tab names fit beside the ×
+const SETTINGS_COLUMN_WIDTH: f32 = 380.0;
 /// Height of the log under the bake layout's columns, in points
 const BAKING_LOG_HEIGHT: f32 = 160.0;
 /// Share of the first bake column the texture set list takes above the mesh map bakers
 const TEXTURE_SET_LIST_SHARE: f32 = 0.4;
 
-/// The dock layout (part of `UiState`; serialized as a craft-ui `Workspace`).
+/// The dock layout (part of `UiState`; serialized as a craft-behavior `Workspace`).
 #[derive(Clone, Debug)]
 pub struct Dock {
     workspace: Workspace,
@@ -327,24 +310,25 @@ impl Dock {
 
     /// Texture sets over the bakers, the two settings tabs, the log under both, then the viewport
     pub(crate) fn for_baking() -> Self {
-        let mut workspace = default_workspace();
+        let painting = default_workspace();
+        let mut hidden = painting.hidden().to_vec();
         for panel in [Panel::Assets, Panel::Layers, Panel::TextureSetSettings, Panel::Properties] {
-            if let Ok(location) = workspace.layout.location(&panel) {
-                workspace.hidden.push((panel, location));
+            if let Ok(location) = painting.layout().location(&panel) {
+                hidden.push((panel, location));
             }
         }
 
         let bake_panels = [Panel::MeshMapSettings, Panel::CommonSettings, Panel::MeshMapBakers, Panel::Log];
-        workspace.hidden.retain(|(panel, _)| !bake_panels.contains(panel));
+        hidden.retain(|(panel, _)| !bake_panels.contains(panel));
 
         let gutter_width = f32::from(crate::theme::GUTTER);
-        let list_column = split(SplitAxis::Vertical, SplitSize::Ratio(TEXTURE_SET_LIST_SHARE), tabs(&[Panel::TextureSetList]), tabs(&[Panel::MeshMapBakers]));
+        let list_column = split(Axis::Y, SplitSize::Ratio(TEXTURE_SET_LIST_SHARE), tabs(&[Panel::TextureSetList]), tabs(&[Panel::MeshMapBakers]));
         let settings_column = tabs(&[Panel::CommonSettings, Panel::MeshMapSettings]);
-        let columns = split(SplitAxis::Horizontal, SplitSize::FixedFirst(BAKERS_COLUMN_WIDTH), list_column, settings_column);
-        let columns_over_log = split(SplitAxis::Vertical, SplitSize::FixedSecond(BAKING_LOG_HEIGHT), columns, tabs(&[Panel::Log]));
+        let columns = split(Axis::X, SplitSize::FixedFirst(BAKERS_COLUMN_WIDTH), list_column, settings_column);
+        let columns_over_log = split(Axis::Y, SplitSize::FixedSecond(BAKING_LOG_HEIGHT), columns, tabs(&[Panel::Log]));
         let columns_width = BAKERS_COLUMN_WIDTH + gutter_width + SETTINGS_COLUMN_WIDTH;
-        let root = split(SplitAxis::Horizontal, SplitSize::FixedFirst(columns_width), columns_over_log, tabs(&[Panel::Viewport]));
-        workspace.layout = Layout { root: Some(root), floating: Vec::new() };
+        let root = split(Axis::X, SplitSize::FixedFirst(columns_width), columns_over_log, tabs(&[Panel::Viewport]));
+        let workspace = Workspace::from_parts(Layout::new(Some(root), Vec::new()), hidden, painting.floated().to_vec());
         Dock { workspace, raise: None, replaced_unreadable: false }
     }
 
@@ -353,12 +337,12 @@ impl Dock {
     }
 
     pub fn is_open(&self, p: Panel) -> bool {
-        self.workspace.layout.contains(&p)
+        self.workspace.layout().contains(&p)
     }
 
     /// Open and the front tab of its group.
     pub fn is_visible(&self, p: Panel) -> bool {
-        self.workspace.layout.panel_state(&p) == PanelState::Front
+        self.workspace.layout().panel_state(&p) == PanelState::Front
     }
 
     /// Hide a visible panel, otherwise bring it up.
@@ -367,7 +351,7 @@ impl Dock {
     }
 
     pub fn close(&mut self, p: Panel) {
-        if let Err(error) = self.workspace.set_visible(p, false, None, permissions) {
+        if let Err(error) = self.workspace.set_visible(p, false, None, false, permissions) {
             log::warn!("panel {p:?} was not closed: {error}");
         }
     }
@@ -376,7 +360,7 @@ impl Dock {
     /// front.
     pub fn focus(&mut self, p: Panel) {
         let mut next = self.workspace.clone();
-        match next.set_visible(p, true, None, permissions) {
+        match next.set_visible(p, true, None, false, permissions) {
             Ok(()) if validate(&next).is_ok() => {
                 self.workspace = next;
                 self.raise = Some(p);
@@ -386,10 +370,12 @@ impl Dock {
         }
     }
 
-    /// Open the closed `panel` as a floating window at `rect` (`[x, y, width, height]`)
-    pub(crate) fn float_at(&mut self, panel: Panel, rect: [f32; 4]) {
-        self.workspace.hidden.retain(|(hidden_panel, _)| *hidden_panel != panel);
-        self.workspace.hidden.push((panel, floating_location(rect)));
+    /// Open the closed `panel` as a floating window at `rect`
+    pub(crate) fn float_at(&mut self, panel: Panel, rect: Rect) {
+        let mut hidden = self.workspace.hidden().to_vec();
+        hidden.retain(|(hidden_panel, _)| *hidden_panel != panel);
+        hidden.push((panel, floating_location(rect)));
+        self.workspace = Workspace::from_parts(self.workspace.layout().clone(), hidden, self.workspace.floated().to_vec());
         self.focus(panel);
     }
 
@@ -397,7 +383,7 @@ impl Dock {
     /// it was.
     fn apply(&mut self, action: Action<Panel>) {
         let mut next = self.workspace.clone();
-        match next.apply(action, permissions) {
+        match next.apply(action, false, permissions) {
             Ok(_) if validate(&next).is_ok() => self.workspace = next,
             Ok(_) => log::warn!("a panel move would break the viewport's rules"),
             Err(error) => log::warn!("a panel move was not applied: {error}"),
@@ -405,58 +391,76 @@ impl Dock {
     }
 }
 
+/// What the dock area keeps between passes: the workspace it shows and the panels' specs.
+#[derive(Default)]
+pub(crate) struct LiveDock {
+    shown: Option<Arc<Workspace>>,
+    specs: Tracked<DockSpecs>,
+    /// The panel whose floating window takes over the held press in the next pass, with the grab point inside the window.
+    continue_move: Option<(Panel, egui::Vec2)>,
+}
+
+impl LiveDock {
+    /// Asks the next pass's dock to let the window holding `panel` follow the held pointer from `grab`.
+    pub(crate) fn hand_over(&mut self, panel: Panel, grab: egui::Vec2) {
+        self.continue_move = Some((panel, grab));
+    }
+
+    /// The `Arc` the dock shows for `workspace`: the last one while the arrangement is the same,
+    /// so an idle pass keeps the workspace's revision and the dock reads no spec.
+    fn shown(&mut self, workspace: &Workspace) -> Arc<Workspace> {
+        if let Some(shown) = self.shown.as_ref().filter(|shown| ***shown == *workspace) {
+            return Arc::clone(shown);
+        }
+        let shown = Arc::new(workspace.clone());
+        self.shown = Some(Arc::clone(&shown));
+        shown
+    }
+}
+
+/// What the dock reads of the panels: their tab names, in [`Panel::ALL`] order.
+#[derive(Clone, Debug, Default, PartialEq, PlainData)]
+struct DockSpecs {
+    labels: Vec<String>,
+}
+
+impl PanelSpecs<Panel> for DockSpecs {
+    fn spec(&self, panel: &Panel) -> PanelSpec {
+        let label = Panel::ALL.iter().position(|p| p == panel).and_then(|index| self.labels.get(index)).cloned().unwrap_or_default();
+        // Every panel body is TextureCraft's own egui code: the dock runs it with the window's style.
+        let spec = PanelSpec::new(label).limits(SizeLimits::at_least(min_size(*panel))).float_size(FLOATING_SIZE.max(min_size(*panel))).host_body();
+        if *panel == Panel::Viewport { spec.canvas() } else { spec }
+    }
+
+    fn permissions(&self, panel: &Panel) -> Permissions {
+        permissions(panel)
+    }
+}
+
+/// The tab name of `panel` in the interface language.
+fn label(app: &TextureCraftApp, panel: Panel) -> String {
+    match panel {
+        Panel::Properties => crate::dock::properties_title(app),
+        p => tr(p.name()).to_string(),
+    }
+}
+
+/// Reads the tab names, moving the specs' revision only when one changed.
+fn refresh_specs(app: &mut TextureCraftApp) {
+    let labels: Vec<String> = Panel::ALL.iter().map(|panel| label(app, *panel)).collect();
+    if app.docks.specs.labels != labels {
+        app.docks.specs.labels = labels;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Drawing
 
-fn area_id() -> Id {
-    Id::unique("texturecraft-docking")
-}
+/// From a panel's left edge to its contents' text (an empty panel's note)
+pub(crate) const HEADER_TITLE_LEFT: f32 = 12.0;
 
-/// Smallest panel extent a divider drag leaves, in points
-const MIN_PANE_EXTENT: f32 = 60.0;
-
-/// Border width of a floating panel, in points
-const FLOATING_BORDER_WIDTH: f32 = 1.0;
-
-/// Text size of the panel tabs, in points
-const TAB_TEXT_SIZE: f32 = 12.5;
-
-/// Narrowest panel tab, in points
-const MIN_TAB_WIDTH: f32 = 54.0;
-
-/// Mixing in title ink keeps the light dock's focus outline above 3:1 on both header surfaces
-const LIGHT_DOCK_ACCENT_TEXT_MIX: f32 = 0.2;
-
-/// The dock look: every panel group is a card under one chrome-coloured header bar, names in capitals at the left, a close × at the right
-fn style(ui: &Ui, tokens: &Tokens) -> DockStyle {
-    let mut dock_style = DockStyle::from_ui(ui);
-    dock_style.gap = f32::from(crate::theme::GUTTER);
-    dock_style.min_pane = MIN_PANE_EXTENT;
-
-    dock_style.background = tokens.panel;
-    dock_style.tab_background = tokens.chrome;
-
-    // The selected title is brighter while the strip keeps its colour
-    dock_style.active_background = tokens.chrome;
-    dock_style.text = tokens.text_strong;
-    dock_style.inactive_text = tokens.text_dim;
-    dock_style.border = egui::Stroke::NONE;
-    dock_style.accent = if tokens.dark { tokens.accent } else { tokens.accent.lerp_to_gamma(tokens.text_strong, LIGHT_DOCK_ACCENT_TEXT_MIX) };
-    dock_style.floating_background = tokens.panel;
-    dock_style.floating_stroke = egui::Stroke::new(FLOATING_BORDER_WIDTH, tokens.button_border);
-
-    dock_style.font = egui::FontId::proportional(TAB_TEXT_SIZE);
-    dock_style.min_tab_width = MIN_TAB_WIDTH;
-    dock_style.tab_height = TAB_HEIGHT;
-
-    // Panels arrange in a split tree around the viewport; floating title bars only move windows
-    dock_style.new_dock_zones = false;
-    dock_style.title_bar_docks = false;
-    dock_style
-}
-
-/// Whether a modal layer or update dialog holds the input, so the panels, floating ones included,
-/// do not take it.
+/// Whether one of TextureCraft's own modal layers or the update dialogs hold the input, so the
+/// panels floated into windows of their own do not take it (`FrameInput::app_modal`).
 pub(crate) fn input_blocked(app: &TextureCraftApp, context: &egui::Context) -> bool {
     let modal = context.memory(|memory| memory.top_modal_layer()).is_some();
     #[cfg(not(target_arch = "wasm32"))]
@@ -478,57 +482,84 @@ pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
 
     let context = ui.ctx().clone();
-    let tokens = Tokens::get(&context);
-    let style = style(ui, &tokens);
-    let layout = app.ui.dock.workspace.layout.clone();
-    let mut area = DockArea::new(area_id()).input_blocked(input_blocked(app, &context));
-    if let Some(panel) = app.ui.dock.raise.take() {
-        area = area.raise_panel(panel);
-    }
-
-    let output = area.show_content(ui, &layout, &style, &mut Panels { app, tokens, layout: &layout, style: &style });
-    crate::rail_popup::hand_drag_to_dock(&context, area_id());
+    refresh_specs(app);
+    let shown = app.docks.shown(&app.ui.dock.workspace);
+    // The specs leave the app while its panels borrow it, and come back with their revision.
+    let specs = std::mem::take(&mut app.docks.specs);
+    let hand_over = app.docks.continue_move.take();
+    let raise = app.ui.dock.raise.take();
+    // Panels arrange in a split tree around the viewport; floating title bars only move windows.
+    // Each closable tab has its close button, as each group header had one for its shown panel.
+    let config = DockConfig::default().new_dock_zones(false).title_bar_docks(false).tab_close_buttons(true);
+    let (output, focused_windows) = {
+        let tokens = Tokens::get(&context);
+        let mut panels = Panels { app: &mut *app, tokens, layout: shown.layout().clone(), focused_windows: Vec::new() };
+        let mut area = DockArea::new("Panels", Bind::given(Arc::clone(&shown)), &specs, &mut panels, config);
+        if let Some(hand_over) = hand_over {
+            area = area.continue_move(hand_over);
+        }
+        if let Some(panel) = raise {
+            area = area.raise(panel);
+        }
+        let output = area.show(ui);
+        (output, panels.focused_windows)
+    };
+    app.docks.specs = specs;
 
     // The popup needs the viewport the dock recorded this frame
     crate::rail_popup::show(app, &context);
 
+    // Keys pressed in a panel floated into a window of its own run the app's shortcuts there
     #[cfg(not(target_arch = "wasm32"))]
-    crate::menus::forwarded_shortcuts(app, &context, output.forwarded_events, output.forwarded_modifiers.unwrap_or_default());
+    for (_, viewport) in &output.windows {
+        let (events, held) = forwarded_events(&context, *viewport, &focused_windows);
+        crate::menus::forwarded_shortcuts(app, &context, events, held);
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = focused_windows;
     if let Some(error) = &output.error {
-        log::warn!("docking: {error}");
+        log::warn!("docking: {:?}", error.error);
     }
 
     // A layout changed by a panel takes priority over gestures from the old layout
-    if app.ui.dock.workspace.layout != layout {
-        craft_ui::docking::cancel_drag::<Panel>(&context, area_id());
+    if app.ui.dock.workspace != *shown {
+        craft_ui::runtime::drag::cancel(&context, craft_behavior::CancelReason::HostChanged);
         return;
     }
 
-    for action in output.actions {
+    for action in output.actions.into_iter().chain(output.requested) {
         app.ui.dock.apply(action);
     }
 }
 
-/// Size of the panel names on a header bar
-const HEADER_TITLE_SIZE: f32 = 12.0;
-
-/// Side of the close × at the right end of a header bar
-const HEADER_CLOSE_SIZE: f32 = 22.0;
-
-/// Room right of the close × button, so its glyph ends where the Properties controls end (side padding plus scroll bar gutter)
-const HEADER_CLOSE_RIGHT_MARGIN: f32 = 18.0;
-
-/// Whether a docked group's header bar ends in a close × (floating windows have one on their title bar; the viewport never closes)
-fn header_closes(active: &Panel, floating: bool) -> bool {
-    !floating && permissions(active).closable
+/// Records in `focused_windows` whether a widget of the running pass's window has the keyboard, after one of the window's
+/// panels drew
+fn note_focus(context: &egui::Context, focused_windows: &mut Vec<ViewportId>) {
+    let window = context.viewport_id();
+    focused_windows.retain(|focused| *focused != window);
+    if context.memory(|memory| memory.focused().is_some()) {
+        focused_windows.push(window);
+    }
 }
 
-/// The panels' contents, names and limits for the dock area
+/// The keys, text and clipboard events `window` hands to the app's shortcuts, with the modifiers held there: nothing
+/// while one of its widgets has the keyboard
+#[cfg(not(target_arch = "wasm32"))]
+fn forwarded_events(context: &egui::Context, window: ViewportId, focused_windows: &[ViewportId]) -> (Vec<egui::Event>, egui::Modifiers) {
+    use egui::Event;
+    let focused = focused_windows.contains(&window);
+    let forwarded = |event: &&Event| !focused && matches!(event, Event::Key { .. } | Event::Text(_) | Event::Copy | Event::Cut | Event::Paste(_));
+    context.input_for(window, |input| (input.events.iter().filter(forwarded).cloned().collect(), input.modifiers))
+}
+
+/// The panels' contents for the dock area
 struct Panels<'a> {
     app: &'a mut TextureCraftApp,
     tokens: Tokens,
-    layout: &'a Layout<Panel>,
-    style: &'a DockStyle,
+    /// The arrangement the dock shows in this pass
+    layout: Layout<Panel>,
+    /// The windows in which a widget had the keyboard once their panels drew
+    focused_windows: Vec<ViewportId>,
 }
 
 /// Room between a panel's edges and its contents
@@ -594,99 +625,41 @@ pub(crate) fn panel_body(app: &mut TextureCraftApp, ui: &mut Ui, panel: Panel) {
     });
 }
 
-impl DockContent<Panel> for Panels<'_> {
-    fn body(&mut self, ui: &mut Ui, panel: &Panel) {
-        if *panel == Panel::Viewport {
-            crate::rail_popup::remember_viewport(ui.ctx(), ui.max_rect());
-            ui.painter().rect_filled(ui.max_rect(), 0.0, self.tokens.viewport);
-            crate::viewport::central(self.app, ui);
-            return;
+impl DockPanels<Panel> for Panels<'_> {
+    fn body(&mut self, panel: &Panel, ui: &mut Ui, _: &mut BodyCx<'_>) {
+        // The viewport is its group's `group_view`
+        if *panel != Panel::Viewport {
+            panel_body(self.app, ui, *panel);
         }
-
-        // Before the rows, which draw over the foot of the shown tab's box
-        self.paint_shown_group_tab(ui, *panel);
-        panel_body(self.app, ui, *panel);
+        note_focus(ui.ctx(), &mut self.focused_windows);
     }
 
-    fn logical_label(&self, panel: &Panel) -> String {
-        match panel {
-            Panel::Properties => crate::dock::properties_title(self.app),
-            p => tr(p.name()).to_string(),
+    /// The viewport, edge to edge in its group.
+    fn group_view(&mut self, panels: &[Panel], _: usize, ui: &mut Ui, at: GroupAt, _: &mut BodyCx<'_>) -> Option<f32> {
+        let GroupAt::Show(rect) = at else { return None };
+        if !panels.contains(&Panel::Viewport) {
+            return None;
         }
+        crate::rail_popup::remember_viewport(ui.ctx(), ui.max_rect());
+        ui.painter().rect_filled(ui.max_rect(), 0.0, self.tokens.viewport);
+        crate::viewport::central(self.app, ui);
+        Some(rect.height())
     }
 
-    fn label(&mut self, ui: &Ui, panel: &Panel, logical: &str, _font: &egui::FontId, color: egui::Color32) -> egui::WidgetText {
-        // Capitals on the bar only: menus and screen readers keep the logical name
-        let name = logical.to_uppercase();
-        let font = crate::theme::semibold(HEADER_TITLE_SIZE);
-
-        // Popup menu rows use their unpadded text metrics
-        if matches!(ui.layer_id().order, egui::Order::Foreground | egui::Order::Tooltip) {
-            return RichText::new(name).font(font).color(color).into();
+    /// A rail panel floating on its own carries the Dock button that sends it back to the rail
+    fn group_header(&mut self, panels: &[Panel], active: usize, ui: &mut Ui, _: &mut BodyCx<'_>) {
+        let Some(active) = panels.get(active).copied() else { return };
+        let floating = self.layout.floating.iter().any(|window| window.contains(&active));
+        if redocks(panels, &active, floating)
+            && crate::widgets::icon_button(ui, egui_phosphor::regular::ARROW_SQUARE_IN, tr("Dock"), false, DOCK_BUTTON_SIZE).clicked()
+        {
+            self.app.ui.dock.close(active);
         }
-
-        header_band::header_name(ui, &name, font, color, self.header_lift(*panel)).into()
-    }
-
-    fn group_header_width(&self, panels: &[Panel], active: &Panel, floating: bool, _strip_width: f32) -> f32 {
-        if header_closes(active, floating) {
-            HEADER_CLOSE_SIZE + HEADER_CLOSE_RIGHT_MARGIN
-        } else if redocks(panels, active, floating) {
-            DOCK_BUTTON_SIZE + DOCK_BUTTON_MARGIN
-        } else {
-            0.0
-        }
-    }
-
-    /// A docked group's bar ends in its close ×; a rail panel floating on its own carries the Dock button that sends it back to the rail
-    fn group_header(&mut self, ui: &mut Ui, panels: &[Panel], active: &Panel, floating: bool) {
-        if redocks(panels, active, floating) {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if crate::widgets::icon_button(ui, egui_phosphor::regular::ARROW_SQUARE_IN, tr("Dock"), false, DOCK_BUTTON_SIZE).clicked() {
-                    self.app.ui.dock.close(*active);
-                }
-            });
-            return;
-        }
-
-        if !header_closes(active, floating) {
-            return;
-        }
-
-        // Centre the close control on the header title line
-        let rect = ui.max_rect();
-        let button = egui::Rect::from_center_size(
-            egui::pos2(rect.right() - HEADER_CLOSE_RIGHT_MARGIN - HEADER_CLOSE_SIZE / 2.0, rect.center().y - self.header_lift(*active)),
-            vec2(HEADER_CLOSE_SIZE, HEADER_CLOSE_SIZE),
-        );
-        let clicked = ui
-            .scope_builder(egui::UiBuilder::new().max_rect(button), |ui| {
-                crate::widgets::icon_button(ui, egui_phosphor::regular::X, tr("Close Panel"), false, HEADER_CLOSE_SIZE).clicked()
-            })
-            .inner;
-        if clicked {
-            self.app.ui.dock.close(*active);
-        }
-    }
-
-    fn permissions(&self, panel: &Panel) -> Permissions {
-        permissions(panel)
-    }
-
-    fn limits(&self, panel: &Panel) -> PanelLimits {
-        PanelLimits { min: min_size(*panel), ..PanelLimits::default() }
-    }
-
-    fn floating_size(&self, panel: &Panel) -> Option<egui::Vec2> {
-        Some(FLOATING_SIZE.max(min_size(*panel)))
     }
 }
 
-/// Size of the Dock button in a floating rail panel's tab strip
+/// Size of the Dock button in a floating rail panel's header
 const DOCK_BUTTON_SIZE: f32 = 22.0;
-
-/// Room right of the Dock button, so it clears the strip's end
-const DOCK_BUTTON_MARGIN: f32 = 6.0;
 
 /// Whether a floating window holds one rail panel alone: its Dock button closes it back onto the rail
 fn redocks(panels: &[Panel], active: &Panel, floating: bool) -> bool {
@@ -698,7 +671,60 @@ mod tests {
     use super::*;
 
     fn panels_of(w: &Workspace) -> Vec<Panel> {
-        w.layout.panels().into_iter().copied().collect()
+        w.layout().panels().into_iter().copied().collect()
+    }
+
+    /// What a floating panel's own window with a text field, focused when `typing`, hands on of `events`
+    #[cfg(not(target_arch = "wasm32"))]
+    fn handed_on(typing: bool, events: &[egui::Event]) -> Vec<egui::Event> {
+        use std::{cell::RefCell, rc::Rc};
+
+        let window = ViewportId::from_hash_of("floating panel");
+        let context = egui::Context::default();
+        context.set_embed_viewports(false);
+
+        // Runs the window's pass inside its parent's, as eframe does
+        let arriving = Rc::new(RefCell::new(Vec::new()));
+        let queued = Rc::clone(&arriving);
+        egui::Context::set_immediate_viewport_renderer(move |context, viewport| {
+            let mut input = egui::RawInput { viewport_id: viewport.ids.this, events: queued.take(), ..Default::default() };
+            input.viewports.insert(viewport.ids.this, egui::ViewportInfo { parent: Some(viewport.ids.parent), ..Default::default() });
+            let mut output = context.run_ui(input, viewport.viewport_ui_cb);
+            output.textures_delta.clear();
+        });
+
+        let mut name = String::new();
+        let mut handed_on = Vec::new();
+        // The field takes the keyboard a pass before the keys arrive
+        for arrived in [Vec::new(), events.to_vec()] {
+            *arriving.borrow_mut() = arrived;
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                let mut focused_windows = Vec::new();
+                ui.ctx().show_viewport_immediate(window, egui::ViewportBuilder::default(), |ui, _| {
+                    let field = ui.text_edit_singleline(&mut name);
+                    if typing {
+                        field.request_focus();
+                    }
+                    note_focus(ui.ctx(), &mut focused_windows);
+                });
+                handed_on.extend(forwarded_events(ui.ctx(), window, &focused_windows).0);
+            });
+            output.textures_delta.clear();
+        }
+
+        assert_eq!(name.is_empty(), !typing, "a focused field types the text");
+        handed_on
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_floating_panel_hands_on_its_keys_unless_a_field_there_has_the_keyboard() {
+        use egui::{Event, Key, Modifiers};
+
+        let key = Event::Key { key: Key::B, physical_key: Some(Key::B), pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        let keys = [key, Event::Text("b".into()), Event::Paste("pasted".into())];
+        assert!(handed_on(true, &keys).is_empty(), "the field's keys are its own");
+        assert_eq!(handed_on(false, &keys), keys, "with nothing focused they are the app's");
     }
 
     #[test]
@@ -708,7 +734,10 @@ mod tests {
         assert!(validate(&workspace).is_ok());
 
         for panel in Panel::ALL {
-            assert!(workspace.layout.contains(&panel) || workspace.hidden.iter().any(|(hidden, _)| *hidden == panel), "{panel:?} is neither shown nor hidden");
+            assert!(
+                workspace.layout().contains(&panel) || workspace.hidden().iter().any(|(hidden, _)| *hidden == panel),
+                "{panel:?} is neither shown nor hidden"
+            );
         }
 
         assert_eq!(panels_of(&workspace), [Panel::Assets, Panel::Viewport, Panel::TextureSetList, Panel::Layers, Panel::TextureSetSettings, Panel::Properties]);
@@ -716,12 +745,14 @@ mod tests {
 
     #[test]
     fn a_saved_split_keeps_its_own_share() {
-        let mut workspace = default_workspace();
-        let Some(Node::Split { second: right, .. }) = workspace.layout.root.as_mut() else { panic!("assets | rest") };
+        let default = default_workspace();
+        let mut layout = default.layout().clone();
+        let Some(Node::Split { second: right, .. }) = layout.root.as_mut() else { panic!("assets | rest") };
         let Node::Split { second: column, .. } = right.as_mut() else { panic!("viewport | right column") };
         let Node::Split { second: below_sets, .. } = column.as_mut() else { panic!("texture sets | rest") };
         let Node::Split { size, .. } = below_sets.as_mut() else { panic!("layers | properties") };
         *size = SplitSize::Ratio(0.57);
+        let workspace = Workspace::from_parts(layout, default.hidden().to_vec(), default.floated().to_vec());
         let back = Dock::from_value(serde_json::to_value(&workspace).unwrap());
 
         assert_eq!(back.workspace(), &workspace, "a layout saved with the old split opens unchanged");
@@ -770,7 +801,23 @@ mod tests {
 
         let dock = Dock::from_value(saved);
         assert!(!dock.replaced_unreadable(), "the saved layout is kept");
-        assert!(dock.workspace().hidden.iter().any(|(panel, _)| *panel == Panel::Export), "Export joins it, closed");
+        assert!(dock.workspace().hidden().iter().any(|(panel, _)| *panel == Panel::Export), "Export joins it, closed");
+    }
+
+    #[test]
+    fn a_focused_panel_is_raised_for_one_frame() {
+        let session = texturecraft_engine::sample_session(128, 32).unwrap();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(vec2(1600.0, 1200.0))
+            .with_context_setup(crate::framework::install_headless)
+            .build_eframe(|cc| TextureCraftApp::new(cc, session));
+        let dock = &mut harness.state_mut().ui.dock;
+        dock.focus(Panel::Display);
+        assert_eq!(dock.raise, Some(Panel::Display));
+
+        harness.run_steps(4);
+
+        assert_eq!(harness.state().ui.dock.raise, None);
     }
 
     #[test]
@@ -779,8 +826,8 @@ mod tests {
         dock.close(Panel::Viewport);
         assert!(dock.is_open(Panel::Viewport));
         let before = dock.clone();
-        dock.apply(Action::Float { panel: Panel::Viewport, rect: [0.0, 0.0, 300.0, 300.0] });
-        dock.apply(Action::Move { panel: Panel::Layers, anchor: Panel::Viewport, placement: Placement::Tab { before: None } });
+        dock.apply(Action::float(Panel::Viewport, Rect::from_min_size(egui::Pos2::ZERO, vec2(300.0, 300.0))));
+        dock.apply(Action::move_beside(Panel::Layers, Panel::Viewport, DockPlacement::tab(None)));
         assert_eq!(dock, before);
     }
 
@@ -804,8 +851,8 @@ mod tests {
         let mut dock = Dock::default();
         dock.focus(Panel::Display);
         assert!(dock.is_visible(Panel::Display));
-        assert_eq!(dock.workspace().layout.floating.len(), 1);
-        assert!(dock.workspace().layout.floating[0].contains(&Panel::Display));
+        assert_eq!(dock.workspace().layout().floating.len(), 1);
+        assert!(dock.workspace().layout().floating[0].contains(&Panel::Display));
         // Hiding and showing the views one by one.
         dock.toggle(Panel::Display);
         assert!(!dock.is_open(Panel::Display));

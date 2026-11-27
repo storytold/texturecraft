@@ -104,16 +104,17 @@ fn apply_picked(app: &mut TextureCraftApp, picked: Vec<(String, Vec<u8>, Pick)>)
     }
 }
 
-/// Bake mode: add high-definition meshes (or load the cage) with the native file dialog. The
-/// meshes load on a later frame, when the dialog answers.
+/// Bake mode: add high polys (they load on a worker) or load the cage with the native file dialog, once it answers
 #[cfg(not(target_arch = "wasm32"))]
 pub fn import_bake_mesh(app: &mut TextureCraftApp, _ctx: &egui::Context, cage: bool) {
     use crate::file_dialogs::{Bound, FileDialog};
     let dialog = if cage { FileDialog::open() } else { FileDialog::open_many() };
     app.ask_file(dialog.filter(tr("Meshes"), &MESH_EXTENSIONS), Bound::Project, move |app, paths| {
-        for p in paths {
-            let cmd = if cage { "bake.cage.set" } else { "bake.highPoly.add" };
-            app.run(cmd, serde_json::json!({ "path": p.display().to_string() }));
+        let mut paths = paths.iter().map(|path| path.display().to_string());
+        if !cage {
+            app.load_high_polys(paths);
+        } else if let Some(path) = paths.next() {
+            app.run("bake.cage.set", serde_json::json!({ "path": path }));
         }
     });
 }
@@ -336,9 +337,9 @@ mod web {
     pub fn export_mesh(app: &mut TextureCraftApp, ext: &str) {
         let name = format!("{}.{ext}", sanitize_file_stem(&app.session.doc.project.name));
         let bytes = match ext {
-            "glb" => app.session.mesh_glb_bytes(),
-            "usdz" => app.session.mesh_usd(texturecraft_engine::formats::UsdFormat::Usdz).map(|u| u.bytes),
-            _ => app.session.mesh_obj_bytes(),
+            "glb" => app.session.mesh_glb_bytes_with_normals(app.ui.mesh_recompute_normals),
+            "usdz" => app.session.mesh_usd_with_normals(texturecraft_engine::formats::UsdFormat::Usdz, app.ui.mesh_recompute_normals).map(|u| u.bytes),
+            _ => app.session.mesh_obj_bytes_with_normals(app.ui.mesh_recompute_normals),
         };
         match bytes.map_err(|e| e.to_string()).and_then(|b| download(&name, &b)) {
             Ok(()) => app.toast(trf("Downloaded {name}", &[("name", &name)]), false),
@@ -435,7 +436,8 @@ mod tests {
     #[test]
     fn mesh_picks_only_update_the_current_new_project_request() {
         let session = Session::closed().unwrap();
-        let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
         let app = harness.state_mut();
         crate::new_project_advanced::open(app);
         app.ui.new_project.mesh_request_id = 2;
@@ -457,7 +459,8 @@ mod tests {
     #[test]
     fn environment_pick_after_close_does_not_edit_the_placeholder() {
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
-        let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
         let png = texturecraft_engine::formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
         let old_project_id = harness.state().session.project_id;
 
@@ -479,7 +482,8 @@ mod tests {
     #[test]
     fn environment_pick_from_replaced_project_does_not_edit_the_new_project() {
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
-        let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
         let png = texturecraft_engine::formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
         let old_project_id = harness.state().session.project_id;
 
@@ -497,7 +501,8 @@ mod tests {
     #[test]
     fn bake_mesh_picks_after_close_do_not_edit_the_placeholder() {
         let session = texturecraft_engine::sample_session(128, 32).unwrap();
-        let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
         let old_project_id = harness.state().session.project_id;
         assert!(harness.state_mut().run("file.close", serde_json::Value::Null).is_some());
         let cage = harness.state().session.mesh_obj_bytes().unwrap();
@@ -507,8 +512,8 @@ mod tests {
             vec![("high.obj".into(), cage.clone(), Pick::HighPoly(old_project_id)), ("cage.obj".into(), cage, Pick::Cage(old_project_id))],
         );
 
-        assert!(harness.state().session.bake_meshes.high.is_empty());
-        assert!(harness.state().session.bake_meshes.cage.is_none());
+        assert!(harness.state().session.doc.bake_meshes.high.is_empty());
+        assert!(harness.state().session.doc.bake_meshes.cage.is_none());
         assert!(!harness.state().session.modified);
         assert_eq!(harness.state().toasts.iter().filter(|toast| toast.error).count(), 2);
 
@@ -521,8 +526,8 @@ mod tests {
             vec![("high.obj".into(), mesh.clone(), Pick::HighPoly(project_id)), ("cage.obj".into(), mesh, Pick::Cage(project_id))],
         );
 
-        assert_eq!(harness.state().session.bake_meshes.high.len(), 1);
-        assert!(harness.state().session.bake_meshes.cage.is_some());
+        assert_eq!(harness.state().session.doc.bake_meshes.high.len(), 1);
+        assert!(harness.state().session.doc.bake_meshes.cage.is_some());
     }
 
     #[test]

@@ -70,7 +70,14 @@ pub(crate) fn one_set_document(src_set: &TextureSet, name: &str) -> Document {
     set.tile_resolutions = src_set.tile_resolutions.clone();
     set.channels = src_set.channels.clone();
     project.texture_sets.push(set);
-    Document { bake_paint: BTreeMap::new(), project, pixels: PixelStore::default(), baked: BTreeMap::new(), resources: BTreeMap::new() }
+    Document {
+        bake_meshes: Default::default(),
+        bake_paint: BTreeMap::new(),
+        project,
+        pixels: PixelStore::default(),
+        baked: BTreeMap::new(),
+        resources: BTreeMap::new(),
+    }
 }
 
 impl Session {
@@ -92,11 +99,12 @@ impl Session {
         images_used(&mini.project, root, &mut used, 0);
         let resources = used.into_iter().filter_map(|name| self.doc.resources.get(&name).map(|bytes| (name, Arc::clone(bytes)))).collect();
 
-        let snapshot = texturecraft_formats::ProjectFile {
+        let snapshot = texturecraft_formats::ProjectFile::<Arc<Vec<u8>>> {
             project: mini.project,
             pixels: mini.pixels,
             baked: BTreeMap::new(),
             mesh: None,
+            mesh_uvs: None,
             high_poly: Vec::new(),
             cage: None,
             bake_paint: BTreeMap::new(),
@@ -129,12 +137,22 @@ impl Session {
             .first()
             .and_then(|t| t.stack.last().copied())
             .ok_or_else(|| EngineError::Other("the smart material file has no layer".into()))?;
+
         let resources: BTreeMap<String, Arc<Vec<u8>>> = project_file.resources.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
-        let source = Document { bake_paint: BTreeMap::new(), project: project_file.project, pixels: project_file.pixels, baked: BTreeMap::new(), resources };
+        let source = Document {
+            bake_meshes: Default::default(),
+            bake_paint: BTreeMap::new(),
+            project: project_file.project,
+            pixels: project_file.pixels,
+            baked: BTreeMap::new(),
+            resources,
+        };
+
         let id = self.edit("Add smart material", |s| {
             for (name, bytes) in &source.resources {
                 s.doc.resources.entry(name.clone()).or_insert_with(|| Arc::clone(bytes));
             }
+
             let ts = s.ts();
             let sel = s.selected_layer();
             let inside = sel.and_then(|l| s.doc.project.layer(l).ok()).is_some_and(|l| l.is_group());
@@ -144,6 +162,7 @@ impl Session {
             s.target = StackTarget::Content;
             Ok(id)
         })?;
+
         self.sync_images();
         Ok(id)
     }

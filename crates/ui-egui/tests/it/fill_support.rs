@@ -18,7 +18,10 @@ pub(crate) fn fill_app(settings: Value, projection: Option<&str>, tab: Option<&s
     if let Some(projection) = projection {
         texturecraft_engine::execute(&mut session, "layer.fill.projection", &json!({"layer": layer, "projection": projection})).unwrap();
     }
-    let mut harness = Harness::builder().with_size(window).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(window)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
 
     // The labels below are English; a first run would speak the system's language
     harness.state_mut().ui.prefs.language = "en".into();

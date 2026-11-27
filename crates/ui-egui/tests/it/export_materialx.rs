@@ -11,7 +11,10 @@ const OPENPBR: &str = "OpenPBR (separate maps)";
 /// The Export textures window writing into a scratch folder of its own for `name`
 fn harness(name: &str) -> (Harness<'static, TextureCraftApp>, std::path::PathBuf) {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
-    let mut app_harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut app_harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     app_harness.state_mut().ui.prefs.language = "en".into();
     app_harness.run_steps(4);
 
@@ -45,6 +48,16 @@ fn mtlx_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files: Vec<_> = entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "mtlx")).collect();
     files.sort();
     files
+}
+
+#[test]
+fn export_materialx_sits_directly_below_the_usd_option() {
+    let (app_harness, _dir) = harness("order");
+    let usd = app_harness.get_by_label("Export USD asset").rect().min.y;
+    let materialx = checkbox(&app_harness).rect().min.y;
+    let shaders = app_harness.get_by_label("Export shader settings").rect().min.y;
+
+    assert!(usd < materialx && materialx < shaders, "USD {usd}, MaterialX {materialx}, shaders {shaders}");
 }
 
 #[test]

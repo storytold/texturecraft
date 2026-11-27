@@ -39,6 +39,7 @@ pub mod image_input;
 pub mod layer;
 pub mod lighting_output;
 pub mod mask_outline;
+pub mod mesh_map_slot;
 pub mod mirror;
 pub mod mirror_corner;
 pub mod mirror_mode;
@@ -51,6 +52,7 @@ pub mod project;
 pub mod projector;
 pub mod ramp_curve;
 pub mod randomized_seed;
+pub mod resource_source;
 mod saved_decal;
 mod saved_projection;
 pub mod selection_background;
@@ -80,11 +82,11 @@ pub const FULL_TURN_DEGREES: f32 = 360.0;
 pub use anisotropic_kuwahara::AnisotropicKuwahara;
 pub use backface::Backface;
 pub use bake::{
-    AmbientOcclusionAttenuation, AmbientOcclusionSettings, BackfaceMode, BakeAntialiasing, BakePaintTarget, BakeResolution, BakeSettings, BakedMap,
-    BentNormalSettings, CageSettings, CageType, CommonBakeSettings, CurvatureMethod, CurvatureSettings, GroundPlaneSettings, HeightNormalization,
-    HeightSettings, HighPolySettings, IdColorGenerator, IdColorSource, IdSettings, MapSettings, MeshCurvatureSettings, MeshMapSettings, MeshMatchMode,
-    NormalMapCurvatureSettings, PositionAxis, PositionMode, PositionNormalizationScale, PositionSettings, RayDistribution, RaySettings, SelfOcclusion,
-    SkewCorrectionMethod, SkewSettings, ThicknessNormalization, ThicknessSettings,
+    AmbientOcclusionAttenuation, AmbientOcclusionSettings, BackfaceMode, BakeAntialiasing, BakePaintTarget, BakeResolution, BakeSettings, BakeSync,
+    BakeSyncGroup, BakedMap, BentNormalSettings, CageSettings, CageType, CommonBakeSettings, CurvatureMethod, CurvatureSettings, GroundPlaneSettings,
+    HeightNormalization, HeightSettings, HighPolySettings, IdColorGenerator, IdColorSource, IdSettings, MapSettings, MeshCurvatureSettings, MeshMapSettings,
+    MeshMatchMode, NormalMapCurvatureSettings, PositionAxis, PositionMode, PositionNormalizationScale, PositionSettings, RayDistribution, RaySettings,
+    SelfOcclusion, SkewCorrectionMethod, SkewSettings, ThicknessNormalization, ThicknessSettings,
 };
 pub use bevel::Bevel;
 pub use bevel_blur::BevelBlur;
@@ -111,14 +113,17 @@ pub use height_to_normal::HeightToNormal;
 pub use highpass_space::HighpassSpace;
 pub use image_input::ImageInput;
 pub use layer::{
-    ChannelBlend, CompareOp, CurvatureDetail, CurvatureMode, Decal, DecalFlip, DecalSymmetry, Effect, EffectKind, Fill, Filter, Filtering, Generator,
-    GeneratorGlobal, GeneratorKind, HeightMask, Layer, LayerId, LayerKind, Levels, LinkParam, LinkPreset, Mask, MaskBackground, MaterialLink, MicroDetail,
-    OutputResolution, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, PathShape, Procedural, ProceduralKind, Projection, ResolutionMode, SIZE_REFERENCE_RES,
-    Sampling, ScaleMode, Source, TileBlending, TileGenerator, TileInputDistribution, TileShape, TileSizeMode, TileSymmetry, UvTransform, UvWrap, gradient,
-    hsl_adjust, per_unit, posterize,
+    AxisBlend, AxisLayer, BorderDistanceParameters, ChannelBlend, CompareOp, CurvatureDetail, CurvatureMode, Decal, DecalFlip, DecalSymmetry,
+    DistanceParameters, DrippingRustParameters, Effect, EffectKind, Fill, Filter, Filtering, Generator, GeneratorGlobal, GeneratorGrayscale, GeneratorKind,
+    GrayscaleConversionParameters, HeightMask, KindControls, Layer, LayerId, LayerKind, Levels, LightParameters, LinearGradientParameters, LinkParam,
+    LinkPreset, Mask, MaskBackground, MaterialLink, MicroCurvatureType, MicroDetails, OutputResolution, POSTERIZE_LEVELS_MAX, POSTERIZE_LEVELS_MIN, PathShape,
+    Procedural, ProceduralKind, Projection, ResolutionMode, SIZE_REFERENCE_RES, Sampling, ScaleMode, SectionParameters, Source, TextureBlend, TextureLayer,
+    TileBlending, TileGenerator, TileInputDistribution, TileShape, TileSizeMode, TileSymmetry, UvCheckerParameters, UvRandomColorParameters, UvTransform,
+    UvWrap, WearParameters, gradient, hsl_adjust, per_unit, posterize,
 };
 pub use lighting_output::LightingOutput;
 pub use mask_outline::MaskOutline;
+pub use mesh_map_slot::MeshMapSlot;
 pub use mirror::Mirror;
 pub use mirror_corner::MirrorCorner;
 pub use mirror_mode::MirrorMode;
@@ -133,6 +138,7 @@ pub use project::{
 pub use projector::Projector;
 pub use ramp_curve::RampCurve;
 pub use randomized_seed::RandomizedSeed;
+pub use resource_source::ResourceSource;
 pub use selection_background::SelectionBackground;
 pub use shape_crop::ShapeCrop;
 pub use slope_blending::SlopeBlending;

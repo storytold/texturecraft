@@ -591,8 +591,7 @@ impl Session {
             self.undo.remove(0);
         }
         self.redo.clear();
-        self.modified = true;
-        self.revision = self.revision.wrapping_add(1);
+        self.mark_modified();
 
         // Recompute committed tiles at low priority because the live preview already shows them
         self.mark_settle(stroke.ts, stroke.target, stroke.canvas.dirty.iter().copied());

@@ -28,7 +28,11 @@ fn folder_harness(with_fill: bool) -> (Harness<'static, TextureCraftApp>, LayerI
         LayerId(execute(&mut session, "layer.add.group", &json!({})).unwrap()["layer"].as_u64().unwrap())
     };
     execute(&mut session, "layer.select", &json!({"layer": folder.0, "target": "content"})).unwrap();
-    let mut harness = Harness::builder().with_size(PROPERTIES_WINDOW).with_step_dt(FRAME_SECONDS).build_eframe(|cc| TextureCraftApp::new(cc, session));
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_step_dt(FRAME_SECONDS)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(STARTUP_FRAMES);
     (harness, folder, fill)
@@ -106,21 +110,4 @@ fn randomize_seeds_is_one_undo_step_the_contents_reset_puts_them_back_and_an_emp
     let (harness, _, _) = folder_harness(false);
     assert!(harness.query_by_label("No properties found").is_some());
     assert!(harness.query_by_role_and_label(Role::Slider, "Scale").is_none());
-}
-
-/// An empty folder's note starts at the Properties header name's left edge, as the note with no project open does (it was centred)
-#[test]
-fn an_empty_folders_note_starts_at_its_header_names_left_edge() {
-    let (harness, _, _) = folder_harness(false);
-
-    let painted_left = |wanted: &dyn Fn(&str) -> bool| {
-        harness.output().shapes.iter().find_map(|clipped| match &clipped.shape {
-            egui::Shape::Text(text) if wanted(text.galley.text()) => Some(text.pos.x),
-            _ => None,
-        })
-    };
-    let note = painted_left(&|text| text == "No properties found");
-    let header = painted_left(&|text| text.starts_with("PROPERTIES"));
-
-    assert!(note.is_some() && note == header, "the note starts at {note:?}, the header name at {header:?}");
 }

@@ -5,7 +5,7 @@ use std::ops::RangeInclusive;
 use egui::{Align2, Color32, FontId, Painter, Rect, Response, Role, Sense, Stroke, StrokeKind, WidgetInfo, pos2, vec2};
 
 use super::row::SECTION_CAPTION_CENTER;
-use super::slider::KNOB_RADIUS;
+use super::slider::{DIAL_AIR, DIAL_RADIUS, KNOB_RADIUS};
 use super::switch_control::PILL_SIZE;
 use super::track::Track;
 use super::{BLOCK_MARGIN, PropertySheet, SMALL_TEXT_SIZE, StackSlider, TEXT_SIZE};
@@ -30,6 +30,15 @@ const PART_LINE: f32 = 22.0;
 const STACK_CAPTION_LINE: f32 = 18.0;
 const STACK_PART_LINE: f32 = 22.0;
 const STACK_GAP: f32 = 6.0;
+
+/// An axis card's air above its name row, the edge of its letter chip, the air from the chip to the name, and its full-width track's line
+const AXIS_CARD_TOP: f32 = 4.0;
+const AXIS_CHIP_SIZE: f32 = 18.0;
+const AXIS_CHIP_TO_NAME: f32 = 8.0;
+const AXIS_TRACK_LINE: f32 = 20.0;
+
+/// The letter on an axis chip: dark on every axis color, in every theme
+const AXIS_CHIP_LETTER: Color32 = Color32::from_rgb(20, 20, 24);
 
 /// The picture's top below the block's (the first caption's letters), how much shorter it is than the stack, and its air before the controls column
 const PICTURE_TOP: f32 = 4.0;
@@ -97,6 +106,35 @@ impl PropertySheet<'_> {
         edit
     }
 
+    /// A card for one axis: its letter on a chip in `tint`, the bold name and the value, then a full-width slider filled in `tint`; the axis's other rows follow, then [`Self::close_card`]
+    pub(crate) fn axis_card(
+        &mut self,
+        (letter, tint): (&str, Color32),
+        name: &str,
+        value: &mut f32,
+        range: RangeInclusive<f32>,
+        decimals: usize,
+    ) -> Option<bool> {
+        self.open_card();
+        self.scope = self.named_id("axis_card", name);
+        self.space(AXIS_CARD_TOP);
+        let head = self.take(super::ROW_HEIGHT);
+        let center_y = head.center().y;
+        let chip = Rect::from_center_size(pos2(self.left + AXIS_CHIP_SIZE / 2.0, center_y), vec2(AXIS_CHIP_SIZE, AXIS_CHIP_SIZE));
+        let painter = self.ui.painter();
+        painter.rect_filled(chip, egui::CornerRadius::same(super::CONTROL_RADIUS), tint);
+        painter.text(chip.center(), Align2::CENTER_CENTER, letter, semibold(SMALL_TEXT_SIZE), AXIS_CHIP_LETTER);
+        painter.text(pos2(chip.right() + AXIS_CHIP_TO_NAME, center_y), Align2::LEFT_CENTER, name, semibold(TEXT_SIZE), self.tokens.text);
+
+        let id = self.next_id();
+        let typed = self.value_field(id, name, center_y, *value, &range, decimals, "");
+        let track_y = self.take(AXIS_TRACK_LINE).center().y;
+        let track = Track { start: self.left + KNOB_RADIUS, end: self.right - KNOB_RADIUS, center_y: track_y, zero: None, ramp: false };
+        let dragged = self.track_filled(id, name, &track, value, &range, tint);
+        self.drawn(track_y + KNOB_RADIUS);
+        Self::apply_typed(value, typed, dragged)
+    }
+
     /// Draw a picture beside captioned sliders and report the edit on each slider.
     pub(crate) fn picture_sliders<const N: usize>(&mut self, picture: &dyn Fn(&Painter, Rect), sliders: &mut [StackSlider<'_>; N]) -> [Option<bool>; N] {
         let count = sliders.len().max(1) as f32;
@@ -117,7 +155,12 @@ impl PropertySheet<'_> {
             self.ui.painter().text(caption, Align2::LEFT_CENTER, slider.label, FontId::proportional(SMALL_TEXT_SIZE), dim);
             let center_y = y + STACK_CAPTION_LINE + STACK_PART_LINE / 2.0;
             let id = self.next_id();
-            let track = Track { start: x0 + KNOB_RADIUS, end: self.track_end(), center_y, zero: None, ramp: false };
+            let dial_x = self.right - self.used.value_width.max(super::VALUE_MIN_WIDTH) - DIAL_AIR - DIAL_RADIUS;
+            let end = if slider.dial { dial_x - DIAL_RADIUS - DIAL_AIR } else { self.track_end() };
+            let track = Track { start: x0 + KNOB_RADIUS, end, center_y, zero: None, ramp: false };
+            if slider.dial {
+                self.paint_dial(pos2(dial_x, center_y), *slider.value);
+            }
             let dragged = self.track(id, slider.label, &track, slider.value, &slider.range);
             let typed = self.value_field(id, slider.label, center_y, *slider.value, &slider.typed, slider.decimals, slider.suffix);
             *edit = Self::apply_typed(slider.value, typed, dragged);

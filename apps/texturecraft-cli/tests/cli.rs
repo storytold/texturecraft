@@ -96,6 +96,38 @@ fn new_info_run_bake_export_batch() {
 }
 
 #[test]
+fn batch_rejects_non_string_paths() {
+    let directory = tmp("batch-paths");
+    let script = directory.join("script.json");
+    let unexpected_project = directory.join("unexpected.tcraft");
+    let invalid_open = serde_json::json!({"steps": [], "open": false, "save": p(&unexpected_project)});
+    let invalid_save = serde_json::json!({
+        "open": "builtin:cube",
+        "save": [p(&unexpected_project)],
+        "steps": [{"id": "file.saveCopy", "params": {"path": p(&unexpected_project)}}]
+    });
+
+    for (body, field) in [(invalid_open, "open"), (invalid_save, "save")] {
+        std::fs::write(&script, body.to_string()).unwrap();
+        let output = cli(&["batch", p(&script)]);
+
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{field}: {error}");
+        assert!(error.contains(&format!("`{field}` field must be a string")), "{error}");
+        assert!(output.stdout.is_empty());
+        assert!(!unexpected_project.exists());
+    }
+
+    std::fs::write(&script, r#"{"steps":[],"open":null,"save":null}"#).unwrap();
+    let reply = json(&["batch", p(&script)]);
+
+    assert_eq!(reply["completed"], 0);
+    assert!(reply["failed"].is_null());
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
 fn info_on_a_mesh_reports_uvs() {
     let d = tmp("mesh");
     let obj = d.join("quad.obj");

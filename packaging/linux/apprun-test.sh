@@ -95,4 +95,22 @@ out="$(APPIMAGE="$odd" "$APPDIR/AppRun" x)" || fail "launch with an odd path exi
 [[ "$out" = "stub: x" ]] || fail "odd path: $out"
 [[ ! -e "$XDG_DATA_HOME" ]] || fail "integrated an AppImage path that needs escaping"
 
+# 10. A Nightly AppImage (package.sh rewrites the channel line) starts the app with the Launcher's
+#     private profile; a version query still passes through untouched.
+NIGHTLY_APPDIR="$TMP/Nightly.AppDir"
+mkdir -p "$NIGHTLY_APPDIR/usr/bin"
+install -Dm755 "$HERE/AppRun" "$NIGHTLY_APPDIR/AppRun"
+cat >"$NIGHTLY_APPDIR/usr/bin/texturecraft" <<'RECORDER'
+#!/bin/sh
+printf '<%s>\n' "$@"
+RECORDER
+chmod +x "$NIGHTLY_APPDIR/usr/bin/texturecraft"
+sed -i 's|^CHANNEL=stable$|CHANNEL=nightly-v1|' "$NIGHTLY_APPDIR/AppRun"
+grep -qx 'CHANNEL=nightly-v1' "$NIGHTLY_APPDIR/AppRun" || fail "Nightly AppRun was not switched"
+out="$(env -u APPIMAGE XDG_DATA_HOME="$TMP/nightly-data" "$NIGHTLY_APPDIR/AppRun" a.glb)" || fail "Nightly AppRun exited non-zero"
+expected="$(printf '<%s>\n' --launch-profile nightly-v1 --profile-root "$TMP/nightly-data/TextureCraft-Nightly" -- a.glb)"
+[[ "$out" = "$expected" ]] || fail "Nightly AppRun did not use the Launcher profile: $out"
+out="$(env -u APPIMAGE "$NIGHTLY_APPDIR/AppRun" --version)" || fail "Nightly version query exited non-zero"
+[[ "$out" = "<--version>" ]] || fail "Nightly AppRun rewrote a version query: $out"
+
 echo "AppRun desktop integration ok"

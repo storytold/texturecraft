@@ -97,6 +97,7 @@ struct SceneConst {
     env_camera: bool,
     heights: Vec<f32>,
     ior: f32,
+    dielectric_f0_scale: f32,
     /// Focus depth (0: the orbit target) and lens radius in world units (0: pinhole).
     lens: [f32; 2],
 }
@@ -348,8 +349,8 @@ impl GpuTracer {
         };
         let same_geometry = self.geometry.as_ref().is_some_and(|g| Arc::ptr_eq(&g.mesh, &scene.mesh) && g.tri_set == scene.tri_set);
         if !same_geometry {
-            let nodes: Vec<(Vec3, Vec3, u32, u32)> = scene.bvh.nodes().collect();
-            if bvh_depth(&nodes).is_none_or(|d| d >= STACK) {
+            let depth = bvh_depth(&scene.bvh.nodes().collect::<Vec<_>>());
+            if depth.is_none_or(|depth| depth >= STACK) {
                 return Err("the mesh's BVH is too deep for GPU traversal".into());
             }
 
@@ -367,24 +368,23 @@ impl GpuTracer {
             })?);
             self.bind = None;
         }
+
         if !self.env.as_ref().is_some_and(|e| Arc::ptr_eq(&e.image, &scene.env)) {
             let img = &scene.env;
             let (w, h) = (img.width as usize, img.height as usize);
-            let valid = w > 0 && h > 0 && img.data.len() >= w * h && img.width.max(img.height) <= limits.max_texture_dimension_2d;
-            let (tw, th, rgba): (u32, u32, Vec<[f32; 4]>) =
-                if valid { (img.width, img.height, img.data.iter().take(w * h).map(|c| [c[0], c[1], c[2], 1.0]).collect()) } else { (1, 1, vec![[0.0; 4]]) };
-            let mut cdf = Vec::new();
-            if let Some(l) = scene.light.as_ref().filter(|l| valid && l.width == w && l.height == h) {
-                cdf.extend_from_slice(&l.rows);
-                cdf.extend_from_slice(&l.cols);
-                cdf.extend_from_slice(&l.prob);
-            }
-            fits("environment table", cdf.len() * 4)?;
-            let light = !cdf.is_empty();
-            if !light {
-                cdf.push(0.0);
-            }
+            let valid = w > 0 && h > 0 && img.width.max(img.height) <= limits.max_texture_dimension_2d && img.data.len() >= w * h;
+            let sampler = scene.light.as_ref().filter(|table| valid && table.width == w && table.height == h);
+
+            // The shader binds one zero when importance sampling is disabled
+            let parts = sampler.map_or([&[0.0][..], &[], &[]], |table| [table.rows.as_slice(), table.cols.as_slice(), table.prob.as_slice()]);
+            fits("environment table", parts.iter().map(|part| std::mem::size_of_val(*part)).sum())?;
+
             let env = scoped(device, "GPU path tracing: environment upload", || {
+                let (tw, th, rgba): (u32, u32, Vec<[f32; 4]>) = if valid {
+                    (img.width, img.height, img.data.iter().take(w * h).map(|c| [c[0], c[1], c[2], 1.0]).collect())
+                } else {
+                    (1, 1, vec![[0.0; 4]])
+                };
                 let tex = device.create_texture_with_data(
                     queue,
                     &wgpu::TextureDescriptor {
@@ -400,16 +400,19 @@ impl GpuTracer {
                     wgpu::util::TextureDataOrder::LayerMajor,
                     bytemuck::cast_slice(&rgba),
                 );
+                drop(rgba);
+
                 EnvGpu {
                     image: scene.env.clone(),
                     view: tex.create_view(&Default::default()),
-                    cdf: buffer(device, "tc_trace_cdf", bytemuck::cast_slice(&cdf)),
-                    light,
+                    cdf: buffer(device, "tc_trace_cdf", bytemuck::cast_slice(&parts.concat())),
+                    light: sampler.is_some(),
                 }
             })?;
             self.env = Some(env);
             self.bind = None;
         }
+
         self.scene = Some(SceneConst {
             spec_gloss: scene.spec_gloss,
             eps: scene.eps,
@@ -418,6 +421,7 @@ impl GpuTracer {
             env_camera: scene.env_camera,
             heights: scene.sets.iter().map(|s| s.height_strength).collect(),
             ior: scene.ior,
+            dielectric_f0_scale: scene.dielectric_f0_scale,
             lens: scene.lens.map_or([0.0; 2], |[focus, aperture]| [focus, aperture.max(0.0) * scene.radius]),
         });
         Ok(())
@@ -609,7 +613,7 @@ impl GpuTracer {
             env: [sin, cos, 0.0, 0.0],
             sigma: sc.sigma.extend(0.0).to_array(),
             eye: cam.eye().extend(1.0).to_array(),
-            lens: [if sc.lens[0] > 0.0 { sc.lens[0] } else { cam.distance }, sc.lens[1], sc.ior, 0.0],
+            lens: [if sc.lens[0] > 0.0 { sc.lens[0] } else { cam.distance }, sc.lens[1], sc.ior, sc.dielectric_f0_scale],
         };
         let mut sets = [[0.0f32; 4]; 256];
         for (i, (slot, m)) in sets.iter_mut().zip(&mat.info).enumerate() {
@@ -1015,6 +1019,33 @@ mod tests {
             cpu.pass(&scene, &camera(), &settings);
         }
         assert_region_means_match("varying roughness, default base color", &gpu, &cpu.rgba8(&d), 48, 36, 3.0);
+    }
+
+    #[test]
+    fn gpu_matches_cpu_with_ior_specular_reflectance() {
+        use Channel::*;
+        let Some((mut h, mut t)) = gpu() else { return };
+
+        // A dark, glossy dielectric shows mostly its F0
+        let values = [(BaseColor, [0.02; 3]), (Metallic, [0.0; 3]), (Roughness, [0.15; 3]), (SpecularLevel, [1.0; 3])];
+        let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false, background: crate::DEFAULT_BACKGROUND };
+        let settings = TraceSettings { bounces: 4 };
+        let mut sphere_brightness = Vec::new();
+
+        for ior_specular in [false, true] {
+            let display = texturecraft_core::DisplaySettings { ior: 1.8, ior_specular, ..Default::default() };
+            let mut scene = sphere_scene(&mut h, crate::ibl::environment("Studio Contrast", 256), &values);
+            (scene.ior, scene.dielectric_f0_scale) = (display.ior, display.dielectric_f0_scale());
+            let (_, _, gpu) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &settings, &d, [48, 36], 1024).unwrap();
+            let mut cpu = Tracer::new(48, 36);
+            for _ in 0..1024 {
+                cpu.pass(&scene, &camera(), &settings);
+            }
+            assert_region_means_match(&format!("IOR specular {ior_specular}"), &gpu, &cpu.rgba8(&d), 48, 36, 3.0);
+            sphere_brightness.push(gpu.as_chunks::<4>().0.iter().map(|pixel| pixel[..3].iter().map(|v| u32::from(*v)).sum::<u32>()).sum::<u32>());
+        }
+
+        assert!(sphere_brightness[1] > sphere_brightness[0], "IOR 1.8 reflects more than the legacy F0: {sphere_brightness:?}");
     }
 
     /// Mean luminance of each 6×6 block of two RGBA8 renders agrees within `tol` 8-bit levels.
