@@ -133,18 +133,6 @@ pub fn report() -> String {
 mod tests {
     use super::*;
 
-    // TEMPORARY (removed before review): prints the regenerated docs/parity.md in CI, because the
-    // box can't build ui-egui right now.
-    #[test]
-    fn temp_print_regenerated_parity_doc() {
-        let doc = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/parity.md")).unwrap_or_default();
-        let want = report();
-        if doc != want {
-            println!("=====BEGIN PARITY DOC=====\n{want}=====END PARITY DOC=====");
-            panic!("docs/parity.md is stale (temporary check)");
-        }
-    }
-
     #[test]
     fn headless_marks_are_current() {
         let ids: Vec<(&str, bool)> = CATALOG.iter().filter(|i| i.label != "-").map(|i| (i.id, texturecraft_engine::find(i.id).is_some())).collect();
