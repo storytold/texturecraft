@@ -256,19 +256,19 @@ fn display_settings_remain_reachable_in_a_short_window() {
     assert!(harness.ctx.content_rect().contains_rect(setting), "the last setting must be reachable: {setting:?}");
 }
 
+/// The History panel has no Undo/Redo buttons (the Edit menu and Ctrl+Z/Ctrl+Y undo); its current step stays reachable
 #[test]
-fn history_actions_remain_reachable_in_a_short_window() {
+fn the_current_history_step_remains_reachable_in_a_short_window() {
     let mut harness = app_of_size(egui::vec2(1600.0, 400.0));
     click_rail(&mut harness, "History");
 
-    for label in ["Undo", "Redo"] {
-        let button = harness
-            .get_all_by_role(Role::Button)
-            .find(|button| button.accesskit_node().label().is_some_and(|text| text.ends_with(label)))
-            .expect("the History action")
-            .rect();
-        assert!(harness.ctx.content_rect().contains_rect(button), "{label} must be reachable: {button:?}");
-    }
+    let name = harness.state().session.history_labels().last().cloned().unwrap_or_else(|| "Project opened".to_owned());
+    let current = harness
+        .get_all_by_role_and_label(Role::Button, &name)
+        .find(|row| row.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True))
+        .expect("the current History step")
+        .rect();
+    assert!(harness.ctx.content_rect().contains_rect(current), "the current step must be reachable: {current:?}");
 }
 
 #[test]

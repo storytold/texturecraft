@@ -36,9 +36,10 @@ fn dock_in_left_column(harness: &mut Harness<'_, TextureCraftApp>, panel: &str) 
     harness.state_mut().ui.dock = Dock::from_value(serde_json::from_str(&swapped).unwrap());
 }
 
-/// The height of the list's scroll bar, which runs the visible height of the list
+/// The height of the list's vertical scroll bar (the taller one, as the Log also scrolls sideways), which runs the visible height of the list
 fn list_height(harness: &Harness<'_, TextureCraftApp>) -> f32 {
-    let bar = harness.get_all_by_role(Role::ScrollBar).find(|bar| bar.rect().max.x < LEFT_COLUMN_MAX_X).expect("a scroll bar in the left column");
+    let bars = harness.get_all_by_role(Role::ScrollBar).filter(|bar| bar.rect().max.x < LEFT_COLUMN_MAX_X);
+    let bar = bars.max_by(|a, b| a.rect().height().total_cmp(&b.rect().height())).expect("a scroll bar in the left column");
     bar.rect().height()
 }
 

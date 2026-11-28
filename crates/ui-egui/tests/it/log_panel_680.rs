@@ -7,6 +7,9 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::docking::Panel;
 
+/// Enough lines that the Log cannot show them all at once
+const LINES_PAST_THE_PANEL: usize = 100;
+
 fn app() -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(256, 64).unwrap();
     let mut h = Harness::builder()
@@ -131,18 +134,83 @@ fn mesh_reimport_clears_log_selection_within_the_same_project() {
 
 #[test]
 fn assets_has_a_greyed_filter_button_with_the_hint() {
-    let mut h = app();
-    assert!(h.query_by_label(egui_phosphor::regular::WARNING).is_none(), "GENERAL has no filter button");
-    h.get_by_label("ASSETS").click();
-    h.run_steps(3);
-    let button = h.get_by_label(egui_phosphor::regular::WARNING);
+    let mut harness = app();
+    assert!(harness.query_by_label("Warnings").is_none(), "GENERAL has no filter button");
+
+    harness.get_by_label("ASSETS").click();
+    harness.run_steps(3);
+
+    let button = harness.get_by_label("Warnings");
     assert!(button.accesskit_node().is_disabled());
+
     let at = button.rect().center();
-    h.hover_at(egui::pos2(1.0, 1.0));
-    h.run_steps(2);
-    h.hover_at(at);
-    h.run_steps(30);
-    assert!(h.query_by_label(texturecraft_ui_egui::unavailable::NOT_AVAILABLE).is_some());
+    harness.hover_at(egui::pos2(1.0, 1.0));
+    harness.run_steps(2);
+    harness.hover_at(at);
+    harness.run_steps(30);
+    assert!(harness.query_by_label(texturecraft_ui_egui::unavailable::NOT_AVAILABLE).is_some());
+}
+
+/// The two tabs share the panel's width equally, side by side
+#[test]
+fn the_log_tabs_split_the_panel_width() {
+    let harness = app();
+    let (general, assets) = (harness.get_by_label("GENERAL").rect(), harness.get_by_label("ASSETS").rect());
+
+    assert!((general.width() - assets.width()).abs() < 1.0, "{general:?} {assets:?}");
+    assert!((general.right() - assets.left()).abs() < 1.0, "{general:?} {assets:?}");
+}
+
+/// The list's scrollbar keeps a gap to the list's frame, which ends where the tabs end
+#[test]
+fn the_log_scroll_bar_stands_clear_of_the_list_frame() {
+    let harness = app();
+    let (general, assets) = (harness.get_by_label("GENERAL").rect(), harness.get_by_label("ASSETS").rect());
+    let bars =
+        harness.get_all_by_role(egui::accesskit::Role::ScrollBar).filter(|bar| bar.rect().left() > general.left() && bar.rect().right() <= assets.right());
+    let bar = bars.max_by(|a, b| a.rect().height().total_cmp(&b.rect().height())).expect("the list's scroll bar").rect();
+
+    // The frame ends where the tab strip ends; its 1 point line and 1 point padding come before its inside
+    let frame_inside = assets.right() - 2.0;
+    assert!(bar.right() < frame_inside, "{bar:?} {assets:?}");
+}
+
+/// How many rows each painted text containing `part` has
+fn painted_rows(harness: &Harness<'_, TextureCraftApp>, part: &str) -> Vec<usize> {
+    harness
+        .output()
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) if text.galley.text().contains(part) => Some(text.galley.rows.len()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Log `message` and show it painted: the status bar repeats the newest message, so another follows it
+fn log_behind_a_newer_line(harness: &mut Harness<'_, TextureCraftApp>, message: &str) {
+    harness.state_mut().session.log.info("Exporter", message.to_owned());
+    harness.state_mut().session.log.info("Exporter", "newest");
+    harness.run_steps(3);
+}
+
+/// A line longer than the panel stays on one row
+#[test]
+fn a_long_line_stays_one_row() {
+    let mut harness = app();
+    log_behind_a_newer_line(&mut harness, &"long ".repeat(400));
+
+    assert_eq!(painted_rows(&harness, "long long"), vec![1]);
+}
+
+/// A message with a line break is painted on its row, not over the lines around it
+#[test]
+fn a_message_with_a_line_break_is_painted_on_one_row() {
+    let mut harness = app();
+    log_behind_a_newer_line(&mut harness, "broken\nmessage");
+
+    assert_eq!(painted_rows(&harness, "broken"), vec![1]);
 }
 
 #[test]
@@ -208,4 +276,31 @@ fn the_assets_menu_clears_all_or_only_the_selected_lines() {
     h.run_steps(3);
     assert!(h.state().session.log.iter().all(|entry| !entry.is_asset()));
     assert_eq!(h.state().session.log.len(), 3, "the GENERAL lines stay");
+}
+
+/// Shift+Tab walks from the newest line to the first one, past the lines on screen when the panel opened
+#[test]
+fn the_keyboard_reaches_lines_scrolled_out_of_view() {
+    let mut harness = app();
+    for number in 0..LINES_PAST_THE_PANEL {
+        harness.state_mut().session.log.info("Exporter", format!("line {number}"));
+    }
+    harness.run_steps(4);
+    line(&harness, &format!("[Exporter] line {}", LINES_PAST_THE_PANEL - 1)).focus();
+    harness.run_steps(2);
+
+    let first_line_focused = |harness: &Harness<'_, TextureCraftApp>| {
+        let screen = harness.ctx.content_rect();
+        harness.query_all_by_label("[Exporter] first").any(|row| row.accesskit_node().is_focused() && screen.y_range().contains(row.rect().top()))
+    };
+    // One press per line is enough to reach the first one
+    for _ in 0..harness.state().session.log.len() {
+        if first_line_focused(&harness) {
+            break;
+        }
+        harness.key_press_modifiers(Modifiers::SHIFT, egui::Key::Tab);
+        harness.run_steps(2);
+    }
+
+    assert!(first_line_focused(&harness));
 }
