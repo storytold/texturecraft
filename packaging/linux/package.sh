@@ -65,6 +65,14 @@ echo "==> TextureCraft $VERSION for Linux $ARCH ($FORMATS, channel=${TEXTURECRAF
 
 if [[ "$SKIP_BUILD" = 0 ]]; then
   (cd "$ROOT" && cargo build --release --locked -p texturecraft -p texturecraft-cli ${CROSS_TARGET:+--target "$CROSS_TARGET"})
+  # The man-and-completions example writes texturecraft-cli's man pages and shell completions
+  # below (Stable only: a Nightly ships no CLI). It is built in its own cargo run: built with the
+  # binaries, its dev-dependencies' features would be unified into them. It is run here, so a
+  # cross build builds it for the host.
+  if [[ "$IS_NIGHTLY" = 0 ]]; then
+    # Unset CARGO_BUILD_TARGET so a cross package still builds a host example (run below).
+    (cd "$ROOT" && env -u CARGO_BUILD_TARGET cargo build --release --locked -p texturecraft-cli --example man-and-completions)
+  fi
 fi
 BIN="$CARGO_TARGET_DIR/${CROSS_TARGET:+$CROSS_TARGET/}release"
 WORK="$CARGO_TARGET_DIR/linux-package"
@@ -80,6 +88,20 @@ install -Dm755 "$BIN/texturecraft" "$STAGE/usr/bin/texturecraft"
 if [[ "$IS_NIGHTLY" = 0 ]]; then
   install -Dm755 "$BIN/texturecraft-cli" "$STAGE/usr/bin/texturecraft-cli"
   "${CROSS_COMPILE:-}strip" "$STAGE/usr/bin/texturecraft-cli" 2>/dev/null || true
+  # texturecraft-cli's man pages and shell completions (RFC-0018 rule 1.9), from its clap
+  # definition, written by the example built above (a --skip-build run needs it built too). zsh
+  # reads site-functions on Fedora and openSUSE; the deb also links the completion into Debian's
+  # vendor-completions (nfpm.yaml).
+  CLI_DOCS="$CARGO_TARGET_DIR/release/examples/man-and-completions"
+  if [[ ! -x "$CLI_DOCS" ]]; then
+    echo "error: $CLI_DOCS is not built (env -u CARGO_BUILD_TARGET cargo build --release -p texturecraft-cli --example man-and-completions)" >&2
+    exit 1
+  fi
+  "$CLI_DOCS" "$WORK/cli-docs"
+  install -Dm644 -t "$STAGE/usr/share/man/man1" "$WORK"/cli-docs/*.1
+  install -Dm644 "$WORK/cli-docs/texturecraft-cli.bash" "$STAGE/usr/share/bash-completion/completions/texturecraft-cli"
+  install -Dm644 "$WORK/cli-docs/_texturecraft-cli" "$STAGE/usr/share/zsh/site-functions/_texturecraft-cli"
+  install -Dm644 "$WORK/cli-docs/texturecraft-cli.fish" "$STAGE/usr/share/fish/vendor_completions.d/texturecraft-cli.fish"
 fi
 install -Dm644 "$HERE/$APP_ID.desktop" "$STAGE/usr/share/applications/$APP_ID.desktop"
 if [[ "$IS_NIGHTLY" = 1 ]]; then
@@ -192,6 +214,9 @@ WRAPPER
   # A Nightly package has no CLI, so its file list must not name one either.
   # shellcheck disable=SC2016
   [[ "$IS_NIGHTLY" = 0 ]] || DROP_CLI='\|^  - src: \${STAGE}/usr/bin/\${NFPM_CLI}|,+2d;/Includes texturecraft-cli/d;'
+  # ... nor the zsh link into Debian's vendor-completions for the CLI's completion.
+  # shellcheck disable=SC2016
+  [[ "$IS_NIGHTLY" = 0 ]] || DROP_CLI="$DROP_CLI"'\|^  - src: /usr/share/zsh/site-functions/_texturecraft-cli|,+3d;'
   # shellcheck disable=SC2016
   sed "${DROP_LIB_TREE}${DROP_CLI}s|\${STAGE}|$NFPM_STAGE|g;s|\${NFPM_BIN}|$NFPM_BIN|g;s|\${NFPM_CLI}|$NFPM_CLI|g" "$HERE/nfpm.yaml" >"$WORK/nfpm.yaml"
   # The riscv64 cross sysroot is Ubuntu 24.04, whose glibc floor is 2.39.

@@ -44,9 +44,9 @@ fn p(path: &Path) -> &str {
 #[test]
 fn version_and_usage_errors() {
     let v = ok(&["--version"]);
-    assert!(v.starts_with("TextureCraft "), "{v}");
+    assert!(v.starts_with("texturecraft-cli "), "{v}");
     assert_eq!(v.lines().count(), 1);
-    assert!(ok(&["--help"]).contains("texturecraft-cli mcp"));
+    assert!(ok(&["--help"]).contains("Usage: texturecraft-cli <COMMAND>"));
     assert_eq!(cli(&[]).status.code(), Some(2));
     assert_eq!(cli(&["frobnicate"]).status.code(), Some(2));
     assert_eq!(cli(&["info", "--bogus"]).status.code(), Some(2));
@@ -54,8 +54,8 @@ fn version_and_usage_errors() {
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stderr).contains("error"));
     assert_eq!(cli(&["run", "builtin:nope", "layer.add.fill"]).status.code(), Some(1));
-    assert_eq!(cli(&["run", "builtin:cube", "layer.add.fill", "{not json"]).status.code(), Some(1));
-    assert_eq!(cli(&["render", "builtin:cube", "x.png", "--size", "big"]).status.code(), Some(1));
+    assert_eq!(cli(&["run", "builtin:cube", "layer.add.fill", "{not json"]).status.code(), Some(2));
+    assert_eq!(cli(&["render", "builtin:cube", "x.png", "--size", "big"]).status.code(), Some(2));
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn new_info_run_bake_export_batch() {
     assert!(r["layer"].is_u64(), "{r}");
     assert_eq!(json(&["info", p(&b)])["layers"][0]["kind"], "fill");
 
-    ok(&["bake", p(&b), "--resolution", "128", "--maps", "ambientOcclusion,curvature"]);
+    ok(&["bake", p(&b), "--resolution", "128", "--maps", "ambientOcclusion,curvature", "--in-place"]);
     let maps = json(&["info", p(&b)])["textureSets"][0]["baked"]["maps"].clone();
     assert_eq!(maps.as_array().unwrap().len(), 2, "{maps}");
 
@@ -202,10 +202,10 @@ fn path_traced_render_needs_no_gpu() {
     // --camera looks through a camera saved in the project; an unknown name is an error.
     let proj = d.join("cams.tcraft");
     ok(&["run", "builtin:cube", "camera.set", r#"{"yaw": 80, "distance": 9}"#, "-o", p(&proj)]);
-    ok(&["run", p(&proj), "camera.add", r#"{"name": "Side"}"#, "-o", p(&proj)]);
+    ok(&["run", p(&proj), "camera.add", r#"{"name": "Side"}"#, "-o", p(&proj), "--in-place"]);
     ok(&["render", p(&proj), p(&out), "--size", "48x32", "--camera", "Side", "--samples", "2", "--cpu"]);
     assert_eq!(cli(&["render", p(&proj), p(&out), "--camera", "Nope", "--samples", "2", "--cpu"]).status.code(), Some(1));
-    assert_eq!(cli(&["render", "builtin:cube", p(&out), "--samples", "0"]).status.code(), Some(1));
+    assert_eq!(cli(&["render", "builtin:cube", p(&out), "--samples", "0"]).status.code(), Some(2));
     assert_eq!(cli(&["render", "builtin:cube", p(&out), "--samples", "4", "--view", "2d"]).status.code(), Some(1));
     let _ = std::fs::remove_dir_all(&d);
 }

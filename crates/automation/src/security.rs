@@ -45,9 +45,16 @@ pub fn generate_token() -> Result<String, AutomationError> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// `TEXTURECRAFT_CONTROL_TOKEN`; an empty (or blank) variable counts as unset, as for every other
+/// variable of the command line (RFC-0018 rule 1.7).
+fn env_token() -> Option<String> {
+    std::env::var(TOKEN_ENV).ok().filter(|t| !t.trim().is_empty())
+}
+
 /// Token for a client of `port`: explicit, else `TEXTURECRAFT_CONTROL_TOKEN`, else the token file.
+/// A blank value counts as not given.
 pub fn client_token(port: u16, supplied: Option<String>) -> Result<String, AutomationError> {
-    let token = match supplied.or_else(|| std::env::var(TOKEN_ENV).ok()) {
+    let token = match supplied.filter(|t| !t.trim().is_empty()).or_else(env_token) {
         Some(t) => t,
         None => {
             let path = token_file(port);
@@ -64,7 +71,7 @@ pub fn client_token(port: u16, supplied: Option<String>) -> Result<String, Autom
 /// [`token_file`] (owner-only on Unix). Returns the token and where it was written. Call it
 /// once the port is bound, so a server that cannot listen never replaces another's token.
 pub fn server_token(port: u16) -> Result<(String, Option<PathBuf>), AutomationError> {
-    if let Ok(t) = std::env::var(TOKEN_ENV) {
+    if let Some(t) = env_token() {
         validate_token(t.trim())?;
         return Ok((t.trim().to_string(), None));
     }
@@ -226,6 +233,25 @@ mod tests {
         assert!(!token_matches(&a, "short"));
         assert!(client_token(1, Some("too short".into())).is_err());
         assert!(client_token(1, Some(format!(" {a}\n"))).is_ok());
+    }
+
+    #[test]
+    fn a_blank_token_counts_as_not_given() {
+        // No token anywhere (the port has no token file): the error says what to set, not that a
+        // blank token is invalid. A non-blank inherited TOKEN_ENV can still satisfy the client
+        // after a blank supplied value, so do not unwrap_err() first.
+        match client_token(1, Some("  ".into())) {
+            Err(error) => {
+                if std::env::var_os(TOKEN_ENV).is_none() {
+                    let message = error.to_string();
+                    assert!(message.contains("no control token"), "{message}");
+                }
+            }
+            Ok(_) => {
+                let inherited = std::env::var(TOKEN_ENV).unwrap_or_default();
+                assert!(!inherited.trim().is_empty(), "a blank token was accepted with no inherited value");
+            }
+        }
     }
 
     fn scratch(name: &str) -> PathBuf {
