@@ -9,7 +9,7 @@ include!(concat!(env!("OUT_DIR"), "/craft_i18n.rs"));
 
 static I18N: LazyLock<craft_i18n::I18n> = LazyLock::new(|| {
     let offered: Vec<_> = LANGUAGES.iter().map(|l| l.code).collect();
-    let (i18n, problems) = craft_i18n::I18n::new(CRAFT_I18N, &offered);
+    let (i18n, problems) = craft_i18n::I18n::new(craft_i18n_catalogs(), &offered);
     for problem in problems {
         log::warn!("translation catalog: {problem}");
     }
@@ -377,7 +377,7 @@ mod tests",
         let keys = keys();
         assert!(keys.len() > 300, "found only {} keys", keys.len());
         let used: BTreeSet<_> = keys.iter().map(String::as_str).collect();
-        for &(locale, common, app) in CRAFT_I18N {
+        for &(locale, common, app) in craft_i18n_catalogs() {
             let Some(lang) = I18N.from_code(locale) else { continue };
             let missing: Vec<_> = keys.iter().filter(|key| I18N.get(lang, "", key).is_none()).collect();
 

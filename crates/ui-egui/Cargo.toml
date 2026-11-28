@@ -12,7 +12,8 @@ workspace = true
 chrono = { workspace = true }
 texturecraft-engine = { workspace = true }
 texturecraft-render = { workspace = true }
-eframe = { workspace = true, features = ["default_fonts", "wgpu", "persistence"] }
+# egui's default fonts: on desktop from egui; the web build uses craft-ui's deflated copies (`fonts::egui_default_definitions`).
+eframe = { workspace = true, features = ["wgpu", "persistence"] }
 egui = { workspace = true }
 craft-ui = { workspace = true }
 craft-behavior = { workspace = true }
@@ -32,6 +33,7 @@ craft-image-codecs = { workspace = true }
 
 # The OS UI language for the first run (MIT OR Apache-2.0; the browser asks `navigator.language`).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+eframe = { workspace = true, features = ["default_fonts"] }
 sys-locale = "0.3"
 # Help > Check for Updates and the check at start (updates_ui.rs).
 craft-update = { workspace = true }
@@ -61,12 +63,16 @@ zbus = { version = "5.19", default-features = false, features = ["async-io", "bl
 # versions craft-libs' craft-fonts-build subsets with).
 [build-dependencies]
 craft-i18n = { workspace = true }
+# The web build embeds its fonts and catalogs deflated (build.rs, `fonts::CraftFont`, `i18n`).
+flate2 = { workspace = true }
 skera = "0.8"
 skrifa = { version = "0.48", default-features = false, features = ["std"] }
 
 # Browser file I/O (web_files.rs): async pickers and Blob downloads.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 craft-zip = { workspace = true }
+# Inflates the embedded fonts and catalogs of the web build.
+flate2 = { workspace = true }
 rfd = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
@@ -74,6 +80,8 @@ js-sys = "0.3"
 web-sys = { version = "0.3", features = ["Window", "Document", "HtmlElement", "HtmlAnchorElement", "Blob", "BlobPropertyBag", "Url", "CssStyleDeclaration", "Navigator"] }
 
 [dev-dependencies]
+# build.rs's `i18n_build.rs`, which tests/i18n_build.rs includes.
+flate2 = { workspace = true }
 craft-zip = { workspace = true }
 zip = { workspace = true }
 

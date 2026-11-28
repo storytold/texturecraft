@@ -7,13 +7,34 @@ use texturecraft_engine::geom::glam::Vec3;
 use texturecraft_render::ibl::{self, EnvImage};
 
 /// The bundled environment: a small photo studio with soft boxes, 512 x 256 equirect Radiance HDR
+#[cfg(not(target_arch = "wasm32"))]
 const STUDIO_HDR: &[u8] = include_bytes!("../../../assets/hdr/studio_small_09_512.hdr");
+/// The same file deflated by build.rs: the web build's wasm is under a download budget
+#[cfg(target_arch = "wasm32")]
+const STUDIO_HDR_DEFLATED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/studio_small_09_512.hdr.deflate"));
 
 /// Prefiltered levels from mirror (0) to fully rough (last)
 const LEVELS: u32 = 6;
 
 /// How far the studio is turned about the vertical axis (radians) so its key soft box lights the orb from the upper left
 const TURN: f32 = 4.4;
+
+/// The bundled file's bytes
+#[cfg(not(target_arch = "wasm32"))]
+fn studio_hdr() -> std::borrow::Cow<'static, [u8]> {
+    std::borrow::Cow::Borrowed(STUDIO_HDR)
+}
+
+/// The bundled file's bytes, inflated; none if the copy does not inflate (the studio falls back)
+#[cfg(target_arch = "wasm32")]
+fn studio_hdr() -> std::borrow::Cow<'static, [u8]> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    match flate2::read::DeflateDecoder::new(STUDIO_HDR_DEFLATED).take(64 << 20).read_to_end(&mut out) {
+        Ok(_) => std::borrow::Cow::Owned(out),
+        Err(_) => std::borrow::Cow::Owned(Vec::new()),
+    }
+}
 
 /// The prefiltered studio
 pub(crate) struct OrbEnvironment {
@@ -27,7 +48,7 @@ impl OrbEnvironment {
     /// The studio, decoded and prefiltered by the first caller (about a tenth of a second in release)
     pub(crate) fn get() -> &'static OrbEnvironment {
         static STUDIO: OnceLock<OrbEnvironment> = OnceLock::new();
-        STUDIO.get_or_init(|| OrbEnvironment::from_hdr(STUDIO_HDR).unwrap_or_else(OrbEnvironment::fallback))
+        STUDIO.get_or_init(|| OrbEnvironment::from_hdr(&studio_hdr()).unwrap_or_else(OrbEnvironment::fallback))
     }
 
     fn from_hdr(bytes: &[u8]) -> Option<OrbEnvironment> {

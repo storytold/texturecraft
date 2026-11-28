@@ -24,7 +24,38 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 /// Fonts bundled with the app (egui's), used when nothing is installed or in the browser.
+#[cfg(not(target_arch = "wasm32"))]
 const BUILT_IN: [(&str, &[u8]); 2] = [("Ubuntu Light", epaint_default_fonts::UBUNTU_LIGHT), ("Hack", epaint_default_fonts::HACK_REGULAR)];
+/// The built-in fonts' names, in [`provide_built_in_fonts`]'s order.
+#[cfg(target_arch = "wasm32")]
+const BUILT_IN_NAMES: [&str; 2] = ["Ubuntu Light", "Hack"];
+#[cfg(target_arch = "wasm32")]
+static BUILT_IN_SOURCE: std::sync::OnceLock<fn() -> [&'static [u8]; 2]> = std::sync::OnceLock::new();
+
+/// The web build's built-in fonts, Ubuntu Light and Hack, from `source`. The browser app already carries egui's faces
+/// (deflated, for its download budget), so it says where to get them instead of the engine embedding a second, raw
+/// copy. `source` runs once, when text first needs a built-in font. Only the first call counts.
+#[cfg(target_arch = "wasm32")]
+pub fn provide_built_in_fonts(source: fn() -> [&'static [u8]; 2]) {
+    let _ = BUILT_IN_SOURCE.set(source);
+}
+
+/// The built-in fonts: names and bytes. On the web the bytes are empty without [`provide_built_in_fonts`].
+#[cfg(target_arch = "wasm32")]
+fn built_in() -> [(&'static str, &'static [u8]); 2] {
+    static BYTES: std::sync::OnceLock<[&'static [u8]; 2]> = std::sync::OnceLock::new();
+    let bytes = match BUILT_IN_SOURCE.get() {
+        Some(source) => *BYTES.get_or_init(*source),
+        None => [&[] as &[u8], &[]],
+    };
+    [(BUILT_IN_NAMES[0], bytes[0]), (BUILT_IN_NAMES[1], bytes[1])]
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn built_in() -> [(&'static str, &'static [u8]); 2] {
+    BUILT_IN
+}
+
 /// Families tried, in order, when no font is asked for.
 #[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_FAMILIES: [&str; 6] = ["Arial", "Segoe UI", "Helvetica", "Liberation Sans", "DejaVu Sans", "Noto Sans"];
@@ -54,7 +85,7 @@ fn fonts() -> Value {
     let families: Vec<(String, Vec<String>)> = Vec::new();
     json!({
         "installed": families.into_iter().map(|(family, styles)| json!({"family": family, "styles": styles})).collect::<Vec<_>>(),
-        "builtIn": BUILT_IN.map(|(name, _)| name),
+        "builtIn": built_in().map(|(name, _)| name),
     })
 }
 
@@ -62,7 +93,8 @@ fn fonts() -> Value {
 /// or the first default family installed, else the built-in font.
 fn font_bytes(family: Option<&str>, style: Option<&str>) -> Result<(std::borrow::Cow<'static, [u8]>, u32)> {
     let is = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
-    if let Some((_, bytes)) = BUILT_IN.iter().find(|(name, _)| family.is_some_and(|f| is(f, name))) {
+    let built_in = built_in();
+    if let Some((_, bytes)) = built_in.iter().find(|(name, _)| family.is_some_and(|f| is(f, name))) {
         return Ok((std::borrow::Cow::Borrowed(bytes), 0));
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -91,7 +123,7 @@ fn font_bytes(family: Option<&str>, style: Option<&str>) -> Result<(std::borrow:
     let _ = style;
     match family {
         Some(f) => Err(bad("resource.text", format!("no font family `{f}` (see text.fonts)"))),
-        None => Ok((std::borrow::Cow::Borrowed(BUILT_IN[0].1), 0)),
+        None => Ok((std::borrow::Cow::Borrowed(built_in[0].1), 0)),
     }
 }
 
