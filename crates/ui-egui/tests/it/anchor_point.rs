@@ -114,3 +114,34 @@ fn a_name_typed_then_left_with_shift_tab_is_kept() {
     assert_eq!(anchor_name(&harness, anchor), "Edges", "the typed name is kept");
     assert_eq!(harness.state().session.history_labels().len(), steps + 1, "in one undo step");
 }
+
+#[test]
+fn material_mode_picker_links_and_clears_an_anchor_point() {
+    let mut session = texturecraft_engine::sample_session(TEXTURE_RESOLUTION, BAKE_RESOLUTION).unwrap();
+    let low = execute(&mut session, "layer.add.fill", &json!({"color": [0.8, 0.2, 0.1], "roughness": 0.2})).unwrap()["layer"].clone();
+    let anchor = LayerId(execute(&mut session, "effect.add.anchor", &json!({"layer": low, "name": "Base Paint"})).unwrap()["effect"].as_u64().unwrap());
+    let top = LayerId(execute(&mut session, "layer.add.fill", &json!({})).unwrap()["layer"].as_u64().unwrap());
+    execute(&mut session, "layer.fill.material", &json!({"layer": top.0, "material": "brass"})).unwrap();
+    execute(&mut session, "layer.select", &json!({"layer": top.0})).unwrap();
+
+    let mut harness = Harness::builder()
+        .with_size(PROPERTIES_WINDOW)
+        .with_step_dt(FRAME_SECONDS)
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
+    harness.state_mut().ui.prefs.language = "en".into();
+    harness.run_steps(STARTUP_FRAMES);
+
+    crate::click_widget(&mut harness, egui::Role::ComboBox, "Brass");
+    crate::click_widget(&mut harness, egui::Role::Tab, "Anchor points");
+    crate::click_widget(&mut harness, egui::Role::ListBoxOption, "Base Paint");
+
+    let texturecraft_engine::core::LayerKind::Fill(fill) = &harness.state().session.doc.project.layer(top).unwrap().kind else {
+        panic!("expected fill layer");
+    };
+    assert_eq!(fill.material, None);
+    assert!(matches!(
+        fill.source(texturecraft_engine::core::Channel::BaseColor),
+        texturecraft_engine::core::Source::Anchor { anchor: picked, channel: texturecraft_engine::core::Channel::BaseColor, .. } if picked == anchor
+    ));
+}

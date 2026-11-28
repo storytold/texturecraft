@@ -164,3 +164,32 @@ fn setting_the_material_again_brings_back_a_content_fill_effects_channel_turned_
         assert_eq!(effect_fill(&s, effect).sources, whole, "the material's roughness is back");
     }
 }
+
+#[test]
+fn a_fill_in_material_mode_can_link_an_anchor_across_all_enabled_channels() {
+    let mut s = session();
+    let base = layer(execute(&mut s, "layer.add.fill", &json!({"color": [0.9, 0.2, 0.1], "roughness": 0.2})).unwrap());
+    let anchor = execute(&mut s, "effect.add.anchor", &json!({"layer": base, "name": "Base Paint"})).unwrap()["effect"].as_u64().unwrap();
+    let top = layer(execute(&mut s, "layer.add.fill", &Value::Null).unwrap());
+    execute(&mut s, "layer.fill.material", &json!({"layer": top, "material": "brass"})).unwrap();
+    execute(&mut s, "layer.fill.set", &json!({"layer": top, "channel": "height", "enabled": false})).unwrap();
+    let steps = s.history_labels().len();
+
+    execute(&mut s, "layer.fill.material", &json!({"layer": top, "anchor": anchor})).unwrap();
+    execute(&mut s, "layer.fill.material", &json!({"layer": top, "anchor": anchor})).unwrap();
+
+    assert_eq!(s.history_labels().len(), steps + 1, "linking the same anchor again adds no undo step");
+    let linked = fill(&s, top);
+    assert_eq!(linked.material, None);
+    for channel in [Channel::BaseColor, Channel::Metallic, Channel::Roughness] {
+        assert_eq!(linked.source(channel), Source::Anchor { anchor: LayerId(anchor), channel, ramp: Vec::new() });
+    }
+    assert!(!channels(&s, top).contains(&Channel::Height), "disabled channel stays off");
+
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(fill(&s, top).material.as_deref(), Some("brass"));
+
+    // Rejects conflicting params or anchors above the target layer
+    assert!(execute(&mut s, "layer.fill.material", &json!({"layer": top, "material": "brass", "anchor": anchor})).is_err());
+    assert!(execute(&mut s, "layer.fill.material", &json!({"layer": base, "anchor": anchor})).is_err());
+}
