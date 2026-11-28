@@ -3563,6 +3563,9 @@ fn arrow_of(button: egui::Rect) -> egui::Pos2 {
 #[test]
 #[ignore]
 fn tool_variant_snapshots() {
+    // Enough frames for egui's tooltip delay to pass
+    const TOOLTIP_FRAMES: usize = 60;
+
     let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
     std::fs::create_dir_all(&output_dir).unwrap();
 
@@ -3612,7 +3615,7 @@ fn tool_variant_snapshots() {
         harness.get_by_role_and_label(egui::Role::RadioButton, "Physical paint").click();
         harness.run_steps(3);
         harness.hover_at(paint.center());
-        harness.run_steps(60);
+        harness.run_steps(TOOLTIP_FRAMES);
         shot(&mut harness, "physical-picked");
         harness.hover_at(AWAY_FROM_TILES);
         harness.run_steps(3);
