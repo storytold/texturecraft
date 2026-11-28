@@ -1,4 +1,4 @@
-//! A fill's Material section: the channel strip turns channels on and off, each slot's row lists the sources, ⟲ and × restore and clear, the ramp inverts, a linked material maps its channels and picks its resolution
+//! A fill's Material section: the channel strip turns channels on and off, the material and the channel slots show together and take drops, each slot's row lists the sources, ⟲ and × restore and clear, the ramp inverts, a linked material maps its channels and picks its resolution
 
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use texturecraft_engine::compose::ImageRes;
 use texturecraft_engine::core::{Channel, CookResolution, LayerId, LayerKind, LinkParam, MaterialLink, Procedural, ProceduralKind, Source};
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::screen_pick::{PickOutcome, ScreenPick};
+use texturecraft_ui_egui::shelf::{Asset, ShelfDrag};
 
 use crate::fill_support::{click_node, fill_app, fill_of};
 use crate::filter_support::{along, click_at, drag, undo_depth};
@@ -265,21 +266,16 @@ fn a_uniform_gray_ramp_inverts_its_value() {
 }
 
 #[test]
-fn a_linked_material_shows_its_inputs_and_the_switch_shows_its_channels() {
+fn a_linked_material_shows_its_inputs_and_its_channels_together() {
     let (mut harness, layer) = app_with_fill(json!({}));
-    assert!(harness.query_by_role_and_label(Role::RadioButton, "Material").is_some(), "every fill has the switch");
 
     let wear = float_param("wear", "Wear", 0.5);
     link_fill(&mut harness, layer, vec![wear], &[]);
 
-    assert!(harness.query_by_role_and_label(Role::ComboBox, "Painted steel").is_some(), "the Material side shows the whole material");
+    assert!(harness.query_by_role_and_label(Role::ComboBox, "Painted steel").is_some(), "the card shows the whole material");
     assert!(harness.query_by_role_and_label(Role::Slider, "Wear").is_some(), "with its inputs");
-    assert!(harness.query_by_role_and_label(Role::ComboBox, "Metallic").is_none(), "and no channel cards");
-
-    click(&mut harness, Role::RadioButton, "Channels");
-
-    assert!(harness.query_by_role_and_label(Role::ComboBox, "Metallic").is_some(), "the Channels side shows a card per channel");
-    assert!(harness.query_by_role_and_label(Role::Slider, "Wear").is_none());
+    assert!(harness.query_by_role_and_label(Role::ComboBox, "Metallic").is_some(), "and a card per channel below");
+    assert!(harness.query_by_role_and_label(Role::RadioButton, "Channels").is_none(), "no switch hides either");
 }
 
 /// A drag on a linked material's number input is one undo step, however many frames it spans
@@ -752,13 +748,9 @@ fn whole_material(harness: &Harness<'_, TextureCraftApp>, layer: LayerId) -> Opt
 }
 
 #[test]
-fn a_plain_fill_switches_to_one_whole_material_picks_it_from_its_card_and_clears_it() {
+fn a_plain_fill_picks_one_whole_material_from_its_card_and_clears_it() {
     let (mut harness, layer) = app_with_fill(json!({}));
-    assert!(harness.query_by_role_and_label(Role::ComboBox, "Metallic").is_some(), "a plain fill opens on Channels: a card per channel");
-
-    click_node(&mut harness, Role::RadioButton, "Material");
-
-    assert!(harness.query_by_role_and_label(Role::ComboBox, "Metallic").is_none(), "the Material side has no channel cards");
+    assert!(harness.query_by_role_and_label(Role::ComboBox, "Metallic").is_some(), "a plain fill shows a card per channel under its material card");
 
     click_node(&mut harness, Role::ComboBox, "None");
 
@@ -778,16 +770,81 @@ fn a_plain_fill_switches_to_one_whole_material_picks_it_from_its_card_and_clears
     assert!(harness.query_by_role_and_label(Role::ComboBox, "Copper Hammered").is_some(), "the card names it");
     assert!(harness.query_by_role(Role::ListBoxOption).is_none(), "the picker closed on the pick");
 
-    click_node(&mut harness, Role::RadioButton, "Channels");
-
     assert!(matches!(source(&harness, layer, Channel::BaseColor), Source::Procedural { .. }), "the material set every channel");
-    assert!(harness.query_by_role_and_label(Role::ComboBox, "Height").is_some(), "its channels show as cards");
+    assert!(harness.query_by_role_and_label(Role::ComboBox, "Height").is_some(), "its channels still show as cards");
 
-    click_node(&mut harness, Role::RadioButton, "Material");
     click_in_slot(&mut harness, "Copper Hammered", Role::Button, "Clear");
 
     assert_eq!(whole_material(&harness, layer), None, "× drops the material");
     assert_eq!(source(&harness, layer, Channel::BaseColor), Source::uniform_of(Channel::BaseColor), "and returns the channels to their defaults");
+}
+
+/// Drops shelf `asset` on the middle of the `role` named `label`, as a drag from the Assets panel ends there
+fn drop_on(harness: &mut Harness<'_, TextureCraftApp>, asset: Asset, role: Role, label: &str) {
+    let position = harness.get_by_role_and_label(role, label).rect().center();
+    egui::DragAndDrop::set_payload(&harness.ctx, ShelfDrag { asset, label: "Dragged".into() });
+    harness.hover_at(position);
+    harness.run_steps(2);
+
+    harness.event(egui::Event::PointerButton { pos: position, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    harness.run_steps(SETTLE_FRAMES);
+}
+
+#[test]
+fn a_material_dropped_on_the_orb_or_the_material_card_becomes_the_fills_material() {
+    let (mut harness, layer) = app_with_fill(json!({}));
+    let steps = undo_depth(&harness);
+    let layers = harness.state().session.doc.project.layers.len();
+
+    drop_on(&mut harness, Asset::Material("copper_hammered"), Role::Image, "Material");
+
+    assert_eq!(whole_material(&harness, layer).as_deref(), Some("copper_hammered"), "the orb takes the material");
+    assert_eq!(undo_depth(&harness), steps + 1, "one drop is one undo step");
+
+    drop_on(&mut harness, Asset::Material("steel"), Role::ComboBox, "Copper Hammered");
+
+    assert_eq!(whole_material(&harness, layer).as_deref(), Some("steel"), "so does the material card");
+    assert_eq!(harness.state().session.doc.project.layers.len(), layers, "the drop edits the fill: no layer is added");
+}
+
+#[test]
+fn the_orb_ignores_smart_materials_and_images() {
+    let (mut harness, layer) = app_with_fill(json!({}));
+    let before = fill_of(&harness, layer);
+    let steps = undo_depth(&harness);
+
+    drop_on(&mut harness, Asset::Material("steel_painted_worn"), Role::Image, "Material");
+    drop_on(&mut harness, Asset::Texture("missing.png".into()), Role::Image, "Material");
+
+    assert_eq!(fill_of(&harness, layer), before);
+    assert_eq!(undo_depth(&harness), steps);
+    assert!(harness.state().toasts.is_empty(), "an asset the orb does not take runs no command");
+}
+
+#[test]
+fn an_image_dropped_on_a_channel_card_of_a_whole_material_fills_that_channel() {
+    let (mut harness, layer) = app_with_fill(json!({}));
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([90, 90, 90, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let name = harness.state_mut().session.import_resource_bytes("rough.png", png).unwrap();
+    drop_on(&mut harness, Asset::Material("copper_hammered"), Role::Image, "Material");
+
+    drop_on(&mut harness, Asset::Texture(name.clone()), Role::ComboBox, "Roughness");
+
+    assert_eq!(source(&harness, layer, Channel::Roughness), Source::image(name), "no switch to press first");
+}
+
+#[test]
+fn a_linked_materials_orb_takes_no_drop() {
+    let (mut harness, layer) = app_with_fill(json!({}));
+    link_fill(&mut harness, layer, Vec::new(), &[]);
+    harness.state_mut().toasts.clear();
+
+    drop_on(&mut harness, Asset::Material("copper_hammered"), Role::Image, "Material");
+
+    assert!(fill_of(&harness, layer).link.is_some(), "the link stays");
+    assert_eq!(whole_material(&harness, layer), None);
+    assert!(harness.state().toasts.is_empty(), "no command runs to be refused");
 }
 
 /// Arms the base colour bar's eyedropper and gives its pick the click outside the app that ended as `outcome`

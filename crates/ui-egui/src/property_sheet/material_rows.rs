@@ -1,20 +1,17 @@
-//! The Material section's own rows: the orb beside the Material | Channels switch and a uniform channel's gray ramp
+//! The Material section's own rows: the material's orb and a uniform channel's gray ramp
 
 use std::ops::RangeInclusive;
 
-use egui::{Color32, Mesh, Painter, Rect, Sense, Vec2, pos2, vec2};
+use egui::{Color32, Mesh, Painter, Rect, Response, Sense, Vec2, pos2, vec2};
 
 use super::ramp_edit::RampEdit;
 use super::slider::KNOB_RADIUS;
 use super::track::Track;
-use super::{CONTROL_HEIGHT, GLYPH_TARGET, PropertySheet, ROW_HEIGHT};
+use super::{GLYPH_TARGET, PropertySheet, ROW_HEIGHT};
 use crate::drawn_icon::DrawnIcon;
 
 /// Side of the material's orb
 const ORB_SIZE: f32 = 90.0;
-
-/// Air between the orb and the switch beside it
-const ORB_TO_SWITCH: f32 = 12.0;
 
 /// Air under the orb
 const ORB_AIR: f32 = 14.0;
@@ -41,19 +38,17 @@ const INVERT_GLYPH_SIZE: f32 = 14.0;
 const CARD_ITEM_SPACING: Vec2 = vec2(8.0, 4.0);
 
 impl PropertySheet<'_> {
-    /// The material's orb with the Material | Channels switch beside it (none without `options`); returns the segment clicked when it was not the chosen one
-    pub(crate) fn orb_switch(&mut self, orb: &dyn Fn(&Painter, Rect), options: &[&str], selected: usize) -> Option<usize> {
+    /// The material's orb, centred and named `label`; the response covers it, for what is dropped on it
+    pub(crate) fn orb(&mut self, orb: &dyn Fn(&Painter, Rect), label: &str) -> Response {
         let rect = self.take(ORB_SIZE);
-        let square = Rect::from_min_size(pos2(self.left, rect.top()), vec2(ORB_SIZE, ORB_SIZE));
+        let square = Rect::from_center_size(rect.center(), vec2(ORB_SIZE, ORB_SIZE));
         orb(self.ui.painter(), square);
-        let switch = Rect::from_min_max(
-            pos2(square.right() + ORB_TO_SWITCH, square.center().y - CONTROL_HEIGHT / 2.0),
-            pos2(self.right, square.center().y + CONTROL_HEIGHT / 2.0),
-        );
-        let picked = if options.is_empty() { None } else { self.segments(switch, options, selected, super::switch_control::untinted, None) };
+        let id = self.next_id();
+        let response = self.ui.interact(square, id, Sense::hover());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, label));
         self.drawn(square.bottom());
         self.space(ORB_AIR);
-        picked
+        response
     }
 
     /// A uniform gray channel: a black-to-white ramp across the card (fills from the middle when `range` is signed), its value and the invert glyph

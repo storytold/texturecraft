@@ -1,9 +1,9 @@
-//! A fill's Material section: the channel strip, the orb with the Material | Channels switch, then one slot card per channel that is on (Channels) or the fill's whole material (Material)
+//! A fill's Material section: the channel strip, the orb, the fill's whole material, then one slot card per channel that is on; a material drops on the orb or the material card, an image on a channel card
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use egui::{Color32, Painter, Rect};
+use egui::{Color32, Painter, Rect, Response, Stroke, StrokeKind, Ui};
 use egui_phosphor::regular as ic;
 use serde_json::{Value, json};
 use texturecraft_engine::Session;
@@ -32,22 +32,20 @@ use crate::property_sheet::PropertySheet;
 use crate::resolution_band::{resolution_band, resolution_row};
 use crate::resource_picker;
 use crate::resource_picker_item::ResourcePickerItem;
+use crate::shelf::{Asset, ShelfDrag};
 use crate::slot_thumbnail::{paint_thumbnail, thumbnail};
 use crate::source_choice::SourceChoice;
 use crate::source_slot::SourceSlot;
 use crate::state::UiState;
 use crate::theme::Tokens;
 use crate::tile_picture::TilePicture;
-use crate::widgets::press_edit;
+use crate::widgets::{dnd_release, press_edit};
 
-/// The switch's two sides: the fill's whole material, or one source per channel
-const MODES: [&str; 2] = [n_("Material"), n_("Channels")];
+/// Width of the outline round a place that takes the dragged material
+const DROP_STROKE_WIDTH: f32 = 2.0;
 
-/// The switch's side that shows the fill's whole material
-const MATERIAL_MODE: usize = 0;
-
-/// The switch's side that shows one source per channel
-const CHANNELS_MODE: usize = 1;
+/// Corner rounding of that outline
+const DROP_ROUNDING: f32 = 3.0;
 
 /// Decimals a linked material's number input shows
 const FLOAT_DECIMALS: usize = 2;
@@ -84,19 +82,16 @@ pub(crate) fn material_section(app: &mut TextureCraftApp, sheet: &mut PropertySh
     let shown = channel_look.as_ref().unwrap_or(&look);
     let orb = |painter: &Painter, rect: Rect| material_orb(painter, rect, shown, &tokens, ("orb", salt));
     let link = fill.link.as_deref().zip(base.get("layer").and_then(Value::as_u64)).map(|(link, layer)| (link, LayerId(layer)));
-    let mode_id = sheet.ui.make_persistent_id(("material_mode", salt));
+    let orb_response = sheet.orb(&orb, tr("Material"));
 
-    // A fill opens on the side that made it: a material (linked or built-in) on Material, separate sources on Channels
-    let made_whole = link.is_some() || fill.material.is_some();
-    let mode = sheet.ui.data(|data| data.get_temp::<usize>(mode_id)).unwrap_or(if made_whole { MATERIAL_MODE } else { CHANNELS_MODE });
-    let modes = MODES.map(tr);
-    if let Some(picked) = sheet.orb_switch(&orb, &modes, mode) {
-        sheet.ui.data_mut(|data| data.insert_temp(mode_id, picked));
+    // A linked material cannot be replaced, so its orb takes no drop
+    if fill.link.is_none() {
+        material_drop(app, sheet.ui, &orb_response, base);
     }
 
     match link {
-        Some((link, layer)) if mode == MATERIAL_MODE => {
-            let shown: Vec<Channel> = channels.into_iter().filter(|channel| on.contains(channel)).collect();
+        Some((link, layer)) => {
+            let shown: Vec<Channel> = channels.iter().copied().filter(|channel| on.contains(channel)).collect();
             material_card(app, sheet, link, layer, &look, salt);
             mapping_band(app, sheet, fill, &shown, layer);
             let texture_set = texture_set_size(app, link.size);
@@ -112,12 +107,29 @@ pub(crate) fn material_section(app: &mut TextureCraftApp, sheet: &mut PropertySh
                 crate::dock::open_link_in_materialcraft(app, layer, link);
             }
         }
-        None if mode == MATERIAL_MODE => whole_material_card(app, sheet, fill, base, &look, salt),
-        _ => {
-            for channel in channels.into_iter().filter(|channel| on.contains(channel)) {
-                source_card(app, sheet, fill.source(channel), base, SourceSlot::Channel(channel), reader, false);
-            }
-        }
+        None if fill.link.is_none() => whole_material_card(app, sheet, fill, base, &look, salt),
+        None => {}
+    }
+
+    for channel in channels.into_iter().filter(|channel| on.contains(channel)) {
+        source_card(app, sheet, fill.source(channel), base, SourceSlot::Channel(channel), reader, false);
+    }
+}
+
+/// A plain built-in material from the Assets panel dropped on `response` becomes the fill's material, outlined while one hovers it. Other assets are not taken: smart and saved materials are stacks of layers
+fn material_drop(app: &mut TextureCraftApp, ui: &Ui, response: &Response, base: &Value) {
+    let plain = |drag: &ShelfDrag| match drag.asset {
+        Asset::Material(id) => find(id).filter(|material| !material.smart),
+        _ => None,
+    };
+    if response.dnd_hover_payload::<ShelfDrag>().and_then(|drag| plain(&drag)).is_none() {
+        return;
+    }
+
+    let accent = Tokens::get(ui.ctx()).accent;
+    ui.painter().rect_stroke(response.rect, DROP_ROUNDING, Stroke::new(DROP_STROKE_WIDTH, accent), StrokeKind::Inside);
+    if let Some(material) = dnd_release::<ShelfDrag>(response).and_then(|drag| plain(&drag)) {
+        app.run("layer.fill.material", with(base, json!({"material": material.id})));
     }
 }
 
@@ -491,7 +503,7 @@ pub(crate) fn band_size(resolution: OutputResolution, texture_set: u32) -> CookR
     }
 }
 
-/// The Material side: the fill's whole material in one card (the row lists its presets), its inputs, then opening it in MaterialCraft
+/// A linked material: the fill's whole material in one card (the row lists its presets), its inputs, then opening it in MaterialCraft
 fn material_card(app: &mut TextureCraftApp, sheet: &mut PropertySheet<'_>, link: &MaterialLink, layer: LayerId, look: &OrbMaterial, salt: FillKey) {
     let tokens = Tokens::get(sheet.ui.ctx());
     let base = json!({"layer": layer.0, "cook": false});
@@ -524,12 +536,13 @@ fn material_card(app: &mut TextureCraftApp, sheet: &mut PropertySheet<'_>, link:
     sheet.close_card();
 }
 
-/// The Material side of a fill without a linked material: one card holding the built-in material its sources came from (the row lists every plain material, × returns the channels to their defaults)
+/// A fill without a linked material: one card holding the built-in material its sources came from (the row lists every plain material, × returns the channels to their defaults)
 fn whole_material_card(app: &mut TextureCraftApp, sheet: &mut PropertySheet<'_>, fill: &Fill, base: &Value, look: &OrbMaterial, salt: FillKey) {
     let tokens = Tokens::get(sheet.ui.ctx());
     let held = fill.material.as_deref().and_then(find);
     let name = held.map_or_else(|| tr("None"), |material| tr(material.label));
     let slot = sheet.slot(&|painter, rect| material_orb(painter, rect, look, &tokens, ("card", salt)), name, tr("Material"), None, held.is_some(), false);
+    material_drop(app, sheet.ui, &slot.pick, base);
     let popup = sheet.ui.make_persistent_id(("material_picker", salt));
     if slot.pick.clicked() {
         resource_picker::toggle(sheet.ui.ctx(), popup);

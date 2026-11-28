@@ -1754,9 +1754,9 @@ fn fill_material_snapshots() {
     harness.key_press(egui::Key::Escape);
     harness.run_steps(2);
 
-    // The same plain fill on the Material side: one whole material, picked from the card's list
-    harness.get_by_role_and_label(egui::Role::RadioButton, "Material").click();
-    harness.run_steps(2);
+    // The material card above the channel cards: one whole material, picked from its list
+    harness.get_by_role_and_label(egui::Role::ComboBox, "None").scroll_to_me();
+    harness.run_steps(25);
     save(&mut harness, &output_dir, "material-whole-none");
     harness.get_by_role_and_label(egui::Role::ComboBox, "None").click();
     harness.run_steps(2);
@@ -1764,18 +1764,12 @@ fn fill_material_snapshots() {
     save(&mut harness, &output_dir, "material-whole-list");
     harness.get_by_role_and_label(egui::Role::ListBoxOption, "Copper").click();
     harness.run_steps(2);
-    harness.get_by_role_and_label(egui::Role::RadioButton, "Channels").hover();
     save(&mut harness, &output_dir, "material-whole-copper");
     for (brightness, name) in [(Brightness::Dark, "dark"), (Brightness::Light, "light")] {
         harness.state_mut().ui.prefs.brightness = brightness;
         save(&mut harness, &output_dir, &format!("material-whole-copper-{name}"));
     }
     harness.state_mut().ui.prefs.brightness = Brightness::MediumDark;
-    harness.get_by_role_and_label(egui::Role::RadioButton, "Channels").click();
-    harness.run_steps(2);
-    save(&mut harness, &output_dir, "material-whole-copper-channels");
-    harness.get_by_role_and_label(egui::Role::RadioButton, "Material").click();
-    harness.run_steps(2);
 
     // Back to the fill the linked shots below expect (the pick was one undo step)
     execute(&mut harness.state_mut().session, "edit.undo", &json!({})).unwrap();
@@ -1811,9 +1805,15 @@ fn fill_material_snapshots() {
     save(&mut harness, &output_dir, "material-resolution-folded");
     harness.get_by_role_and_label(egui::Role::Button, "Resolution").click();
     harness.run_steps(2);
-    reach(&mut harness, egui::Role::ComboBox, "Texture set  ·  256");
+    // Procedural channel cards below the band have a Resolution row too: the band's is the topmost
+    harness
+        .get_all_by_role_and_label(egui::Role::ComboBox, "Texture set  ·  256")
+        .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .unwrap()
+        .scroll_to_me();
+    harness.run_steps(25);
     save(&mut harness, &output_dir, "material-resolution");
-    harness.get_by_role_and_label(egui::Role::ComboBox, "Texture set  ·  256").click();
+    harness.get_all_by_role_and_label(egui::Role::ComboBox, "Texture set  ·  256").min_by(|a, b| a.rect().top().total_cmp(&b.rect().top())).unwrap().click();
     harness.run_steps(2);
     harness.get_by_role_and_label(egui::Role::ListBoxOption, "×2  ·  512").hover();
     save(&mut harness, &output_dir, "material-resolution-relative-list");
@@ -1838,8 +1838,6 @@ fn fill_material_snapshots() {
         save(&mut harness, &output_dir, &format!("material-linked-{name}"));
     }
     harness.state_mut().ui.prefs.brightness = Brightness::MediumDark;
-    harness.get_by_role_and_label(egui::Role::RadioButton, "Channels").click();
-    save(&mut harness, &output_dir, "material-linked-channels");
 }
 
 /// The armed eyedropper is the pointer over the panels too, its tip on the hovered pixel
