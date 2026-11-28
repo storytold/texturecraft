@@ -303,8 +303,16 @@ fn shader_settings_show_the_reference_rows_and_the_shader_choice() {
     harness.get_by_role_and_label(Role::Button, "open-pbr").click();
     harness.run_steps(SETTLE_FRAMES);
 
-    let tiles: Vec<String> =
-        texturecraft_ui_egui::shader_settings::SHADER_TYPES.iter().map(|name| format!("{}\n{name}", egui_phosphor::regular::SPHERE)).collect();
+    let tiles: Vec<String> = texturecraft_ui_egui::shader_settings::SHADER_TYPES
+        .iter()
+        .map(|name| {
+            if *name == texturecraft_ui_egui::shader_settings::CURRENT_SHADER {
+                name.to_string()
+            } else {
+                format!("{}\n{name}", egui_phosphor::regular::SPHERE)
+            }
+        })
+        .collect();
     for name in &tiles {
         assert!(harness.query_all_by_label(name).next().is_some(), "{name:?} is listed");
     }
@@ -313,9 +321,41 @@ fn shader_settings_show_the_reference_rows_and_the_shader_choice() {
         .get_all_by_role(Role::TextInput)
         .any(|field| field.accesskit_node().value().as_deref() == Some(texturecraft_ui_egui::shader_settings::SHADER_QUERY));
     assert!(query, "the search starts at shaders");
-    let open_pbr = harness.get_by_label(&tiles[4]);
+    let open_pbr = harness.get_all_by_label(&tiles[4]).find(|node| node.accesskit_node().toggled().is_some()).unwrap();
     assert!(!open_pbr.accesskit_node().is_disabled() && is_on(&open_pbr), "open-pbr is the current shader");
     assert!(harness.get_by_label(&tiles[1]).accesskit_node().is_disabled(), "the others are not available yet");
+}
+
+#[test]
+fn keyboard_selects_an_imported_shader_and_edits_its_parameters_through_commands() {
+    let mut h = app();
+    h.state_mut().run("shader.import", serde_json::json!({"name":"Banded","source":include_str!("../../../../examples/shaders/banded.glsl")})).unwrap();
+    h.state_mut().ui.dock.focus(Panel::Shader);
+    h.run_steps(STARTUP_FRAMES);
+    h.get_by_role_and_label(Role::Button, "open-pbr").click();
+    h.run_steps(SETTLE_FRAMES);
+    let label = "Banded";
+    h.get_by_role_and_label(Role::Button, label).focus();
+    h.key_press(egui::Key::Space);
+    h.run_steps(SETTLE_FRAMES);
+    assert_eq!(h.state().session.doc.project.display.custom_shader.as_deref(), Some("Banded"));
+    assert!(h.get_all_by_label("Shader selected: Banded").any(|message| message.accesskit_node().live() == egui::accesskit::Live::Polite));
+    h.get_by_role_and_label(Role::CheckBox, "Use normal map").focus();
+    h.key_press(egui::Key::Space);
+    h.run_steps(SETTLE_FRAMES);
+    let checkbox = h.get_by_role_and_label(Role::CheckBox, "Use normal map");
+    assert!(checkbox.is_focused());
+    assert!(!is_on(&checkbox));
+    let shader = &h.state().session.doc.project.display.custom_shaders[0];
+    assert_eq!(shader.parameters.iter().find(|p| p.name == "use_normal").unwrap().value, serde_json::json!(false));
+    h.state_mut().run("edit.undo", serde_json::json!({})).unwrap();
+    h.run_steps(SETTLE_FRAMES);
+    assert!(is_on(&h.get_by_role_and_label(Role::CheckBox, "Use normal map")));
+    h.get_by_role_and_label(Role::ComboBox, "Tint texture").focus();
+    h.run_steps(SETTLE_FRAMES);
+    let image_input = h.get_by_role_and_label(Role::ComboBox, "Tint texture");
+    assert!(image_input.is_focused());
+    assert_eq!(image_input.accesskit_node().value().as_deref(), Some("Default color"));
 }
 
 #[test]

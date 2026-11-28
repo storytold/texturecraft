@@ -378,7 +378,7 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "name": to }))
 }
 
-/// Points every layer, effect, stored path and the environment that read image resource `from` at `to`
+/// Points every layer, effect, stored path, shader and environment that read image resource `from` at `to`
 fn rename_references(project: &mut texturecraft_core::Project, from: &str, to: &str) {
     for layer in project.layers.values_mut() {
         let fill_images: Vec<&mut String> = match &mut layer.kind {
@@ -400,9 +400,14 @@ fn rename_references(project: &mut texturecraft_core::Project, from: &str, to: &
     if project.display.environment_resource() == Some(from) {
         project.display.environment = format!("{}{to}", texturecraft_core::project::ENV_RESOURCE_PREFIX);
     }
+    for input in project.display.custom_shaders.iter_mut().flat_map(|shader| &mut shader.textures) {
+        if input.resource.as_deref() == Some(from) {
+            input.resource = Some(to.to_string());
+        }
+    }
 }
 
-/// Every image resource a layer, mask effect, stored path or the environment of `project` uses
+/// Every image resource a layer, mask effect, stored path, shader or environment of `project` uses
 fn project_images(project: &texturecraft_core::Project) -> Vec<String> {
     let mut used = Vec::new();
     for set in &project.texture_sets {
@@ -411,6 +416,7 @@ fn project_images(project: &texturecraft_core::Project) -> Vec<String> {
         }
     }
     used.extend(project.display.environment_resource().map(str::to_string));
+    used.extend(project.display.custom_shaders.iter().flat_map(|shader| &shader.textures).filter_map(|input| input.resource.clone()));
     used
 }
 
@@ -427,7 +433,7 @@ fn images_in_use(s: &Session) -> Vec<String> {
     used
 }
 
-/// Drop resources unused by layers, mesh maps, paint tools or the environment (one undo step)
+/// Drop resources unused by layers, mesh maps, shaders, paint tools or the environment (one undo step)
 fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
     let used = images_in_use(s);
     let unused: Vec<String> = s.doc.resources.keys().filter(|k| !used.contains(k)).cloned().collect();

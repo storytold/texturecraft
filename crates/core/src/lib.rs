@@ -25,6 +25,7 @@ pub mod contents_offset;
 pub mod conversion_mode;
 pub mod cook_resolution;
 pub mod curve_preset;
+pub mod custom_shader;
 pub mod depth_culling;
 pub mod directional_distance;
 pub mod directional_light;

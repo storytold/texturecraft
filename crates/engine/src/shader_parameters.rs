@@ -13,6 +13,11 @@ pub fn shader_parameters(project: &Project, sets: &[usize]) -> Value {
     let model = if display.spec_gloss { "specularGlossiness" } else { "metallicRoughness" };
     let names: Vec<&str> = sets.iter().filter_map(|ts| project.texture_sets.get(*ts)).map(|set| set.name.as_str()).collect();
 
+    if let Some(shader) = display.custom_shaders.iter().find(|shader| Some(&shader.name) == display.custom_shader.as_ref()) {
+        let parameters: serde_json::Map<String, Value> = shader.parameters.iter().map(|p| (p.name.clone(), p.value.clone())).collect();
+        return json!({"shaders":[{"model":"customGlsl","name":shader.name,"instanceName":display.shader_instance_name,"parameters":parameters,"textures":shader.textures,"textureSets":names}]});
+    }
+
     json!({
         "shaders": [{
             "model": model,

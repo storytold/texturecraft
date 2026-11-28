@@ -24,6 +24,9 @@ impl Headless {
     pub fn render(&mut self, frame: &crate::Frame) -> Option<(u32, u32, Vec<u8>)> {
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_headless") });
         self.renderer.prepare(&self.device, &self.queue, &mut enc, frame);
+        if frame.shade.custom_shader.is_some() && frame.shade.view_mode == 0 && matches!(frame.kind, crate::ViewKind::Scene) && !self.renderer.shader_ready() {
+            return None;
+        }
         self.queue.submit([enc.finish()]);
         self.renderer.read_view(&self.device, &self.queue, frame.view_id)
     }

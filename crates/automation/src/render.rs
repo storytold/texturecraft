@@ -32,6 +32,10 @@ impl Gpu {
         &self.h.adapter_name
     }
 
+    pub fn shader_error(&self) -> Option<&str> {
+        self.h.renderer.shader_error()
+    }
+
     /// Bring the GPU up to date with the session (mesh, texture sets, environment, dirty tiles).
     fn sync(&mut self, session: &mut Session) {
         session.update();
@@ -52,6 +56,9 @@ impl Gpu {
         }
 
         let display = &session.doc.project.display;
+        if let Some(shader) = display.custom_shaders.iter().find(|shader| Some(&shader.name) == display.custom_shader.as_ref()) {
+            headless.renderer.upload_shader_inputs(&headless.device, &headless.queue, shader, &session.images);
+        }
         let image = display.environment_resource().and_then(|name| session.images.get(name));
         if display.environment != self.env.0 || self.env.1.as_ref().map(Weak::as_ptr) != image.map(Arc::as_ptr) {
             headless.renderer.set_environment(&headless.device, &headless.queue, &display.environment, image.map(Arc::as_ref));
@@ -88,6 +95,9 @@ impl Gpu {
                     Some(texturecraft_render::mesh_maps::mesh_map_rgba(session.doc.baked.get(&set_index), map, resolution, cache.size, &composite.block_scales))
                 }
                 ViewMode::Mask(id) if session.doc.project.locate(id).is_some_and(|(set, _, _)| set == set_index) => session.mask_view_rgba(id, resolution),
+                _ if session.doc.project.display.custom_shader.is_some() => {
+                    Some(texturecraft_render::mesh_maps::shader_maps_rgba(session.doc.baked.get(&set_index), resolution, cache.size, &composite.block_scales))
+                }
                 _ => None,
             };
             if let Some(rgba) = aux {

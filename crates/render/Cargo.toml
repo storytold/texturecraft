@@ -29,5 +29,6 @@ pollster = "0.4"
 wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
+serde_json = { workspace = true }
 image = { workspace = true }
 texturecraft-formats = { workspace = true }

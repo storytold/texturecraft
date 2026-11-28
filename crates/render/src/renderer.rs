@@ -146,8 +146,10 @@ const SET_HOVER_OPACITY: f32 = 0.35;
 const HIGHLIGHT_SHIFTS: u32 = 4;
 
 /// How the material is shaded (from the project's display settings and the view mode).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Shade {
+    /// Selected project-owned surface shader (material view only).
+    pub custom_shader: Option<texturecraft_core::custom_shader::CustomShader>,
     /// Exposure in EV, applied in the post pass (not to data views).
     pub exposure_ev: f32,
     /// ACES filmic tone mapping (else linear, clipped).
@@ -245,6 +247,7 @@ impl Shade {
     /// channel, height strength and wireframe toggles.
     pub fn from_display(d: &DisplaySettings) -> Shade {
         Shade {
+            custom_shader: d.custom_shaders.iter().find(|shader| Some(&shader.name) == d.custom_shader.as_ref()).cloned(),
             exposure_ev: d.env_exposure,
             aces: d.tone_mapping == ToneMapping::AcesFilmic,
             env_rotation_deg: d.env_rotation,
@@ -292,6 +295,7 @@ impl Shade {
 impl Default for Shade {
     fn default() -> Self {
         Shade {
+            custom_shader: None,
             exposure_ev: 0.0,
             aces: true,
             env_rotation_deg: 0.0,
@@ -547,6 +551,7 @@ struct Behind {
 }
 
 struct ViewTargets {
+    shader_parameters: wgpu::Buffer,
     size: [u32; 2],
     msaa: wgpu::TextureView,
     depth: wgpu::TextureView,
@@ -592,7 +597,20 @@ struct ShadowMap {
     bg: wgpu::BindGroup,
 }
 
+struct ShaderInputKeys {
+    inputs: Vec<texturecraft_core::custom_shader::ShaderTexture>,
+    images: Vec<Option<std::sync::Weak<ImageRes>>>,
+}
+
 pub struct Renderer {
+    shader_inputs: Tex,
+    shader_input_keys: Option<ShaderInputKeys>,
+    mesh_module: wgpu::ShaderModule,
+    custom_pipeline: Option<wgpu::RenderPipeline>,
+    custom_source: Option<std::sync::Arc<str>>,
+    custom_pending: Option<std::sync::Mutex<Checked<wgpu::RenderPipeline>>>,
+    custom_error: Option<String>,
+    custom_error_reported: bool,
     target_format: wgpu::TextureFormat,
     /// [`HDR_FORMAT`], or [`COLOR_FORMAT`] where float targets are not renderable (WebGL2
     /// without float color buffers).
@@ -949,6 +967,146 @@ const MAX_ANISOTROPY: u16 = 8;
 const PLACEHOLDER_ENV_SIZE: [u32; 2] = [512, 256];
 
 impl Renderer {
+    /// Resolve shader image inputs to one bounded texture array. Unbound inputs use their declared colors.
+    pub fn upload_shader_inputs(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        shader: &texturecraft_core::custom_shader::CustomShader,
+        images: &texturecraft_compose::ImageStore,
+    ) {
+        let sources: Vec<_> = shader.textures.iter().map(|input| input.resource.as_ref().and_then(|name| images.get(name))).collect();
+        if self.shader_input_keys.as_ref().is_some_and(|keys| {
+            keys.inputs == shader.textures
+                && keys.images.len() == sources.len()
+                && keys.images.iter().zip(&sources).all(|(a, b)| a.as_ref().map(std::sync::Weak::as_ptr) == b.map(std::sync::Arc::as_ptr))
+        }) {
+            return;
+        }
+        let side =
+            sources.iter().flatten().map(|image| image.width.max(image.height)).max().unwrap_or(1).clamp(1, 512).min(device.limits().max_texture_dimension_2d);
+        if self.shader_inputs.texture.size().width != side {
+            self.shader_inputs = shader_input_array(device, side);
+            for view in self.views.values_mut() {
+                view.globals_bg = None;
+            }
+        }
+        for (layer, input) in shader.textures.iter().take(texturecraft_core::custom_shader::MAX_SHADER_TEXTURES).enumerate() {
+            let mut pixels = Vec::with_capacity((side * side * 4) as usize);
+            for y in 0..side {
+                for x in 0..side {
+                    let value =
+                        sources[layer].map_or(input.default_color, |image| image.sample((x as f32 + 0.5) / side as f32, (y as f32 + 0.5) / side as f32));
+                    pixels.extend(value.map(|v| half::f16::from_f32(if v.is_finite() { v } else { 0.0 }).to_bits()));
+                }
+            }
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.shader_inputs.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&pixels),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(side * 8), rows_per_image: Some(side) },
+                wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+            );
+        }
+        self.shader_input_keys =
+            Some(ShaderInputKeys { inputs: shader.textures.clone(), images: sources.iter().map(|image| image.map(std::sync::Arc::downgrade)).collect() });
+        self.content_rev = self.content_rev.wrapping_add(1);
+    }
+
+    fn prepare_custom_shader(&mut self, device: &wgpu::Device, shader: Option<&texturecraft_core::custom_shader::CustomShader>) {
+        let Some(shader) = shader else { return };
+        if self.custom_source.as_deref() == Some(shader.wgsl.as_ref()) {
+            self.resolve_custom_shader();
+            return;
+        }
+        self.custom_source = Some(shader.wgsl.clone());
+        self.custom_pipeline = None;
+        self.custom_error = None;
+        self.custom_error_reported = false;
+        self.custom_pending = Some(std::sync::Mutex::new(checked(device, "Custom GLSL shader", || {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tc_custom_shader"),
+                source: wgpu::ShaderSource::Wgsl(shader.wgsl.as_ref().into()),
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("tc_custom_shader"),
+                bind_group_layouts: &[Some(&self.globals_bgl), Some(&self.set_bgl), Some(&self.refr_bgl)],
+                immediate_size: 0,
+            });
+            let buffers = [Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<Vertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2],
+            })];
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("tc_custom_shader"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &self.mesh_module,
+                    entry_point: Some("vs_mesh"),
+                    buffers: &buffers,
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("main"),
+                    targets: &[Some(wgpu::ColorTargetState { format: self.hdr_format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+                depth_stencil: Some(depth_state(true, wgpu::CompareFunction::Less)),
+                multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false },
+                multiview_mask: None,
+                cache: None,
+            })
+        })));
+        self.resolve_custom_shader();
+    }
+
+    fn resolve_custom_shader(&mut self) {
+        let Some(pending) = self.custom_pending.take() else { return };
+        let pending = pending.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let answer = match pending {
+            Checked::Done(result) => result,
+            Checked::Later(pipeline, receiver) => match receiver.try_recv() {
+                Ok(None) => Ok(pipeline),
+                Ok(Some(error)) => Err(error),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.custom_pending = Some(std::sync::Mutex::new(Checked::Later(pipeline, receiver)));
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("Custom GLSL shader validation did not complete".into()),
+            },
+        };
+        match answer {
+            Ok(pipeline) => {
+                self.custom_pipeline = Some(pipeline);
+                self.content_rev = self.content_rev.wrapping_add(1);
+            }
+            Err(error) => self.custom_error = Some(error),
+        }
+    }
+
+    pub fn shader_error(&self) -> Option<&str> {
+        self.custom_error.as_deref()
+    }
+
+    pub fn take_shader_error(&mut self) -> Option<String> {
+        if self.custom_error_reported {
+            return None;
+        }
+        self.custom_error_reported = self.custom_error.is_some();
+        self.custom_error.clone()
+    }
+
+    pub fn shader_ready(&self) -> bool {
+        self.custom_pipeline.is_some()
+    }
+
     /// `target_format`: the format of the pass [`Renderer::blit`] draws into.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target_format: wgpu::TextureFormat) -> Renderer {
         let shader = |label: &str, source: &str| {
@@ -967,6 +1125,15 @@ impl Renderer {
             "tc_globals",
             &[
                 uniform_entry(0),
+                uniform_entry(5),
+                fragment_entry(
+                    6,
+                    wgpu::BindingType::Texture {
+                        multisampled: false,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                    },
+                ),
                 tex_entry(1),
                 sampler_entry(2),
                 fragment_entry(
@@ -1248,6 +1415,14 @@ impl Renderer {
         let env = Tex::new(device, "tc_env", PLACEHOLDER_ENV_SIZE[0], PLACEHOLDER_ENV_SIZE[1], wgpu::TextureFormat::Rgba16Float, ENV_LEVELS);
 
         let mut renderer = Renderer {
+            shader_inputs: shader_input_array(device, 1),
+            shader_input_keys: None,
+            mesh_module: module,
+            custom_pipeline: None,
+            custom_source: None,
+            custom_pending: None,
+            custom_error: None,
+            custom_error_reported: false,
             target_format,
             hdr_format,
             globals_bgl: globals_bind_group_layout,
@@ -1666,7 +1841,7 @@ impl Renderer {
     /// Whether a full-size texture still waits for WebGPU's verdict: keep drawing frames, since
     /// [`Renderer::prepare`] installs it (or reports the failure) once the answer is in.
     pub fn awaiting_gpu(&self) -> bool {
-        self.sets.iter().any(|s| s.pending.iter().any(Option::is_some))
+        self.custom_pending.is_some() || self.sets.iter().any(|s| s.pending.iter().any(Option::is_some))
     }
 
     /// Install the pending full-size textures WebGPU accepted; drop the ones it rejected (their
@@ -1854,6 +2029,7 @@ impl Renderer {
             ],
         });
         ViewTargets {
+            shader_parameters: uniform("tc_shader_parameters", texturecraft_core::custom_shader::MAX_SHADER_PARAMETERS * 16),
             size,
             msaa: target_view(device, "tc_msaa", size, self.hdr_format, MSAA),
             depth: target_view(device, "tc_depth", size, DEPTH_FORMAT, MSAA),
@@ -1936,6 +2112,8 @@ impl Renderer {
                 layout: bgl,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: v.globals.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: v.shader_parameters.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.shader_inputs.view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(env_view) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(env_sampler) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(shadow_view) },
@@ -2037,6 +2215,10 @@ impl Renderer {
     /// `shade.taa` that repeats the previous one adds a jittered sample to the average instead,
     /// and renders nothing once [`TAA_SAMPLES`] are in.
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, frame: &Frame) {
+        self.prepare_custom_shader(device, frame.shade.custom_shader.as_ref());
+        if frame.shade.custom_shader.is_some() && frame.shade.view_mode == 0 && matches!(frame.kind, ViewKind::Scene) && !self.shader_ready() {
+            return;
+        }
         self.resolve_pending(device);
         self.generate_mips(device, encoder);
         let rev = self.content_rev;
@@ -2162,6 +2344,9 @@ impl Renderer {
         v.samples = sample;
         let Some(v) = self.views.get(&frame.view_id) else { return };
         let Some(globals_bg) = v.globals_bg.as_ref() else { return };
+        if let Some(shader) = &frame.shade.custom_shader {
+            queue.write_buffer(&v.shader_parameters, 0, bytemuck::cast_slice(&shader.uniform_values()));
+        }
         if refraction && let Some(b) = &v.behind {
             self.behind_pass(encoder, v, b, globals_bg, frame);
         }
@@ -2304,7 +2489,14 @@ impl Renderer {
             ViewKind::Uv { ts, .. } => Some(ts),
         };
         let (pipe, wire) = match uv_ts {
-            None => (&self.mesh_pipeline, frame.shade.wireframe_3d.then_some(&self.wire3d_pipeline)),
+            None => (
+                if frame.shade.view_mode == 0 && frame.shade.custom_shader.is_some() {
+                    self.custom_pipeline.as_ref().unwrap_or(&self.mesh_pipeline)
+                } else {
+                    &self.mesh_pipeline
+                },
+                frame.shade.wireframe_3d.then_some(&self.wire3d_pipeline),
+            ),
             Some(_) => (&self.uv_pipeline, frame.shade.wireframe.then_some(&self.wire_pipeline)),
         };
 
@@ -2498,6 +2690,21 @@ impl Renderer {
     pub fn drop_view(&mut self, id: u64) {
         self.views.remove(&id);
     }
+}
+
+fn shader_input_array(device: &wgpu::Device, side: u32) -> Tex {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tc_shader_inputs"),
+        size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: texturecraft_core::custom_shader::MAX_SHADER_TEXTURES as u32 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+    Tex { texture, view, format: wgpu::TextureFormat::Rgba16Float, mips: 1 }
 }
 
 /// Index ranges of `ranges` (first, count, material) whose texture set (from `material_sets`) is visible and is `only`, when given, with that set's index

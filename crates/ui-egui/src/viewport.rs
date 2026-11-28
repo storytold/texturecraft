@@ -56,6 +56,7 @@ fn aux_view(app: &TextureCraftApp) -> Option<crate::gpu::AuxView> {
         _ if app.ui.mode == crate::state::Mode::Baking && app.ui.bake_visualization.bent_normal_shown() => {
             Some(crate::gpu::AuxView::MeshMap(BakedMap::BentNormal))
         }
+        _ if app.session.doc.project.display.custom_shader.is_some() => Some(crate::gpu::AuxView::ShaderMaps),
         _ => None,
     }
 }

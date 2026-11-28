@@ -3,6 +3,23 @@
 use texturecraft_compose::BakedMaps;
 use texturecraft_core::{BakedMap, BlockScales};
 
+/// Linear scalar mesh maps for surface shaders: curvature, thickness and baked AO.
+pub fn shader_maps_rgba(baked: Option<&BakedMaps>, size: u32, working_size: (u32, u32), scales: &BlockScales) -> Vec<u8> {
+    let mut out = vec![0; (size.max(1) * size.max(1) * 4) as usize];
+    for y in 0..size.max(1) {
+        for x in 0..size.max(1) {
+            let uv = [(x as f32 + 0.5) / size.max(1) as f32, (y as f32 + 0.5) / size.max(1) as f32];
+            let offset = ((y * size.max(1) + x) * 4) as usize;
+            for (lane, map) in [BakedMap::Curvature, BakedMap::Thickness, BakedMap::AmbientOcclusion].into_iter().enumerate() {
+                let value = scales.bake_uv(uv, working_size).and_then(|uv| baked.and_then(|b| b.sample_uv(map, uv))).unwrap_or(map.neutral())[0];
+                out[offset + lane] = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+            out[offset + 3] = 255;
+        }
+    }
+    out
+}
+
 /// RGBA8 of baked map `m` resampled to `size × size` stretched over the map (mid gray where not
 /// baked). Scalar maps are shown as grayscale; ID maps as their colors. Values are display
 /// (sRGB) encoded.

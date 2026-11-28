@@ -327,6 +327,11 @@ pub struct DisplaySettings {
     /// Shader: PBR specular/glossiness (base color = diffuse, Specular = F0 color, Glossiness)
     /// instead of metallic/roughness.
     pub spec_gloss: bool,
+    /// Imported surface shaders, embedded so reopening needs no original files.
+    pub custom_shaders: Vec<crate::custom_shader::CustomShader>,
+    /// None uses the built-in PBR shader.
+    pub custom_shader: Option<String>,
+    pub shader_instance_name: String,
     /// Parallax occlusion mapping from the height channel (same depth as height-to-normal).
     pub parallax: bool,
     /// Displacement: the viewport moves the surface by the height channel (a finer copy of the
@@ -458,6 +463,9 @@ impl Default for DisplaySettings {
             ao_intensity: 0.75,
             taa: true,
             spec_gloss: false,
+            custom_shaders: Vec::new(),
+            custom_shader: None,
+            shader_instance_name: "Main shader".into(),
             parallax: false,
             displacement: false,
             scatter_color: [1.0, 0.4, 0.25],
@@ -758,6 +766,30 @@ impl Project {
 
     /// Check structural invariants (ids exist, no layer appears twice). Used after loading.
     pub fn validate(&self) -> Result<()> {
+        let mut names = BTreeSet::new();
+        if self.display.custom_shaders.len() > crate::custom_shader::MAX_CUSTOM_SHADERS {
+            return Err(CoreError::Invalid("too many custom shaders".into()));
+        }
+        let instance_name = &self.display.shader_instance_name;
+        if instance_name.trim().is_empty() || instance_name.len() > 128 || instance_name.chars().any(char::is_control) {
+            return Err(CoreError::Invalid("invalid shader instance name".into()));
+        }
+        for shader in &self.display.custom_shaders {
+            if shader.name.is_empty()
+                || shader.name.len() > 128
+                || shader.name == "open-pbr"
+                || shader.name.chars().any(char::is_control)
+                || !names.insert(&shader.name)
+                || shader.source.len() > 1 << 20
+                || shader.parameters.len() > crate::custom_shader::MAX_SHADER_PARAMETERS
+                || shader.textures.len() > crate::custom_shader::MAX_SHADER_TEXTURES
+            {
+                return Err(CoreError::Invalid("invalid custom shader".into()));
+            }
+        }
+        if self.display.custom_shader.as_ref().is_some_and(|name| !names.contains(name)) {
+            return Err(CoreError::Invalid("selected custom shader is missing".into()));
+        }
         if self.format_version > FORMAT_VERSION {
             return Err(CoreError::Invalid(format!("project format {} is newer than this TextureCraft supports ({FORMAT_VERSION})", self.format_version)));
         }
