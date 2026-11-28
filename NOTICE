@@ -26,6 +26,9 @@ Studio Small 09 HDR environment (assets/hdr/studio_small_09_512.hdr),
 by Sergej Majboroda (Poly Haven) — CC0-1.0.
 Source: https://polyhaven.com/a/studio_small_09 (1K HDR, reduced to 512x256).
 
+Native autosave file identity checks use same-file (Unlicense OR MIT).
+Copyright (c) 2017 Andrew Gallant.
+
 Native eyedropper components:
 - raw-window-handle — MIT OR Apache-2.0 OR Zlib. Copyright (c) 2019, 2020 Osspial.
 - winsafe — MIT. Copyright (c) 2019-present, Rodrigo Cesar de Freitas Dias.

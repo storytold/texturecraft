@@ -67,6 +67,7 @@ mod perf;
 mod polygon_fill;
 mod project_recovery;
 mod rebuilt_uv_layout;
+mod rename_project;
 mod resource_updater;
 mod resources_used;
 mod sample;

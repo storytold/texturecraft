@@ -765,3 +765,99 @@ fn project_config_snapshots() {
     h.run_steps(6);
     h.render().unwrap().save(output_dir.join("project-config-ocio.png")).unwrap();
 }
+
+fn type_project_name(h: &mut Harness<'_, TextureCraftApp>, name: &str) {
+    in_window(h, Role::TextInput, "Project name").focus();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    in_window(h, Role::TextInput, "Project name").type_text(name);
+    h.run_steps(2);
+}
+
+#[test]
+fn a_typed_project_name_applies_only_with_ok() {
+    let dir = temp_dir("project-name");
+    let mut h = app_on_a_quad(&dir);
+    let before = h.state().session.doc.project.name.clone();
+
+    for button in ["Cancel", "OK"] {
+        open_window(&mut h);
+        type_project_name(&mut h, "Knight");
+        click_in_window(&mut h, Role::Button, button);
+
+        let expected = if button == "OK" { "Knight" } else { before.as_str() };
+        assert_eq!(h.state().session.doc.project.name, expected, "after {button}");
+        assert!(!window_is_open(&h), "{button} closes the window");
+    }
+}
+
+#[test]
+fn an_invalid_project_name_leaves_other_configuration_changes_pending() {
+    use texturecraft_engine::core::NormalFormat;
+
+    let dir = temp_dir("invalid-project-name");
+    let mut h = app_on_a_quad(&dir);
+    let triangle = dir.join("tri.obj");
+    std::fs::write(&triangle, TRIANGLE).unwrap();
+
+    open_window(&mut h);
+    select(&mut h, &triangle);
+    click_in_window(&mut h, Role::ComboBox, FORMAT_HINT);
+    click_in_window(&mut h, Role::Button, "DirectX");
+    type_project_name(&mut h, " ");
+    click_in_window(&mut h, Role::Button, "OK");
+
+    assert!(window_is_open(&h));
+    assert_eq!(h.state().session.doc.project.name, "quad");
+    assert_eq!(h.state().session.mesh.triangle_count(), 2);
+    assert_eq!(project_normal_format(&h), NormalFormat::OpenGl);
+    let message = h.get_by_label("Project name must be 1 to 128 characters after trimming, without control characters.");
+    assert_eq!(message.accesskit_node().live(), egui::accesskit::Live::Polite);
+
+    type_project_name(&mut h, "Knight");
+    click_in_window(&mut h, Role::Button, "OK");
+
+    assert!(!window_is_open(&h));
+    assert_eq!(h.state().session.doc.project.name, "Knight");
+    assert_eq!(h.state().session.mesh.triangle_count(), 1);
+    assert_eq!(project_normal_format(&h), NormalFormat::DirectX);
+}
+
+#[test]
+fn the_project_name_limit_applies_after_trimming_in_the_dialog() {
+    use texturecraft_engine::project_cmds::MAX_PROJECT_NAME_CHARS;
+
+    let dir = temp_dir("project-name-limit");
+    let mut h = app_on_a_quad(&dir);
+    let name = format!("{}Z", "x".repeat(MAX_PROJECT_NAME_CHARS - 1));
+
+    open_window(&mut h);
+    type_project_name(&mut h, &format!(" {name} "));
+    click_in_window(&mut h, Role::Button, "OK");
+
+    assert!(!window_is_open(&h));
+    assert_eq!(h.state().session.doc.project.name, name);
+}
+
+#[test]
+fn a_reopened_name_field_cannot_undo_to_a_discarded_draft() {
+    let dir = temp_dir("project-name-history");
+    let mut h = app_on_a_quad(&dir);
+    let original = h.state().session.doc.project.name.clone();
+
+    open_window(&mut h);
+    type_project_name(&mut h, "Discard this name");
+
+    // Drive enough virtual frames for the text edit to record an undo point
+    h.run_steps(90);
+    click_in_window(&mut h, Role::Button, "Cancel");
+
+    open_window(&mut h);
+    in_window(&h, Role::TextInput, "Project name").focus();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+
+    let field = in_window(&h, Role::TextInput, "Project name");
+    assert_eq!(field.accesskit_node().value().as_deref(), Some(original.as_str()));
+}

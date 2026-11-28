@@ -383,9 +383,12 @@ pub struct TextureCraftApp {
     /// When the next autosave is due (seconds of app time; desktop only).
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     next_autosave: f64,
-    /// The unsaved project (its id) and the suffix of its autosave copy.
+    /// The unsaved project (its id) and the stable filename of its autosave copy.
     #[cfg(not(target_arch = "wasm32"))]
-    unsaved_autosave_suffix: Option<(u64, u64)>,
+    unsaved_autosave_file: Option<(u64, String)>,
+    /// The dialog opening that owns the Project name widget's undo state.
+    #[cfg(not(target_arch = "wasm32"))]
+    project_name_editor_opening: Option<u64>,
     /// The brightness and accent the style was last built for.
     styled: Option<(theme::Brightness, theme::Accent)>,
     /// Whether the window had focus last frame.
@@ -537,7 +540,9 @@ impl TextureCraftApp {
             last_time: 0.0,
             next_autosave,
             #[cfg(not(target_arch = "wasm32"))]
-            unsaved_autosave_suffix: None,
+            unsaved_autosave_file: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            project_name_editor_opening: None,
             styled: None,
             focused: true,
             #[cfg(not(target_arch = "wasm32"))]
@@ -584,6 +589,9 @@ impl TextureCraftApp {
                     Err(error) => app.toast(format!("{}: {error}", i18n::tr("Could not create the session log")), true),
                 }
             }
+
+            // The desktop launcher can supply an already-open autosave copy
+            app.detach_autosave_copy();
 
             // An export folder still at the default follows the data folder
             if app.ui.export.dir == data_folder("").join("export").display().to_string() {
@@ -665,6 +673,9 @@ impl TextureCraftApp {
                     Some(_) => self.camera_glide = None,
                     None => self.settle_camera_glide(id, before),
                 }
+
+                #[cfg(not(target_arch = "wasm32"))]
+                let value = self.recover_file_open(id, value);
 
                 Some(value)
             }

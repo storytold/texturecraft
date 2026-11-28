@@ -717,8 +717,32 @@ fn disambiguated_psd_stem(stem: &str, set_index: usize, limit: usize, taken: imp
 }
 
 /// [`sanitize_file_stem`] for each `/`-separated folder name and the file stem.
-pub fn sanitize_file_path(s: &str) -> String {
-    s.split('/').map(sanitize_file_stem).collect::<Vec<_>>().join("/")
+pub fn sanitize_file_path(path: &str) -> String {
+    if !path.contains('/') {
+        return sanitize_file_stem(path);
+    }
+
+    path.split('/').map(sanitize_file_stem).collect::<Vec<_>>().join("/")
+}
+
+/// Expand tokens in the template while keeping the substituted values literal.
+fn expand_file_template(template: &str, variables: &[(&str, &str)]) -> String {
+    let mut expanded = String::with_capacity(template.len());
+    let mut remaining = template;
+    while let Some(index) = remaining.find('$') {
+        let (literal, variable) = remaining.split_at(index);
+        expanded.push_str(literal);
+        if let Some((value, tail)) = variables.iter().find_map(|&(token, value)| variable.strip_prefix(token).map(|tail| (value, tail))) {
+            expanded.push_str(value);
+            remaining = tail;
+        } else {
+            expanded.push('$');
+            remaining = &variable[1..];
+        }
+    }
+
+    expanded.push_str(remaining);
+    expanded
 }
 
 /// The files `opts` produces for texture set `ts` without rendering ([`FILE_TOKENS`] are the template variables); PSD maps are layers of one file
@@ -773,14 +797,19 @@ fn plan_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &ExportOpti
         } else {
             std::borrow::Cow::Borrowed(map.file.as_str())
         };
+        let channel = channel_label(map);
         let expand_stem = |udim: &str| {
-            let expanded = template
-                .replace("$udim", udim)
-                .replace("$project", &project_stem)
-                .replace("$mesh", &mesh_stem)
-                .replace("$textureSet", &set_stem)
-                .replace("$channel", channel_label(map))
-                .replace("$colorSpace", color_space);
+            let expanded = expand_file_template(
+                &template,
+                &[
+                    ("$udim", udim),
+                    ("$project", &project_stem),
+                    ("$mesh", &mesh_stem),
+                    ("$textureSet", &set_stem),
+                    ("$channel", channel),
+                    ("$colorSpace", color_space),
+                ],
+            );
             sanitize_file_path(&expanded)
         };
 

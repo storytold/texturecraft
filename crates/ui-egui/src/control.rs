@@ -35,8 +35,10 @@ impl ControlRequest {
     }
 }
 
-fn ok(v: Value) -> Value {
-    json!({ "ok": true, "result": v })
+fn ok(result: Value) -> Value {
+    let mut reply = json!({ "ok": true });
+    reply["result"] = result;
+    reply
 }
 
 fn err(e: impl std::fmt::Display) -> Value {
@@ -154,9 +156,9 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
                 return err("A manual project save is already running");
             }
 
-            let command_params = params.get("params").cloned().unwrap_or(Value::Null);
+            let command_params = params.get("params").unwrap_or(&Value::Null);
             let before = app.session.camera;
-            match texturecraft_engine::execute(&mut app.session, id, &command_params) {
+            match texturecraft_engine::execute(&mut app.session, id, command_params) {
                 Ok(value) => {
                     if matches!(id, "brush.preset.store" | "brush.preset.rename" | "brush.preset.delete") {
                         app.thumbs.forget_saved_files();
@@ -176,6 +178,9 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
 
                     // A command that moved the camera takes over from a glide in progress; a projection switch joins it
                     app.settle_camera_glide(id, before);
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let value = app.recover_file_open(id, value);
 
                     ok(value)
                 }

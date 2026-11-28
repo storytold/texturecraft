@@ -41,6 +41,10 @@ tempfile = "3"
 # Whether the app runs in a real window, where an eyedropper pick may take clicks outside it (screen_pick).
 raw-window-handle = "0.6"
 
+[target.'cfg(all(not(unix), not(target_arch = "wasm32")))'.dependencies]
+# Compare filesystem identities on native platforms without Unix device and inode metadata
+same-file = "1"
+
 # An eyedropper click outside the window (screen_pick): a low-level mouse hook and the eyedropper as the system pointer
 # (winsafe, MIT) and one desktop pixel through GDI (xcap, Apache-2.0).
 [target.'cfg(windows)'.dependencies]

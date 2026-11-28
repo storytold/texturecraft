@@ -523,19 +523,29 @@ fn sets_with_the_same_file_name_warn_instead_of_overwriting() {
 fn a_material_never_points_at_a_texture_kept_for_another_set() {
     let mut session = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
 
-    // The first set's name expands to the same base-colour filename as the second
-    execute(&mut session, "textureSet.rename", &json!({"ts": 0, "name": "$channel"})).unwrap();
-    execute(&mut session, "textureSet.rename", &json!({"ts": 1, "name": "baseColor"})).unwrap();
+    execute(&mut session, "textureSet.rename", &json!({"ts": 0, "name": "body"})).unwrap();
+    execute(&mut session, "textureSet.rename", &json!({"ts": 1, "name": "trim"})).unwrap();
     let directory = temp("shared-map");
 
-    let result = export(&mut session, &directory, OPENPBR, true);
+    // Give the first set a map with the same filename as the second set's canonical base colour
+    let mut preset = texturecraft_engine::formats::builtin_preset(OPENPBR).unwrap();
+    let mut conflicting_map = preset.maps.iter().find(|map| map.file.ends_with("_base_color")).unwrap().clone();
+    let conflicting_stem = "material_ball_trim_base_color";
+    conflicting_map.file = conflicting_stem.into();
+    preset.maps.push(conflicting_map);
 
-    let materials: Vec<_> = files(&result).into_iter().filter(|path| path.ends_with(".mtlx")).collect();
-    assert!(materials.len() >= 2, "{result}");
-    assert!(std::fs::read_to_string(&materials[0]).unwrap().contains("material_ball_baseColor_base_color.png"));
-    for material in materials.iter().skip(1) {
-        assert!(!std::fs::read_to_string(material).unwrap().contains("material_ball_baseColor_base_color.png"), "{material}");
-    }
+    let result =
+        execute(&mut session, "file.exportTextures", &json!({"dir": directory.display().to_string(), "preset": preset, "ts": [0, 1], "materialX": true}))
+            .unwrap();
+
+    let conflicting_file = format!("{conflicting_stem}.png");
+    assert!(names(&result).contains(&conflicting_file), "{result}");
+    assert!(warned(&result, &format!("\"{conflicting_file}\" was not written")), "{result}");
+    let body = referenced(&std::fs::read_to_string(directory.join("material_ball_body.mtlx")).unwrap());
+    let trim = referenced(&std::fs::read_to_string(directory.join("material_ball_trim.mtlx")).unwrap());
+    assert!(body.iter().any(|file| file == "material_ball_body_base_color.png"), "{body:?}");
+    assert!(trim.iter().any(|file| file.starts_with("material_ball_trim_")), "{trim:?}");
+    assert!(!trim.contains(&conflicting_file), "{trim:?}");
 }
 
 #[test]

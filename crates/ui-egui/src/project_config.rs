@@ -1,13 +1,15 @@
 //! Edit > Project Configuration...: the project's settings in sections. 3D MESH picks another mesh
-//! file for the project or reads the current one again; PROJECT SETTINGS sets the normal map format
-//! and shows the UV tiles. Settings TextureCraft does not have yet (tangent space per fragment,
-//! physical size, OpenColorIO, import options other than stroke preservation) are shown disabled.
+//! file for the project or reads the current one again; PROJECT SETTINGS sets the project name and
+//! normal map format and shows the UV tiles. Unsupported options such as tangent space per fragment,
+//! physical size and OpenColorIO are shown disabled.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use egui::{Key, Modifiers};
 use serde_json::{Value, json};
 use texturecraft_engine::core::NormalFormat;
+use texturecraft_engine::project_cmds::{MAX_PROJECT_NAME_CHARS, validate_project_name};
 
 use crate::TextureCraftApp;
 use crate::dock::info_icon;
@@ -33,6 +35,7 @@ const MIN_FIELD_WIDTH_POINTS: f32 = 60.0;
 const DEFAULT_DIALOG_WIDTH_POINTS: f32 = 560.0;
 /// Leave space around the centered dialog on short viewports.
 const DIALOG_VIEWPORT_MARGIN_POINTS: f32 = 32.0;
+const PROJECT_NAME_FIELD_ID: &str = "project_config_name";
 
 /// Opens the window on the current project, with nothing chosen yet.
 pub(crate) fn open(app: &mut TextureCraftApp) {
@@ -44,6 +47,7 @@ pub(crate) fn open(app: &mut TextureCraftApp) {
         mesh: None,
         reimport: false,
         preserve: true,
+        draft_name: None,
         normal_format: None,
         color_management: crate::project_form::ColorManagement::Legacy,
         confirm: false,
@@ -115,13 +119,22 @@ fn format_name(format: NormalFormat) -> &'static str {
     }
 }
 
-pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
-    let Some(mut config) = app.ui.windows.project_config.take() else { return };
-
-    // Choices for another project cannot be applied here
-    if config.project != app.session.project_id {
+fn sync_name_editor(app: &mut TextureCraftApp, ctx: &egui::Context, opening: Option<u64>) {
+    if app.project_name_editor_opening == opening {
         return;
     }
+
+    // Egui keeps widget undo data after the dialog closes
+    app.project_name_editor_opening = opening;
+    ctx.data_mut(|data| data.remove::<egui::text_edit::TextEditState>(egui::Id::unique(PROJECT_NAME_FIELD_ID)));
+}
+
+pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    // Choices for another project cannot be applied here
+    let config = app.ui.windows.project_config.take().filter(|config| config.project == app.session.project_id);
+    sync_name_editor(app, ctx, config.as_ref().map(|config| config.opening_id));
+
+    let Some(mut config) = config else { return };
 
     let project = &app.session.doc.project;
     let current_mesh_path = &project.mesh_path;
@@ -137,7 +150,7 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let mut open = true;
     let (mut ok, mut cancel, mut select) = (std::mem::take(&mut config.confirm), false, false);
 
-    // Start with a form that fits the viewport; subsequent sizes follow the user's resize
+    // Fit the first frame to the viewport and follow the user's resize after that
     let form_height = (ctx.content_rect().height() - DIALOG_VIEWPORT_MARGIN_POINTS - DIALOG_CHROME_HEIGHT_POINTS)
         .clamp(crate::project_form::MIN_FORM_HEIGHT_POINTS, crate::project_form::FORM_HEIGHT_POINTS);
     let dialog = crate::windows::dialog(ctx, "project_config", tr("Project Configuration"), &mut open)
@@ -211,6 +224,20 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
                     ui.add_space(12.0);
                     ui.label(caption(tr("PROJECT SETTINGS")));
                     ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(ROW_INDENT_POINTS);
+                        let label = ui.label(tr("Project name")).id;
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            info_icon(ui, tr("The name $project stands for in export file names. The project file keeps its own name."));
+                            let was_edited = config.draft_name.is_some();
+                            let mut name = config.draft_name.take().map_or(Cow::Borrowed(project.name.as_str()), Cow::Owned);
+                            let field = egui::TextEdit::singleline(&mut name).id(egui::Id::unique(PROJECT_NAME_FIELD_ID)).desired_width(FIELD_WIDTH_POINTS);
+                            if ui.add(field).labelled_by(label).changed() || was_edited {
+                                config.draft_name = Some(name.into_owned());
+                            }
+                        });
+                    });
+
                     let shown_format = config.normal_format.unwrap_or(current_normal_format);
                     row(
                         ui,
@@ -284,7 +311,6 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
                     physical_size(ui, "project_config_physical_size", false);
                     color_management(ui, "project_config_color_management", &mut config.color_management);
                 });
-
             });
         });
     });
@@ -303,9 +329,19 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
         });
     }
 
-    // Apply the mesh first so a failed mesh change leaves the format untouched
+    let confirming = ok && !cancel && open;
+
+    // Reject invalid drafts before applying mesh or format changes
+    if confirming && config.draft_name.as_deref().is_some_and(|name| validate_project_name(name).is_err()) {
+        app.toast(trf("Project name must be 1 to {max} characters after trimming, without control characters.", &[("max", &MAX_PROJECT_NAME_CHARS)]), true);
+        app.announce_latest_toast();
+        app.ui.windows.project_config = Some(config);
+        return;
+    }
+
+    // Apply the mesh first so a failed mesh change leaves the remaining settings untouched
     let mut mesh_applied = false;
-    let done = ok && !cancel && open && {
+    let done = confirming && {
         let reimport = config.reimport.then(|| app.session.remembered_mesh_path().map(str::to_string)).flatten();
         mesh_applied = if config.reimport && chosen_mesh.is_none() && reimport.is_none() {
             // Drop a stale reimport tick so the user can retry the remaining settings
@@ -328,15 +364,21 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
                 }
                 None => true,
             }
+            && match config.draft_name.as_deref() {
+                Some(name) => app.run("project.rename", json!({"name": name})).is_some(),
+                None => true,
+            }
     };
 
     if !done && !cancel && open {
-        // A format retry must not reimport an already changed mesh
+        // A retry must not reimport an already changed mesh
         if ok && mesh_applied {
             (config.mesh, config.reimport) = (None, false);
         }
 
         app.ui.windows.project_config = Some(config);
+    } else {
+        sync_name_editor(app, ctx, None);
     }
 }
 

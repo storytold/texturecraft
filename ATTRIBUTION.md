@@ -30,6 +30,9 @@ licensed and keep their license file next to them.
 | `crates/formats/src/mesh_import/usd/fixtures/crafted-references.usdc` | Synthetic USDC class/reference/time-sample acceptance fixture | ArtCraft Team and craft-libs contributors | [Pinned generator and provenance](crates/formats/src/mesh_import/usd/fixtures/README.md) | MIT (`crates/formats/src/mesh_import/usd/fixtures/LICENSE-MIT`) |
 | `apps/texturecraft/src/xwayland_pen.rs` | Pen on Wayland opens the window through Xwayland: pen detection, the Xwayland decision and the X11 library check (adapted, reduced to the pen decision) | PhotoCraft contributors | storytold/photocraft `830316b775f1f6734498ac6e39fd1298955ff93f`: [`apps/photocraft/src/tablet.rs`](https://github.com/storytold/photocraft/blob/830316b775f1f6734498ac6e39fd1298955ff93f/apps/photocraft/src/tablet.rs), [`apps/photocraft/src/linux_libs.rs`](https://github.com/storytold/photocraft/blob/830316b775f1f6734498ac6e39fd1298955ff93f/apps/photocraft/src/linux_libs.rs) | MIT OR Apache-2.0 |
 
+Native autosave recovery uses `same-file` to compare file identities. Copyright (c) 2017 Andrew Gallant.
+The crate is available under Unlicense OR MIT. [Upstream source and licences](https://github.com/BurntSushi/same-file)
+
 ## Third-party assets compiled into the binary
 
 These come from Rust crate dependencies (not files in this repository) and keep their licenses.

@@ -13,6 +13,12 @@ Everything TextureCraft does is an engine command with a stable id (`layer.add.f
 Programmatic calls never open dialogs: a command runs with its defaults. Only `ui.menu.invoke`
 behaves like a menu click. `session.inspect` shows every layer, mask, effect, fill source and
 painted tile count, so an agent can verify its work without a screenshot.
+
+`project.rename {name}` sets the internal project name used by `$project` in export
+templates and returns `{name}` with the trimmed value. The name must contain 1–128
+characters after trimming and contain no control characters. Renaming is undoable.
+Submitting the current name leaves history unchanged. The project file keeps its own name.
+
 `effect.histogram {effect, channel?, bins?}` counts the values an effect reads (a levels
 effect's input), so an agent can pick its input range from the data. `effect.move {effect,
 index}` reorders an effect within its stack (0 = bottom) and `effect.duplicate {effect}` copies

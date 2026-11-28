@@ -18,7 +18,7 @@ pub const HEADLESS: &[(&str, &str, &str, &str)] = &[
     ("ui.saveAsTemplate", "partial", "window", "the dialog is desktop-only; `project.template.save` saves it"),
     ("ui.export", "partial", "window", "the dialog is desktop-only; `file.exportTextures` exports"),
     ("ui.saveReduced", "no", "engine-gap", "a smaller save could be a command"),
-    ("ui.projectConfig", "no", "engine-gap", "project settings could be set by a command"),
+    ("ui.projectConfig", "partial", "window", "the dialog is desktop-only; `project.rename` sets the project name"),
     ("ui.recent.clear", "no", "window", "the desktop recent-projects list"),
     ("ui.quit", "no", "window", "quits the desktop app"),
     ("ui.settings", "no", "window", "the desktop settings window"),

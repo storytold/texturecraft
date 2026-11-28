@@ -1,4 +1,4 @@
-//! Project-level commands: new project, sample project, smart materials, inspection.
+//! Project-level commands: new project, rename, sample project, smart materials, inspection.
 
 use serde_json::{Value, json};
 use texturecraft_compose::BakedMaps;
@@ -8,6 +8,9 @@ use texturecraft_geom::primitives;
 use crate::commands::{CommandSpec, always, bad, boolp, strp, u64p};
 use crate::materials::Place;
 use crate::{Result, Session, cmd};
+
+/// Longest project name, in characters; it goes into export file names.
+pub const MAX_PROJECT_NAME_CHARS: usize = 128;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -22,6 +25,15 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!("project.sample", "Open sample project", ["File"], None, "{}", always, sample),
         cmd!("project.inspect", "Inspect project", [], None, "{}", always, |s, _| Ok(crate::inspect::session(s))),
+        cmd!(
+            "project.rename",
+            "Rename project",
+            [],
+            None,
+            "{name: 1-128 characters without control characters} — the name `$project` stands for in export file names; the project file keeps its own name",
+            always,
+            rename
+        ),
         cmd!(
             "material.apply",
             "Add smart material",
@@ -49,6 +61,30 @@ fn new(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.switch_to(next);
     Ok(crate::inspect::session(s))
+}
+
+/// Trim and validate a proposed name without changing the project.
+pub fn validate_project_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().nth(MAX_PROJECT_NAME_CHARS).is_some() || name.chars().any(char::is_control) {
+        return Err(bad("project.rename", format!("`name` must be 1-{MAX_PROJECT_NAME_CHARS} characters without control characters")));
+    }
+
+    Ok(name)
+}
+
+fn rename(session: &mut Session, params: &Value) -> Result<Value> {
+    let name = validate_project_name(strp(params, "name").unwrap_or_default())?;
+
+    // The same name is not an undo step and leaves a saved project unmodified
+    if name != session.doc.project.name {
+        session.edit("Rename project", |session| {
+            session.doc.project.name = name.to_owned();
+            Ok(())
+        })?;
+    }
+
+    Ok(json!({ "name": name }))
 }
 
 fn material(s: &mut Session, p: &Value) -> Result<Value> {
