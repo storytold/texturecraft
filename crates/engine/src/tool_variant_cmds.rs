@@ -1,5 +1,4 @@
-//! Tool variant commands: select a tool in one of its variants (the shelf's variant menu runs
-//! them), and list the variant each tool is in
+//! Commands that select a tool in one of its variants, and list the variant each tool is in
 
 use serde_json::{Map, Value, json};
 
@@ -100,8 +99,9 @@ fn pick(session: &mut Session, variant: ToolVariant) -> Result<Value> {
         Tool::Path => {
             let path = &session.tool.path;
 
-            // Paint along path keeps a closed outline closed
-            let (closed, fill) = if variant == ToolVariant::PathFilled { (true, true) } else { (path.closed, false) };
+            // Paint along path keeps a closed outline closed, but with no points there is no outline to keep
+            let keeps_closed = path.closed && !(path.fill && path.points.is_empty());
+            let (closed, fill) = if variant == ToolVariant::PathFilled { (true, true) } else { (keeps_closed, false) };
             if (closed, fill) != (path.closed, path.fill) {
                 session.path_checkpoint();
             }

@@ -125,13 +125,13 @@ impl PathState {
         (&self.points, self.corner_flags(), self.closed, self.fill, self.uv) == (&other.points, other.corner_flags(), other.closed, other.fill, other.uv)
     }
 
-    /// Empty the tool for the next path: no points, open unless it fills, nothing selected or edited
+    /// Empty the tool for the next path: no points, open unless it was filling, nothing selected or edited
     pub fn clear(&mut self) {
         self.points.clear();
         self.corners.clear();
 
-        // Filling is a tool mode (Filled path): its outline stays closed for the next path
-        self.closed = self.fill;
+        // Filling is a tool mode (Filled path): a filled outline stays closed for the next path
+        self.closed = self.closed && self.fill;
         self.selected = None;
         self.editing = None;
         self.edited = false;
@@ -147,7 +147,9 @@ impl PathState {
                 self.corners.remove(i);
             }
         }
-        if self.closed && !self.fill && self.points.len() < 3 {
+
+        // A new filled path keeps its mode below three points, while a stored one opens to stay paintable
+        if self.closed && (!self.fill || self.editing.is_some()) && self.points.len() < 3 {
             self.closed = false;
         }
     }
@@ -627,7 +629,8 @@ impl Session {
 
         let path = &self.tool.path;
         if path.closed && path.fill && path.points.len() < 3 {
-            return Ok(false);
+            // Nothing fills yet, so the preview of a longer outline goes
+            return Ok(self.remove_draft_preview());
         }
 
         let Some((eid, index, stored)) = stored else { return self.start_path_draft(viewport) };
@@ -895,14 +898,20 @@ impl Session {
 
     /// Stop editing a stored path (its changes are already applied) and clear the tool; a new path's preview is removed
     pub fn stop_path_edit(&mut self) {
-        if let Some(draft) = self.path_draft.take() {
-            let preview = std::mem::replace(&mut self.doc, draft.base);
-            self.changed_without_history(&preview);
-        }
+        self.remove_draft_preview();
         if self.tool.path.editing.is_some() {
             self.tool.path.clear();
         }
         self.path_steps = Default::default();
+    }
+
+    /// Take a new path's preview out of the document; false without one
+    fn remove_draft_preview(&mut self) -> bool {
+        let Some(draft) = self.path_draft.take() else { return false };
+
+        let preview = std::mem::replace(&mut self.doc, draft.base);
+        self.changed_without_history(&preview);
+        true
     }
 
     /// The selected path sublayer, or a new one on the selected paint layer's content or mask

@@ -1,5 +1,4 @@
-//! Tool variants (the shelf's variant menu): each `tool.variant.*` command selects its tool and
-//! sets the setting it maps to, and `tool.variants` reports what the settings say
+//! Each `tool.variant.*` command sets its tool and setting, and `tool.variants` reports what the settings say
 
 use serde_json::{Value, json};
 use texturecraft_engine::core::Channel;
@@ -173,6 +172,55 @@ fn removing_a_point_keeps_filled() {
 
     assert_eq!(s.tool.path.points.len(), 2);
     assert_eq!(variant_of(&mut s, "path"), "pathFilled");
+}
+
+#[test]
+fn a_filled_preview_goes_below_three_points() {
+    let mut s = session();
+    execute(&mut s, "tool.variant.pathFilled", &Value::Null).unwrap();
+    execute(&mut s, "tool.path", &json!({"uvPoints": [[0.3, 0.3], [0.7, 0.3], [0.5, 0.7]]})).unwrap();
+    assert!(red_uv(&s, 0.5, 0.4), "three points preview the fill");
+
+    s.remove_selected_path_point();
+    s.path_live().unwrap();
+
+    assert!(!red_uv(&s, 0.5, 0.4), "two points fill nothing");
+}
+
+#[test]
+fn removing_a_point_of_a_stored_filled_path_repaints_it_open() {
+    let mut s = session();
+    let report =
+        execute(&mut s, "tool.path", &json!({"uvPoints": [[0.3, 0.3], [0.7, 0.3], [0.5, 0.7]], "closed": true, "fill": true, "commit": true})).unwrap();
+    execute(&mut s, "path.edit", &json!({"effect": report["committed"]["effect"], "index": 0})).unwrap();
+
+    s.remove_selected_path_point();
+    s.path_live().unwrap();
+
+    assert!(!red_uv(&s, 0.5, 0.4), "the old fill is repainted away");
+    assert!(red_uv(&s, 0.5, 0.3), "the two points paint as an open line");
+}
+
+#[test]
+fn a_filled_path_opened_by_hand_stays_open() {
+    let mut s = session();
+    execute(&mut s, "tool.variant.pathFilled", &Value::Null).unwrap();
+    execute(&mut s, "tool.path", &json!({"closed": false})).unwrap();
+
+    execute(&mut s, "tool.path", &json!({"uvPoints": SQUARE_UV, "commit": true})).unwrap();
+
+    assert_eq!(variant_of(&mut s, "path"), "pathAlong");
+    assert!(!s.tool.path.closed);
+}
+
+#[test]
+fn paint_along_path_without_points_starts_an_open_path() {
+    let mut s = session();
+    execute(&mut s, "tool.variant.pathFilled", &Value::Null).unwrap();
+
+    execute(&mut s, "tool.variant.pathAlong", &Value::Null).unwrap();
+
+    assert!(!s.tool.path.closed);
 }
 
 #[test]
