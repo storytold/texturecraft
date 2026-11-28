@@ -41,6 +41,11 @@ inputs use their `default_color` until assigned an imported image; their `defaul
 must be the empty string (named default resources are unsupported). Automatic
 `channel_user0`–`channel_user7` inputs are also assignable.
 
+Image samples and `default_color` use straight-alpha RGB. `normalUnpack`
+decodes RGB in the normalized 0–1 range and attenuates the normal direction
+toward a flat normal by alpha. Zero-alpha inputs and zero-length blends return
+a flat normal. Use `getTSNormal` for the built-in signed normal channel.
+
 Material bindings include base color, roughness, metallic, ambient occlusion,
 normal, height, emissive, opacity and specular level. Baked curvature, thickness
 and ambient occlusion are available through their automatic texture bindings.

@@ -42,23 +42,51 @@ fn custom_glsl_changes_material_render_and_parameter_edits_reach_the_gpu() {
 uniform int code;
 //: param custom {"default":[-1,2147483647,-2147483648,16777217]}
 uniform ivec4 codes;
+//: param custom {"default":"","default_color":[0.5,0.5,1.0,0.5]}
+uniform sampler2D normal_image;
+//: param auto channel_user0
+uniform SamplerSparse normal_channel;
 void shade(V2F i) {
     bool exact = code==3 && codes.x==-1 && codes.y==2147483647 && codes.z==(-2147483647-1) && codes.w==16777217;
     bool neutral_normal = dot(normalUnpack(vec4(0.0)),vec3(0.0,0.0,1.0))>0.99;
-    vec3 partial_flat = normalUnpack(vec4(0.25,0.25,0.5,0.5));
+    vec3 partial_flat = normalUnpack(vec4(0.5,0.5,1.0,0.5));
     vec3 opaque_tilt = normalUnpack(vec4(1.0,0.5,0.5,1.0),1.0);
-    vec3 partial_tilt = normalUnpack(vec4(0.5,0.25,0.25,0.5),1.0);
+    vec3 partial_tilt = normalUnpack(vec4(1.0,0.5,0.5,0.5),1.0);
     bool alpha_normal = dot(partial_flat,vec3(0.0,0.0,1.0))>0.99
         && partial_tilt.x>0.0 && partial_tilt.x<opaque_tilt.x && partial_tilt.z>opaque_tilt.z
         && abs(dot(partial_tilt,partial_tilt)-1.0)<0.001;
-    diffuseShadingOutput((exact && neutral_normal && alpha_normal ? vec3(1.0,0.0,0.0) : vec3(0.0,1.0,0.0))*getShadowFactor());
+    vec3 direct_normal = normalUnpack(texture(normal_image,i.tex_coord));
+    vec3 lod_normal = normalUnpack(textureLod(normal_image,i.tex_coord,0.0));
+    vec3 sparse_normal = normalUnpack(textureSparse(normal_channel,i.sparse_coord));
+    vec3 channel_normal = getTSNormal(i.sparse_coord,normal_channel);
+    bool sampled_normal = dot(direct_normal,vec3(0.0,0.0,1.0))>0.99
+        && dot(lod_normal,vec3(0.0,0.0,1.0))>0.99 && dot(sparse_normal,vec3(0.0,0.0,1.0))>0.99
+        && dot(channel_normal,vec3(0.0,0.0,1.0))>0.99;
+    bool zero_blend = dot(normalUnpack(vec4(0.5,0.5,0.0,0.5),1.0),vec3(0.0,0.0,1.0))>0.99;
+    diffuseShadingOutput((exact && neutral_normal && alpha_normal && sampled_normal && zero_blend
+        ? vec3(1.0,0.0,0.0) : vec3(0.0,1.0,0.0))*getShadowFactor());
 }
 "#;
     let mut typed = texturecraft_formats::custom_shader::import("Exact lanes", probe).unwrap();
+    images.insert("flat normal".into(), std::sync::Arc::new(ImageRes::new(1, 1, vec![[0.5, 0.5, 1.0, 0.5]], false)));
+    typed.textures[1].resource = Some("flat normal".into());
+    h.renderer.upload_shader_inputs(&h.device, &h.queue, &typed, &images);
     let red = texturecraft_formats::custom_shader::import("Red", "void shade(V2F i) { diffuseShadingOutput(vec3(1.0,0.0,0.0)); }").unwrap();
     let expected = render(&mut h, &shaded(&frame, |s| s.custom_shader = Some(red)), "custom_shader_red");
     let typed_frame = shaded(&frame, |s| s.custom_shader = Some(typed.clone()));
-    assert_same(&expected, &render(&mut h, &typed_frame, "custom_shader_exact_lanes"), "all integer lanes and transparent normals reach the shader correctly");
+    assert_same(
+        &expected,
+        &render(&mut h, &typed_frame, "custom_shader_exact_lanes"),
+        "integer lanes, default normal colors, sparse image normals and degenerate blends reach the shader correctly",
+    );
+    typed.textures[0].resource = Some("flat normal".into());
+    h.renderer.upload_shader_inputs(&h.device, &h.queue, &typed, &images);
+    let typed_frame = shaded(&frame, |s| s.custom_shader = Some(typed.clone()));
+    assert_same(
+        &expected,
+        &render(&mut h, &typed_frame, "custom_shader_image_normals"),
+        "assigned straight-alpha images decode as flat normals on every sampling path",
+    );
     fill(&mut h, &[0, 1], DisplayKind::BaseColor, &[128, 128, 128, 64]);
     assert_same(&expected, &render(&mut h, &typed_frame, "custom_shader_default_opacity"), "default shader opacity is independent of document opacity");
     typed.parameters[1].value = serde_json::json!([-1, 2147483647, -2147483648, 16777216]);
