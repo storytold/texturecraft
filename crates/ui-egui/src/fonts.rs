@@ -23,10 +23,108 @@ pub struct CraftFont {
     pub style: &'static str,
     /// ISO 15924 scripts the font is for, e.g. `"Jpan"`.
     pub scripts: &'static [&'static str],
-    pub bytes: &'static [u8],
+    /// The font file; deflated in a web build, where the data is part of the download (see `deflated`).
+    data: &'static [u8],
+    deflated: bool,
+}
+
+impl CraftFont {
+    /// Whether this build carries no data for the font.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// The font file's bytes: borrowed as embedded, or inflated from the web build's copy. Data that does not inflate
+    /// gives no bytes (the font is left out), never a panic.
+    pub fn bytes(&self) -> std::borrow::Cow<'static, [u8]> {
+        if self.deflated { std::borrow::Cow::Owned(inflate(self.data)) } else { std::borrow::Cow::Borrowed(self.data) }
+    }
+
+    /// The font as egui takes it, without copying an embedded one.
+    pub fn font_data(&self) -> FontData {
+        match self.bytes() {
+            std::borrow::Cow::Borrowed(bytes) => FontData::from_static(bytes),
+            std::borrow::Cow::Owned(bytes) => FontData::from_owned(bytes),
+        }
+    }
 }
 
 include!(concat!(env!("OUT_DIR"), "/craft_fonts.rs"));
+
+/// Inflates a font the web build embeds deflated. Empty when the data does not inflate.
+#[cfg(target_arch = "wasm32")]
+fn inflate(deflated: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+    // The largest face is under 1 MB; the bound keeps corrupt data from growing without limit.
+    const MAX_INFLATED_BYTES: u64 = 64 << 20;
+    let mut out = Vec::new();
+    match flate2::read::DeflateDecoder::new(deflated).take(MAX_INFLATED_BYTES + 1).read_to_end(&mut out) {
+        Ok(_) if out.len() as u64 <= MAX_INFLATED_BYTES => out,
+        _ => Vec::new(),
+    }
+}
+
+/// Adds the Phosphor icon font to `fonts`: the font itself on desktop, the web build's deflated copy there (the icon
+/// font is half a megabyte of the download). Icons draw as missing-glyph boxes if the copy does not inflate.
+pub(crate) fn add_icon_font(fonts: &mut egui::FontDefinitions) {
+    #[cfg(not(target_arch = "wasm32"))]
+    egui_phosphor::add_to_fonts(fonts, egui_phosphor::Variant::Regular);
+    #[cfg(target_arch = "wasm32")]
+    {
+        static PHOSPHOR: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+        let bytes = PHOSPHOR.get_or_init(|| Vec::leak(inflate(include_bytes!(concat!(env!("OUT_DIR"), "/Phosphor.ttf.deflate")))));
+        if bytes.is_empty() {
+            log::warn!("the icon font did not inflate; icons show as boxes");
+        } else {
+            egui_phosphor::add_font_bytes_to_fonts(fonts, "phosphor", bytes);
+        }
+    }
+}
+
+/// egui's default fonts (Hack, Ubuntu Light and egui's icons, in egui's family order). The web build takes them from
+/// craft-ui's deflated copies instead of egui's `default_fonts` feature, which would embed a second, raw copy, and it
+/// hands the engine its built-in text fonts from the same copies.
+pub(crate) fn egui_default_definitions() -> egui::FontDefinitions {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        egui::FontDefinitions::default()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        texturecraft_engine::text_cmds::provide_built_in_fonts(engine_fonts);
+        let mut fonts = craft_ui::fonts::deflated_default_definitions();
+        // craft-ui's Inter: TextureCraft adds its own (`theme::font_definitions`) and its own semibold family.
+        for name in ["Inter-Regular", "Inter-SemiBold"] {
+            fonts.font_data.remove(name);
+        }
+        fonts.families.remove(&FontFamily::Name(craft_ui::fonts::SEMIBOLD.into()));
+        let known: Vec<String> = fonts.font_data.keys().cloned().collect();
+        for list in fonts.families.values_mut() {
+            list.retain(|name| known.contains(name));
+        }
+        fonts
+    }
+}
+
+/// The engine's built-in text fonts, Ubuntu Light and Hack, copied once from the deflated defaults. Empty when a face
+/// is unavailable (the text command then reports the font as unusable).
+#[cfg(target_arch = "wasm32")]
+fn engine_fonts() -> [&'static [u8]; 2] {
+    let fonts = craft_ui::fonts::deflated_default_definitions();
+    let face = |name: &str| -> &'static [u8] {
+        match fonts.font_data.get(name) {
+            Some(data) => Vec::leak((*data.font).as_ref().to_vec()),
+            None => &[],
+        }
+    };
+    [face("Ubuntu-Light"), face("Hack")]
+}
+
+/// Only the web build embeds deflated data.
+#[cfg(not(target_arch = "wasm32"))]
+fn inflate(_deflated: &[u8]) -> Vec<u8> {
+    Vec::new()
+}
 
 /// Skip absurdly large files (a corrupt or non-font path must not eat memory).
 #[cfg(not(target_arch = "wasm32"))]
@@ -186,8 +284,8 @@ impl UiFonts {
 
 /// The first available font for `script`: craft-fonts' (embedded), then the system's.
 fn load(script: Script) -> Option<FontData> {
-    if let Some(f) = CRAFT_FONTS.iter().find(|f| f.scripts.contains(&script.iso()) && f.style == "Regular" && !f.bytes.is_empty()) {
-        return Some(aligned(FontData::from_static(f.bytes)));
+    if let Some(f) = CRAFT_FONTS.iter().find(|f| f.scripts.contains(&script.iso()) && f.style == "Regular" && !f.is_empty()) {
+        return Some(aligned(f.font_data()));
     }
     #[cfg(not(target_arch = "wasm32"))]
     for (path, index) in script.system_files() {

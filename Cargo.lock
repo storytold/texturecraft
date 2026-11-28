@@ -6172,6 +6172,7 @@ dependencies = [
  "egui",
  "egui-phosphor",
  "egui_kittest",
+ "flate2",
  "image",
  "js-sys",
  "log",

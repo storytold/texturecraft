@@ -301,20 +301,20 @@ pub(crate) const HARD_SHADOW: Color32 = Color32::from_rgb(12, 14, 18);
 /// adds CJK).
 pub fn font_definitions() -> egui::FontDefinitions {
     use std::sync::Arc;
-    let mut fonts = egui::FontDefinitions::default();
-    let face = |style: &str| crate::fonts::CRAFT_FONTS.iter().find(|f| f.family == "Inter" && f.style == style && !f.bytes.is_empty());
+    let mut fonts = crate::fonts::egui_default_definitions();
+    let face = |style: &str| crate::fonts::CRAFT_FONTS.iter().find(|f| f.family == "Inter" && f.style == style && !f.is_empty());
     // Inter is drawn a little under its size, as in VectorCraft: its letters are wide.
-    let inter = |bytes: &'static [u8]| Arc::new(egui::FontData::from_static(bytes).tweak(egui::FontTweak { scale: 0.92, ..Default::default() }));
+    let inter = |face: &crate::fonts::CraftFont| Arc::new(face.font_data().tweak(egui::FontTweak { scale: 0.92, ..Default::default() }));
     let mut semibold = None;
     if let (Some(regular), Some(bold)) = (face("Regular"), face("SemiBold")) {
-        fonts.font_data.insert("inter".into(), inter(regular.bytes));
-        fonts.font_data.insert("inter-semibold".into(), inter(bold.bytes));
+        fonts.font_data.insert("inter".into(), inter(regular));
+        fonts.font_data.insert("inter-semibold".into(), inter(bold));
         if let Some(list) = fonts.families.get_mut(&FontFamily::Proportional) {
             list.insert(0, "inter".into());
         }
         semibold = Some("inter-semibold");
     }
-    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    crate::fonts::add_icon_font(&mut fonts);
     // The semibold family: the regular family with its first face swapped for the weight.
     let mut list = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     if let (Some(w), Some(first)) = (semibold, list.first_mut()) {

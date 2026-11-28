@@ -18,12 +18,13 @@ texturecraft-paint = { workspace = true }
 texturecraft-bake = { workspace = true }
 texturecraft-formats = { workspace = true }
 rayon = { workspace = true }
-epaint_default_fonts = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The built-in text fonts; the web build gets them from the app (`text_cmds::provide_built_in_fonts`).
+epaint_default_fonts = { workspace = true }
 tempfile = "3"
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
