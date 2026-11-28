@@ -6,8 +6,10 @@ crafted archive) as an argument, which is why packaging/macos/nightly_sign_tests
 app's ordinary Linux CI.
 """
 import os
+import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -16,9 +18,18 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 LIB = HERE / "nightly-lib.sh"
 APP = "TextureCraft Nightly.app"
+APP_NOTICES = ("README.md", "LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "ATTRIBUTION.md")
+OPTIONAL_NOTICES = ("LICENSE", "COPYRIGHT")
 IDENTITY = "A" * 40
 TEAM = "DJ6XS33FX8"
 APP_CONFIG_ID = "ai.storyteller.texturecraft.nightly"
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+VERSION = "0.24.0-nightly.20261124.7.2.g" + COMMIT[:12]
+ASSET = f"texturecraft-{VERSION}-macos-aarch64-nightly.zip"
+SECRETS = (
+    "APPLE_CERTIFICATE", "APPLE_CERTIFICATE_PASSWORD", "KEYCHAIN_PASSWORD",
+    "APPLE_ID", "APPLE_PASSWORD", "APPLE_TEAM_ID", "MACOS_SIGN_IDENTITY", "MACOS_KEYCHAIN",
+)
 
 
 
@@ -176,6 +187,199 @@ class ZipEntries(unittest.TestCase):
             (f"{APP}/Contents/with\\backslash", stat.S_IFREG | 0o644),
         ]:
             self.assertFalse(self.checked([*good, entry]), entry[0])
+
+
+class PackageFixture:
+    """Stand-in POSIX harness for driving packaging/macos/nightly.sh and nightly-verify.sh."""
+
+    def __init__(self, case):
+        directory = tempfile.TemporaryDirectory()
+        case.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        self.bin = self.root / "bin"
+        self.dist = self.root / "dist"
+        self.temp = self.root / "tmp"
+        for path in (self.bin, self.dist, self.temp):
+            path.mkdir()
+        self._install_shims()
+
+    def _write_shim(self, name, body):
+        path = self.bin / name
+        path.write_text(body)
+        path.chmod(0o755)
+
+    def _install_shims(self):
+        python = sys.executable
+        self._write_shim(
+            "uname",
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  -s) echo Darwin ;;\n"
+            "  -m) echo arm64 ;;\n"
+            "  *) /usr/bin/uname \"$@\" ;;\n"
+            "esac\n",
+        )
+        self._write_shim("lipo", "#!/bin/sh\necho arm64\n")
+        self._write_shim(
+            "plutil",
+            f"#!{python}\n"
+            "import plistlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "if args[:1] == ['-lint']:\n"
+            "    with open(args[1], 'rb') as f:\n"
+            "        plistlib.load(f)\n"
+            "    sys.exit(0)\n"
+            "if args[:1] == ['-extract'] and len(args) == 6 and args[3:5] == ['-o', '-']:\n"
+            "    key, fmt, plist_path = args[1], args[2], args[5]\n"
+            "    with open(plist_path, 'rb') as f:\n"
+            "        data = plistlib.load(f)\n"
+            "    if key not in data:\n"
+            "        sys.exit(1)\n"
+            "    value = data[key]\n"
+            "    if fmt == 'raw':\n"
+            "        print(value)\n"
+            "    else:\n"
+            "        print(plistlib.dumps(value).decode('utf-8'))\n"
+            "    sys.exit(0)\n"
+            "sys.exit(f'unsupported plutil args: {args}')\n",
+        )
+        self._write_shim(
+            "ditto",
+            f"#!{python}\n"
+            "import os, stat, sys, zipfile\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "src, dst = Path(args[-2]), Path(args[-1])\n"
+            "if '-c' in args:\n"
+            "    base = src.parent if '--keepParent' in args else src\n"
+            "    with zipfile.ZipFile(dst, 'w', compression=zipfile.ZIP_DEFLATED) as z:\n"
+            "        items = [src] + sorted(src.rglob('*')) if '--keepParent' in args else sorted(src.rglob('*'))\n"
+            "        for item in items:\n"
+            "            rel = item.relative_to(base).as_posix()\n"
+            "            if item.is_dir():\n"
+            "                info = zipfile.ZipInfo(rel + '/')\n"
+            "                info.external_attr = (stat.S_IFDIR | (item.stat().st_mode & 0o777)) << 16\n"
+            "                z.writestr(info, b'')\n"
+            "            else:\n"
+            "                info = zipfile.ZipInfo(rel)\n"
+            "                info.external_attr = (stat.S_IFREG | (item.stat().st_mode & 0o777)) << 16\n"
+            "                z.writestr(info, item.read_bytes())\n"
+            "elif '-x' in args:\n"
+            "    dst.mkdir(parents=True, exist_ok=True)\n"
+            "    with zipfile.ZipFile(src) as z:\n"
+            "        for info in z.infolist():\n"
+            "            target = dst / info.filename\n"
+            "            if info.is_dir():\n"
+            "                target.mkdir(parents=True, exist_ok=True)\n"
+            "            else:\n"
+            "                target.parent.mkdir(parents=True, exist_ok=True)\n"
+            "                target.write_bytes(z.read(info.filename))\n"
+            "                mode = (info.external_attr >> 16) & 0o777\n"
+            "                if mode:\n"
+            "                    os.chmod(target, mode)\n"
+            "else:\n"
+            "    sys.exit(f'unsupported ditto args: {args}')\n",
+        )
+
+    def env(self, **changes):
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "HOME": str(self.root), "RUNNER_TEMP": str(self.temp)}
+        for key, value in changes.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = str(value)
+        return env
+
+    def run(self, script, *args, **changes):
+        path = Path(script) if Path(script).is_absolute() else HERE / script
+        return subprocess.run(
+            ["bash", str(path), *(str(a) for a in args)],
+            env=self.env(**changes), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+        )
+
+    def package(self, font_licences):
+        """Drive the real producer from a clean fixture checkout, without Cargo or Apple tools."""
+        source = HERE.parents[1]
+        checkout = self.root / "source"
+        checkout.mkdir()
+        notices = APP_NOTICES + tuple(name for name in OPTIONAL_NOTICES if (source / name).is_file())
+        for relative in (*notices, "packaging/env.sh", "packaging/nightly-common.sh", "packaging/nightly_paths.py",
+                         "packaging/macos/nightly.sh", "packaging/macos/nightly-lib.sh",
+                         "packaging/macos/Info.plist.in", "packaging/macos/nightly_plist.py",
+                         "assets/app-icon/texturecraft-nightly.icns"):
+            target = checkout / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / relative, target)
+        env = self.env(**dict.fromkeys(SECRETS))
+
+        def git(*args):
+            return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", *args],
+                                  cwd=checkout, env=env, check=True, capture_output=True, text=True, timeout=30).stdout
+
+        git("init", "-q")
+        git("add", "--", ".")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Packaging fixture")
+        commit = git("rev-parse", "HEAD").strip()
+        version = VERSION[:-12] + commit[:12]
+        # Generated licence text exercises the copier without depending on a font checkout.
+        fonts = self.root / "craft-fonts"
+        for family, data in font_licences.items():
+            licence = fonts / "fonts" / family / "OFL.txt"
+            licence.parent.mkdir(parents=True)
+            licence.write_bytes(data)
+        self._write_shim(
+            "cargo",
+            '#!/bin/sh\nset -eu\n'
+            'gui="$CARGO_TARGET_DIR/aarch64-apple-darwin/release/texturecraft"\n'
+            'mkdir -p "$(dirname "$gui")"\n'
+            "printf \"#!/bin/sh\\necho 'TextureCraft %s (nightly-v1)'\\n\" \"$TEXTURECRAFT_VERSION\" >\"$gui\"\n",
+        )
+        result = self.run(checkout / "packaging/macos/nightly.sh", "--arch", "aarch64", **dict.fromkeys(SECRETS),
+                          DIST=str(self.dist), CARGO_TARGET_DIR=str(self.root / "target"), CRAFT_FONTS_DIR=str(fonts),
+                          TEXTURECRAFT_BUILD_CHANNEL="nightly-v1", TEXTURECRAFT_VERSION=version,
+                          TEXTURECRAFT_BUILD_SHA=commit, TEXTURECRAFT_BUILD_DATE="2026-11-24")
+        assert result.returncode == 0, result.stdout
+        return self.dist / ASSET.replace(VERSION, version)
+
+
+class Build(unittest.TestCase):
+    def test_unsigned_archive_has_launcher_layout_and_keeps_all_notices(self):
+        f = PackageFixture(self)
+        fonts = {
+            "inter": b"generated font notice one",
+            "biz-ud-pgothic": b"generated font notice two",
+            "noto-sans-cjk-sc": b"generated font notice three",
+        }
+        archive = f.package(fonts)
+        source = HERE.parents[1]
+        resources = f"{APP}/Contents/Resources"
+        icon = "texturecraft-nightly.icns"
+        notice_files = {name: (source / name).read_bytes() for name in APP_NOTICES}
+        notice_files.update({name: (source / name).read_bytes() for name in OPTIONAL_NOTICES if (source / name).is_file()})
+        notice_files.update({f"OFL-{family}.txt": data for family, data in fonts.items()})
+        # Shipped Launcher v0.20.3 accepts these leaves only in Resources/docs, except for the root icon.
+        expected_files = {f"{resources}/docs/{name}": data for name, data in notice_files.items()}
+        expected_files[f"{resources}/{icon}"] = (source / "assets/app-icon" / icon).read_bytes()
+        contents = f"{APP}/Contents"
+        gui = f"{contents}/MacOS/TextureCraft"
+        with zipfile.ZipFile(archive) as zipped:
+            entries = zipped.infolist()
+            names = {entry.filename for entry in entries}
+            self.assertEqual(len(entries), len({name.casefold() for name in names}), "unique paths, ignoring case")
+            self.assertEqual({entry.filename for entry in entries if not entry.is_dir()},
+                             set(expected_files) | {gui, f"{contents}/Info.plist", f"{contents}/PkgInfo"})
+            self.assertTrue({entry.filename for entry in entries if entry.is_dir()} <= {
+                f"{APP}/", f"{contents}/", f"{contents}/MacOS/", f"{resources}/", f"{resources}/docs/"})
+            for path, data in expected_files.items():
+                with self.subTest(path=path):
+                    self.assertEqual(zipped.read(path), data)
+                    mode = zipped.getinfo(path).external_attr >> 16
+                    self.assertTrue(stat.S_ISREG(mode))
+                    self.assertFalse(mode & 0o111)
+            mode = zipped.getinfo(gui).external_attr >> 16
+            self.assertTrue(stat.S_ISREG(mode) and mode & stat.S_IXUSR)
+        result = f.run("nightly-verify.sh", "--input", archive, "--expect", "unsigned", **dict.fromkeys(SECRETS))
+        self.assertEqual(result.returncode, 0, result.stdout)
 
 
 if __name__ == "__main__":
