@@ -11,5 +11,7 @@ pub(super) struct Lane {
     pub(super) source: Option<StampSource>,
     pub(super) prev: Option<[f32; 2]>,
     pub(super) alpha: TileImage,
+    /// Per channel with per-channel coverage (see `Pickup::channel_alphas`)
+    pub(super) alphas: BTreeMap<Channel, TileImage>,
     pub(super) values: BTreeMap<Channel, TileImage>,
 }

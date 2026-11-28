@@ -512,3 +512,123 @@ fn solo_keeps_the_document_source_for_clone_and_the_material_picker() {
     s.update();
     assert!(red(color_at(&s, 240.0, 200.0)));
 }
+
+fn layer_of(v: Value) -> u64 {
+    v["layer"].as_u64().expect("the command returns the layer")
+}
+
+fn smudge_right(s: &mut Session, from: f32, to: f32) {
+    execute(s, "tool.smudge", &Value::Null).unwrap();
+    execute(s, "tool.brush", &json!({"size": 10, "smudgeStrength": 100, "spacing": 5})).unwrap();
+    let pts: Vec<[f32; 2]> = (0..=(to - from) as i32).map(|i| [from + i as f32, 200.0]).collect();
+    execute(s, "tool.stroke", &json!({"points": pts})).unwrap();
+}
+
+#[test]
+fn smudge_on_a_multiply_layer_drags_the_layer_not_the_stack_through_it_again() {
+    // An orange fill with an orange Multiply fill over it, the copy of that fill flattened to paint
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.5, 0.1]})).unwrap();
+    let multiply = layer_of(execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.5, 0.1]})).unwrap());
+    execute(&mut s, "layer.blend", &json!({"layer": multiply, "channel": "all", "mode": "multiply"})).unwrap();
+    let copy = layer_of(execute(&mut s, "layer.duplicate", &json!({"layer": multiply})).unwrap());
+    let flat = layer_of(execute(&mut s, "layer.flatten", &json!({"layer": copy})).unwrap());
+    execute(&mut s, "layer.select", &json!({"layer": flat})).unwrap();
+    s.update();
+    let before = color_at(&s, 205.0, 200.0);
+
+    smudge_right(&mut s, 170.0, 210.0);
+
+    let after = color_at(&s, 205.0, 200.0);
+    let hue = |v: [f32; 3]| v[1] / v[0].max(1e-4);
+    assert!(hue(after) > hue(before) * 0.9, "a smudge across one flat color keeps the color, no red splotch: {before:?} -> {after:?}");
+}
+
+#[test]
+fn smudge_on_a_pass_through_layer_drags_the_layers_below() {
+    let mut s = session();
+    paint_red(&mut s, 12.0);
+    dab(&mut s, 170.0, 200.0);
+    let below = color_at(&s, 205.0, 200.0);
+    let top = layer_of(execute(&mut s, "layer.add.paint", &json!({})).unwrap());
+    execute(&mut s, "layer.select", &json!({"layer": top})).unwrap();
+
+    // On Normal, the empty layer has nothing to drag
+    smudge_right(&mut s, 170.0, 210.0);
+    let normal = color_at(&s, 205.0, 200.0);
+    assert!((normal[0] - below[0]).abs() < 0.02, "an empty Normal layer drags nothing: {below:?} -> {normal:?}");
+
+    execute(&mut s, "layer.blend", &json!({"layer": top, "channel": "all", "mode": "passthrough"})).unwrap();
+    smudge_right(&mut s, 170.0, 210.0);
+    let pass = color_at(&s, 205.0, 200.0);
+    assert!(pass[0] - below[0] > 0.2 && pass[1] < below[1], "on Pass through the smudge drags the red below: {below:?} -> {pass:?}");
+}
+
+#[test]
+fn smudge_on_an_instance_of_a_pass_through_layer_drags_the_layers_below() {
+    let mut s = session();
+    paint_red(&mut s, 12.0);
+    dab(&mut s, 170.0, 200.0);
+    let below = color_at(&s, 205.0, 200.0);
+    let source = layer_of(execute(&mut s, "layer.add.paint", &json!({})).unwrap());
+    execute(&mut s, "layer.blend", &json!({"layer": source, "channel": "all", "mode": "passthrough"})).unwrap();
+    let instance = layer_of(execute(&mut s, "layer.instance", &json!({"layer": source})).unwrap());
+    execute(&mut s, "layer.select", &json!({"layer": instance})).unwrap();
+
+    smudge_right(&mut s, 170.0, 210.0);
+    let pass = color_at(&s, 205.0, 200.0);
+    assert!(pass[0] - below[0] > 0.2 && pass[1] < below[1], "the instance smudges like its Pass through source: {below:?} -> {pass:?}");
+}
+
+/// Most coverage of channel `c` of `layer` over the whole texture (0 where it has no paint)
+fn layer_coverage(s: &Session, layer: LayerId, c: Channel) -> f32 {
+    let Some(img) = s.doc.pixels.layer(layer, c) else { return 0.0 };
+    let last = img.comps() - 1;
+    (0..img.height())
+        .flat_map(|y| (0..img.width()).map(move |x| (x, y)))
+        .map(|(x, y)| texturecraft_engine::texel::from_u16(img.get(x, y)[last]))
+        .fold(0.0, f32::max)
+}
+
+#[test]
+fn smudging_a_layer_leaves_its_unpainted_channels_unpainted() {
+    // Red base color painted with every other channel off: the layer holds base color only
+    let mut s = session();
+    paint_red(&mut s, 12.0);
+    let others: Vec<Channel> = s.doc.project.texture_sets[0].channels.iter().map(|(c, _)| *c).filter(|c| *c != Channel::BaseColor).collect();
+    for c in &others {
+        execute(&mut s, "tool.material", &json!({"channel": c.id(), "enabled": false})).unwrap();
+    }
+    dab(&mut s, 170.0, 200.0);
+    let layer = s.selected_layer_id().unwrap();
+    assert!(others.iter().all(|c| layer_coverage(&s, layer, *c) == 0.0), "setup: only base color painted");
+    let before = color_at(&s, 205.0, 200.0);
+
+    // Smudging with every channel on drags the red but writes nothing where those channels have no paint
+    for c in &others {
+        execute(&mut s, "tool.material", &json!({"channel": c.id(), "enabled": true})).unwrap();
+    }
+    smudge_right(&mut s, 170.0, 210.0);
+    let after = color_at(&s, 205.0, 200.0);
+    assert!(after[0] - before[0] > 0.2, "the red is dragged: {before:?} -> {after:?}");
+    for c in &others {
+        assert_eq!(layer_coverage(&s, layer, *c), 0.0, "{c:?} stays unpainted");
+    }
+}
+
+#[test]
+fn a_channel_the_set_dropped_does_not_stop_a_pass_through_smudge() {
+    let mut s = session();
+    paint_red(&mut s, 12.0);
+    dab(&mut s, 170.0, 200.0);
+    let below = color_at(&s, 205.0, 200.0);
+    let top = layer_of(execute(&mut s, "layer.add.paint", &json!({})).unwrap());
+    execute(&mut s, "layer.select", &json!({"layer": top})).unwrap();
+
+    // The layer keeps its roughness entry (Normal) after the set drops roughness
+    execute(&mut s, "textureSet.channel.remove", &json!({"channel": "roughness"})).unwrap();
+    execute(&mut s, "layer.blend", &json!({"layer": top, "channel": "all", "mode": "passthrough"})).unwrap();
+    smudge_right(&mut s, 170.0, 210.0);
+    let pass = color_at(&s, 205.0, 200.0);
+    assert!(pass[0] - below[0] > 0.2 && pass[1] < below[1], "the smudge drags the red below: {below:?} -> {pass:?}");
+}

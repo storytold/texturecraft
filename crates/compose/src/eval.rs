@@ -139,6 +139,9 @@ pub struct StrokePreview {
     pub stencil: Option<Stencil>,
     /// Clone and smudge: straight values per channel carried by the stroke (replace `values`).
     pub carried: BTreeMap<Channel, TileImage>,
+    /// Smudge of one layer: per channel, the stroke alpha that replaces `alpha` (empty: every
+    /// channel uses `alpha`).
+    pub carried_alpha: BTreeMap<Channel, TileImage>,
     /// Mask coverage sampled by a mask pickup.
     pub carried_mask: Option<TileImage>,
 }
@@ -4275,7 +4278,9 @@ impl<'a, 'b> Texel<'a, 'b> {
     /// coverage per texel), with the live stroke when `preview`.
     fn painted(&mut self, data: Option<&[u16]>, c: &ChanPlan, preview: bool) -> ([f32; 3], f32) {
         let pv = if preview { self.inp.preview } else { None };
-        let mut sa = pv.map(|p| (self.stroke * p.opacity).clamp(0.0, 1.0)).unwrap_or(0.0);
+        let channel_alpha = pv.and_then(|p| Channel::ALL.get(c.ch).and_then(|ch| p.carried_alpha.get(ch)));
+        let stroke = channel_alpha.map_or(self.stroke, |a| from_u16(a.get(self.x, self.y)[0]));
+        let mut sa = pv.map(|p| (stroke * p.opacity).clamp(0.0, 1.0)).unwrap_or(0.0);
 
         // Projection: the stencil's alpha shapes the stroke and its color is the base color
         let stencil = match pv.and_then(|p| p.stencil.as_ref()) {
@@ -5817,6 +5822,7 @@ mod tests {
             mask_gray: MaskGray::Value(1.0),
             stencil: None,
             carried: BTreeMap::new(),
+            carried_alpha: BTreeMap::new(),
             carried_mask: None,
         };
         let out = run(&f, Some(&preview));
@@ -7502,6 +7508,7 @@ soft {soft:?}"
             mask_gray: MaskGray::Value(1.0),
             stencil: None,
             carried: BTreeMap::new(),
+            carried_alpha: BTreeMap::new(),
             carried_mask: None,
         };
         let mut projectors = ProjectorDepthCache::default();

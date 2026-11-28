@@ -1118,6 +1118,7 @@ impl Session {
                 stencil: stroke.stencil.clone(),
                 carried_mask: stroke.canvas.pickup.as_ref().and_then(|pickup| pickup.mask_values()).cloned(),
                 carried: stroke.canvas.pickup.as_ref().map(|pickup| pickup.values.clone()).unwrap_or_default(),
+                carried_alpha: stroke.canvas.pickup.as_ref().and_then(|pickup| pickup.channel_alphas()).cloned().unwrap_or_default(),
             })
         });
 

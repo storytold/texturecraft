@@ -350,6 +350,7 @@ fn stroke(target: LayerId) -> StrokePreview {
         mask_gray: MaskGray::Value(1.0),
         stencil: None,
         carried: BTreeMap::new(),
+        carried_alpha: BTreeMap::new(),
         carried_mask: None,
     }
 }

@@ -37,9 +37,9 @@ pub struct Pickup {
     pub mode: PickupMode,
     /// The composite when the stroke began (what the stroke reads).
     source: Composite,
-    /// How much of `source` there is to read per texel (a single layer's coverage); None reads
-    /// everywhere.
-    coverage: Option<TileImage>,
+    /// How much of `source` there is to read per channel and texel (a single layer's coverage);
+    /// None reads every channel everywhere.
+    coverage: Option<BTreeMap<Channel, TileImage>>,
     mask: bool,
     snapshot: Option<Arc<PickupSnapshot>>,
     loaded: BTreeSet<(u32, u32)>,
@@ -47,6 +47,9 @@ pub struct Pickup {
     gbuf: Arc<UvGBuffer>,
     /// Straight values per painted channel; the stroke alpha lives in the stroke canvas.
     pub values: BTreeMap<Channel, TileImage>,
+    /// With per-channel coverage: how much each channel received per texel, which replaces the
+    /// stroke alpha for that channel (a channel only takes deposits where the layer had it).
+    alphas: BTreeMap<Channel, TileImage>,
     /// Previous smudge stamp center (texels).
     prev: Option<[f32; 2]>,
     /// Smudge with symmetry: each copy drags its own trail (see [`Pickup::isolate_copies`]).
@@ -55,6 +58,8 @@ pub struct Pickup {
     /// Per-stamp scratch: texels that receive values, and the values read for them.
     reads: Vec<(u32, u32, f32)>,
     read_values: Vec<[f32; 3]>,
+    /// The alpha each channel of a read receives (per-channel coverage only).
+    read_alphas: Vec<f32>,
 }
 
 fn get(img: &TileImage, c: Channel, x: u32, y: u32) -> [f32; 3] {
@@ -79,12 +84,26 @@ impl Pickup {
             loaded: BTreeSet::new(),
             gbuf,
             values,
+            alphas: BTreeMap::new(),
             prev: None,
             isolated: false,
             lanes: Vec::new(),
             reads: Vec::new(),
             read_values: Vec::new(),
+            read_alphas: Vec::new(),
         }
+    }
+
+    /// Read each channel only where the source has it: one coverage and stroke alpha per channel.
+    fn per_channel(&mut self, size: (u32, u32)) {
+        self.coverage = Some(self.values.keys().map(|c| (*c, TileImage::new(size.0, size.1, 1))).collect());
+        self.alphas = self.values.keys().map(|c| (*c, TileImage::new(size.0, size.1, 1))).collect();
+    }
+
+    /// Per channel, the stroke alpha that replaces the stroke canvas's (None: every channel uses
+    /// the canvas's).
+    pub fn channel_alphas(&self) -> Option<&BTreeMap<Channel, TileImage>> {
+        self.coverage.is_some().then_some(&self.alphas)
     }
 
     /// A pickup reading one layer alone, from its flattened tiles (premultiplied values plus
@@ -94,7 +113,7 @@ impl Pickup {
         let channels: Vec<Channel> = channels.into_iter().collect();
         let source = Composite::with_size(&channels, size.0, size.1);
         let mut pickup = Self::new(mode, source, gbuf, channels);
-        pickup.coverage = Some(TileImage::new(size.0, size.1, 1));
+        pickup.per_channel(size);
         pickup.add_layer_tiles(flat);
         pickup
     }
@@ -106,7 +125,7 @@ impl Pickup {
             let Some(img) = self.source.channels.get_mut(c) else { continue };
             let (n, kind) = (c.components(), c.kind());
             let mut straight = vec![0u16; TILE_AREA * n];
-            let Some(cov) = coverage.tile_mut(*tx, *ty, &[0]) else { continue };
+            let Some(cov) = coverage.get_mut(c).and_then(|cov| cov.tile_mut(*tx, *ty, &[0])) else { continue };
             for (o, px) in data.chunks_exact(n + 1).enumerate() {
                 let a = px.get(n).copied().unwrap_or(0);
                 if a == 0 {
@@ -141,9 +160,11 @@ impl Pickup {
         let mask = matches!(snapshot.target, PaintTarget::Mask(_));
         let channels = if mask { vec![MASK_CHANNEL] } else { channels.into_iter().collect() };
         let source = Composite::with_size(&channels, gbuf.width, gbuf.height);
-        let coverage = (!mask).then(|| TileImage::new(gbuf.width, gbuf.height, 1));
+        let size = (gbuf.width, gbuf.height);
         let mut pickup = Self::new(mode, source, gbuf, channels);
-        pickup.coverage = coverage;
+        if !mask {
+            pickup.per_channel(size);
+        }
         pickup.mask = mask;
         pickup.snapshot = Some(Arc::new(snapshot));
         pickup
@@ -231,6 +252,7 @@ impl Pickup {
         let (w, h) = (i64::from(self.source.resolution), i64::from(self.source.height));
         self.reads.clear();
         self.read_values.clear();
+        self.read_alphas.clear();
         for &(x, y, a) in texels {
             // Saturate hostile offsets so the bounds check rejects them without overflow
             let (sx, sy) = (i64::from(x).saturating_add(shift[0]), i64::from(y).saturating_add(shift[1]));
@@ -239,34 +261,52 @@ impl Pickup {
             }
 
             let (sx, sy) = (sx as u32, sy as u32);
-            let a = a * strength * self.coverage.as_ref().map_or(1.0, |c| from_u16(c.get(sx, sy)[0]));
-            if a <= 0.0 {
-                continue;
-            }
 
             // Each smudge copy reads its own deposits over the original source
-            let (seen_alpha, seen_values) = match &lane {
-                Some(l) => (&l.alpha, &l.values),
-                None => (&*alpha, &self.values),
+            let (seen_alpha, seen_alphas, seen_values) = match &lane {
+                Some(l) => (&l.alpha, &l.alphas, &l.values),
+                None => (&*alpha, &self.alphas, &self.values),
             };
-            let m = if smudge { from_u16(seen_alpha.get(sx, sy)[0]) } else { 0.0 };
+            let at = |img: Option<&TileImage>| img.map_or(0.0, |img| from_u16(img.get(sx, sy)[0]));
+            let stroke_m = if smudge { at(Some(seen_alpha)) } else { 0.0 };
+
+            // What there is to read per channel: the stroke's own deposits over the source's
+            // coverage, so a smudge of one layer drags its paint on into the layer's empty
+            // texels and leaves the channels the layer has no paint of alone
+            let start = self.read_values.len();
+            let mut most = 0.0f32;
             for c in self.values.keys() {
+                let (m, cov) = match &self.coverage {
+                    Some(coverage) => (if smudge { at(seen_alphas.get(c)) } else { 0.0 }, at(coverage.get(c))),
+                    None => (stroke_m, 1.0),
+                };
+                let held = m + cov * (1.0 - m);
                 let base = self.source.value(*c, sx, sy);
                 let v = match seen_values.get(c) {
                     Some(img) if m > 0.0 => {
                         let carried = get(img, *c, sx, sy);
-                        std::array::from_fn(|k| carried[k] * m + base[k] * (1.0 - m))
+                        std::array::from_fn(|k| (carried[k] * m + base[k] * cov * (1.0 - m)) / held)
                     }
                     _ => base,
                 };
+                let channel_alpha = a * strength * held;
+                most = most.max(channel_alpha);
                 self.read_values.push(v);
+                self.read_alphas.push(channel_alpha);
             }
-            self.reads.push((x, y, a));
+            if most <= 0.0 {
+                self.read_values.truncate(start);
+                self.read_alphas.truncate(start);
+                continue;
+            }
+            self.reads.push((x, y, most));
         }
+        let per_channel = self.coverage.is_some();
+        let reads = Reads { texels: &self.reads, values: &self.read_values, alphas: per_channel.then_some(&self.read_alphas[..]) };
         if let Some(l) = &mut lane {
-            deposit(&mut l.alpha, &mut l.values, &self.reads, &self.read_values);
+            deposit(&mut l.alpha, &mut l.alphas, &mut l.values, &reads);
         }
-        deposit(alpha, &mut self.values, &self.reads, &self.read_values);
+        deposit(alpha, &mut self.alphas, &mut self.values, &reads);
         let painted = !self.reads.is_empty();
         self.put_back(lane, painted)
     }
@@ -277,7 +317,8 @@ impl Pickup {
             Some(i) => self.lanes.swap_remove(i),
             None => {
                 let values = self.values.iter().map(|(c, img)| (*c, TileImage::new(img.width(), img.height(), c.components()))).collect();
-                Lane { source, prev: None, alpha: TileImage::new(alpha.width(), alpha.height(), 1), values }
+                let alphas = self.alphas.keys().map(|c| (*c, TileImage::new(alpha.width(), alpha.height(), 1))).collect();
+                Lane { source, prev: None, alpha: TileImage::new(alpha.width(), alpha.height(), 1), alphas, values }
             }
         }
     }
@@ -297,19 +338,40 @@ fn covered(gbuf: &UvGBuffer, x: u32, y: u32) -> bool {
     usize::try_from(i).ok().and_then(|i| gbuf.tri.get(i)).is_some_and(|t| *t != NO_TRI)
 }
 
-/// Blend the texels `reads` `(x, y, alpha)` with their `read_values` (one entry per channel of
-/// `values`, in order) into `alpha` and `values` ("over").
-fn deposit(alpha: &mut TileImage, values: &mut BTreeMap<Channel, TileImage>, reads: &[(u32, u32, f32)], read_values: &[[f32; 3]]) {
+/// One stamp's reads: the texels `(x, y, alpha)` that receive values, their values (one entry
+/// per carried channel, in order) and, with per-channel coverage, the alpha each channel
+/// receives (same layout as the values).
+struct Reads<'a> {
+    texels: &'a [(u32, u32, f32)],
+    values: &'a [[f32; 3]],
+    alphas: Option<&'a [f32]>,
+}
+
+/// Blend `reads` into the stroke `alpha`, the per-channel `alphas` (with per-channel reads) and
+/// `values` ("over"). A channel that receives no alpha keeps its value.
+fn deposit(alpha: &mut TileImage, alphas: &mut BTreeMap<Channel, TileImage>, values: &mut BTreeMap<Channel, TileImage>, reads: &Reads) {
     let n = values.len();
-    for (i, &(x, y, a)) in reads.iter().enumerate() {
+    for (i, &(x, y, a)) in reads.texels.iter().enumerate() {
         let m = from_u16(alpha.get(x, y)[0]);
-        let m2 = a + m * (1.0 - a);
         for (k, (c, img)) in values.iter_mut().enumerate() {
-            let Some(src) = read_values.get(i * n + k) else { continue };
+            let Some(src) = reads.values.get(i * n + k) else { continue };
+            let (a, channel_alpha) = match reads.alphas {
+                Some(per_channel) => (per_channel.get(i * n + k).copied().unwrap_or(0.0), alphas.get_mut(c)),
+                None => (a, None),
+            };
+            if a <= 0.0 {
+                continue;
+            }
+
+            let m = channel_alpha.as_ref().map_or(m, |img| from_u16(img.get(x, y)[0]));
+            let m2 = a + m * (1.0 - a);
             let old = get(img, *c, x, y);
             put(img, *c, x, y, std::array::from_fn(|j| (src[j] * a + old[j] * m * (1.0 - a)) / m2.max(1e-6)));
+            if let Some(channel_alpha) = channel_alpha {
+                channel_alpha.set(x, y, &[to_u16(m2)]);
+            }
         }
-        alpha.set(x, y, &[to_u16(m2)]);
+        alpha.set(x, y, &[to_u16(a + m * (1.0 - a))]);
     }
 }
 

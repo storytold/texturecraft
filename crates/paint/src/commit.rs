@@ -25,6 +25,9 @@ struct Blend<'a> {
     value: &'a [f32],
     stencil_color: bool,
     carried: Option<&'a TileImage>,
+    /// The stroke alpha of this image when it differs from the stroke's (a smudge of one layer
+    /// gives each channel only where the layer has it)
+    alpha: Option<&'a TileImage>,
     gray: Option<&'a MaskGray>,
 }
 
@@ -36,14 +39,15 @@ fn over(img: &mut TileImage, b: &Blend, src: &CommitSource, mut staged: Option<S
     let comps = img.comps();
     let empty = empty_texel(b.kind, comps);
     let key = BlendKey::new(b, src);
+    let stroke_alpha = b.alpha.unwrap_or(src.alpha);
 
     // Compute replacement tiles in parallel while undo snapshots share the old tiles
     let image = &*img;
-    let tiles: Vec<_> = src.tiles.iter().map(|&t| (t, staged.as_mut().and_then(|s| s.take(image, src.alpha, &key, &empty, t)))).collect();
+    let tiles: Vec<_> = src.tiles.iter().map(|&t| (t, staged.as_mut().and_then(|s| s.take(image, stroke_alpha, &key, &empty, t)))).collect();
     let updated: Vec<((u32, u32), Vec<u16>)> = tiles
         .into_par_iter()
         .filter_map(|((tx, ty), staged)| {
-            let a = src.alpha.tile(tx, ty)?;
+            let a = stroke_alpha.tile(tx, ty)?;
             if let Some((data, true)) = staged {
                 return Some(((tx, ty), data));
             }
@@ -238,7 +242,7 @@ impl StagedImage {
 
                 let mut data = old.map(|o| o.data).unwrap_or_default();
                 fill_from(&mut data, from.map(|f| f.as_slice()), &empty);
-                let alpha = src.alpha.tile_handle(tx, ty).filter(|_| blend).cloned();
+                let alpha = b.alpha.unwrap_or(src.alpha).tile_handle(tx, ty).filter(|_| blend).cloned();
                 if let Some(a) = &alpha {
                     blend_tile(&mut data, comps, a, (tx, ty), b, src, None);
                 }
@@ -300,6 +304,7 @@ fn layer_blend<'a>(c: Channel, values: &'a BTreeMap<Channel, [f32; 3]>, src: &Co
         value: value.get(..c.components()).unwrap_or(value),
         stencil_color: c == Channel::BaseColor,
         carried: src.carried.and_then(|m| m.get(&c)),
+        alpha: src.carried_alpha.and_then(|m| m.get(&c)),
         gray: None,
     }
 }
@@ -315,7 +320,7 @@ fn mask_value(gray: &MaskGray) -> [f32; 1] {
 /// How a mask stroke painting `gray` blends (`value` from [`mask_value`])
 fn mask_blend<'a>(gray: &'a MaskGray, value: &'a [f32; 1]) -> Blend<'a> {
     let gray = matches!(gray, MaskGray::Image { .. }).then_some(gray);
-    Blend { kind: ChannelKind::Scalar, value, stencil_color: false, carried: None, gray }
+    Blend { kind: ChannelKind::Scalar, value, stencil_color: false, carried: None, alpha: None, gray }
 }
 
 /// Per-texel override of a stroke: `(x, y)` → (base color, alpha factor), None = no paint.
@@ -332,6 +337,9 @@ pub struct CommitSource<'a> {
     pub per_texel: Option<TexelFn<'a>>,
     /// Clone and smudge: straight values per channel carried by the stroke (replace `values`).
     pub carried: Option<&'a BTreeMap<Channel, TileImage>>,
+    /// Smudge of one layer: per channel, the stroke alpha that replaces `alpha` (see
+    /// [`crate::Pickup::channel_alphas`]).
+    pub carried_alpha: Option<&'a BTreeMap<Channel, TileImage>>,
     /// Scalar values sampled from a mask by clone or smudge.
     pub carried_mask: Option<&'a TileImage>,
 }
@@ -360,7 +368,7 @@ pub fn commit_mask(pixels: &mut PixelStore, effect: LayerId, size: (u32, u32), g
 
 /// Commit a stroke into a coverage-only image (1 component), e.g. the quick mask
 pub fn commit_coverage(img: &mut TileImage, src: CommitSource) {
-    over(img, &Blend { kind: ChannelKind::Scalar, value: &[], stencil_color: false, carried: None, gray: None }, &src, None);
+    over(img, &Blend { kind: ChannelKind::Scalar, value: &[], stencil_color: false, carried: None, alpha: None, gray: None }, &src, None);
 }
 
 #[cfg(test)]
@@ -368,7 +376,7 @@ mod tests {
     use super::*;
 
     fn src<'a>(alpha: &'a TileImage, tiles: &'a BTreeSet<(u32, u32)>, opacity: f32, erase: bool) -> CommitSource<'a> {
-        CommitSource { alpha, tiles, opacity, erase, per_texel: None, carried: None, carried_mask: None }
+        CommitSource { alpha, tiles, opacity, erase, per_texel: None, carried: None, carried_alpha: None, carried_mask: None }
     }
 
     fn alpha(v: f32) -> (TileImage, BTreeSet<(u32, u32)>) {

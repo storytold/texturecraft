@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use texturecraft_compose::{MaskGray, PaintTarget};
-use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, Source};
+use texturecraft_core::{BlendMode, Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground, Source};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_paint::{
     CommitSource, EyeDepth, PickCtx, Pickup, PickupMode, RasterCtx, Shape, Staging, Stroke, StrokeCanvas, SurfaceHit, commit_layer, commit_mask, pick,
@@ -227,17 +227,22 @@ impl Session {
         let ts = self.ts();
         let size = self.caches.get(ts).map(|c| c.size).unwrap_or((1024, 1024));
         let pickup = if quick_mask { None } else { self.pickup_mode(first_uv)? };
-        let composite_pickup = tool == Tool::Smudge || (tool == Tool::Clone && self.tool.clone_from == CloneFrom::Composite);
-        if pickup.is_some() && composite_pickup && !self.paints_mask() && self.solo.is_none() {
-            // Only a composite pickup reads the viewport cache
+        let smudge_reads_layer = tool == Tool::Smudge && !self.paints_mask() && !self.smudge_reads_stack();
+        let composite_pickup = (tool == Tool::Smudge && !smudge_reads_layer) || (tool == Tool::Clone && self.tool.clone_from == CloneFrom::Composite);
+        if pickup.is_some() && (composite_pickup || smudge_reads_layer) && !self.paints_mask() && self.solo.is_none() {
+            // A composite pickup reads the viewport cache, and a smudge of the layer needs its
+            // earlier strokes in the layer before it flattens it
             self.update();
         }
 
-        // Cloning from the selected layer reads that layer alone
+        // Cloning from the selected layer reads that layer alone, and so does a smudge: it drags
+        // the layer's own content, whatever the layer's blend mode
         let layer_source = match self.selected_layer() {
             Some(id) if pickup.is_some() && tool == Tool::Clone && self.tool.clone_from == CloneFrom::Layer && !self.paints_mask() => {
                 Some(self.flatten(ts, id).ok_or_else(|| EngineError::Other("clone from a paint or fill layer (folders have no content of their own)".into()))?)
             }
+            // A folder or a missing layer has nothing to drag: the stroke target check reports it
+            Some(id) if pickup.is_some() && smudge_reads_layer => self.flatten(ts, id),
             _ => None,
         };
         let before = self.doc.clone();
@@ -349,6 +354,23 @@ impl Session {
             staging: Staging::default(),
         });
         Ok(())
+    }
+
+    /// Smudge reads what the texture set shows, not the selected layer, when every channel it
+    /// paints passes through on that layer: that is how a smudge layer over the stack smears the
+    /// layers below without changing them. Any other blend mode (Multiply, for one) would apply
+    /// the layer a second time to what it already shows, so there the smudge reads the layer.
+    fn smudge_reads_stack(&self) -> bool {
+        let p = &self.doc.project;
+        let Some(id) = self.selected_layer() else { return false };
+        let owner = p.effect(id).map_or(id, |(owner, _)| owner);
+        // An instance paints its source and keeps no channel blends of its own: read the source's
+        let Some(layer) = p.content_layer(owner) else { return false };
+
+        // Only the channels the stroke paints count (a layer can keep a channel its set dropped)
+        let painted_channels = self.stroke_values(PaintTarget::Layer(layer.id));
+        let mut painted = painted_channels.keys().filter_map(|c| layer.blend(*c)).peekable();
+        painted.peek().is_some() && painted.all(|b| b.mode == BlendMode::Passthrough)
     }
 
     /// The name of the layer a stroke paints on (the owner layer when an effect is selected)
@@ -662,7 +684,16 @@ impl Session {
     pub(crate) fn paint_fill(&mut self, ts: usize, canvas: &StrokeCanvas, gray: &MaskGray) -> Result<()> {
         let size = (canvas.alpha.width(), canvas.alpha.height());
         let opacity = self.tool.brush.opacity;
-        let source = CommitSource { alpha: &canvas.alpha, tiles: &canvas.dirty, opacity, erase: false, per_texel: None, carried: None, carried_mask: None };
+        let source = CommitSource {
+            alpha: &canvas.alpha,
+            tiles: &canvas.dirty,
+            opacity,
+            erase: false,
+            per_texel: None,
+            carried: None,
+            carried_alpha: None,
+            carried_mask: None,
+        };
         if self.quick_mask.editing {
             self.commit_quick_mask(ts, size, source);
             return Ok(());
@@ -755,5 +786,6 @@ fn with_commit_source<R>(
     let per_texel: Option<texturecraft_paint::TexelFn> = if st.stencil.is_some() { Some(&stencil_fn) } else { None };
     let carried = st.canvas.pickup.as_ref().map(|p| &p.values);
     let carried_mask = st.canvas.pickup.as_ref().and_then(|p| p.mask_values());
-    f(CommitSource { alpha: &st.canvas.alpha, tiles, opacity: st.stroke.settings.opacity, erase: st.erase, per_texel, carried, carried_mask })
+    let carried_alpha = st.canvas.pickup.as_ref().and_then(|p| p.channel_alphas());
+    f(CommitSource { alpha: &st.canvas.alpha, tiles, opacity: st.stroke.settings.opacity, erase: st.erase, per_texel, carried, carried_alpha, carried_mask })
 }
