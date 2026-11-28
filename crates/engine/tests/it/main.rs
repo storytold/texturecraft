@@ -71,6 +71,7 @@ mod rename_project;
 mod resource_updater;
 mod resources_used;
 mod sample;
+mod shared_uv_parts;
 mod solo;
 mod swatches;
 mod symmetry;

@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use rayon::prelude::*;
 
-use texturecraft_geom::glam::Vec3;
+use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, NO_TRI, UvGBuffer};
 use texturecraft_texel::{TILE, TileImage, from_u16, to_u16};
 
@@ -200,7 +200,8 @@ pub fn rasterize(canvas: &mut StrokeCanvas, context: &RasterCtx, stamps: &[Stamp
         triangles.clear();
         context.bvh.query_box(stamp.center - extent, stamp.center + extent, |triangle| triangles.push(triangle));
 
-        // Each texel belongs to one triangle, so large stamps can scan triangles in parallel
+        // Triangles scan independently (in parallel for large stamps); stamp alphas combine
+        // commutatively, so the order does not matter
         let scan = |&triangle: &u32| scan_triangle(context, stamp, triangle, width, height, fade_lo, fade_hi, pixels_per_unit);
         let parts: Vec<TriTexels> = if triangles.len() > PARALLEL_TRIANGLE_THRESHOLD {
             triangles.par_iter().filter_map(scan).collect()
@@ -210,11 +211,19 @@ pub fn rasterize(canvas: &mut StrokeCanvas, context: &RasterCtx, stamps: &[Stamp
 
         // The footprint texel nearest the stamp center supplies the pickup's center
         let mut center = ([0.0f32; 2], f32::MAX);
-        for (texels, nearest) in parts {
+        let mut shared = false;
+        for (texels, nearest, sh) in parts {
             if nearest.1 < center.1 {
                 center = nearest;
             }
+            shared |= sh;
             canvas.texels.extend(texels);
+        }
+        if shared {
+            // Texels reached through shared UVs can be painted by several triangles (every part
+            // mapped to those UVs): keep each texel once, with its strongest alpha.
+            canvas.texels.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)).then(b.2.total_cmp(&a.2)));
+            canvas.texels.dedup_by_key(|t| (t.0, t.1));
         }
 
         canvas.add_stamp(center.0, stamp.source);
@@ -222,7 +231,20 @@ pub fn rasterize(canvas: &mut StrokeCanvas, context: &RasterCtx, stamps: &[Stamp
 }
 
 /// Texels of one triangle a stamp covers, and the one nearest the stamp center.
-type TriTexels = (Vec<(u32, u32, f32)>, ([f32; 2], f32));
+/// The flag is set when some painted texels are owned by another triangle in the G-buffer
+/// (the mesh has parts sharing UVs).
+type TriTexels = (Vec<(u32, u32, f32)>, ([f32; 2], f32), bool);
+
+/// Two surface points count as the same one when their squared distance is within this
+/// fraction of twice the triangle's area (a distance of about a thousandth of its size).
+const SAME_POINT_AREA_FRACTION: f32 = 1e-6;
+/// Two shading normals count as the same when the cosine between them is at least this. Only
+/// then does the owner's scan accept and reject the texel exactly as this triangle's would.
+const SAME_NORMAL_COS: f32 = 0.9999;
+/// A texel-space triangle with less double area than this (texels squared) has no usable barycentrics.
+const MIN_UV_TRIANGLE_AREA: f32 = 1e-12;
+/// How far outside an edge a texel center may sit and still count as on it, as a share of the double area.
+const UV_EDGE_SLACK: f32 = 1e-6;
 
 #[allow(clippy::too_many_arguments)]
 fn scan_triangle(
@@ -257,17 +279,48 @@ fn scan_triangle(
     let world_area = (*position_b - *position_a).cross(*position_c - *position_a).length();
     let shape = context.shape.at_radius(stamp.radius * (uv_area / world_area).sqrt());
 
+    // Only a layout with overlapping UVs can have texels owned by another triangle of a
+    // different surface point; without overlaps every texel has its single owner, and the
+    // scan below stays exactly the single-owner path.
+    let shared_uvs = context.gbuf.overlaps > 0;
+    let texel_size = Vec2::new(width as f32, height as f32);
+    let uv_texels = [*uv_a * texel_size, *uv_b * texel_size, *uv_c * texel_size];
+    let same_point_tolerance2 = world_area * SAME_POINT_AREA_FRACTION;
+
     let mut texels = Vec::new();
     let mut center = ([0.0f32; 2], f32::MAX);
+    let mut shared = false;
 
     for y in y0..y1 {
         for x in x0..x1 {
             let texel = (y * width + x) as usize;
-            if context.gbuf.tri.get(texel).copied().unwrap_or(NO_TRI) != triangle {
+            let owner = context.gbuf.tri.get(texel).copied().unwrap_or(NO_TRI);
+            let mut via_other_owner = false;
+            let [b1, b2] = if owner == triangle {
+                let Some(bary) = context.gbuf.bary.get(texel).copied() else { continue };
+                bary
+            } else if owner != NO_TRI && shared_uvs {
+                // The texel is owned by another triangle. When UVs overlap, this triangle can
+                // be another part mapped to the same UVs (mirrored or instanced): paint that
+                // part's surface point here too — unless the owner has the same surface point and
+                // normal (a plain edge two neighbours share), so its own scan paints it the same
+                // way. A coincident owner facing the other way (a double-sided card) rejects the
+                // texel for its normal, so this triangle still paints it.
+                let Some(bary) = uv_bary(uv_texels, [x as f32 + 0.5, y as f32 + 0.5]) else { continue };
+                let b0 = 1.0 - bary[0] - bary[1];
+                let point = *position_a * b0 + *position_b * bary[0] + *position_c * bary[1];
+                let normal = (*normal_a * b0 + *normal_b * bary[0] + *normal_c * bary[1]).try_normalize();
+                let same_as_owner = owner_surface(context, owner, texel).is_some_and(|(q, n)| {
+                    q.distance_squared(point) <= same_point_tolerance2 && normal.zip(n).is_some_and(|(a, b)| a.dot(b) >= SAME_NORMAL_COS)
+                });
+                if same_as_owner {
+                    continue;
+                }
+                via_other_owner = true;
+                bary
+            } else {
                 continue;
-            }
-
-            let Some([b1, b2]) = context.gbuf.bary.get(texel).copied() else { continue };
+            };
             let b0 = 1.0 - b1 - b2;
             let position = *position_a * b0 + *position_b * b1 + *position_c * b2;
             let offset = position - stamp.center;
@@ -312,11 +365,43 @@ fn scan_triangle(
             let alpha = shape.sample(local_x, local_y, stamp.hardness, stamp.seed) * stamp.flow * fade;
             if alpha > 0.0 {
                 texels.push((x, y, alpha));
+                shared |= via_other_owner;
             }
         }
     }
 
-    (center.1 < f32::MAX || !texels.is_empty()).then_some((texels, center))
+    (center.1 < f32::MAX || !texels.is_empty()).then_some((texels, center, shared))
+}
+
+/// The surface point and shading normal the G-buffer's owner triangle `owner` has at texel `texel`.
+fn owner_surface(context: &RasterCtx, owner: u32, texel: usize) -> Option<(Vec3, Option<Vec3>)> {
+    let [a, b, c] = context.mesh.tri(owner as usize)?;
+    let [b1, b2] = context.gbuf.bary.get(texel).copied()?;
+    let b0 = 1.0 - b1 - b2;
+    let (positions, normals) = (&context.mesh.positions, &context.mesh.normals);
+    let point = *positions.get(a)? * b0 + *positions.get(b)? * b1 + *positions.get(c)? * b2;
+    let normal = (*normals.get(a)? * b0 + *normals.get(b)? * b1 + *normals.get(c)? * b2).try_normalize();
+    Some((point, normal))
+}
+
+/// Barycentric weights (of vertices 1 and 2) of texel point `p` in the texel-space triangle
+/// `uv`, edges included as in the G-buffer; None outside or for a degenerate triangle.
+fn uv_bary(uv: [Vec2; 3], p: [f32; 2]) -> Option<[f32; 2]> {
+    let edge = |a: Vec2, b: Vec2, p: Vec2| (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+    let [pa, pb, pc] = uv;
+    let p = Vec2::from(p);
+    let area = edge(pa, pb, pc);
+    if area.abs() < MIN_UV_TRIANGLE_AREA {
+        return None;
+    }
+    let sign = area.signum();
+    let (w0, w1, w2) = (edge(pb, pc, p) * sign, edge(pc, pa, p) * sign, edge(pa, pb, p) * sign);
+    let eps = -UV_EDGE_SLACK * area.abs();
+    if w0 < eps || w1 < eps || w2 < eps {
+        return None;
+    }
+    let inv = 1.0 / area.abs();
+    Some([w1 * inv, w2 * inv])
 }
 
 /// Stroke alpha covering whole triangles (polygon fill): every texel of `tris` gets alpha 1.
@@ -778,6 +863,192 @@ mod tests {
         rasterize(&mut underside, &below, &[stamp]);
 
         assert!(underside.dirty.is_empty());
+    }
+
+    /// A mesh part mapped to the same UVs as another part (a mirrored/symmetric model): a
+    /// stroke on either part must paint the shared texels, not only the part that owns them
+    /// in the G-buffer.
+    #[test]
+    fn parts_sharing_uvs_are_both_paintable() {
+        // Two copies of one subdivided quad, 10 units apart along Z, with identical UVs.
+        let part = primitives::plane(2.0, 2);
+        let n = part.positions.len() as u32;
+        let positions: Vec<Vec3> = part.positions.iter().copied().chain(part.positions.iter().map(|p| *p + Vec3::new(0.0, 0.0, 10.0))).collect();
+        let uvs: Vec<Vec2> = part.uvs.iter().chain(part.uvs.iter()).copied().collect();
+        let indices: Vec<u32> = part.indices.iter().copied().chain(part.indices.iter().map(|i| i + n)).collect();
+        let mesh = Mesh::from_parts(positions, None, uvs, indices, "two parts").unwrap();
+        let bvh = Bvh::new(&mesh);
+        let gbuf = UvGBuffer::new(&mesh, 0, 128, 128);
+        assert!(gbuf.overlaps > 0, "both parts cover the same texels");
+
+        // The same quad alone: the reference footprint of one stamp.
+        let lone = primitives::plane(2.0, 2);
+        let lone_bvh = Bvh::new(&lone);
+        let lone_gbuf = UvGBuffer::new(&lone, 0, 128, 128);
+
+        let stamp = |z: f32| Stamp {
+            center: Vec3::new(0.0, 0.0, z),
+            normal: Vec3::Y,
+            tangent: Vec3::X,
+            bitangent: Vec3::Z,
+            radius: 0.25,
+            flow: 1.0,
+            hardness: 0.9,
+            depth: 1.0,
+            seed: 0,
+            source: None,
+        };
+        fn context<'a>(mesh: &'a Mesh, bvh: &'a Bvh, gbuf: &'a UvGBuffer, z: f32) -> RasterCtx<'a> {
+            RasterCtx {
+                mesh,
+                bvh,
+                gbuf,
+                material: 0,
+                depth: None,
+                eye: Vec3::new(0.0, 5.0, z),
+                backface_culling: true,
+                angle_fade: (70.0, 85.0),
+                shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            }
+        }
+        let painted = |canvas: &StrokeCanvas| {
+            (0..128).flat_map(|y| (0..128).map(move |x| (x, y))).filter(|&(x, y)| from_u16(canvas.alpha.get(x, y)[0]) > 0.01).collect::<Vec<_>>()
+        };
+
+        let mut reference = StrokeCanvas::new(128, 128);
+        rasterize(&mut reference, &context(&lone, &lone_bvh, &lone_gbuf, 0.0), &[stamp(0.0)]);
+        let reference_texels = painted(&reference);
+        assert!(reference_texels.len() > 200, "the lone part takes the stamp: {}", reference_texels.len());
+
+        for z in [0.0, 10.0] {
+            let mut canvas = StrokeCanvas::new(128, 128);
+            rasterize(&mut canvas, &context(&mesh, &bvh, &gbuf, z), &[stamp(z)]);
+            assert_eq!(painted(&canvas), reference_texels, "a stroke on the part at z={z} paints the same texels as on a lone part");
+            assert!(from_u16(canvas.alpha.get(64, 64)[0]) > 0.99, "the part at z={z} takes the stamp center");
+            assert!(!canvas.dirty.is_empty(), "the stroke on the part at z={z} touches tiles");
+        }
+    }
+
+    /// Scan every triangle of `mesh` with a stamp at its center; asserts that no triangle
+    /// counts a texel as shared-UV (which would send the stamp through the sort/dedup path)
+    /// and returns how many texels the stamp painted.
+    fn scan_all_triangles(mesh: &Mesh, bvh: &Bvh, gbuf: &UvGBuffer, radius: f32) -> usize {
+        let stamp = Stamp {
+            center: Vec3::ZERO,
+            normal: Vec3::Y,
+            tangent: Vec3::X,
+            bitangent: Vec3::Z,
+            radius,
+            flow: 1.0,
+            hardness: 0.9,
+            depth: 1.0,
+            seed: 0,
+            source: None,
+        };
+        let context = RasterCtx {
+            mesh,
+            bvh,
+            gbuf,
+            material: 0,
+            depth: None,
+            eye: Vec3::new(0.0, 5.0, 0.0),
+            backface_culling: true,
+            angle_fade: (70.0, 85.0),
+            shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+        };
+        let (fade_hi, fade_lo) = (70.0f32.to_radians().cos(), 85.0f32.to_radians().cos());
+
+        let mut texels = 0;
+        for t in 0..mesh.triangle_count() as u32 {
+            if let Some((t_texels, _, shared)) = scan_triangle(&context, &stamp, t, gbuf.width, gbuf.height, fade_lo, fade_hi, 1.0) {
+                assert!(!shared, "triangle {t} counts a texel owned by a neighbour as shared-UV");
+                texels += t_texels.len();
+            }
+        }
+        texels
+    }
+
+    /// A mesh without overlapping UVs never takes the shared-UV path: with no overlaps in
+    /// the G-buffer, stamps keep the single-owner scan, so painting is not slower than before.
+    #[test]
+    fn a_mesh_without_shared_uvs_never_takes_the_shared_path() {
+        let mesh = primitives::plane(2.0, 8);
+        let bvh = Bvh::new(&mesh);
+        let gbuf = UvGBuffer::new(&mesh, 0, 128, 128);
+        assert_eq!(gbuf.overlaps, 0, "a plain subdivided plane has no overlapping UVs");
+        assert!(scan_all_triangles(&mesh, &bvh, &gbuf, 0.6) > 500, "the stamp covers a good part of the plane");
+    }
+
+    /// A mesh that has shared UVs somewhere (a far-away triangle with the first triangle's
+    /// UVs) still keeps ordinary stamps off the shared path: a texel a triangle's edge runs
+    /// through belongs to the neighbouring triangle but is the same surface point, painted
+    /// once by its owner.
+    #[test]
+    fn regular_parts_of_a_mesh_with_shared_uvs_do_not_take_the_shared_path() {
+        let plane = primitives::plane(2.0, 8);
+        let [a, b, c] = plane.tri(0).unwrap();
+        let n = plane.positions.len() as u32;
+        let positions: Vec<Vec3> = plane.positions.iter().copied().chain([a, b, c].iter().map(|&i| plane.positions[i] + Vec3::new(0.0, 0.0, 10.0))).collect();
+        let uvs: Vec<Vec2> = plane.uvs.iter().copied().chain([a, b, c].iter().map(|&i| plane.uvs[i])).collect();
+        let indices: Vec<u32> = plane.indices.iter().copied().chain([n, n + 1, n + 2]).collect();
+        let mesh = Mesh::from_parts(positions, None, uvs, indices, "plane plus a shared-UV triangle").unwrap();
+        let bvh = Bvh::new(&mesh);
+        let gbuf = UvGBuffer::new(&mesh, 0, 128, 128);
+        assert!(gbuf.overlaps > 0, "the far-away triangle shares the first triangle's UVs");
+        assert!(scan_all_triangles(&mesh, &bvh, &gbuf, 0.6) > 500, "the stamp covers a good part of the plane");
+    }
+
+    /// A double-sided card: a front quad and a coincident back quad facing the other way, with
+    /// the same UVs. Whichever of them owns the texels in the G-buffer, a stamp on the front
+    /// paints them (the back owner rejects them for its normal, so the front must not skip them).
+    #[test]
+    fn a_double_sided_card_is_paintable_whichever_side_owns_the_texels() {
+        let front = primitives::plane(2.0, 2);
+        let n = front.positions.len() as u32;
+        let back_indices: Vec<u32> = front.indices.chunks(3).flat_map(|t| [t[0], t[2], t[1]]).collect();
+        for back_first in [false, true] {
+            let (first, second): (Vec<u32>, Vec<u32>) = if back_first {
+                (back_indices.clone(), front.indices.iter().map(|i| i + n).collect())
+            } else {
+                (front.indices.clone(), back_indices.iter().map(|i| i + n).collect())
+            };
+            let (first_normal, second_normal) = if back_first { (Vec3::NEG_Y, Vec3::Y) } else { (Vec3::Y, Vec3::NEG_Y) };
+            let positions: Vec<Vec3> = front.positions.iter().chain(front.positions.iter()).copied().collect();
+            let normals: Vec<Vec3> = std::iter::repeat_n(first_normal, n as usize).chain(std::iter::repeat_n(second_normal, n as usize)).collect();
+            let uvs: Vec<Vec2> = front.uvs.iter().chain(front.uvs.iter()).copied().collect();
+            let indices: Vec<u32> = first.into_iter().chain(second).collect();
+            let mesh = Mesh::from_parts(positions, Some(normals), uvs, indices, "double-sided card").unwrap();
+            let bvh = Bvh::new(&mesh);
+            let gbuf = UvGBuffer::new(&mesh, 0, 128, 128);
+            assert!(gbuf.overlaps > 0, "both sides cover the same texels");
+
+            let stamp = Stamp {
+                center: Vec3::ZERO,
+                normal: Vec3::Y,
+                tangent: Vec3::X,
+                bitangent: Vec3::Z,
+                radius: 0.25,
+                flow: 1.0,
+                hardness: 0.9,
+                depth: 1.0,
+                seed: 0,
+                source: None,
+            };
+            let context = RasterCtx {
+                mesh: &mesh,
+                bvh: &bvh,
+                gbuf: &gbuf,
+                material: 0,
+                depth: None,
+                eye: Vec3::new(0.0, 5.0, 0.0),
+                backface_culling: true,
+                angle_fade: (70.0, 85.0),
+                shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
+            };
+            let mut canvas = StrokeCanvas::new(128, 128);
+            rasterize(&mut canvas, &context, &[stamp]);
+            assert!(from_u16(canvas.alpha.get(64, 64)[0]) > 0.99, "the front takes the stamp center (back listed first: {back_first})");
+        }
     }
 }
 
