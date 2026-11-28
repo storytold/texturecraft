@@ -358,7 +358,7 @@ impl Session {
     }
 
     pub fn to_project_bytes(&self) -> Result<Vec<u8>> {
-        let mut reservation = texturecraft_formats::RamReservation::for_save().map_err(fe)?;
+        let mut reservation = self.reserve_save()?;
         reservation.save_bytes(&self.project_snapshot()).map_err(fe)
     }
 

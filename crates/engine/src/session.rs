@@ -517,6 +517,8 @@ pub struct Session {
     /// Backing files in the native template library, keyed by ASCII case-insensitive name.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) template_files: BTreeMap<String, std::path::PathBuf>,
+    /// Optional isolated MaterialCraft cook/save RAM allowance (None uses the process-global allowance).
+    pub(crate) ram_allowance: Option<Arc<texturecraft_formats::RamAllowance>>,
 }
 
 impl Session {
@@ -590,6 +592,7 @@ impl Session {
             templates: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             template_files: Default::default(),
+            ram_allowance: None,
         })
     }
 
@@ -621,9 +624,42 @@ impl Session {
         {
             next.template_files = std::mem::take(&mut self.template_files);
         }
+        next.ram_allowance = self.ram_allowance.clone();
 
         crate::tool_settings::ToolSettings::of(&self.tool).apply(&mut next.tool);
         *self = next;
+    }
+
+    /// Give this session its own MaterialCraft RAM allowance so concurrent test sessions do not contend.
+    pub fn isolate_ram_allowance(&mut self) -> Arc<texturecraft_formats::RamAllowance> {
+        let allowance = Arc::new(texturecraft_formats::RamAllowance::new());
+        self.ram_allowance = Some(Arc::clone(&allowance));
+        allowance
+    }
+
+    /// Share or clear an explicit MaterialCraft RAM allowance for this session.
+    pub fn set_ram_allowance(&mut self, allowance: Option<Arc<texturecraft_formats::RamAllowance>>) {
+        self.ram_allowance = allowance;
+    }
+
+    pub(crate) fn reserve_save(&self) -> Result<texturecraft_formats::RamReservation> {
+        self.reserve_ram(texturecraft_formats::RamReservation::for_save, texturecraft_formats::RamAllowance::for_save)
+    }
+
+    pub(crate) fn reserve_cook(&self) -> Result<texturecraft_formats::RamReservation> {
+        self.reserve_ram(texturecraft_formats::RamReservation::for_cook, texturecraft_formats::RamAllowance::for_cook)
+    }
+
+    fn reserve_ram(
+        &self,
+        global: fn() -> texturecraft_formats::Result<texturecraft_formats::RamReservation>,
+        isolated: fn(&Arc<texturecraft_formats::RamAllowance>) -> texturecraft_formats::Result<texturecraft_formats::RamReservation>,
+    ) -> Result<texturecraft_formats::RamReservation> {
+        match &self.ram_allowance {
+            Some(allowance) => isolated(allowance),
+            None => global(),
+        }
+        .map_err(|error| EngineError::Other(error.to_string()))
     }
 
     /// A new project: one texture set per mesh material, each with an empty paint layer. Sets

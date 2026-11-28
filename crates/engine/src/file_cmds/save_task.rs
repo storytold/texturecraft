@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use texturecraft_core::PROJECT_EXT;
-use texturecraft_formats::{ProjectFile, project_file::SaveProgress};
+use texturecraft_formats::{ProjectFile, RamAllowance, project_file::SaveProgress};
 use texturecraft_geom::Mesh;
 
 use super::{BakePaintMaps, SaveOutput, ext_of, fe, prepare_archive, save_target::SaveTarget};
@@ -16,6 +16,7 @@ pub struct SaveTask {
     archive: ProjectFile<Arc<Vec<u8>>, Arc<Vec<u8>>>,
     bake_paint: BakePaintMaps,
     uv_source: Option<Arc<Mesh>>,
+    ram_allowance: Option<Arc<RamAllowance>>,
 }
 
 impl Session {
@@ -28,6 +29,7 @@ impl Session {
             archive: self.capture_archive(self.doc.resources.clone(), Arc::clone),
             bake_paint: self.doc.bake_paint.clone(),
             uv_source: self.saved_uv_source().cloned(),
+            ram_allowance: self.ram_allowance.clone(),
         }
     }
 }
@@ -36,7 +38,11 @@ impl SaveTask {
     /// Complete the atomic write on the worker. Waiting for a previous save to release the
     /// RAM allowance also happens here.
     pub fn run(mut self, progress: Option<&SaveProgress>) -> Result<SaveOutput> {
-        let mut reservation = texturecraft_formats::RamReservation::for_save().map_err(fe)?;
+        let mut reservation = match &self.ram_allowance {
+            Some(allowance) => allowance.for_save(),
+            None => texturecraft_formats::RamReservation::for_save(),
+        }
+        .map_err(fe)?;
         prepare_archive(&mut self.archive, self.uv_source.as_deref(), &self.bake_paint);
         drop(self.uv_source);
         drop(self.bake_paint);

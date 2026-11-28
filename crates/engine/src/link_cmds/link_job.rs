@@ -31,6 +31,7 @@ pub struct LinkJob {
     pub(super) baked: Option<texturecraft_compose::BakedMaps>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) budget: LinkMemoryBudget,
+    pub(super) ram_allowance: Option<Arc<texturecraft_formats::RamAllowance>>,
     pub canceled: Arc<AtomicBool>,
 }
 
@@ -305,6 +306,11 @@ impl LinkJob {
 
 impl LinkJob {
     pub fn run(&self) -> Result<CookedMaterial> {
-        self.run_reserved(CookReservation::for_cook().map_err(|error| EngineError::Other(error.to_string()))?)
+        let reservation = match &self.ram_allowance {
+            Some(allowance) => allowance.for_cook(),
+            None => CookReservation::for_cook(),
+        }
+        .map_err(|error| EngineError::Other(error.to_string()))?;
+        self.run_reserved(reservation)
     }
 }
