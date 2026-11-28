@@ -100,6 +100,8 @@ mod tile_transform_params;
 mod tool_availability;
 pub mod tool_cmds;
 pub mod tool_settings;
+pub mod tool_variant;
+pub mod tool_variant_cmds;
 mod uv_stroke_state;
 mod uv_symmetry;
 pub mod uv_tile_cmds;

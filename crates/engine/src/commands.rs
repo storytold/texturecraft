@@ -25,17 +25,14 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
-    /// Whether a keyboard shortcut can run this command: it acts with no parameters at all, or
-    /// every parameter in its first `params` form is optional (`name?`) and none of them is one
-    /// of several alternatives. Left out: commands that need a path, name or similar, commands
-    /// that only return data or do nothing without parameters, and the ones that replace the
-    /// open project (the menu asks to save first).
+    /// Whether a keyboard shortcut can run this command: it acts with no parameters and keeps the open project
     pub fn bindable(&self) -> bool {
         const NOT_FROM_A_KEY: &[&str] = &[
             "project.inspect",
             "project.templates",
             "project.new",
             "tool.state",
+            "tool.variants",
             "text.fonts",
             "export.presets",
             "edit.history",
@@ -126,6 +123,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::effect_clipboard::specs());
         v.extend(crate::effect_blending_cmds::specs());
         v.extend(crate::tool_cmds::specs());
+        v.extend(crate::tool_variant_cmds::specs());
         v.extend(crate::brush_preset_cmds::specs());
         v.extend(crate::path_tool::specs());
         v.extend(crate::view_cmds::specs());
@@ -352,6 +350,8 @@ mod tests {
             "effect.add.paint",
             "file.save",
             "tool.paint",
+            "tool.variant.physicalPaint",
+            "tool.variant.pathFilled",
             "camera.add",
             "effect.duplicate",
             "effect.paste",
@@ -382,6 +382,7 @@ mod tests {
             "edit.history",
             "export.presets",
             "tool.state",
+            "tool.variants",
             "project.new",
             "camera.set",
             "layer.blend",

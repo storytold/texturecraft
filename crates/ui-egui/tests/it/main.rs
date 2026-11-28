@@ -113,6 +113,7 @@ mod template_invert;
 mod templates_681;
 mod tool_availability;
 mod tool_settings_saved;
+mod tool_variants;
 mod toolbar;
 mod user_smart_mask;
 mod view2d_navigation;

@@ -1,4 +1,4 @@
-use super::{Point, invert, pipette};
+use super::{Point, drop, filled_nib, invert, pipette};
 
 /// The largest side an icon is rendered at, in pixels
 const MAX_SIDE: u32 = 256;
@@ -10,6 +10,10 @@ pub(crate) enum DrawnIcon {
     Pipette,
     /// A square half clear, half solid, an arrow out of each half
     Invert,
+    /// A drop of liquid, point up (a variant badge)
+    Drop,
+    /// A pen nib drawn solid (the filled-path variant)
+    FilledNib,
 }
 
 impl DrawnIcon {
@@ -18,6 +22,8 @@ impl DrawnIcon {
         match self {
             DrawnIcon::Pipette => pipette::glyph(point),
             DrawnIcon::Invert => invert::glyph(point),
+            DrawnIcon::Drop => drop::glyph(point),
+            DrawnIcon::FilledNib => filled_nib::glyph(point),
         }
     }
 

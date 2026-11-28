@@ -3,7 +3,6 @@
 
 use egui::{Color32, CornerRadius, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, vec2};
 
-use crate::drawn_icon::DrawnIcon;
 use crate::i18n::tr;
 use crate::press_edit::PressEdit;
 use crate::theme::Tokens;
@@ -217,17 +216,22 @@ pub fn icon_button(ui: &mut Ui, icon: &str, tooltip: &str, selected: bool, size:
     icon_button_without_tooltip(ui, icon, tooltip, selected, size).on_hover_text(tooltip)
 }
 
-/// An `icon_button` showing an icon drawn in code
-pub(crate) fn drawn_icon_button(ui: &mut Ui, icon: DrawnIcon, tooltip: &str, selected: bool, size: f32) -> Response {
+/// An `icon_button` with no tooltip whose icon `paint_icon` draws from the button's rect, icon tint and fill (clear at rest), so a badge can be cut out of the icon
+pub(crate) fn painted_icon_button(
+    ui: &mut Ui,
+    label: &str,
+    selected: bool,
+    size: f32,
+    paint_icon: impl FnOnce(&egui::Painter, Rect, Color32, Color32),
+) -> Response {
     let style = icon_button_style(&Tokens::get(ui.ctx()));
-    IconButton::new(tooltip, vec2(size, size), &style)
+    IconButton::new(label, vec2(size, size), &style)
         .selected(selected)
-        .show(ui, |ui, rect, color| icon.paint(ui.painter(), rect.center(), size * ICON_SCALE, color))
-        .on_hover_text(tooltip)
+        .show_with_visuals(ui, |ui, rect, visuals| paint_icon(ui.painter(), rect, visuals.icon, visuals.fill))
 }
 
 /// Icon glyph size as a fraction of the button height
-const ICON_SCALE: f32 = 0.62;
+pub(crate) const ICON_SCALE: f32 = 0.62;
 
 /// Extra width an `icon_dropdown_button` gives its caret, as a fraction of the button height
 const CARET_STRIP_SCALE: f32 = 0.34;
@@ -340,15 +344,23 @@ impl<'a> IconButton<'a> {
         self
     }
 
-    /// Paints the button and returns its response. `paint_icon` gets the button's rect and the icon tint. A
-    /// non-finite, non-positive or oversized (over 4096 points) size gives an inert zero-size response.
+    /// Paints the button, `paint_icon` getting its rect and icon tint; an unusable size gives an inert zero-size response
     fn show(self, ui: &mut Ui, paint_icon: impl FnOnce(&Ui, Rect, Color32)) -> Response {
-        let valid = self.size.is_finite() && self.size.x > 0.0 && self.size.y > 0.0 && self.size.x <= 4096.0 && self.size.y <= 4096.0;
+        self.show_with_visuals(ui, |ui, rect, visuals| paint_icon(ui, rect, visuals.icon))
+    }
+
+    /// `show`, giving `paint_icon` the whole look of the button's state
+    fn show_with_visuals(self, ui: &mut Ui, paint_icon: impl FnOnce(&Ui, Rect, ButtonVisuals)) -> Response {
+        const MAX_SIDE_POINTS: f32 = 4096.0;
+        const FOCUS_RING_INSET_POINTS: f32 = 2.0;
+
+        let valid = self.size.is_finite() && self.size.x > 0.0 && self.size.y > 0.0 && self.size.x <= MAX_SIDE_POINTS && self.size.y <= MAX_SIDE_POINTS;
         let (rect, response) = ui.allocate_exact_size(if valid { self.size } else { Vec2::ZERO }, if valid { Sense::click() } else { Sense::hover() });
         response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, valid && ui.is_enabled(), self.selected, self.label));
         if !valid {
             return response;
         }
+
         let visuals = self.style.visuals(self.selected, response.hovered(), response.is_pointer_button_down_on());
         let stroke = bounded_stroke(visuals.stroke, rect);
         if visuals.fill != Color32::TRANSPARENT {
@@ -357,9 +369,12 @@ impl<'a> IconButton<'a> {
         if !stroke.is_empty() {
             ui.painter().rect_stroke(rect, self.style.corner_radius, stroke, StrokeKind::Inside);
         }
-        paint_icon(ui, rect, visuals.icon);
-        if response.has_focus() && rect.width() > 4.0 && rect.height() > 4.0 {
-            let focus_rect = rect.shrink(2.0);
+        paint_icon(ui, rect, visuals);
+
+        // The ring needs room inside its inset on both sides
+        let smallest_ring_side = FOCUS_RING_INSET_POINTS * 2.0;
+        if response.has_focus() && rect.width() > smallest_ring_side && rect.height() > smallest_ring_side {
+            let focus_rect = rect.shrink(FOCUS_RING_INSET_POINTS);
             let stroke = bounded_stroke(self.style.focus_stroke, focus_rect);
             if !stroke.is_empty() {
                 ui.painter().rect_stroke(focus_rect, self.style.corner_radius, stroke, StrokeKind::Inside);

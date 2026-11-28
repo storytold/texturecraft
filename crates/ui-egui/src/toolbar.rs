@@ -4,6 +4,7 @@ use egui::{RichText, vec2};
 use egui_phosphor::regular as ic;
 use serde_json::json;
 use texturecraft_engine::Tool;
+use texturecraft_engine::tool_variant::ToolVariant;
 
 use crate::TextureCraftApp;
 use crate::drawn_icon::DrawnIcon;
@@ -12,7 +13,8 @@ use crate::i18n::{tr, trf};
 use crate::keymap::{shortcut_of, tip};
 use crate::state::{Mode, ViewLayout};
 use crate::theme::{GUTTER, Tokens, card};
-use crate::widgets::{bar_slider, drawn_icon_button, icon_button, icon_button_without_tooltip, icon_dropdown_button, icon_dropdown_button_width};
+use crate::tool_variant_menu;
+use crate::widgets::{ICON_SCALE, bar_slider, icon_button, icon_button_without_tooltip, icon_dropdown_button, icon_dropdown_button_width, painted_icon_button};
 
 const BAR_SPACING: f32 = 10.0;
 const COMPACT_BAR_SPACING: f32 = 4.0;
@@ -334,7 +336,11 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
             }
 
             ui.separator();
-            if icon_button(ui, ic::CLOUD_RAIN, tr("Particle brush: particles slide down the surface"), brush.particles.enabled, button_size).clicked() {
+
+            // Paint, Eraser and Projection switch particles through their shelf variants (Physical paint, ...)
+            if !matches!(tool, Tool::Paint | Tool::Eraser | Tool::Projection)
+                && icon_button(ui, ic::CLOUD_RAIN, tr("Particle brush: particles slide down the surface"), brush.particles.enabled, button_size).clicked()
+            {
                 brush.particles.enabled = !brush.particles.enabled;
             }
             if crate::symmetry::applies_to(tool) {
@@ -356,7 +362,7 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
 
             if tool == Tool::Path {
                 ui.separator();
-                path_controls(app, ui);
+                path_controls(app, ui, false);
             }
         }
         Tool::PolygonFill => {
@@ -407,20 +413,21 @@ pub fn fill_mode_buttons(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     }
 }
 
-/// Path tool options and actions (top bar and properties)
-pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
+/// Path tool options and actions (top bar and properties); the top bar leaves Fill to the shelf's Filled path variant
+pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, fill_button: bool) {
     let button_size = ui.spacing().interact_size.y;
     let path = &app.session.tool.path;
     let (closed, fill) = (path.closed, path.fill);
     let selected = path.selected.is_some_and(|i| i < path.points.len());
     let has_points = !path.points.is_empty();
     let corner = path.selected.is_some_and(|i| path.is_corner(i));
+
     if icon_button(ui, ic::POLYGON, tr("Closed path"), closed, button_size).clicked() {
         app.session.set_path_closed(!closed);
     }
 
     let fill_tip = if closed { tr("Fill the closed path (lasso)") } else { tr("Fill the path (close it first)") };
-    if icon_button(ui, ic::PAINT_BUCKET, fill_tip, fill, button_size).clicked() {
+    if fill_button && icon_button(ui, ic::PAINT_BUCKET, fill_tip, fill, button_size).clicked() {
         app.session.set_path_fill(!fill);
     }
 
@@ -481,7 +488,13 @@ pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
             if !tools.is_empty() {
                 for &tool in tools {
                     let command = format!("tool.{}", tool.id());
-                    let hint = tip(&app.ui.keymap, tr(tool.label()), &command);
+
+                    // Painting shows a tool with variants as its current one, and its variant menu; Baking's brushes have none
+                    let variant = if app.ui.mode == Mode::Painting { ToolVariant::current(&app.session.tool, tool) } else { None };
+
+                    // Screen readers hear the tool's key after its name; the tooltip shows only the name
+                    let name = tip(&app.ui.keymap, tr(tool.label()), &command);
+                    let tooltip = tr(variant.map_or(tool.label(), ToolVariant::label));
                     let (usable, selected) = match app.ui.mode {
                         // In bake mode Paint is the cage or skew brush while one of them is being painted
                         Mode::Baking => {
@@ -495,12 +508,18 @@ pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                         }
                     };
                     let button = ui
-                        .add_enabled_ui(usable, |ui| match tool {
-                            Tool::ColorPicker => drawn_icon_button(ui, DrawnIcon::Pipette, &hint, selected, SHELF_BUTTON_SIZE),
-                            _ => icon_button(ui, tool_icon(tool), &hint, selected, SHELF_BUTTON_SIZE),
+                        .add_enabled_ui(usable, |ui| match (variant, tool) {
+                            (Some(variant), _) => tool_variant_menu::button(ui, variant, &name, selected, SHELF_BUTTON_SIZE),
+                            (None, Tool::ColorPicker) => painted_icon_button(ui, &name, selected, SHELF_BUTTON_SIZE, |painter, rect, color, _| {
+                                DrawnIcon::Pipette.paint(painter, rect.center(), SHELF_BUTTON_SIZE * ICON_SCALE, color);
+                            }),
+                            (None, _) => icon_button_without_tooltip(ui, tool_icon(tool), &name, selected, SHELF_BUTTON_SIZE),
                         })
-                        .inner;
-                    if button.on_disabled_hover_text(tr(tool.label())).clicked() && app.ui.mode == Mode::Painting {
+                        .inner
+                        .on_hover_text(tooltip)
+                        .on_disabled_hover_text(tooltip);
+                    let opened_menu = variant.is_some() && tool_variant_menu::menu(app, &button, tool);
+                    if button.clicked() && !opened_menu && app.ui.mode == Mode::Painting {
                         app.run("tool.select", json!({"tool": tool.id()}));
                     }
                 }

@@ -3535,3 +3535,128 @@ fn export_window_snapshots() {
     harness.state_mut().ui.export.tab = 2;
     save(&mut harness, &output_dir, &format!("ep-list-{theme}"));
 }
+
+/// The shelf button of the tool named `name`, with or without its shortcut after it
+fn shelf_button(harness: &Harness<'_, TextureCraftApp>, name: &str) -> egui::Rect {
+    let named = |label: &str| label == name || label.strip_prefix(name).is_some_and(|rest| rest.starts_with(" ("));
+    harness.get_all_by_role(egui::Role::Button).find(|node| node.accesskit_node().label().is_some_and(|label| named(&label))).unwrap().rect()
+}
+
+/// A press and release at `position`, each in its own frame, as a hand clicks
+fn click_at(harness: &mut Harness<'_, TextureCraftApp>, position: egui::Pos2) {
+    harness.hover_at(position);
+    harness.run_steps(1);
+    for pressed in [true, false] {
+        harness.event(egui::Event::PointerButton { pos: position, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+        harness.run_steps(1);
+    }
+    harness.run_steps(2);
+}
+
+/// The corner arrow of a shelf button: a point inside its lower-right hit square
+fn arrow_of(button: egui::Rect) -> egui::Pos2 {
+    const ARROW_INSET_POINTS: f32 = 3.0;
+    button.right_bottom() - egui::vec2(ARROW_INSET_POINTS, ARROW_INSET_POINTS)
+}
+
+/// The shelf's variant arrows, menus, picked and greyed badges, the Baking shelf and the smallest window; `TC_UI_THEMES` adds dark and light
+#[test]
+#[ignore]
+fn tool_variant_snapshots() {
+    // Enough frames for egui's tooltip delay to pass
+    const TOOLTIP_FRAMES: usize = 60;
+
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&output_dir).unwrap();
+
+    let mut themes = vec![(Brightness::MediumDark, "medium")];
+    if std::env::var_os("TC_UI_THEMES").is_some() {
+        themes.extend([(Brightness::Dark, "dark"), (Brightness::Light, "light")]);
+    }
+    for (brightness, theme) in themes {
+        let session = texturecraft_engine::sample_session(256, 64).unwrap();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1600.0, 960.0))
+            .with_pixels_per_point(1.0)
+            .wgpu()
+            .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+            .build_eframe(|cc| TextureCraftApp::new(cc, session));
+        harness.state_mut().ui.prefs.language = "en".into();
+        harness.state_mut().ui.prefs.brightness = brightness;
+        harness.run_steps(4);
+        let shot = |harness: &mut Harness<'_, TextureCraftApp>, name: &str| save_with_pointer(harness, &output_dir, &format!("variants-{name}-{theme}"));
+
+        harness.hover_at(AWAY_FROM_TILES);
+        shot(&mut harness, "shelf");
+        let eraser = shelf_button(&harness, "Eraser");
+        harness.hover_at(arrow_of(eraser));
+        shot(&mut harness, "arrow-hover");
+
+        // Each tool's menu with its second row hovered
+        for (tool, hovered) in [
+            ("Paint", "Physical paint"),
+            ("Eraser", "Physical eraser"),
+            ("Projection", "Physical projection"),
+            ("Clone", "Clone (absolute source)"),
+            ("Path", "Filled path"),
+        ] {
+            let button = shelf_button(&harness, tool);
+            click_at(&mut harness, arrow_of(button));
+            let row = harness.get_by_role_and_label(egui::Role::RadioButton, hovered).rect();
+            harness.hover_at(row.center());
+            shot(&mut harness, &format!("menu-{}", tool.to_lowercase()));
+            harness.key_press(egui::Key::Escape);
+            harness.run_steps(3);
+        }
+
+        // Physical paint picked: the shelf shows its icon, lit and with its tooltip
+        let paint = shelf_button(&harness, "Paint");
+        click_at(&mut harness, arrow_of(paint));
+        harness.get_by_role_and_label(egui::Role::RadioButton, "Physical paint").click();
+        harness.run_steps(3);
+        harness.hover_at(paint.center());
+        harness.run_steps(TOOLTIP_FRAMES);
+        shot(&mut harness, "physical-picked");
+        harness.hover_at(AWAY_FROM_TILES);
+        harness.run_steps(3);
+
+        // The other variants picked: their badges at rest
+        for (tool, variant) in
+            [("Eraser", "Physical eraser"), ("Projection", "Physical projection"), ("Clone", "Clone (absolute source)"), ("Path", "Filled path")]
+        {
+            let button = shelf_button(&harness, tool);
+            click_at(&mut harness, arrow_of(button));
+            harness.get_by_role_and_label(egui::Role::RadioButton, variant).click();
+            harness.run_steps(3);
+        }
+        harness.hover_at(AWAY_FROM_TILES);
+        shot(&mut harness, "all-variants");
+
+        // The top bar, wide enough to show all its controls: the variants stand for the particle toggle and the path Fill button
+        harness.set_size(egui::vec2(2600.0, 960.0));
+        for tool in [texturecraft_engine::Tool::Paint, texturecraft_engine::Tool::Clone, texturecraft_engine::Tool::Path] {
+            harness.state_mut().session.tool.tool = tool;
+            harness.run_steps(4);
+            shot(&mut harness, &format!("topbar-{}", tool.id()));
+        }
+        harness.set_size(egui::vec2(1600.0, 960.0));
+        harness.run_steps(4);
+
+        // Painting tools can't act on a fill layer's content: their buttons grey out with the badges
+        let session = &mut harness.state_mut().session;
+        let fill = texturecraft_engine::execute(session, "layer.add.fill", &serde_json::json!({})).unwrap()["layer"].as_u64().unwrap();
+        texturecraft_engine::execute(session, "layer.select", &serde_json::json!({"layer": fill, "target": "content"})).unwrap();
+        shot(&mut harness, "disabled");
+
+        harness.state_mut().ui.mode = Mode::Baking;
+        shot(&mut harness, "baking");
+        harness.state_mut().ui.mode = Mode::Painting;
+
+        // The smallest window: the Path menu stays on screen
+        harness.set_size(egui::vec2(1280.0, 720.0));
+        harness.run_steps(4);
+        let path = shelf_button(&harness, "Path");
+        click_at(&mut harness, arrow_of(path));
+        shot(&mut harness, "menu-small-window");
+    }
+}

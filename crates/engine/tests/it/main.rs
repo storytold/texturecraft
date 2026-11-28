@@ -78,6 +78,7 @@ mod thumbs;
 mod tile_generator;
 mod tool_availability;
 mod tool_settings;
+mod tool_variants;
 mod tools;
 mod udim;
 mod usd_asset;

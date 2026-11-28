@@ -165,6 +165,11 @@ Clone tool's source. The source belongs to the active texture set: selecting ano
 {cloneAligned}` (default `true`) chooses how later strokes use it: aligned keeps the offset the
 first stroke fixed, so the source moves along with the brush; `false` makes every stroke start
 sampling at the source point. Changing `cloneAligned` forgets the offset of earlier strokes.
+
+`tool.variant.{paint, physicalPaint, eraser, physicalEraser, projection, physicalProjection,
+cloneRelative, cloneAbsolute, pathAlong, pathFilled}` select a tool in one of the variants the
+tool shelf lists (particles off / on, aligned / fixed clone source, the Path tool painting along
+its curve / filling it); `tool.variants` returns the variant each of those tools is in.
 `tool.brush` takes the alpha's shared parameters next to `alpha`: `alphaSizeX` and `alphaSizeY`
 (5..100, percent of the stamp the alpha fills, default 100), `alphaRoundness` (0..100, only for the
 procedural Round alpha: 100 is a circle, 0 a square), `alphaContrast` (1..8, 1 leaves the values

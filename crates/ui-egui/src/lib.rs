@@ -193,6 +193,8 @@ mod tile_edits;
 mod tile_picture;
 pub mod titlebar;
 pub mod toast_action;
+mod tool_variant_icon;
+mod tool_variant_menu;
 pub mod toolbar;
 pub mod ui_state_store;
 pub mod unavailable;

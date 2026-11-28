@@ -5,6 +5,7 @@
 use egui::{Key, Modifiers, class::HasClasses as _};
 use serde_json::{Value, json};
 use texturecraft_engine::Tool;
+use texturecraft_engine::tool_variant::ToolVariant;
 
 use crate::TextureCraftApp;
 use crate::i18n::tr;
@@ -193,8 +194,11 @@ pub fn enabled(app: &TextureCraftApp, id: &str) -> bool {
         return app.session.project_open || !ui_needs_project(id);
     }
 
-    // Scripts may pick any tool, but the shelf and its shortcuts offer only those that can act
-    let tool = id.strip_prefix("tool.").and_then(|tool_id| Tool::ALL.into_iter().find(|tool| tool.id() == tool_id));
+    // Scripts may pick any tool, but the shelf and its shortcuts offer only those that can act, in any of their variants
+    let tool = id
+        .strip_prefix("tool.")
+        .and_then(|tool_id| Tool::ALL.into_iter().find(|tool| tool.id() == tool_id))
+        .or_else(|| ToolVariant::from_command_id(id).map(ToolVariant::tool));
     if tool.is_some_and(|tool| !app.session.tool_usable(tool)) {
         return false;
     }

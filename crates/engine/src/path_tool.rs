@@ -26,6 +26,8 @@ use crate::{Document, EngineError, Result, Session, cmd};
 
 /// Control points kept at most.
 pub const MAX_PATH_POINTS: usize = 4096;
+/// Control points an outline needs to enclose an area
+const MIN_AREA_POINTS: usize = 3;
 /// The undo step that adds a new path
 pub(crate) const NEW_PATH_LABEL: &str = "Path";
 /// Curve sampling step in viewport pixels (3D view) and texture units (2D view).
@@ -120,16 +122,23 @@ impl PathState {
         self.selected
     }
 
+    /// Whether a new path paints a preview: it has points, and a filled outline has enough to enclose an area
+    fn has_preview(&self) -> bool {
+        !self.points.is_empty() && !(self.closed && self.fill && self.points.len() < MIN_AREA_POINTS)
+    }
+
     /// The same curve (points, open or closed, filled, view) as `other`
     fn same_curve(&self, other: &PathState) -> bool {
         (&self.points, self.corner_flags(), self.closed, self.fill, self.uv) == (&other.points, other.corner_flags(), other.closed, other.fill, other.uv)
     }
 
-    /// Empty the tool for the next path: no points, open, nothing selected or edited
+    /// Empty the tool for the next path: no points, open unless it was filling, nothing selected or edited
     pub fn clear(&mut self) {
         self.points.clear();
         self.corners.clear();
-        self.closed = false;
+
+        // Filling is a tool mode (Filled path): a filled outline stays closed for the next path
+        self.closed = self.closed && self.fill;
         self.selected = None;
         self.editing = None;
         self.edited = false;
@@ -145,7 +154,9 @@ impl PathState {
                 self.corners.remove(i);
             }
         }
-        if self.closed && self.points.len() < 3 {
+
+        // A filled path keeps its mode below three points, so adding them back fills again
+        if self.closed && !self.fill && self.points.len() < MIN_AREA_POINTS {
             self.closed = false;
         }
     }
@@ -624,8 +635,13 @@ impl Session {
         }
 
         let path = &self.tool.path;
-        if path.closed && path.fill && path.points.len() < 3 {
-            return Ok(false);
+        if !path.has_preview() {
+            // Nothing fills yet, so the preview goes, and the tool must not keep pointing at it
+            let removed = self.remove_draft_preview();
+            if removed {
+                self.tool.path.editing = None;
+            }
+            return Ok(removed);
         }
 
         let Some((eid, index, stored)) = stored else { return self.start_path_draft(viewport) };
@@ -739,6 +755,12 @@ impl Session {
 
         self.path_checkpoint();
         self.tool.path.remove_selected();
+
+        // A stored path opens instead, so it stays paintable; a new path's preview also counts as edited, so the draft tells them apart
+        let stored = self.tool.path.editing.is_some() && self.path_draft.is_none();
+        if stored && self.tool.path.points.len() < MIN_AREA_POINTS {
+            self.tool.path.closed = false;
+        }
     }
 
     /// Make a point a corner or smooth again, with point undo; false when nothing changed
@@ -801,8 +823,12 @@ impl Session {
             return 0;
         }
 
-        let (point_steps, clears_path) = self.path_steps_before_document(true);
-        let cancel_draft = self.path_draft.is_some() && !clears_path;
+        let (point_steps, clears_path, restored) = self.path_steps_before_document(true);
+
+        // Undoing a new path's points can add or remove its preview, which decides whether there is one left to cancel
+        let stored = self.tool.path.editing.is_some() && self.path_draft.is_none();
+        let previews = restored.filter(|_| !stored).map_or(self.path_draft.is_some(), PathState::has_preview);
+        let cancel_draft = previews && !clears_path;
         document_steps.saturating_add(point_steps).saturating_add(usize::from(cancel_draft))
     }
 
@@ -816,10 +842,10 @@ impl Session {
         document_steps.saturating_add(self.path_steps_before_document(false).0)
     }
 
-    /// Count pending point steps and whether their last step clears the path
-    fn path_steps_before_document(&self, back: bool) -> (usize, bool) {
+    /// Count pending point steps, whether their last step clears the path, and the curve that step restores
+    fn path_steps_before_document(&self, back: bool) -> (usize, bool, Option<&PathState>) {
         if self.tool.tool != Tool::Path {
-            return (0, false);
+            return (0, false, None);
         }
 
         let states = if back { &self.path_steps.0 } else { &self.path_steps.1 };
@@ -834,13 +860,13 @@ impl Session {
 
             // Restoring an empty curve cancels the draft and clears point history in the same step
             if state.points.is_empty() {
-                return (steps, true);
+                return (steps, true, Some(state));
             }
 
             current = state;
         }
 
-        (steps, false)
+        (steps, false, (steps > 0).then_some(current))
     }
 
     /// Undo (`back`) or redo a point change and repaint before returning; failure preserves the curve and history
@@ -893,14 +919,20 @@ impl Session {
 
     /// Stop editing a stored path (its changes are already applied) and clear the tool; a new path's preview is removed
     pub fn stop_path_edit(&mut self) {
-        if let Some(draft) = self.path_draft.take() {
-            let preview = std::mem::replace(&mut self.doc, draft.base);
-            self.changed_without_history(&preview);
-        }
+        self.remove_draft_preview();
         if self.tool.path.editing.is_some() {
             self.tool.path.clear();
         }
         self.path_steps = Default::default();
+    }
+
+    /// Take a new path's preview out of the document; false without one
+    fn remove_draft_preview(&mut self) -> bool {
+        let Some(draft) = self.path_draft.take() else { return false };
+
+        let preview = std::mem::replace(&mut self.doc, draft.base);
+        self.changed_without_history(&preview);
+        true
     }
 
     /// The selected path sublayer, or a new one on the selected paint layer's content or mask
@@ -1095,7 +1127,7 @@ impl Session {
             return Err(EngineError::Other("the path has no points: click the surface to add some".into()));
         }
 
-        if fill && pts.len() < 3 {
+        if fill && pts.len() < MIN_AREA_POINTS {
             return Err(EngineError::Other("a filled path needs at least three points".into()));
         }
 
