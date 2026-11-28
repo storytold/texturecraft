@@ -799,3 +799,242 @@ def Mesh "Overlaid" {
     assert_eq!(&layout[..3], &layout[3..], "the independently packed triangles have equal UVs");
     assert_eq!(reopened, rebuilt);
 }
+
+/// A uniform 2 × 2 PNG of one RGBA color.
+fn png(rgba: [u8; 4]) -> Vec<u8> {
+    let image = image::RgbaImage::from_pixel(2, 2, image::Rgba(rgba));
+    let mut png = Vec::new();
+    image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    png
+}
+
+/// A GLB of one triangle whose material "Rust" embeds a base color image (with a darkening
+/// factor), a packed metallic-roughness image and a normal image on UV set 1, plus a second
+/// material with factors only.
+fn pbr_glb() -> Vec<u8> {
+    let mut bin = Vec::new();
+    let mut view = |bytes: &[u8]| {
+        let offset = bin.len();
+        bin.extend_from_slice(bytes);
+        bin.resize(bin.len().next_multiple_of(4), 0);
+        serde_json::json!({ "buffer": 0, "byteOffset": offset, "byteLength": bytes.len() })
+    };
+    let floats = |v: Vec<f32>| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    let positions = floats(vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+    let uvs = floats(vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]);
+    let indices: Vec<u8> = [0u16, 1, 2].iter().flat_map(|i| i.to_le_bytes()).collect();
+    let base_color = png([200, 90, 40, 255]);
+    let metallic_roughness = png([0, 160, 220, 255]);
+    let normal = png([128, 128, 255, 255]);
+    let views = vec![view(&positions), view(&uvs), view(&indices), view(&base_color), view(&metallic_roughness), view(&normal)];
+    let doc = serde_json::json!({
+        "asset": { "version": "2.0" },
+        "scene": 0,
+        "scenes": [{ "nodes": [0] }],
+        "nodes": [{ "mesh": 0 }],
+        "meshes": [{ "primitives": [
+            { "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }, "indices": 2, "material": 0 },
+            { "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }, "indices": 2, "material": 1 }
+        ] }],
+        "materials": [
+            {
+                "name": "Rust",
+                "pbrMetallicRoughness": {
+                    "baseColorFactor": [0.5, 0.5, 0.5, 1.0],
+                    "baseColorTexture": { "index": 0 },
+                    "metallicRoughnessTexture": { "index": 1 }
+                },
+                "normalTexture": { "index": 2, "texCoord": 1 }
+            },
+            { "name": "Plain", "pbrMetallicRoughness": { "baseColorFactor": [0.2, 0.4, 0.6, 1.0] } }
+        ],
+        "textures": [{ "source": 0 }, { "source": 1 }, { "source": 2 }],
+        "images": [
+            { "bufferView": 3, "mimeType": "image/png" },
+            { "bufferView": 4, "mimeType": "image/png" },
+            { "bufferView": 5, "mimeType": "image/png" }
+        ],
+        "buffers": [{ "byteLength": bin.len() }],
+        "bufferViews": views,
+        "accessors": [
+            { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 0.0] },
+            { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2" },
+            { "bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR" }
+        ]
+    });
+    let mut text = serde_json::to_vec(&doc).unwrap();
+    text.resize(text.len().next_multiple_of(4), b' ');
+    let mut glb = Vec::new();
+    glb.extend_from_slice(b"glTF");
+    glb.extend_from_slice(&2u32.to_le_bytes());
+    glb.extend_from_slice(&((12 + 8 + text.len() + 8 + bin.len()) as u32).to_le_bytes());
+    glb.extend_from_slice(&(text.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&text);
+    glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"BIN\0");
+    glb.extend_from_slice(&bin);
+    glb
+}
+
+#[test]
+fn glb_embedded_pbr_inputs_are_extracted_and_split_per_material() {
+    use texturecraft_core::Channel;
+
+    let imported = import_mesh_bytes("m.glb", &pbr_glb()).unwrap();
+
+    // Only the material with textures is kept; the factors-only one is not.
+    assert_eq!(imported.materials.len(), 1, "{:?}", imported.materials.iter().map(|m| m.material.as_str()).collect::<Vec<_>>());
+    let m = &imported.materials[0];
+    assert_eq!(m.material, "Rust");
+    assert_eq!(m.base_color, Vec4::splat(0.5).with_w(1.0));
+    assert!(m.base_color_image.is_some() && m.metallic_roughness_image.is_some());
+    // The normal texture is on UV set 1, which the importer does not read: warned, not applied.
+    assert!(m.normal_image.is_none());
+    assert!(imported.report.warnings.iter().any(|w| w.contains("normal texture of Rust uses UV set 1")), "{:?}", imported.report.warnings);
+
+    let maps = m.maps();
+    assert!(maps.warnings.is_empty(), "{:?}", maps.warnings);
+    let image = |c: Channel| maps.images.iter().find(|(ch, _, _)| *ch == c).map(|(_, b, _)| b.clone());
+    let value = |c: Channel| maps.values.iter().find(|(ch, _)| *ch == c).map(|(_, v)| *v);
+
+    // The base color image is scaled by the linear factor (sRGB in, sRGB out).
+    let base = image::load_from_memory(&image(Channel::BaseColor).unwrap()).unwrap().into_rgba8();
+    let p = base.get_pixel(0, 0).0;
+    let lin = |v: u8| texturecraft_texel::srgb_to_linear(f32::from(v) / 255.0);
+    let half = |v: u8| lin(v) * 0.5;
+    assert!((lin(p[0]) - half(200)).abs() < 0.01 && (lin(p[1]) - half(90)).abs() < 0.01 && (lin(p[2]) - half(40)).abs() < 0.01, "{p:?}");
+
+    // The packed metallic-roughness image splits into gray maps: roughness from green, metallic from blue.
+    let gray = |c: Channel| {
+        let bytes = image(c).unwrap();
+        let img = image::load_from_memory(&bytes).unwrap().to_luma16();
+        f32::from(img.get_pixel(0, 0).0[0]) / f32::from(u16::MAX)
+    };
+    assert!((gray(Channel::Roughness) - 160.0 / 255.0).abs() < 0.01, "roughness from green");
+    assert!((gray(Channel::Metallic) - 220.0 / 255.0).abs() < 0.01, "metallic from blue");
+
+    // With a texture, the factors are folded into the maps, not repeated as values.
+    assert!(value(Channel::Metallic).is_none() && value(Channel::Roughness).is_none());
+}
+
+#[test]
+fn material_factors_without_textures_become_uniform_values() {
+    use texturecraft_core::Channel;
+
+    let m = MaterialTextures {
+        material: "Plain".into(),
+        base_color: Vec4::new(0.2, 0.4, 0.6, 1.0),
+        metallic: 0.25,
+        roughness: 0.75,
+        occlusion_strength: 0.5,
+        ..Default::default()
+    };
+    assert!(!m.has_images());
+    let maps = m.maps();
+    assert!(maps.images.is_empty());
+    assert_eq!(maps.values, vec![(Channel::BaseColor, [0.2, 0.4, 0.6]), (Channel::Metallic, [0.25; 3]), (Channel::Roughness, [0.75; 3]),]);
+}
+
+/// A material with only a normal texture keeps glTF's default white base color, not black.
+#[test]
+fn a_material_without_a_base_color_input_stays_white() {
+    use texturecraft_core::Channel;
+
+    let m = MaterialTextures { material: "N".into(), normal_image: Some(png([128, 128, 255, 255])), ..Default::default() };
+    let base = m.maps().values.into_iter().find(|(c, _)| *c == Channel::BaseColor).map(|(_, v)| v);
+    assert!(base.is_some_and(|v| v.iter().all(|&x| x > 0.99)), "base color {base:?}");
+}
+
+#[test]
+fn normal_scale_shrinks_xy_deviation_and_keeps_z_and_alpha() {
+    use texturecraft_core::Channel;
+
+    // A tilted normal map (x high, y low, z flat, opaque), scaled by glTF's normalTexture.scale 0.5.
+    // The map is data, so it is read raw: no sRGB linearization anywhere in this path.
+    let m = MaterialTextures { material: "N".into(), normal_image: Some(png([200, 60, 255, 255])), normal_scale: 0.5, ..Default::default() };
+    let maps = m.maps();
+    assert!(maps.warnings.is_empty(), "{:?}", maps.warnings);
+    let bytes = maps.images.iter().find(|(c, _, _)| *c == Channel::Normal).map(|(_, b, _)| b.clone()).expect("a normal map");
+    let p = image::load_from_memory(&bytes).unwrap().into_rgba8().get_pixel(0, 0).0;
+
+    // z (blue) stays high (the normal still points out of the surface), and alpha stays opaque.
+    assert!(p[2] >= 230 && p[3] == 255, "z and alpha must be kept, not zeroed: {p:?}");
+    // x and y move towards the flat normal 0.5: the deviation from 0.5 shrinks, keeping its sign.
+    let dev = |v: u8| (f32::from(v) / 255.0 - 0.5).abs();
+    assert!(dev(p[0]) < dev(200) && f32::from(p[0]) / 255.0 > 0.5, "x must shrink towards 0.5 from above: {p:?}");
+    assert!(dev(p[1]) < dev(60) && f32::from(p[1]) / 255.0 < 0.5, "y must shrink towards 0.5 from below: {p:?}");
+}
+
+/// A normal scale above 1 tilts the normal further but keeps its direction (glTF normalizes
+/// after scaling), instead of clipping one component.
+#[test]
+fn normal_scale_above_one_keeps_the_direction() {
+    use texturecraft_core::Channel;
+
+    // About (0.8, 0, 0.6) packed; scale 2 gives (1.6, 0, 0.6), normalized about (0.94, 0, 0.35).
+    let m = MaterialTextures { material: "N".into(), normal_image: Some(png([230, 128, 204, 255])), normal_scale: 2.0, ..Default::default() };
+    let maps = m.maps();
+    let bytes = maps.images.iter().find(|(c, _, _)| *c == Channel::Normal).map(|(_, b, _)| b.clone()).expect("a normal map");
+    let p = image::load_from_memory(&bytes).unwrap().into_rgba8().get_pixel(0, 0).0;
+    let unpack = |v: u8| f32::from(v) / 255.0 * 2.0 - 1.0;
+    let (x, z) = (unpack(p[0]), unpack(p[2]));
+    let (x0, z0) = (unpack(230), unpack(204));
+    assert!(x / z > 2.0 * x0 / z0 * 0.9, "x/z doubles with the scale: {p:?}");
+    assert!(z < z0, "the scaled normal tilts away from straight out: {p:?}");
+}
+
+/// Occlusion strength blends toward no occlusion: 0 is white, 1 the texture's red.
+#[test]
+fn occlusion_strength_blends_toward_white() {
+    use texturecraft_core::Channel;
+
+    let gray = |strength: f32| {
+        let m = MaterialTextures { material: "O".into(), occlusion_image: Some(png([51, 0, 0, 255])), occlusion_strength: strength, ..Default::default() };
+        let bytes = m.maps().images.into_iter().find(|(c, _, _)| *c == Channel::AmbientOcclusion).map(|(_, b, _)| b).expect("an occlusion map");
+        f32::from(image::load_from_memory(&bytes).unwrap().into_luma16().get_pixel(0, 0).0[0]) / 65535.0
+    };
+    assert!(gray(0.0) > 0.99, "strength 0 is no occlusion");
+    assert!((gray(1.0) - 0.2).abs() < 0.01, "strength 1 is the red channel");
+    assert!(gray(0.5) > gray(1.0) && gray(0.5) < gray(0.0), "half strength lies in between");
+}
+
+/// An emissive strength above 1 brightens the texture instead of being clamped to 1, and the
+/// clipping above 1 is reported.
+#[test]
+fn emissive_strength_above_one_brightens_the_texture() {
+    use texturecraft_core::Channel;
+
+    let texel = |factor: f32| {
+        let m = MaterialTextures { material: "E".into(), emissive_image: Some(png([60, 60, 60, 255])), emissive: Vec3::splat(factor), ..Default::default() };
+        let maps = m.maps();
+        let bytes = maps.images.iter().find(|(c, _, _)| *c == Channel::Emissive).map(|(_, b, _)| b.clone()).expect("an emissive map");
+        (image::load_from_memory(&bytes).unwrap().into_rgba8().get_pixel(0, 0).0[0], maps.warnings)
+    };
+    let (dim, dim_warnings) = texel(0.5);
+    let (bright, bright_warnings) = texel(2.0);
+    assert!(bright > 60 && dim < 60, "strength 2 brightens, 0.5 dims: {dim} {bright}");
+    assert!(dim_warnings.is_empty() && bright_warnings.iter().any(|w| w.contains("above 1")), "{bright_warnings:?}");
+}
+
+#[test]
+fn base_colors_alone_make_no_material_entry_but_merge_into_gltf_ones() {
+    let raw = |base_colors: Vec<RawBaseColor>, materials: Vec<MaterialTextures>| {
+        let mut raw = RawMesh { positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y], base_colors, materials, ..RawMesh::default() };
+        raw.group("M", "p").extend_from_slice(&[0, 1, 2]);
+        raw
+    };
+    let base = || RawBaseColor { material: "M".into(), factor: Vec4::new(0.5, 0.5, 0.5, 1.0), image: Some(png([200, 90, 40, 255])) };
+
+    // FBX and USD fill only base_colors: with no glTF PBR slot there is no entry, so their
+    // imports keep the plain empty paint layer.
+    let imported = finish(raw(vec![base()], Vec::new()), true).unwrap();
+    assert!(imported.materials.is_empty(), "base color alone must not make an entry: {:?}", imported.materials);
+
+    // glTF records a PBR slot for the same material: the base color merges into that entry.
+    let slot = MaterialTextures { material: "M".into(), normal_image: Some(png([128, 128, 255, 255])), ..Default::default() };
+    let imported = finish(raw(vec![base()], vec![slot]), true).unwrap();
+    assert_eq!(imported.materials.len(), 1, "{:?}", imported.materials.iter().map(|m| m.material.as_str()).collect::<Vec<_>>());
+    assert_eq!(imported.materials[0].base_color, Vec4::splat(0.5).with_w(1.0));
+    assert!(imported.materials[0].base_color_image.is_some() && imported.materials[0].normal_image.is_some());
+}

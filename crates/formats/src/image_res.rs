@@ -173,6 +173,22 @@ pub fn gray16_resource(width: u32, height: u32, values: impl Iterator<Item = f32
     Ok((png, DecodedImage { width, height, rgba, srgb: true }))
 }
 
+/// PNG bytes of an RGBA8 image (`width × height`, top row first): a colour map scaled by a
+/// material factor, or a normal map with its scale applied.
+pub fn rgba8_png(width: u32, height: u32, pixels: &[[u8; 4]]) -> Result<Vec<u8>> {
+    let texels = u64::from(width) * u64::from(height);
+    if width == 0 || height == 0 || width > MAX_IMAGE_SIZE || height > MAX_IMAGE_SIZE || texels > MAX_RESOURCE_TEXELS {
+        return Err(FormatError::TooLarge(format!("image is {width}x{height} (limit {MAX_RESOURCE_TEXELS} texels)")));
+    }
+    let expected = usize::try_from(texels).map_err(|_| FormatError::TooLarge(format!("image is {width}x{height}")))?;
+    if pixels.len() != expected {
+        return Err(FormatError::Invalid(format!("{} pixels for {width}x{height}", pixels.len())));
+    }
+    let data: Vec<u8> = pixels.iter().flat_map(|p| p.iter().copied()).collect();
+    let image = Image::from_u8(width, height, ChannelLayout::Rgba, data).map_err(|error| FormatError::Invalid(error.to_string()))?;
+    encode_resource_png(&image)
+}
+
 fn encode_resource_png(image: &Image) -> Result<Vec<u8>> {
     let options = EncodeOptions { png_compression: PngCompression::Fast, ..EncodeOptions::default() };
     craft_image_codecs::encode(image, Format::Png, &options).map_err(|error| FormatError::Invalid(error.to_string()))

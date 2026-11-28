@@ -140,6 +140,7 @@ fn add_part(
         && let Some(mat) = scene.materials.get(i)
     {
         base_color(raw, scene, mat, &mat_name);
+        pbr(raw, scene, mat, &mat_name);
     }
 
     let uv_set = mesh.uv_sets.first();
@@ -223,6 +224,49 @@ fn base_color(raw: &mut RawMesh, scene: &craft_mesh::Scene, material: &craft_mes
     if image.is_some() || factor != Vec4::ONE {
         raw.base_colors.push(super::RawBaseColor { material: name.to_string(), factor, image });
     }
+}
+
+/// Record `material`'s metallic, roughness, normal, occlusion and emissive inputs (the base
+/// color goes through [`base_color`]).
+fn pbr(raw: &mut RawMesh, scene: &craft_mesh::Scene, material: &craft_mesh::Material, name: &str) {
+    let mut read = |what: &str, tex: Option<craft_mesh::TextureRef>| -> Option<Vec<u8>> {
+        let tex = tex?;
+        if tex.uv_set != 0 {
+            raw.warnings.push(format!("the {what} texture of {name} uses UV set {}; only the first is read", tex.uv_set));
+            return None;
+        }
+        if tex.transform.is_some() {
+            raw.warnings.push(format!("the {what} texture of {name} uses a KHR_texture_transform, which is not applied"));
+        }
+        scene.images.get(tex.image).and_then(|im| im.data.clone())
+    };
+    let textures = super::MaterialTextures {
+        material: name.to_string(),
+        base_color: Vec4::from(material.base_color),
+        metallic: material.metallic,
+        roughness: material.roughness,
+        metallic_roughness_image: read("metallic/roughness", material.metallic_roughness_texture),
+        normal_image: read("normal", material.normal_texture),
+        normal_scale: material.normal_scale,
+        occlusion_image: read("occlusion", material.occlusion_texture),
+        occlusion_strength: material.occlusion_strength,
+        emissive: Vec3::from(material.emissive),
+        emissive_image: read("emissive", material.emissive_texture),
+        ..Default::default()
+    };
+    if material.base_color_texture.is_some_and(|tex| tex.transform.is_some()) {
+        raw.warnings.push(format!("the base color texture of {name} uses a KHR_texture_transform, which is not applied"));
+    }
+    if material.clearcoat_texture.is_some() || material.clearcoat_roughness_texture.is_some() {
+        raw.warnings.push(format!("the clearcoat textures of {name} are not applied"));
+    }
+    if material.sheen_color_texture.is_some() || material.sheen_roughness_texture.is_some() {
+        raw.warnings.push(format!("the sheen textures of {name} are not applied"));
+    }
+    if material.alpha_mode != craft_mesh::AlphaMode::Opaque {
+        raw.warnings.push(format!("the alpha mode of {name} is not applied"));
+    }
+    raw.materials.push(textures);
 }
 
 pub(crate) fn percent_decode(s: &str) -> Option<String> {

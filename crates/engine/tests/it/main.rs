@@ -58,6 +58,7 @@ mod mask_paint_image;
 mod materialcraft_link;
 mod materialx;
 mod materialx_import;
+mod mesh_import;
 mod meshmap_import;
 mod painter_gaps;
 mod path_perf;

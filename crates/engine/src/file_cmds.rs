@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use texturecraft_core::{Channel, Fill, Layer, LayerKind, Project, Source, TextureSet};
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_core::{NormalFormat, PROJECT_EXT};
-use texturecraft_core::{Project, TextureSet};
 use texturecraft_formats::PlannedFile;
 use texturecraft_formats::mesh_import::{MeshUvSource, import_mesh_geometry};
 use texturecraft_formats::{ExportInput, ExportOptions, ExportedFile, FileFormat, MapOverride, MapPreview, Padding, ProjectFile};
@@ -263,6 +263,20 @@ impl Session {
         session.doc.project.cameras = imported.cameras;
 
         session.log.warnings("Importer", imported.report.warnings);
+        if imported.report.uvs_generated {
+            // The embedded textures were made for the file's UVs, not the generated ones
+            for m in &imported.materials {
+                session.log.warn(
+                    "Importer",
+                    format!("the embedded textures of {} were not applied: the UVs were generated, so the textures would not line up", m.material),
+                );
+            }
+        } else {
+            for m in &imported.materials {
+                session.apply_material_textures(m);
+            }
+        }
+        session.sync_images();
         session.log.info(
             "Importer",
             format!(
@@ -275,6 +289,53 @@ impl Session {
         );
 
         Ok(session)
+    }
+
+    /// A fill layer at the bottom of the texture set of material `m`, from the PBR textures the
+    /// mesh file embedded for it (stored as image resources). Textures that cannot be used are
+    /// logged; a material without textures changes nothing.
+    fn apply_material_textures(&mut self, m: &texturecraft_formats::MaterialTextures) {
+        let Some(ts) = self.mesh.materials.iter().position(|n| *n == m.material).and_then(|i| self.texture_set_of_material(i)) else { return };
+        let maps = m.maps();
+        self.log.warnings("Importer", maps.warnings);
+        if maps.images.is_empty() && maps.values.is_empty() {
+            return;
+        }
+        let stem = texturecraft_formats::sanitize_resource_name(&m.material);
+        let mut fill = Fill::default();
+        let mut channels: Vec<Channel> = Vec::new();
+        for (c, bytes, ext) in maps.images {
+            let file_name = format!("{stem}_{}.{ext}", c.id());
+            match self.add_image_resource(&file_name, bytes, texturecraft_formats::MAX_RESOURCE_TEXELS) {
+                Ok(name) => {
+                    // glTF normal maps are OpenGL (+Y up), the convention of `Source::image`.
+                    fill.sources.insert(c, Source::image(name));
+                    channels.push(c);
+                }
+                Err(e) => self.log.warn("Importer", format!("the {} texture of {}: {e}", c.id(), m.material)),
+            }
+        }
+        for (c, v) in maps.values {
+            fill.sources.entry(c).or_insert(Source::Uniform(v));
+            if !channels.contains(&c) {
+                channels.push(c);
+            }
+        }
+        if fill.sources.is_empty() {
+            return;
+        }
+        for &c in &channels {
+            if let Err(e) = crate::set_cmds::add_channel(self, ts, c) {
+                self.log.warn("Importer", format!("the {} channel of {}: {e}", c.id(), m.material));
+            }
+        }
+        let id = self.doc.project.alloc_id();
+        let name = self.doc.project.next_layer_name(ts, &m.material);
+        self.doc.project.layers.insert(id, Layer::new(id, name, LayerKind::Fill(fill), &channels));
+        match self.doc.project.texture_set_mut(ts) {
+            Ok(set) => set.stack.insert(0, id),
+            Err(e) => self.log.warn("Importer", format!("the textures of {}: {e}", m.material)),
+        }
     }
 
     /// Open a `.tcraft` project from bytes.

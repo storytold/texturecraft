@@ -11,6 +11,7 @@ mod dae;
 mod external;
 mod fbx;
 mod gltf;
+mod material;
 mod mesh_uv_source;
 mod obj;
 mod ply;
@@ -33,6 +34,7 @@ use crate::{FormatError, Result};
 #[cfg(not(target_arch = "wasm32"))]
 pub use external::read_mesh_file;
 pub use external::{MeshFile, self_contained_mesh};
+pub use material::{MaterialMaps, MaterialTextures};
 pub use mesh_uv_source::MeshUvSource;
 
 /// Mesh files larger than this are refused before reading.
@@ -54,6 +56,9 @@ pub struct ImportedMesh {
     pub report: MeshReport,
     /// Cameras of the file (glTF, FBX, COLLADA, USD), as orbit cameras around the mesh.
     pub cameras: Vec<texturecraft_core::Camera>,
+    /// Materials with embedded PBR textures (glTF only), by material name. The other formats
+    /// record only base colors, which stay on the high-poly bake path.
+    pub materials: Vec<MaterialTextures>,
 }
 
 /// Most entries of a zip package (usdz, an FBX with its textures).
@@ -139,6 +144,8 @@ pub(crate) struct RawMesh {
     pub cameras: Vec<RawCamera>,
     /// Materials whose base color is not plain white (glTF).
     pub base_colors: Vec<RawBaseColor>,
+    /// Materials' PBR inputs beyond the base color (glTF; the base color is in `base_colors`).
+    pub materials: Vec<MaterialTextures>,
     /// Vertex pairs (smaller first) that [`RawMesh::polygon`] added to split polygons.
     pub diagonals: HashSet<(u32, u32)>,
 }
@@ -525,11 +532,26 @@ pub(crate) fn finish(raw: RawMesh, rebuild_uvs: bool) -> Result<ImportedMesh> {
 fn finish_with_layout(mut raw: RawMesh, uv_source: MeshUvSource<'_>) -> Result<ImportedMesh> {
     let mut raw_cameras = std::mem::take(&mut raw.cameras);
     raw_cameras.truncate(MAX_CAMERAS);
+    let materials = material_textures(std::mem::take(&mut raw.materials), std::mem::take(&mut raw.base_colors));
     let (mesh, warnings, uvs_generated) = complete_mesh(raw, uv_source)?;
 
     let report = report(&mesh, uvs_generated, warnings);
     let cameras = orbit_cameras(&raw_cameras, &mesh);
-    Ok(ImportedMesh { mesh, report, cameras })
+    Ok(ImportedMesh { mesh, report, cameras, materials })
+}
+
+/// `materials` with their base colors merged into the matching entry, keeping those that carry
+/// at least one texture. Only glTF records PBR slots in `materials`, so a base color alone
+/// (FBX, USD, ...) makes no entry: those formats keep the plain import.
+fn material_textures(mut materials: Vec<MaterialTextures>, base_colors: Vec<RawBaseColor>) -> Vec<MaterialTextures> {
+    for c in base_colors {
+        if let Some(m) = materials.iter_mut().find(|m| m.material == c.material) {
+            m.base_color = c.factor;
+            m.base_color_image = c.image;
+        }
+    }
+    materials.retain(MaterialTextures::has_images);
+    materials
 }
 
 fn complete_mesh(raw: RawMesh, uv_source: MeshUvSource<'_>) -> Result<(Mesh, Vec<String>, bool)> {
