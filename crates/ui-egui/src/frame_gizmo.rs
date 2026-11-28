@@ -123,8 +123,8 @@ impl FrameGizmo {
             (axes, steps)
         };
         let arrows = if show_move {
-            move_steps
-                .map(|step| step.filter(|step| step.length() * reach > MIN_SCREEN_SPAN).map(|step| center + step.normalized() * ARROW * manipulator_scale))
+            let plane_scale = screen_plane_scale(app, rect, origin, center, reach);
+            move_steps.map(|step| foreshortened_arrow(center, step, reach, plane_scale, ARROW * manipulator_scale))
         } else {
             [None; 3]
         };
@@ -280,9 +280,38 @@ pub(crate) fn center_distance(center: Pos2, p: Pos2) -> f32 {
     Rect::from_center_size(center, egui::Vec2::splat(CENTER_SQUARE)).distance_to_pos(p)
 }
 
+/// Screen points per world unit in the camera's plane around `origin`
+pub(crate) fn screen_plane_scale(app: &TextureCraftApp, rect: Rect, origin: Vec3, center: Pos2, reach: f32) -> f32 {
+    let (tangent, bitangent) = app.session.camera.forward().any_orthonormal_pair();
+    let span = |axis: Vec3| project(app, rect, origin + axis * reach).map_or(0.0, |point| (point - center).length() / reach.max(f32::MIN_POSITIVE));
+    span(tangent).max(span(bitangent))
+}
+
+/// Tip of an axis arrow foreshortened by its angle to the screen plane, or None when it would stay inside the centre square
+pub(crate) fn foreshortened_arrow(center: Pos2, step: Option<egui::Vec2>, reach: f32, plane_scale: f32, arrow_length: f32) -> Option<Pos2> {
+    let step = step?;
+    if step.length() * reach <= MIN_SCREEN_SPAN || plane_scale <= f32::MIN_POSITIVE {
+        return None;
+    }
+
+    let foreshorten = (step.length() / plane_scale).clamp(0.0, 1.0);
+    let span = arrow_length * foreshorten;
+    if span <= CENTER_SQUARE * 0.5 {
+        return None;
+    }
+
+    Some(center + step.normalized() * span)
+}
+
+/// Drawn and hit-tested head length for an arrow reaching `span` points from the centre
+pub(crate) fn arrow_head_length(span: f32) -> f32 {
+    ARROW_HEAD.min((span - CENTER_SQUARE * 0.5).max(0.0))
+}
+
 /// How far `p` is from the arrow from `center` to `tip`, its head included
 pub(crate) fn arrow_distance(p: Pos2, center: Pos2, tip: Pos2) -> f32 {
-    distance_to_segment(p, center, tip + (tip - center).normalized() * ARROW_HEAD)
+    let head = arrow_head_length(tip.distance(center));
+    distance_to_segment(p, center, tip + (tip - center).normalized() * head)
 }
 
 /// The handle nearest its distance, if one is within `GRAB` (the first listed wins a tie)
@@ -465,11 +494,12 @@ pub(crate) fn move_handles(painter: &egui::Painter, center: Pos2, arrows: [Optio
 
         let color = arrow_color(axis);
         let direction = (tip - center).normalized();
-        let side = direction.rot90() * ARROW_HEAD * ARROW_HEAD_HALF_WIDTH;
+        let head = arrow_head_length(tip.distance(center));
+        let side = direction.rot90() * head * ARROW_HEAD_HALF_WIDTH;
         let start = center + direction * CENTER_SQUARE * 0.5;
         painter.line_segment([start, tip], Stroke::new(SHAFT_WIDTH + SHAFT_HALO_EXTRA_WIDTH, SHAFT_HALO));
         painter.line_segment([start, tip], Stroke::new(SHAFT_WIDTH, color));
-        painter.add(egui::Shape::convex_polygon(vec![tip + direction * ARROW_HEAD, tip + side, tip - side], color, HANDLE_EDGE));
+        painter.add(egui::Shape::convex_polygon(vec![tip + direction * head, tip + side, tip - side], color, HANDLE_EDGE));
     }
     let square_rect = Rect::from_center_size(center, vec2(CENTER_SQUARE, CENTER_SQUARE));
     painter.rect(square_rect, CENTER_SQUARE_CORNER_RADIUS, square, HANDLE_EDGE, egui::StrokeKind::Middle);
@@ -1287,5 +1317,33 @@ pub(crate) mod tests {
         drag_frames(&mut harness, layer, warp.corners[0], warp.corners[0] + vec2(-25.0, -15.0), Modifiers::NONE, false, check(layer));
         let Projection::Warp { corners, .. } = projection(&harness, layer) else { panic!("a warp") };
         assert_ne!(corners[0], Projection::FRAME_CORNERS[0], "the corner was pulled");
+    }
+
+    #[test]
+    fn axes_pointing_at_camera_foreshorten_and_hide_instead_of_drawing_full_arrows() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut harness, _) = fill_app("planar");
+
+        // Looking straight along the frame's Z normal hides the Z arrow while keeping X and Y at full length
+        harness.state_mut().session.camera.yaw = 0.0;
+        harness.state_mut().session.camera.pitch = 0.0;
+        harness.run_steps(2);
+        let head_on = gizmo(&harness);
+
+        assert!(head_on.arrows[2].is_none(), "head-on axis stays hidden: {:?}", head_on.arrows);
+        assert!(head_on.arrows[0].unwrap().distance(head_on.center) > ARROW * 0.9);
+
+        // Tilting slightly keeps Z visibly shorter than the in-plane Y axis and keeps hit testing aligned
+        harness.state_mut().session.camera.yaw = 0.12;
+        harness.run_steps(2);
+        let tilted = gizmo(&harness);
+        let z_tip = tilted.arrows[2].expect("slightly tilted axis shows a foreshortened arrow");
+        let z_len = z_tip.distance(tilted.center);
+        let y_len = tilted.arrows[1].unwrap().distance(tilted.center);
+        let past_tip = tilted.center + (z_tip - tilted.center).normalized() * ARROW;
+
+        assert!(z_len < y_len * 0.4, "tilted arrow {z_len} should be much shorter than in-plane {y_len}");
+        assert!(arrow_distance(z_tip, tilted.center, z_tip) <= GRAB);
+        assert!(arrow_distance(past_tip, tilted.center, z_tip) > GRAB, "full-length reach must not hit a short arrow");
     }
 }
