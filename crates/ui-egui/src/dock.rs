@@ -24,6 +24,11 @@ use crate::theme::{Tokens, caption};
 use crate::toolbar::{MAX_BRUSH_SIZE, MIN_BRUSH_SIZE};
 use crate::widgets::{chip, color_swatch, combo, dnd_release, elided, icon_button, press_edit, section, section_with_reset, slider, slider_edit};
 
+#[cfg(test)]
+mod anchor_badge_tests;
+mod anchor_link;
+mod broken_anchor_order;
+
 const TAG_COLORS: [Color32; 8] = [
     Color32::from_rgb(0xc0, 0x40, 0x40),
     Color32::from_rgb(0xd0, 0x80, 0x30),
@@ -141,6 +146,34 @@ const LAYER_TOOLBAR_GAP: f32 = 2.0;
 /// Least height of the drop space under the layer rows, so a drop to the bottom always has a target
 const BOTTOM_DROP_MIN_HEIGHT: f32 = 24.0;
 
+/// Highlight fill alpha and outline width when hovering a reader layer's anchor badge
+const ANCHOR_HIGHLIGHT_FILL_ALPHA: f32 = 0.14;
+const ANCHOR_HIGHLIGHT_STROKE: f32 = 1.5;
+
+/// Subtitle-row badge sizing for anchor-reading layers
+const ANCHOR_BADGE_WIDTH: f32 = 16.0;
+const ANCHOR_BADGE_HEIGHT: f32 = 14.0;
+const ANCHOR_BADGE_GAP: f32 = 4.0;
+
+fn hovered_anchor_prev_id() -> egui::Id {
+    egui::Id::unique("layers_anchor_hover_prev")
+}
+
+fn hovered_anchor_curr_id() -> egui::Id {
+    egui::Id::unique("layers_anchor_hover_curr")
+}
+
+fn highlighted_anchor(ctx: &egui::Context) -> Option<LayerId> {
+    ctx.data(|data| {
+        data.get_temp::<Option<LayerId>>(hovered_anchor_curr_id()).flatten().or_else(|| data.get_temp::<Option<LayerId>>(hovered_anchor_prev_id()).flatten())
+    })
+}
+
+fn paint_anchor_row_highlight(painter: &egui::Painter, rect: Rect, tokens: &Tokens) {
+    painter.rect_filled(rect, 0.0, tokens.accent.gamma_multiply(ANCHOR_HIGHLIGHT_FILL_ALPHA));
+    painter.rect_stroke(rect.shrink(ANCHOR_HIGHLIGHT_STROKE * 0.5), 0.0, Stroke::new(ANCHOR_HIGHLIGHT_STROKE, tokens.accent), egui::StrokeKind::Inside);
+}
+
 pub(crate) fn layers(app: &mut TextureCraftApp, ui: &mut Ui) {
     let tokens = Tokens::get(ui.ctx());
 
@@ -153,6 +186,32 @@ pub(crate) fn layers(app: &mut TextureCraftApp, ui: &mut Ui) {
 
     ui.add_space(LAYER_TOOLBAR_GAP);
     let set = app.session.ts();
+    let broken_anchors = broken_anchor_order::broken_anchor_orders(&app.session.doc.project, set);
+    if let Some(first) = broken_anchors.first() {
+        let message = if broken_anchors.len() == 1 {
+            trf("Anchor \"{anchor}\" sits above \"{reader}\".", &[("anchor", &first.anchor_name), ("reader", &first.lowest_reader_name)])
+        } else {
+            let count = broken_anchors.len();
+            trf("{count} anchors sit above layers that read them.", &[("count", &count)])
+        };
+        egui::Frame::new().fill(tokens.panel).stroke(Stroke::new(1.0, tokens.warning)).inner_margin(egui::Margin::symmetric(6, 4)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(ic::WARNING).color(tokens.warning));
+                ui.label(RichText::new(message).size(LAYER_SUBTITLE_FONT_SIZE).color(tokens.text_strong));
+                if ui.small_button(tr("Fix")).clicked() {
+                    app.run("layer.move", broken_anchor_order::fix_anchor_order_command(&app.session.doc.project, first));
+                }
+            });
+        });
+        ui.add_space(LAYER_TOOLBAR_GAP);
+    }
+
+    let prev_hover = ui.ctx().data_mut(|data| {
+        let last = data.remove_temp::<Option<LayerId>>(hovered_anchor_curr_id()).flatten();
+        data.insert_temp(hovered_anchor_prev_id(), last);
+        last
+    });
+
     let stack: Vec<LayerId> =
         app.session.doc.project.texture_sets.get(set).map(|texture_set| texture_set.stack.iter().rev().copied().collect()).unwrap_or_default();
     let now = ui.input(|input| input.time);
@@ -197,6 +256,10 @@ pub(crate) fn layers(app: &mut TextureCraftApp, ui: &mut Ui) {
             crate::shelf_drag_ghost::accept(ui.ctx());
         }
     });
+    let curr_hover = ui.ctx().data(|data| data.get_temp::<Option<LayerId>>(hovered_anchor_curr_id())).flatten();
+    if curr_hover != prev_hover {
+        ui.ctx().request_repaint();
+    }
     select_all_layers(app, ui);
 }
 
@@ -507,6 +570,9 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         row_shade(&tokens, index)
     };
     painter.rect_filled(rect, 0.0, background);
+    if highlighted_anchor(ui.ctx()).is_some_and(|anchor| anchor_link::layer_owns_anchor(layer, anchor)) {
+        paint_anchor_row_highlight(&painter, rect, &tokens);
+    }
     let solo = app.session.solo.filter(|solo| solo.layer == layer.id);
     let (indent, thumbnail_size) = layer_thumbnail_layout(rect.width(), depth, layer.is_group(), preferred_size);
 
@@ -707,6 +773,7 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         }
     }
     let renaming = app.ui.rename.as_ref().is_some_and(|(id, _)| *id == layer.id.0);
+    let mut anchor_badge_clicked = false;
     if renaming {
         let mut editor_ui = ui.new_child(egui::UiBuilder::new().max_rect(name_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
         if let Some((_, text)) = app.ui.rename.as_mut() {
@@ -745,13 +812,42 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
             (None, 1) => format!("{kind} · {}", tr("1 effect")),
             (None, count) => format!("{kind} · {}", trf("{count} effects", &[("count", &count)])),
         };
-        let subtitle = elided(&painter, subtitle, LAYER_SUBTITLE_FONT_SIZE, tokens.text_dim, name_rect.width());
+        let anchor_links = anchor_link::layer_anchor_links(&app.session.doc.project, layer.id);
+        let show_anchor_badge = !anchor_links.is_empty() && name_rect.width() >= MIN_NAME_WIDTH + ANCHOR_BADGE_WIDTH;
+        let subtitle_width = if show_anchor_badge { name_rect.width() - ANCHOR_BADGE_WIDTH - ANCHOR_BADGE_GAP } else { name_rect.width() };
+        let subtitle = elided(&painter, subtitle, LAYER_SUBTITLE_FONT_SIZE, tokens.text_dim, subtitle_width);
 
         // A name or subtitle cut short by a narrow panel is shown in full on hover
         if name_elided || subtitle.elided {
             row.clone().on_hover_text(format!("{}\n{}", layer.name, subtitle.text()));
         }
         painter.galley(pos2(name_rect.left(), rect.center().y + NAME_LINE_GAP), subtitle, tokens.text_dim);
+
+        if show_anchor_badge {
+            let broken = anchor_links.iter().any(|link| link.broken);
+            let badge_rect = Rect::from_min_size(
+                pos2(name_rect.right() - ANCHOR_BADGE_WIDTH, rect.center().y + NAME_LINE_GAP - 1.0),
+                vec2(ANCHOR_BADGE_WIDTH, ANCHOR_BADGE_HEIGHT),
+            );
+            let first = &anchor_links[0];
+            let tip = if broken {
+                trf("Broken anchor link: {anchor} sits above this layer\nClick to select", &[("anchor", &first.anchor_name)])
+            } else {
+                trf("Linked to anchor: {anchor}\nClick to select", &[("anchor", &first.anchor_name)])
+            };
+            let badge_color = if broken { tokens.warning } else { tokens.accent };
+            let glyph = if broken { ic::LINK_BREAK } else { ic::ANCHOR };
+            painter.text(badge_rect.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(LAYER_SUBTITLE_FONT_SIZE + 1.0), badge_color);
+            let badge = ui.interact(badge_rect, ui.scope_id().with(("anchor_badge", layer.id.0)), Sense::click());
+            badge.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tip.clone()));
+            if badge.hovered() {
+                ui.ctx().data_mut(|data| data.insert_temp(hovered_anchor_curr_id(), Some(first.anchor)));
+            }
+            if badge.clone().on_hover_text(tip).clicked() {
+                anchor_badge_clicked = true;
+                app.run("layer.select", json!({"layer": first.owner.0, "target": first.anchor.0}));
+            }
+        }
     }
 
     // Blend mode and opacity of the displayed channel, stacked at the right
@@ -781,7 +877,7 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
     }
 
     // Interaction: select, rename, drag & drop, context menu
-    let on_control = eye_response.clicked() || content_response.clicked();
+    let on_control = eye_response.clicked() || content_response.clicked() || anchor_badge_clicked;
 
     // Shift or Ctrl/Cmd clicks in quick succession pick layers; only a plain double click renames
     let modifiers = ui.input(|input| input.modifiers);
@@ -1050,6 +1146,9 @@ fn effect_row(
         tokens.panel.lerp_to_gamma(tokens.row_hover, EFFECT_ROW_SHADES[row_index % EFFECT_ROW_SHADES.len()])
     };
     painter.rect_filled(rect, 0.0, background);
+    if matches!(effect.kind, EffectKind::Anchor) && highlighted_anchor(ui.ctx()) == Some(effect_id) {
+        paint_anchor_row_highlight(&painter, rect, &tokens);
+    }
     let indent = effect_row_indent(rect.width(), level, preview_size);
     effect_tree_line(&painter, &tokens, rect, indent, !last);
     if selected {
