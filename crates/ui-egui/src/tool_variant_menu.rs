@@ -38,7 +38,7 @@ const CURRENT_BAR_WIDTH: f32 = 3.0;
 const HOLD_SECONDS: f64 = 0.4;
 
 /// The keys a focused row takes from egui's focus moves: the menu moves between its rows, and Tab and Escape leave it
-const ROW_KEYS: egui::EventFilter = egui::EventFilter { tab: true, horizontal_arrows: false, vertical_arrows: true, escape: true };
+const ROW_KEYS: egui::EventFilter = egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true };
 
 /// Temp-data keys under the menu's id: focus the current row on the next frame, and the last pass a row had the focus
 const FOCUS_CURRENT_ROW: &str = "focus_current_row";

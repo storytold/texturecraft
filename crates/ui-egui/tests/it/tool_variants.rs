@@ -318,6 +318,10 @@ fn keyboard_opens_picks_and_returns_focus() {
     assert!(row_focused(&harness, "Physical paint"));
     key(&mut harness, Key::ArrowDown, Modifiers::NONE);
     assert!(row_focused(&harness, "Physical paint"), "the last row keeps the focus in the menu");
+    for sideways in [Key::ArrowLeft, Key::ArrowRight] {
+        key(&mut harness, sideways, Modifiers::NONE);
+        assert!(row_focused(&harness, "Physical paint"), "{sideways:?} does not take the focus out of the menu");
+    }
 
     key(&mut harness, Key::Enter, Modifiers::NONE);
     assert!(harness.state().session.tool.brush.particles.enabled, "Enter picks the focused row");
