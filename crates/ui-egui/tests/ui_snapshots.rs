@@ -46,14 +46,47 @@ fn save(harness: &mut Harness<'_, TextureCraftApp>, dir: &Path, name: &str) {
     let control_tree = control_roles
         .into_iter()
         .flat_map(|role| harness.query_all_by_role(role).map(move |control| (role, control)))
-        .filter_map(|(role, control)| {
+        .map(|(role, control)| {
             let node = control.accesskit_node();
-            node.label().map(|label| format!("{role:?} {label}: disabled={}, checked={:?}", node.is_disabled(), node.toggled()))
+            format!(
+                "{role:?} {}: disabled={}, checked={:?}, value={:?}",
+                node.label().as_deref().unwrap_or("<unnamed>"),
+                node.is_disabled(),
+                node.toggled(),
+                node.value()
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(dir.join(format!("{name}.txt")), control_tree).unwrap();
     eprintln!("wrote {}", path.display());
+}
+
+#[test]
+#[ignore]
+fn custom_shader_snapshot() {
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session =
+        texturecraft_engine::Session::new_project("Shader preview", texturecraft_engine::geom::primitives::sphere(1.0, 24, 12), "builtin:sphere", None, 128)
+            .unwrap();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1100.0, 800.0))
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.prefs.language = "en".into();
+    harness.state_mut().run("shader.import", serde_json::json!({"name":"Banded","source":include_str!("../../../examples/shaders/banded.glsl")})).unwrap();
+    harness.state_mut().run("shader.select", serde_json::json!({"name":"Banded"})).unwrap();
+    harness.state_mut().ui.dock.focus(Panel::Shader);
+    save(&mut harness, &output_dir, "custom-shader-controls");
+    harness.get_by_role_and_label(egui::Role::Button, "Banded").click();
+    // The shared preview renderer does one sphere per frame, on this same GPU device.
+    for _ in 0..4 {
+        harness.run_steps(2);
+        harness.render().unwrap();
+    }
+    save(&mut harness, &output_dir, "custom-shader-picker");
 }
 
 #[test]

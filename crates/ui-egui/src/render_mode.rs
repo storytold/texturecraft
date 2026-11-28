@@ -379,6 +379,11 @@ fn start(app: &TextureCraftApp, ctx: &egui::Context, key: String, size: (u32, u3
 
 /// Draw Rendering mode over the 3D view in `rect` (navigation is handled by the 3D view).
 pub fn show(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect) {
+    if app.session.doc.project.display.custom_shader.is_some() {
+        stop(app);
+        ui.put(rect, egui::Label::new(tr("Custom GLSL shaders support viewport rendering; path tracing is unavailable for the selected shader")));
+        return;
+    }
     let on_gpu = !app.ui.render.cpu && show_gpu(app, ui, rect);
     if !on_gpu {
         drop_gpu(app);

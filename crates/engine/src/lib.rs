@@ -88,6 +88,7 @@ pub mod resource_update_cmds;
 pub mod session;
 mod session_log;
 pub mod set_cmds;
+pub mod shader_cmds;
 pub mod shader_parameters;
 pub mod smart_masks;
 mod solo;

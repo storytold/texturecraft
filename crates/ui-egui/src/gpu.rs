@@ -18,6 +18,7 @@ use crate::bake_scene::{BakeSceneLink, CageUpload};
 /// Content shown through the aux texture.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AuxView {
+    ShaderMaps,
     MeshMap(BakedMap),
     Mask(LayerId),
     /// The quick mask being edited, over the base color.
@@ -37,6 +38,7 @@ pub type MissingSeamEdges = Vec<Vec<(u32, u32)>>;
 /// What the renderer must catch up with before drawing.
 #[derive(Default)]
 pub struct SceneSync {
+    pub shader_inputs: Option<(texturecraft_engine::core::custom_shader::CustomShader, texturecraft_engine::compose::ImageStore)>,
     pub mesh: Option<(Arc<Mesh>, u64)>,
     /// (texels across and down, material) per texture set, the mesh material count and the
     /// viewport texture resolution (display shift).
@@ -202,6 +204,17 @@ impl GpuLink {
         session.update_for(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms);
 
         let mut out = SceneSync::default();
+        if let Some(shader) =
+            session.doc.project.display.custom_shaders.iter().find(|shader| Some(&shader.name) == session.doc.project.display.custom_shader.as_ref())
+        {
+            let images = shader
+                .textures
+                .iter()
+                .filter_map(|input| input.resource.as_ref())
+                .filter_map(|name| session.images.get(name).map(|image| (name.clone(), image.clone())))
+                .collect();
+            out.shader_inputs = Some((shader.clone(), images));
+        }
         if self.lost.swap(false, Ordering::AcqRel) {
             self.mesh_id = 0;
             self.sets.clear();
@@ -296,6 +309,17 @@ impl GpuLink {
         }
 
         match aux_map {
+            Some(AuxView::ShaderMaps) => {
+                for (index, set) in session.doc.project.texture_sets.iter().enumerate() {
+                    let key = ("shader_maps".to_string(), session.revision);
+                    if self.aux.get(&index) != Some(&key) {
+                        let resolution = texturecraft_render::aux_size(set.size());
+                        let rgba = texturecraft_render::mesh_maps::shader_maps_rgba(session.doc.baked.get(&index), resolution, set.size(), &set.block_scales());
+                        out.aux.push((index, resolution, rgba));
+                        self.aux.insert(index, key);
+                    }
+                }
+            }
             Some(AuxView::MeshMap(map)) => self.sync_mesh_maps(session, map, None, &mut out),
             Some(AuxView::IdMask(effect)) => {
                 let shown = self.sync_id_mask(session, effect, &mut out);
@@ -481,6 +505,9 @@ impl CallbackTrait for ViewCallback {
         let Some(gpu) = resources.get_mut::<GpuState>() else { return Vec::new() };
         let sync = self.sync.lock().unwrap_or_else(PoisonError::into_inner).take();
         if let Some(sync) = sync {
+            if let Some((shader, images)) = &sync.shader_inputs {
+                gpu.renderer.upload_shader_inputs(device, queue, shader, images);
+            }
             if let Some((env, image)) = &sync.env {
                 gpu.renderer.set_environment(device, queue, env, image.as_deref());
             }
@@ -537,6 +564,10 @@ impl CallbackTrait for ViewCallback {
 
         // Also installs (or rejects) full-size textures WebGPU answered for since last frame
         gpu.renderer.prepare(device, queue, encoder, &self.frame);
+        if let Some(error) = gpu.renderer.take_shader_error() {
+            gpu.reports.lock().unwrap_or_else(PoisonError::into_inner).errors.push(error);
+            gpu.ctx.request_repaint();
+        }
         let failed = gpu.renderer.take_memory_failures();
         if !failed.is_empty() {
             let mut reports = gpu.reports.lock().unwrap_or_else(PoisonError::into_inner);

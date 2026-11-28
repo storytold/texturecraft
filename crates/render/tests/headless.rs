@@ -9,6 +9,33 @@ use texturecraft_render::{BakeOverlay, BakeVisualization, CageGeometry, Frame, N
 /// The UI's key light (`viewport::shade`).
 const LIGHT: [f32; 4] = [0.5, 0.8, 0.4, 2.5];
 
+#[test]
+fn custom_glsl_changes_material_render_and_parameter_edits_reach_the_gpu() {
+    let Some((mut h, frame)) = setup() else { return };
+    let mut shader = texturecraft_formats::custom_shader::import("Banded", include_str!("../../../examples/shaders/banded.glsl")).unwrap();
+    let mut images = texturecraft_compose::ImageStore::new();
+    h.renderer.upload_shader_inputs(&h.device, &h.queue, &shader, &images);
+    let pbr = render(&mut h, &frame, "custom_shader_pbr");
+    let custom = render(&mut h, &shaded(&frame, |s| s.custom_shader = Some(shader.clone())), "custom_shader_banded");
+    assert_ne!(pbr.px, custom.px, "the selected GLSL shader runs");
+    shader.parameters.iter_mut().find(|p| p.name == "shadow_tint").unwrap().value = serde_json::json!([0.9, 0.1, 0.1]);
+    let changed = render(&mut h, &shaded(&frame, |s| s.custom_shader = Some(shader.clone())), "custom_shader_changed");
+    assert_ne!(custom.px, changed.px, "parameter values reach the fragment shader");
+    images.insert("green".into(), std::sync::Arc::new(ImageRes::new(1, 1, vec![[0.0, 1.0, 0.0, 1.0]], false)));
+    shader.textures[0].resource = Some("green".into());
+    h.renderer.upload_shader_inputs(&h.device, &h.queue, &shader, &images);
+    let textured = render(&mut h, &shaded(&frame, |s| s.custom_shader = Some(shader.clone())), "custom_shader_textured");
+    assert_ne!(changed.px, textured.px, "assigned images reach shader samplers");
+    shader.textures[0].resource = None;
+    h.renderer.upload_shader_inputs(&h.device, &h.queue, &shader, &images);
+    assert_same(
+        &changed,
+        &render(&mut h, &shaded(&frame, |s| s.custom_shader = Some(shader)), "custom_shader_default_input"),
+        "clearing an image restores its default color",
+    );
+    assert_same(&pbr, &render(&mut h, &frame, "custom_shader_restored"), "returning to PBR restores its shader");
+}
+
 struct Img {
     w: u32,
     px: Vec<u8>,

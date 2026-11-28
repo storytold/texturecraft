@@ -15,6 +15,7 @@ mod closed_session;
 mod color_selection;
 mod compare_mask;
 mod content_effects;
+mod custom_shader;
 mod effect_blending;
 mod export_colour_space;
 mod export_file_types;

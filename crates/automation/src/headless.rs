@@ -247,6 +247,32 @@ impl Headless {
         Ok(json!({ "name": self.session.import_resource_bytes(path, bytes)? }))
     }
 
+    /// Import a GLSL shader below the configured automation read root.
+    pub fn import_shader(&mut self, path: &str) -> Result<Value, AutomationError> {
+        self.require_project()?;
+        let limit = texturecraft_formats::custom_shader::MAX_SHADER_BYTES as u64;
+        let bytes = match &self.fs {
+            Filesystem::Workspace(workspace) => workspace.read_bounded(path, limit)?,
+            Filesystem::Denied => return Err(bad("file access is not granted: start the server with --read-root <dir>")),
+            Filesystem::TrustedLocal => {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::fs::File::open(path)
+                    .map_err(|error| AutomationError::Io(error.to_string()))?
+                    .take(limit + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| AutomationError::Io(error.to_string()))?;
+                if bytes.len() as u64 > limit {
+                    return Err(bad("GLSL shader exceeds 1 MiB"));
+                }
+                bytes
+            }
+        };
+        let source = std::str::from_utf8(&bytes).map_err(|_| bad("shader must be UTF-8"))?;
+        let name = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).ok_or_else(|| bad("invalid shader filename"))?;
+        Ok(texturecraft_engine::shader_cmds::import_source(&mut self.session, name, source)?)
+    }
+
     /// Save a layer (default: the selected one) as a smart material file (`.tcmat`).
     pub fn material_save(&mut self, p: &Value) -> Result<Value, AutomationError> {
         self.require_project()?;
@@ -364,6 +390,9 @@ impl Headless {
             }
         }
         if let Some(samples) = options.samples {
+            if self.session.doc.project.display.custom_shader.is_some() {
+                return Err(bad("Custom GLSL shaders support viewport rendering; path tracing is unavailable for the selected shader"));
+            }
             if !(1..=MAX_TRACE_SAMPLES).contains(&samples) || options.view.as_deref().is_some_and(|v| v != "3d") {
                 return Err(bad(format!("path tracing renders the 3D view with 1 to {MAX_TRACE_SAMPLES} samples")));
             }
@@ -409,7 +438,7 @@ impl Headless {
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu.render(session, kind, size, camera)));
         let (w, h, rgba) = match out {
             Ok(Some(px)) => px,
-            Ok(None) => return Err(AutomationError::Other("the GPU returned no image".into())),
+            Ok(None) => return Err(AutomationError::Other(gpu.shader_error().unwrap_or("the GPU returned no image").into())),
             Err(_) => {
                 self.gpu = None;
                 return Err(AutomationError::Other("the GPU renderer failed".into()));

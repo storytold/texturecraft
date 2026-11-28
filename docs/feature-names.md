@@ -1,5 +1,21 @@
 # Feature names
 
+## Custom GLSL shaders
+
+On 2026-11-28, the new wording was checked against descriptive shader usage in
+three unrelated products: [Godot's Shaders documentation](https://docs.godotengine.org/en/stable/tutorials/shaders/index.html),
+[Unity's Custom shaders documentation](https://docs.unity3d.com/Manual/Shaders.html)
+and [Blender's Shader Nodes documentation](https://docs.blender.org/manual/en/latest/render/shader_nodes/index.html).
+The controls use ordinary action and data names such as **Import shader** and
+**Search shaders**; GLSL identifies the supported language, as permitted by
+the naming standard. **Banded** describes our example shader's lighting.
+Names supplied by imported user documents remain document data.
+
+No trademark-register clearance is claimed. Register searches were not
+completed in this environment; this departs from the standard's SHOULD check.
+The decision is to use descriptive wording and the accurate language name,
+with no product or distinctive feature name used for the new controls.
+
 ## Generator picker
 
 The picker uses **Worn Metal Edges** for metal edge wear, **Exposed Glass Fibers**

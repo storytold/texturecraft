@@ -126,6 +126,13 @@ fill's image sources. `engine::link_cmds` imports a procedural MCMAT v3 by askin
 
 ## Commands and automation
 
+Custom surface shaders are project-owned data in `core::custom_shader`.
+`formats::custom_shader` maps annotated GLSL to TextureCraft's material bindings
+and compiles WGSL with Naga. `engine::shader_cmds` validates imports and edits
+before committing undo snapshots; the renderer validates the GPU pipeline
+before drawing it. See [custom-shaders.md](custom-shaders.md) for the supported
+interface and limits.
+
 Every action is a `CommandSpec` in `engine::commands` (id, label, menu path, shortcut, params doc,
 enabled predicate, run). The menus, shortcuts, the desktop app's control channel
 (`--control <port>`), the CLI and the MCP server all execute commands by id, so an agent can do

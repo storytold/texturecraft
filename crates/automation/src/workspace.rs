@@ -31,6 +31,12 @@ impl AuthorizedWorkspace {
 
     /// Read one regular file below the read root.
     pub fn read(&self, path: &str) -> Result<Vec<u8>, AutomationError> {
+        self.read_bounded(path, MAX_READ_BYTES)
+    }
+
+    /// Read a file with a tighter format-specific cap, retaining the same root checks.
+    pub fn read_bounded(&self, path: &str, limit: u64) -> Result<Vec<u8>, AutomationError> {
+        let limit = limit.min(MAX_READ_BYTES);
         let rel = relative_path(path)?;
         let root = self.read.as_ref().ok_or_else(|| denied("read"))?;
         let file = root.open(&rel).map_err(|e| file_error("read", path, e))?;
@@ -38,11 +44,14 @@ impl AuthorizedWorkspace {
         if !meta.is_file() {
             return Err(bad(format!("not a regular file: `{path}`")));
         }
-        if meta.len() > MAX_READ_BYTES {
-            return Err(bad(format!("`{path}` is {} bytes (limit {MAX_READ_BYTES})", meta.len())));
+        if meta.len() > limit {
+            return Err(bad(format!("`{path}` is {} bytes (limit {limit})", meta.len())));
         }
         let mut bytes = Vec::new();
-        file.take(MAX_READ_BYTES).read_to_end(&mut bytes).map_err(|e| file_error("read", path, e))?;
+        file.take(limit + 1).read_to_end(&mut bytes).map_err(|e| file_error("read", path, e))?;
+        if bytes.len() as u64 > limit {
+            return Err(bad(format!("`{path}` exceeds {limit} bytes")));
+        }
         Ok(bytes)
     }
 

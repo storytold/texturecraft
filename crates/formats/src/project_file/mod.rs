@@ -462,8 +462,23 @@ fn load_archive<R: Read + Seek>(mut zip: ZipArchive<R>, mut budget: LoadBudget) 
         return Err(FormatError::NewerVersion { found: version, supported: FORMAT_VERSION });
     }
 
-    let (project, mut recovered) = recovery::read_project(&json).map_err(|e| malformed(KIND, format!("project.json: {e}")))?;
+    let (mut project, mut recovered) = recovery::read_project(&json).map_err(|e| malformed(KIND, format!("project.json: {e}")))?;
     project.validate()?;
+    // Recompile embedded source rather than trusting a project's cached GPU program or control metadata.
+    for shader in &mut project.display.custom_shaders {
+        let mut checked = crate::custom_shader::import(&shader.name, &shader.source)?;
+        for p in &mut checked.parameters {
+            if let Some(saved) = shader.parameters.iter().find(|saved| saved.name == p.name) {
+                p.value = crate::custom_shader::validate_value(p, &saved.value)?;
+            }
+        }
+        for input in &mut checked.textures {
+            if let Some(saved) = shader.textures.iter().find(|saved| saved.name == input.name) {
+                input.resource = saved.resource.clone();
+            }
+        }
+        *shader = checked;
+    }
     let too_large = |t: &texturecraft_core::TextureSet| u64::from(t.size().0) * u64::from(t.size().1) > MAX_TEXELS;
     if let Some(ts) = project.texture_sets.iter().find(|t| t.resolution == 0 || t.resolution > MAX_IMAGE_SIZE || too_large(t)) {
         return Err(malformed(KIND, format!("texture set \"{}\" has resolution {} over {} UV tiles", ts.name, ts.resolution, ts.uv_tiles.len().max(1))));

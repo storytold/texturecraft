@@ -297,6 +297,11 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   Settings and Texture Set Settings. *Python Console* and *Online assets* are greyed ("Not available yet").
 - **Display and Shader Settings** are one scrolling page each: their section tabs jump to a
   section, and scrolling highlights the tab of the section in view.
+- **Custom GLSL shaders** can be imported and selected from a searchable grid in
+  Shader Settings. Annotated parameters and image inputs are editable and saved
+  with the project, with undo and redo. The same commands are available through
+  CLI and MCP. The 3D material viewport runs the shader; path tracing is
+  unavailable. See [supported interfaces and limits](custom-shaders.md).
 - A **Log** panel with a *GENERAL* and an *ASSETS* tab: asset messages (resources that do not
   decode, skipped templates and presets, PBR folder and MaterialX import warnings) go under ASSETS.
   Lines read `[Source] message`, coloured by level (info, warning, error), and can be

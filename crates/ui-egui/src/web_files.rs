@@ -26,6 +26,32 @@ pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "tga", "tif", "tiff", "b
 /// Equirect HDR images Display settings › Import HDR accepts.
 pub const ENV_EXTS: &[&str] = &["hdr", "exr"];
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn import_shader(app: &mut TextureCraftApp, _ctx: &egui::Context) {
+    use crate::file_dialogs::{Bound, FileDialog};
+    app.ask_file(FileDialog::open().filter(tr("GLSL shaders"), &["glsl"]), Bound::Project, |app, paths| {
+        if let Some(path) = paths.first()
+            && let Some(result) = app.run("shader.import", serde_json::json!({"path":path.display().to_string()}))
+            && let Some(name) = result.get("name").and_then(serde_json::Value::as_str)
+        {
+            select_imported_shader(app, name);
+        }
+    });
+}
+
+fn import_shader_source(app: &mut TextureCraftApp, name: &str, source: &str) {
+    if app.run("shader.import", serde_json::json!({"name":name,"source":source})).is_some() {
+        select_imported_shader(app, name);
+    }
+}
+
+fn select_imported_shader(app: &mut TextureCraftApp, name: &str) {
+    if app.run("shader.select", serde_json::json!({"name":name})).is_some() {
+        app.toast(trf("Shader selected: {name}", &[("name", &name)]), false);
+        app.announce_latest_toast();
+    }
+}
+
 /// Materials File › Import material adds as layers: smart materials, MaterialCraft portable
 /// materials and MaterialCraft packages.
 pub const MATERIAL_EXTS: &[&str] = &["tcmat", "mcmat", "mcraft"];
@@ -37,6 +63,7 @@ const MESH_RESOLUTION: u32 = if cfg!(target_arch = "wasm32") { 1024 } else { 204
 #[derive(Clone, Copy, PartialEq)]
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 enum Pick {
+    Shader(u64),
     /// File > Open / a dropped file: a project, a mesh or an image resource.
     Open,
     /// Display settings > Import HDR.
@@ -69,17 +96,29 @@ fn apply_picked(app: &mut TextureCraftApp, picked: Vec<(String, Vec<u8>, Pick)>)
             }
 
             // A late project-bound pick must not modify the placeholder or a replacement project
-            Pick::Environment(_) | Pick::HighPoly(_) | Pick::Cage(_) if !app.session.project_open => {
+            Pick::Shader(_) | Pick::Environment(_) | Pick::HighPoly(_) | Pick::Cage(_) if !app.session.project_open => {
                 app.toast(tr("No project is open"), true);
                 continue;
             }
 
-            Pick::Environment(project_id) | Pick::HighPoly(project_id) | Pick::Cage(project_id) if project_id != app.session.project_id => {
+            Pick::Shader(project_id) | Pick::Environment(project_id) | Pick::HighPoly(project_id) | Pick::Cage(project_id)
+                if project_id != app.session.project_id =>
+            {
                 app.toast(tr("The project changed while the dialog was open, so nothing was done"), true);
                 continue;
             }
 
             Pick::Environment(_) => app.session.import_resource_bytes(&name, bytes).map(|res| use_environment(app, &res)),
+            Pick::Shader(_) => {
+                match std::str::from_utf8(&bytes) {
+                    Ok(source) => {
+                        let name = std::path::Path::new(&name).file_stem().and_then(|s| s.to_str()).unwrap_or(&name);
+                        import_shader_source(app, name, source);
+                    }
+                    Err(_) => app.toast(tr("Shader must be UTF-8"), true),
+                }
+                continue;
+            }
             Pick::HighPoly(_) => app.session.add_high_poly_bytes(&name, bytes).map(|n| app.toast(trf("High poly: {name}", &[("name", &n)]), false)),
             Pick::Cage(_) => app.session.set_cage_bytes(&name, bytes).map(|n| app.toast(trf("Cage: {name}", &[("name", &n)]), false)),
             Pick::NewProjectMesh(request_id) => {
@@ -245,8 +284,8 @@ use texturecraft_engine::shader_parameters::shader_parameters_sidecar;
 
 #[cfg(target_arch = "wasm32")]
 pub use web::{
-    download, export_mesh, export_textures, import_bake_mesh, import_environment, import_images, import_material, import_preset, open, open_sample_project,
-    pick_new_project_mesh, save_project, sync_unsaved, unsaved,
+    download, export_mesh, export_textures, import_bake_mesh, import_environment, import_images, import_material, import_preset, import_shader, open,
+    open_sample_project, pick_new_project_mesh, save_project, sync_unsaved, unsaved,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -254,6 +293,10 @@ mod web {
     use super::*;
     use serde_json::Value;
     use wasm_bindgen::JsCast as _;
+
+    pub fn import_shader(app: &mut TextureCraftApp, ctx: &egui::Context) {
+        pick(ctx, tr("GLSL shaders"), &["glsl"], false, Pick::Shader(app.session.project_id));
+    }
 
     /// Whether the project has unsaved changes, for the page's `beforeunload` listener.
     static UNSAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

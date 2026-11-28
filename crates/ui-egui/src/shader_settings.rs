@@ -42,9 +42,6 @@ pub const SHADER_TYPES: [&str; 17] = [
 /// The shader choice's search starts as the reference's: shaders only
 pub const SHADER_QUERY: &str = "u:shader";
 
-/// The reference's default instance name
-const INSTANCE_NAME: &str = "Main shader";
-
 /// Wide enough for the longer shader model name
 const SHADER_MODEL_COMBO_WIDTH: f32 = 260.0;
 
@@ -59,7 +56,7 @@ const SCATTER_ANISOTROPY_SHOWN: f32 = 0.1;
 const SUBDIVISION_COUNT_SHOWN: f32 = 1.0;
 
 /// Size of a tile in the shader choice, and the columns it has
-const SHADER_TILE_SIZE: egui::Vec2 = vec2(64.0, 64.0);
+pub(crate) const SHADER_TILE_SIZE: egui::Vec2 = vec2(64.0, 64.0);
 const SHADER_TILE_COLUMNS: usize = 5;
 
 /// Size of the shader choice's reset button
@@ -67,7 +64,21 @@ const RESET_QUERY_SIZE: f32 = 22.0;
 
 /// The Shader Settings panel body (a dock tab or rail popup)
 pub(crate) fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
-    header(ui);
+    header(app, ui);
+
+    let custom = app
+        .session
+        .doc
+        .project
+        .display
+        .custom_shaders
+        .iter()
+        .find(|shader| Some(&shader.name) == app.session.doc.project.display.custom_shader.as_ref())
+        .cloned();
+    if let Some(shader) = custom {
+        custom_parameters(app, ui, &shader);
+        return;
+    }
 
     let mut display = app.session.doc.project.display.clone();
     let mut ior_specular = display.ior_specular;
@@ -87,42 +98,72 @@ pub(crate) fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
 }
 
 /// Undo and Redo of the shader's settings, the shader button and the instance name
-fn header(ui: &mut Ui) {
+fn header(app: &mut TextureCraftApp, ui: &mut Ui) {
+    let mut edit_action = None;
     ui.columns(2, |columns| {
         let width = columns[0].available_width();
-        unavailable::greyed(&mut columns[0], |ui| ui.add_sized([width, ui.spacing().interact_size.y], egui::Button::new(tr("Undo"))));
-        unavailable::greyed(&mut columns[1], |ui| ui.add_sized([width, ui.spacing().interact_size.y], egui::Button::new(tr("Redo"))));
+        if columns[0].add_enabled(app.session.can_undo(), egui::Button::new(tr("Undo")).min_size(vec2(width, 24.0))).clicked() {
+            edit_action = Some("edit.undo");
+        }
+        if columns[1].add_enabled(app.session.can_redo(), egui::Button::new(tr("Redo")).min_size(vec2(width, 24.0))).clicked() {
+            edit_action = Some("edit.redo");
+        }
     });
 
-    let shader = ui.add_sized([ui.available_width(), ui.spacing().interact_size.y], egui::Button::new(CURRENT_SHADER));
-    egui::Popup::menu(&shader).id(ui.make_persistent_id("shader_choice")).show(shader_choice);
+    let selected = app.session.doc.project.display.custom_shader.as_deref().unwrap_or(CURRENT_SHADER);
+    let shader = ui.add_sized([ui.available_width(), ui.spacing().interact_size.y], egui::Button::new(selected));
+    egui::Popup::menu(&shader).id(ui.make_persistent_id("shader_choice")).show(|ui| shader_choice(app, ui));
 
     ui.horizontal(|ui| {
         ui.label(tr("Instance name"));
-        let mut name = tr(INSTANCE_NAME).to_string();
-        unavailable::greyed(ui, |ui| ui.add(egui::TextEdit::singleline(&mut name).desired_width(ui.available_width())));
+        let draft_id = ui.make_persistent_id(("shader_instance_draft", app.session.project_id));
+        let mut name = ui.data(|data| data.get_temp::<String>(draft_id)).unwrap_or_else(|| app.session.doc.project.display.shader_instance_name.clone());
+        let field = ui.add(egui::TextEdit::singleline(&mut name).id(draft_id).desired_width(ui.available_width()));
+        field.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tr("Instance name")));
+        if field.changed() {
+            ui.data_mut(|data| data.insert_temp(draft_id, name.clone()));
+        }
+        if field.lost_focus() && name != app.session.doc.project.display.shader_instance_name {
+            app.run("shader.set", serde_json::json!({"instanceName":name}));
+            ui.data_mut(|data| data.remove::<String>(draft_id));
+        }
+        if !field.has_focus() && !field.changed() {
+            ui.data_mut(|data| data.remove::<String>(draft_id));
+        }
     });
+    if let Some(command) = edit_action {
+        app.run(command, serde_json::json!({}));
+    }
 }
 
-/// The shader choice under the shader button: a search, and a tile for each shader the reference lists (only the current one works)
-fn shader_choice(ui: &mut Ui) {
+/// Search built-in entries and project-owned imports in the shader picker.
+fn shader_choice(app: &mut TextureCraftApp, ui: &mut Ui) {
     let query_id = ui.make_persistent_id("shader_query");
     let mut query = ui.data(|data| data.get_temp::<String>(query_id)).unwrap_or_else(|| SHADER_QUERY.to_string());
     ui.horizontal(|ui| {
         let field_width = SHADER_TILE_SIZE.x * SHADER_TILE_COLUMNS as f32 - RESET_QUERY_SIZE;
-        ui.add(egui::TextEdit::singleline(&mut query).desired_width(field_width));
+        let field = ui.add(egui::TextEdit::singleline(&mut query).desired_width(field_width));
+        field.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tr("Search shaders")));
         if crate::widgets::icon_button(ui, ic::ARROW_COUNTER_CLOCKWISE, tr("Reset"), false, RESET_QUERY_SIZE).clicked() {
             query = SHADER_QUERY.to_string();
         }
     });
     ui.data_mut(|data| data.insert_temp(query_id, query.clone()));
 
+    let selected = app.session.doc.project.display.custom_shader.clone();
+    let imported = app.session.doc.project.display.custom_shaders.clone();
     egui::Grid::new("shader_types").spacing(vec2(4.0, 4.0)).show(ui, |ui| {
         let mut shown = 0;
         for name in SHADER_TYPES.iter().filter(|name| matches_query(name, &query)) {
-            let tile = egui::Button::selectable(*name == CURRENT_SHADER, RichText::new(format!("{}\n{name}", ic::SPHERE))).min_size(SHADER_TILE_SIZE);
+            let tile = egui::Button::selectable(*name == CURRENT_SHADER && selected.is_none(), RichText::new(format!("{}\n{name}", ic::SPHERE)))
+                .min_size(SHADER_TILE_SIZE);
             if *name == CURRENT_SHADER {
-                if ui.add(tile).clicked() {
+                let response = crate::shader_previews::tile(app, ui, name, selected.is_none(), None);
+                if response.clicked() {
+                    if app.run("shader.select", serde_json::json!({"name":CURRENT_SHADER})).is_some() {
+                        app.toast(crate::i18n::trf("Shader selected: {name}", &[("name", &CURRENT_SHADER)]), false);
+                        app.announce_latest_toast();
+                    }
                     ui.close();
                 }
             } else {
@@ -133,6 +174,140 @@ fn shader_choice(ui: &mut Ui) {
             if shown % SHADER_TILE_COLUMNS == 0 {
                 ui.end_row();
             }
+        }
+        for shader in imported.iter().filter(|shader| matches_query(&shader.name, &query)) {
+            let name = &shader.name;
+            let response = crate::shader_previews::tile(app, ui, name, selected.as_ref() == Some(name), Some(shader));
+            if response.on_hover_text(name).clicked() {
+                if app.run("shader.select", serde_json::json!({"name":name})).is_some() {
+                    app.toast(crate::i18n::trf("Shader selected: {name}", &[("name", name)]), false);
+                    app.announce_latest_toast();
+                }
+                ui.close();
+            }
+            shown += 1;
+            if shown % SHADER_TILE_COLUMNS == 0 {
+                ui.end_row();
+            }
+        }
+    });
+    if ui.button(tr("Import shader")).clicked() {
+        crate::web_files::import_shader(app, ui.ctx());
+        ui.close();
+    }
+}
+
+fn custom_parameters(app: &mut TextureCraftApp, ui: &mut Ui, shader: &texturecraft_engine::core::custom_shader::CustomShader) {
+    ui.label(tr("Shader parameters"));
+    ui.label(tr(texturecraft_engine::core::custom_shader::SHADER_SUPPORT));
+    for warning in &shader.warnings {
+        ui.label(tr(warning));
+    }
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for input in &shader.textures {
+            let mut resource = input.resource.clone();
+            let before = resource.clone();
+            let selected = resource.clone().unwrap_or_else(|| tr("Default color").to_string());
+            let response = ui
+                .push_id(&input.name, |ui| {
+                    combo(ui, tr(&input.label), &selected, |ui| {
+                        ui.selectable_value(&mut resource, None, tr("Default color"));
+                        let mut names: Vec<_> = app.session.images.keys().collect();
+                        names.sort();
+                        for name in names {
+                            ui.selectable_value(&mut resource, Some(name.clone()), name);
+                        }
+                    })
+                })
+                .inner;
+            response.widget_info(|| egui::WidgetInfo {
+                current_text_value: Some(selected.clone()),
+                ..egui::WidgetInfo::labeled(egui::Role::ComboBox, ui.is_enabled(), tr(&input.label))
+            });
+            if resource != before {
+                let mut textures = serde_json::Map::new();
+                textures.insert(input.name.clone(), serde_json::json!(resource));
+                app.run("shader.set", serde_json::json!({"textures":textures}));
+            }
+        }
+        let mut last_group = String::new();
+        for p in &shader.parameters {
+            if p.group != last_group {
+                ui.separator();
+                ui.label(tr(&p.group));
+                last_group = p.group.clone();
+            }
+            let mut value = p.value.clone();
+            let changed = if p.kind == "bool" {
+                let mut on = value.as_bool().unwrap_or(false);
+                let changed = ui.checkbox(&mut on, tr(&p.label)).on_hover_text(tr(&p.description)).changed();
+                value = serde_json::json!(on);
+                changed
+            } else if !p.choices.is_empty() {
+                let mut selected = value.as_i64().unwrap_or(0) as i32;
+                let before = selected;
+                let text = p.choices.iter().find(|(_, v)| *v == selected).map_or("", |(label, _)| tr(label)).to_string();
+                let response = ui
+                    .push_id(&p.name, |ui| {
+                        combo(ui, tr(&p.label), &text, |ui| {
+                            for (label, v) in &p.choices {
+                                ui.selectable_value(&mut selected, *v, tr(label));
+                            }
+                        })
+                    })
+                    .inner;
+                response.widget_info(|| egui::WidgetInfo {
+                    current_text_value: Some(text.clone()),
+                    ..egui::WidgetInfo::labeled(egui::Role::ComboBox, ui.is_enabled(), tr(&p.label))
+                });
+                response.on_hover_text(tr(&p.description));
+                value = serde_json::json!(selected);
+                selected != before
+            } else if p.widget == "color" && p.kind == "vec3" {
+                let mut color = std::array::from_fn(|i| value.get(i).and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32);
+                ui.label(tr(&p.label));
+                let response = ui.color_edit_button_rgb(&mut color);
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tr(&p.label)));
+                let changed = response.on_hover_text(tr(&p.description)).changed();
+                value = serde_json::json!(color);
+                changed
+            } else {
+                let mut values: Vec<f32> = value
+                    .as_array()
+                    .map_or_else(|| vec![value.as_f64().unwrap_or(0.0) as f32], |a| a.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect());
+                let mut changed = false;
+                for (i, v) in values.iter_mut().enumerate() {
+                    let label = if p.value.is_array() { format!("{} {}", tr(&p.label), i + 1) } else { tr(&p.label).to_string() };
+                    if let (Some(min), Some(max)) = (p.min, p.max) {
+                        let mut control = egui::Slider::new(v, min..=max).text(&label);
+                        if p.kind == "int" || p.kind.starts_with("ivec") {
+                            control = control.integer();
+                        }
+                        changed |= ui.add(control).on_hover_text(tr(&p.description)).changed();
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(&label);
+                            let mut control = egui::DragValue::new(v).speed(0.01);
+                            if p.kind == "int" || p.kind.starts_with("ivec") {
+                                control = control.speed(1.0).max_decimals(0);
+                            }
+                            let response = ui.add(control);
+                            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::SpinButton, true, &label));
+                            changed |= response.changed();
+                        });
+                    }
+                }
+                value = if p.value.is_array() { serde_json::json!(values) } else { serde_json::json!(values[0]) };
+                changed
+            };
+            if changed {
+                let mut parameters = serde_json::Map::new();
+                parameters.insert(p.name.clone(), value);
+                app.run("shader.set", serde_json::json!({"parameters":parameters}));
+            }
+        }
+        if ui.button(tr("Restore defaults")).clicked() {
+            app.run("shader.set", serde_json::json!({"reset":true}));
         }
     });
 }

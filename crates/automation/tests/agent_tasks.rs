@@ -318,6 +318,22 @@ const TOOLS: [&str; 22] = [
 ];
 
 #[tokio::test(flavor = "multi_thread")]
+async fn custom_shader_import_and_edit_use_the_same_commands_over_mcp() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("banded.glsl"), include_str!("../../../examples/shaders/banded.glsl")).unwrap();
+    let (c, server) = connect(workspace(root.path())).await;
+    tool(&c, "shader_import", json!({"path":"banded.glsl"})).await;
+    tool(&c, "command_run", json!({"id":"shader.select","params":{"name":"banded"}})).await;
+    let before = tool(&c, "command_run", json!({"id":"shader.list","params":{}})).await;
+    tool(&c, "command_run", json!({"id":"shader.set","params":{"parameters":{"bands":6}}})).await;
+    let after = tool(&c, "command_run", json!({"id":"shader.list","params":{}})).await;
+    assert_ne!(before, after);
+    tool(&c, "command_run", json!({"id":"edit.undo","params":{}})).await;
+    assert_eq!(tool(&c, "command_run", json!({"id":"shader.list","params":{}})).await, before);
+    shutdown(c, server).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn paths_outside_the_workspace_are_rejected() {
     let base = tmp("security");
     let (root, outside) = (base.join("root"), base.join("outside"));
@@ -331,6 +347,7 @@ async fn paths_outside_the_workspace_are_rejected() {
         tool_err(&c, "project_open", json!({"path": path})).await;
         tool_err(&c, "mesh_import", json!({"path": path})).await;
         tool_err(&c, "resource_import", json!({"path": path})).await;
+        tool_err(&c, "shader_import", json!({"path": path})).await;
         tool_err(&c, "material_load", json!({"path": path})).await;
         tool_err(&c, "material_save", json!({"path": path})).await;
         tool_err(&c, "project_save", json!({"path": path})).await;
@@ -347,6 +364,7 @@ async fn paths_outside_the_workspace_are_rejected() {
         ("file.save", json!({})),
         ("file.exportTextures", json!({"dir": "x"})),
         ("resource.import", json!({"path": abs})),
+        ("shader.import", json!({"path": abs})),
         ("material.save", json!({"path": abs})),
     ] {
         let e = tool_err(&c, "command_run", json!({"id": id, "params": p})).await;

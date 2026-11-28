@@ -354,8 +354,8 @@ impl TexturecraftMcp {
                 "mesh.reimport" if p.get("path").is_none() => {
                     b.call("command.run", json!({"id": "file.reimportMesh", "params": {"preserveStrokes": p.get("preserveStrokes")}})).await
                 }
-                "project.save" | "project.open" | "mesh.import" | "mesh.reimport" | "mesh.export" | "bake.mesh.add" | "resource.import" | "material.save"
-                | "material.load" | "textures.export" | "command.batch" | "render" => {
+                "project.save" | "project.open" | "mesh.import" | "mesh.reimport" | "mesh.export" | "bake.mesh.add" | "resource.import" | "shader.import"
+                | "material.save" | "material.load" | "textures.export" | "command.batch" | "render" => {
                     Err(bad(format!("`{method}` with paths works in headless mode only: the running app reads and writes its own files (use ui_menu_invoke)")))
                 }
                 _ => b.call(method, p).await,
@@ -492,6 +492,13 @@ impl TexturecraftMcp {
         resource. Returns its name, for command_run layer.add.image {name} or tool.stencil {image}.")]
     async fn resource_import(&self, Parameters(p): Parameters<OpenParams>) -> Result<CallToolResult, McpError> {
         to_result(self.call("resource.import", params(&p)).await)
+    }
+
+    #[tool(
+        description = "Import an annotated GLSL surface shader (path relative to the read root). Validates before adding it. Select with command_run shader.select."
+    )]
+    async fn shader_import(&self, Parameters(p): Parameters<OpenParams>) -> Result<CallToolResult, McpError> {
+        to_result(self.call("shader.import", params(&p)).await)
     }
 
     #[tool(description = "Save a layer or folder (default: the selected one) as a smart material file (.tcmat) below the write root.")]

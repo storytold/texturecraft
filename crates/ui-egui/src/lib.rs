@@ -159,6 +159,7 @@ mod section_page;
 #[cfg(not(target_arch = "wasm32"))]
 mod session_log_file;
 pub mod settings_window;
+mod shader_previews;
 pub mod shader_settings;
 pub mod shelf;
 pub mod shelf_custom_preview;
@@ -720,7 +721,6 @@ impl TextureCraftApp {
         self.toasts.push(Toast { text: text.into(), error, until, show_log: false, action: None, announce: false });
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn announce_latest_toast(&mut self) {
         if let Some(toast) = self.toasts.last_mut() {
             toast.announce = true;

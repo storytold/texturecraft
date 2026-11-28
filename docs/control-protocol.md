@@ -824,6 +824,12 @@ set.
 
 ## CLI
 
+Custom surface shaders use `shader.import`, `shader.list`, `shader.select` and
+`shader.set`. MCP exposes `shader_import {path}` below the configured read root;
+selection and edits use `command_run`. The embedded source and settings persist
+with the project. See [custom-shaders.md](custom-shaders.md) for parameters,
+viewport support limits and CLI examples.
+
 ```sh
 texturecraft-cli --version                                   # texturecraft-cli 0.1.0 (abc1234 2026-10-14)
 texturecraft-cli info model.glb                              # triangles, materials, UV report
