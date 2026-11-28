@@ -30,9 +30,11 @@ fn import_inner(name: &str, source: &str) -> Result<CustomShader> {
     let mut textures = Vec::new();
     let mut uniforms = std::collections::HashSet::new();
     let mut warnings = Vec::new();
+    let mut libraries = std::collections::BTreeSet::new();
+    let mut block_comment = false;
     for (line_index, line) in source.lines().enumerate() {
         let line = line.trim();
-        if let Some(comment) = line.strip_prefix("//:") {
+        if !block_comment && let Some(comment) = line.strip_prefix("//:") {
             if comment.trim().starts_with("param ") {
                 annotation.clear();
             }
@@ -50,6 +52,8 @@ fn import_inner(name: &str, source: &str) -> Result<CustomShader> {
             annotation.push(' ');
             continue;
         }
+        let uncommented = without_comments(line, &mut block_comment);
+        let line = uncommented.trim();
         if line.is_empty() || line.starts_with("//") {
             continue;
         }
@@ -71,6 +75,12 @@ fn import_inner(name: &str, source: &str) -> Result<CustomShader> {
             {
                 return Err(error(format!("unsupported import `{library}` at line {}", line_index + 1)));
             }
+            libraries.insert(library.to_string());
+            if library == "lib-pbr.glsl" {
+                libraries.extend(["lib-env.glsl", "lib-emissive.glsl", "lib-vectors.glsl", "lib-normal.glsl"].map(str::to_string));
+            } else if library == "lib-vectors.glsl" {
+                libraries.insert("lib-normal.glsl".into());
+            }
             annotation.clear();
             continue;
         }
@@ -91,8 +101,11 @@ fn import_inner(name: &str, source: &str) -> Result<CustomShader> {
                     if textures.len() >= MAX_SHADER_TEXTURES {
                         return Err(error("too many shader texture inputs"));
                     }
-                    if !default.is_string() {
+                    let Some(default) = default.as_str() else {
                         return Err(error("sampler default must be a resource name"));
+                    };
+                    if !default.is_empty() {
+                        return Err(error("named sampler defaults are unsupported; use an empty default and assign a project image with shader.set"));
                     }
                     let color = meta.get("default_color").cloned().unwrap_or_else(|| serde_json::json!([0.0, 0.0, 0.0, 1.0]));
                     let values = color.as_array().filter(|a| a.len() == 4).ok_or_else(|| error("default_color needs four components"))?;
@@ -117,8 +130,8 @@ fn import_inner(name: &str, source: &str) -> Result<CustomShader> {
                     group: text("group"),
                     description: text("description"),
                     widget: text("widget"),
-                    min: meta.get("min").and_then(Value::as_f64).map(|v| v as f32),
-                    max: meta.get("max").and_then(Value::as_f64).map(|v| v as f32),
+                    min: meta.get("min").and_then(Value::as_f64),
+                    max: meta.get("max").and_then(Value::as_f64),
                     choices: Vec::new(),
                     default: default.clone(),
                     value: default,
@@ -126,8 +139,8 @@ fn import_inner(name: &str, source: &str) -> Result<CustomShader> {
                 if p.label.is_empty() {
                     p.label = uniform.into();
                 }
-                if p.min.is_some_and(|v| !v.is_finite())
-                    || p.max.is_some_and(|v| !v.is_finite())
+                if p.min.is_some_and(|v| !v.is_finite() || !(v as f32).is_finite())
+                    || p.max.is_some_and(|v| !v.is_finite() || !(v as f32).is_finite())
                     || matches!((p.min, p.max), (Some(min), Some(max)) if min > max)
                 {
                     return Err(error("invalid shader parameter range"));
@@ -148,9 +161,9 @@ fn import_inner(name: &str, source: &str) -> Result<CustomShader> {
                 };
                 let value = format!("tc_params.values[{}].{swizzle}", parameters.len());
                 let value = match kind {
-                    "bool" => format!("({value} != 0.0)"),
-                    "int" | "ivec2" | "ivec3" | "ivec4" => format!("floatBitsToInt({value})"),
-                    _ => format!("{kind}({value})"),
+                    "bool" => format!("({value} != 0u)"),
+                    "int" | "ivec2" | "ivec3" | "ivec4" => format!("{kind}({value})"),
+                    _ => format!("uintBitsToFloat({value})"),
                 };
                 body.push_str(&format!("#define {uniform} ({value})\n"));
                 parameters.push(p);
@@ -191,8 +204,15 @@ fn import_inner(name: &str, source: &str) -> Result<CustomShader> {
         body.push_str(line);
         body.push('\n');
     }
+    if block_comment {
+        return Err(error("unterminated GLSL block comment"));
+    }
+    let library_defines = libraries
+        .iter()
+        .map(|library| format!("#define TC_LIB_{}\n", library.trim_start_matches("lib-").trim_end_matches(".glsl").replace('-', "_").to_uppercase()))
+        .collect::<String>();
     let glsl = format!(
-        "{}\n{}\n{}\n#define sampler2D TCInputTexture\n{body}\n{}",
+        "{}\n{}\n{library_defines}{}\n#define sampler2D TCInputTexture\n{body}\n{}",
         include_str!("custom_shader/interface.glsl"),
         include_str!("custom_shader/surface.glsl"),
         include_str!("custom_shader/library_parameters.glsl"),
@@ -230,6 +250,30 @@ fn import_inner(name: &str, source: &str) -> Result<CustomShader> {
     Ok(CustomShader { name: name.into(), source: source.into(), wgsl: wgsl.into(), parameters, textures, warnings })
 }
 
+/// Remove GLSL comments while keeping whitespace between tokens and block state across lines.
+fn without_comments(line: &str, block: &mut bool) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if *block {
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                *block = false;
+                out.push(' ');
+            }
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            *block = true;
+            out.push(' ');
+        } else if c == '/' && chars.peek() == Some(&'/') {
+            break;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn identifier(name: &str) -> bool {
     !name.is_empty() && !name.starts_with("tc_") && name.chars().enumerate().all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
 }
@@ -251,7 +295,7 @@ pub fn validate_value(p: &ShaderParameter, value: &Value) -> Result<Value> {
     }
     let check = |v: &Value| -> Result<Value> {
         let number = v.as_f64().filter(|n| n.is_finite() && (*n as f32).is_finite()).ok_or_else(|| error(format!("{} must contain finite numbers", p.name)))?;
-        if p.min.is_some_and(|min| number < min as f64) || p.max.is_some_and(|max| number > max as f64) {
+        if p.min.is_some_and(|min| number < min) || p.max.is_some_and(|max| number > max) {
             return Err(error(format!("{} is outside its range", p.name)));
         }
         if p.kind == "int" || p.kind.starts_with("ivec") {
@@ -313,4 +357,43 @@ fn auto_value(kind: &str, tag: &str) -> Result<String> {
         _ => return Err(error(format!("unsupported automatic parameter `{tag}`"))),
     };
     Ok(expression.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn annotated_ranges_accept_endpoints_and_comments_but_reject_outside_values() {
+        // Original GLSL regression inputs, authored for TextureCraft (MIT OR Apache-2.0).
+        let source = r#"
+//: param custom {"default":0.1,"min":0.1,"max":0.9}
+uniform /* type */ float amount; // intensity
+/* uniform int ignored;
+   still a comment */
+void shade(V2F i) { diffuseShadingOutput(vec3(amount)); }
+"#;
+        let shader = import("Endpoints", source).unwrap();
+        let parameter = &shader.parameters[0];
+        for value in [0.1, 0.9] {
+            assert!(validate_value(parameter, &json!(value)).is_ok());
+        }
+        for value in [0.099999999, 0.900000001] {
+            assert!(validate_value(parameter, &json!(value)).is_err());
+        }
+        assert!(import("Upper endpoint", &source.replace("\"default\":0.1", "\"default\":0.9")).is_ok());
+    }
+
+    #[test]
+    fn library_imports_scope_aliases_and_named_sampler_defaults_are_explicitly_rejected() {
+        let local = "void shade(V2F i) { float facing=0.5; float normal_texture=0.25; diffuseShadingOutput(vec3(facing+normal_texture)); }";
+        assert!(import("Local names", local).is_ok());
+        let imported =
+            "import lib-pbr.glsl\nvoid shade(V2F i) { if (facing==0) diffuseShadingOutput(textureSparse(height_texture,i.sparse_coord).rgb*maxLod); }";
+        assert!(import("Transitive libraries", imported).is_ok());
+        let sampler = "//: param custom {\"default\":\"named-image\"}\nuniform sampler2D image;\nvoid shade(V2F i) { diffuseShadingOutput(texture(image,i.tex_coord).rgb); }";
+        assert!(import("Named default", sampler).unwrap_err().to_string().contains("named sampler defaults are unsupported"));
+        assert!(import("Color default", &sampler.replace("named-image", "")).is_ok());
+    }
 }

@@ -8,7 +8,7 @@ licensed and keep their license file next to them.
 
 | Path | Title | Author | Source | License |
 |---|---|---|---|---|
-| `examples/shaders/banded.glsl`, custom-shader test image inputs | Banded lighting shader and generated flat-color integration fixtures | TextureCraft contributors | Original GLSL and pixels written for this feature using the [published surface API](https://adobedocs.github.io/painter-shader-api/) (accessed 2026-11-28); no third-party shader source copied | MIT OR Apache-2.0 |
+| `examples/shaders/banded.glsl`, custom-shader test inputs in formats/engine/render/UI/automation | Banded lighting shader, inline GLSL regression inputs and generated flat-color integration fixtures | TextureCraft contributors | Original GLSL and pixels written for this feature using the [published surface API](https://adobedocs.github.io/painter-shader-api/) (accessed 2026-11-28); no third-party shader source copied | MIT OR Apache-2.0 |
 | `naga` 30.0.1 | GLSL compiler (unmodified dependency) | gfx-rs developers | https://crates.io/crates/naga/30.0.1 | MIT OR Apache-2.0; MIT notice in `NOTICE` |
 | `pp-rs` 0.2.1 | GLSL preprocessor (unmodified transitive dependency) | Corentin Wallez | https://crates.io/crates/pp-rs/0.2.1 | BSD-3-Clause; notice in `NOTICE` |
 | `unicode-xid` 0.2.6 | Identifier character tables (unmodified transitive dependency) | Rust Project Developers | https://crates.io/crates/unicode-xid/0.2.6 | MIT OR Apache-2.0; MIT notice in `NOTICE` |

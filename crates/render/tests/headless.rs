@@ -34,6 +34,64 @@ fn custom_glsl_changes_material_render_and_parameter_edits_reach_the_gpu() {
         "clearing an image restores its default color",
     );
     assert_same(&pbr, &render(&mut h, &frame, "custom_shader_restored"), "returning to PBR restores its shader");
+
+    // Original regression shaders: exercise exact integer lanes, transparent normal inputs,
+    // default opacity, explicit shadow sampling and the uploaded camera orientation.
+    let probe = r#"
+//: param custom {"default":3}
+uniform int code;
+//: param custom {"default":[-1,2147483647,-2147483648,16777217]}
+uniform ivec4 codes;
+void shade(V2F i) {
+    bool exact = code==3 && codes.x==-1 && codes.y==2147483647 && codes.z==(-2147483647-1) && codes.w==16777217;
+    bool neutral_normal = dot(normalUnpack(vec4(0.0)),vec3(0.0,0.0,1.0))>0.99;
+    diffuseShadingOutput((exact && neutral_normal ? vec3(1.0,0.0,0.0) : vec3(0.0,1.0,0.0))*getShadowFactor());
+}
+"#;
+    let mut typed = texturecraft_formats::custom_shader::import("Exact lanes", probe).unwrap();
+    let red = texturecraft_formats::custom_shader::import("Red", "void shade(V2F i) { diffuseShadingOutput(vec3(1.0,0.0,0.0)); }").unwrap();
+    let expected = render(&mut h, &shaded(&frame, |s| s.custom_shader = Some(red)), "custom_shader_red");
+    let typed_frame = shaded(&frame, |s| s.custom_shader = Some(typed.clone()));
+    assert_same(&expected, &render(&mut h, &typed_frame, "custom_shader_exact_lanes"), "all integer lanes and transparent normals reach the shader correctly");
+    fill(&mut h, &[0, 1], DisplayKind::BaseColor, &[128, 128, 128, 64]);
+    assert_same(&expected, &render(&mut h, &typed_frame, "custom_shader_default_opacity"), "default shader opacity is independent of document opacity");
+    typed.parameters[1].value = serde_json::json!([-1, 2147483647, -2147483648, 16777216]);
+    let wrong = render(&mut h, &shaded(&frame, |s| s.custom_shader = Some(typed)), "custom_shader_changed_integer");
+    assert_ne!(expected.px, wrong.px, "a one-unit integer edit above float precision changes shading");
+
+    let view_probe = texturecraft_formats::custom_shader::import(
+        "Camera up",
+        "//: param auto camera_view_matrix\nuniform mat4 view;\nvoid shade(V2F i) { diffuseShadingOutput(abs((view*vec4(0.0,1.0,0.0,0.0)).xyz)); }",
+    )
+    .unwrap();
+    let mut level = shaded(&frame, |s| s.custom_shader = Some(view_probe));
+    level.camera.set_angles(0.0, 0.0);
+    let level_image = render(&mut h, &level, "custom_shader_level_camera");
+    let mut rolled = level.clone();
+    rolled.camera.free = true;
+    rolled.camera.orient = texturecraft_geom::glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+    assert!(level.camera.eye().distance(rolled.camera.eye()) < level.camera.distance * 1e-5, "rolling keeps the eye position within float precision");
+    assert!(level.camera.forward().distance(rolled.camera.forward()) < 1e-5, "rolling keeps the view direction within float precision");
+    let rolled_image = render(&mut h, &rolled, "custom_shader_rolled_camera");
+    let center = (level.size[0] / 2, level.size[1] / 2);
+    assert!(level_image.at(center.0, center.1)[1] > level_image.at(center.0, center.1)[0]);
+    assert!(rolled_image.at(center.0, center.1)[0] > rolled_image.at(center.0, center.1)[1], "camera roll turns the view-matrix up vector");
+
+    let sphere = primitives::sphere(1.0, 32, 16);
+    h.renderer.set_mesh(&h.device, &h.queue, &sphere, MESH_ID + 1);
+    let cutout = texturecraft_formats::custom_shader::import(
+        "Transparent front",
+        "void shade(V2F i) { diffuseShadingOutput(vec3(1.0,0.0,0.0)); alphaOutput(isBackFace()?1.0:0.0); }",
+    )
+    .unwrap();
+    let mut cutout_frame = shaded(&level, |s| s.custom_shader = Some(cutout));
+    let (lo, hi) = sphere.bounds();
+    cutout_frame.camera.frame(lo, hi);
+    let back = render(&mut h, &cutout_frame, "custom_shader_cutout_depth");
+    let mut backdrop_frame = cutout_frame.clone();
+    backdrop_frame.visible = vec![false, false];
+    let backdrop = render(&mut h, &backdrop_frame, "custom_shader_backdrop");
+    assert_ne!(back.at(center.0, center.1), backdrop.at(center.0, center.1), "transparent front faces leave the back faces visible");
 }
 
 struct Img {

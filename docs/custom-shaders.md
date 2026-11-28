@@ -37,7 +37,8 @@ Supported parameter types are `bool`, `int`, `float`, `vec2`–`vec4` and
 `ivec2`–`ivec4`. An integer `values` object supplies combobox choices. Optional
 `label`, `group`, `description`, `widget`, `min` and `max` metadata describe
 controls. Values are checked before editing the project. Custom `sampler2D`
-inputs use their `default_color` until assigned an imported image; automatic
+inputs use their `default_color` until assigned an imported image; their `default`
+must be the empty string (named default resources are unsupported). Automatic
 `channel_user0`–`channel_user7` inputs are also assignable.
 
 Material bindings include base color, roughness, metallic, ambient occlusion,
@@ -72,7 +73,7 @@ pipeline.
 | `shader.import` | `{name, source}` or `{path}`; adds a validated shader |
 | `shader.list` | `{}`; selected name, instance name, parameters, image inputs and support limits |
 | `shader.select` | `{name}`; imported name or `open-pbr` |
-| `shader.set` | `{parameters?: {uniform: value}, textures?: {input: resourceName | null}, instanceName?, reset?: bool}` |
+| `shader.set` | `{parameters?: {uniform: value}, textures?: {input: resourceName \| null}, instanceName?, reset?: bool}` |
 
 For MCP, use `shader_import {path}` to read a file below the configured
 automation read root. Use `command_run` for selection and parameter changes;

@@ -15,6 +15,18 @@ struct Cached {
     failed: bool,
 }
 
+#[derive(Clone)]
+struct PreviewError {
+    source: Weak<str>,
+    message: String,
+}
+
+impl PreviewError {
+    fn matches(&self, shader: &CustomShader) -> bool {
+        self.source.upgrade().is_some_and(|source| source == shader.source)
+    }
+}
+
 impl Cached {
     fn matches(&self, frame: &Frame, images: &ImageStore) -> bool {
         let current = image_keys(frame, images);
@@ -94,8 +106,15 @@ impl CallbackTrait for PreviewCallback {
                     },
                 );
             }
-            if let Some(error) = previews.renderer.take_shader_error() {
-                self.ctx.data_mut(|data| data.insert_temp(egui::Id::unique(("shader_preview_error", self.project, id)), error));
+            if let Some(error) = previews.renderer.take_shader_error()
+                && let Some(shader) = &self.frame.shade.custom_shader
+            {
+                self.ctx.data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::unique(("shader_preview_error", self.project, id)),
+                        PreviewError { source: Arc::downgrade(&shader.source), message: error },
+                    );
+                });
             }
             self.ctx.request_repaint();
         }
@@ -149,9 +168,11 @@ fn show(app: &crate::TextureCraftApp, ui: &egui::Ui, response: &egui::Response, 
     };
     let name = shader.map_or(crate::shader_settings::CURRENT_SHADER, |shader| shader.name.as_str());
     let id = egui::Id::unique(("shader_preview", name)).value();
-    let error = ui.data(|data| data.get_temp::<String>(egui::Id::unique(("shader_preview_error", app.session.project_id, id))));
+    let error = ui
+        .data(|data| data.get_temp::<PreviewError>(egui::Id::unique(("shader_preview_error", app.session.project_id, id))))
+        .filter(|error| shader.is_some_and(|shader| error.matches(shader)));
     if let Some(error) = error {
-        response.clone().on_hover_text(format!("{}: {error}", crate::i18n::tr("Shader preview unavailable")));
+        response.clone().on_hover_text(format!("{}: {}", crate::i18n::tr("Shader preview unavailable"), error.message));
         return;
     }
     let side = (response.rect.width() - 8.0).min(42.0);

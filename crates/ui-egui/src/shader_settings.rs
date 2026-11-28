@@ -272,9 +272,8 @@ fn custom_parameters(app: &mut TextureCraftApp, ui: &mut Ui, shader: &texturecra
                 value = serde_json::json!(color);
                 changed
             } else {
-                let mut values: Vec<f32> = value
-                    .as_array()
-                    .map_or_else(|| vec![value.as_f64().unwrap_or(0.0) as f32], |a| a.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect());
+                let mut values: Vec<f64> =
+                    value.as_array().map_or_else(|| vec![value.as_f64().unwrap_or(0.0)], |a| a.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect());
                 let mut changed = false;
                 for (i, v) in values.iter_mut().enumerate() {
                     let label = if p.value.is_array() { format!("{} {}", tr(&p.label), i + 1) } else { tr(&p.label).to_string() };

@@ -1018,7 +1018,10 @@ impl Renderer {
     }
 
     fn prepare_custom_shader(&mut self, device: &wgpu::Device, shader: Option<&texturecraft_core::custom_shader::CustomShader>) {
-        let Some(shader) = shader else { return };
+        let Some(shader) = shader else {
+            self.resolve_custom_shader();
+            return;
+        };
         if self.custom_source.as_deref() == Some(shader.wgsl.as_ref()) {
             self.resolve_custom_shader();
             return;
@@ -2029,7 +2032,7 @@ impl Renderer {
             ],
         });
         ViewTargets {
-            shader_parameters: uniform("tc_shader_parameters", texturecraft_core::custom_shader::MAX_SHADER_PARAMETERS * 16),
+            shader_parameters: uniform("tc_shader_parameters", 64 + texturecraft_core::custom_shader::MAX_SHADER_PARAMETERS * 16),
             size,
             msaa: target_view(device, "tc_msaa", size, self.hdr_format, MSAA),
             depth: target_view(device, "tc_depth", size, DEPTH_FORMAT, MSAA),
@@ -2345,7 +2348,8 @@ impl Renderer {
         let Some(v) = self.views.get(&frame.view_id) else { return };
         let Some(globals_bg) = v.globals_bg.as_ref() else { return };
         if let Some(shader) = &frame.shade.custom_shader {
-            queue.write_buffer(&v.shader_parameters, 0, bytemuck::cast_slice(&shader.uniform_values()));
+            queue.write_buffer(&v.shader_parameters, 0, bytemuck::cast_slice(&frame.camera.view().to_cols_array_2d()));
+            queue.write_buffer(&v.shader_parameters, 64, bytemuck::cast_slice(&shader.uniform_values()));
         }
         if refraction && let Some(b) = &v.behind {
             self.behind_pass(encoder, v, b, globals_bg, frame);

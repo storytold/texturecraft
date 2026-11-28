@@ -34,13 +34,11 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     let path = strp(p, "path").ok_or_else(|| bad("shader.import", "source and name, or path, are required"))?;
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        std::fs::File::open(path)
-            .map_err(|e| bad("shader.import", e.to_string()))?
-            .take((texturecraft_formats::custom_shader::MAX_SHADER_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|e| bad("shader.import", e.to_string()))?;
+        let bytes = crate::resource_cmds::read_resource_file(
+            "shader.import",
+            std::path::Path::new(path),
+            texturecraft_formats::custom_shader::MAX_SHADER_BYTES as u64,
+        )?;
         let source = std::str::from_utf8(&bytes).map_err(|_| bad("shader.import", "shader must be UTF-8"))?;
         let name = std::path::Path::new(path).file_stem().and_then(|v| v.to_str()).ok_or_else(|| bad("shader.import", "shader filename is invalid"))?;
         import_source(s, name, source)

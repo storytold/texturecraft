@@ -36,10 +36,7 @@ struct V2F { vec3 position; vec3 normal; vec3 tangent; vec3 bitangent; vec2 tex_
 struct LocalVectors { vec3 normal; vec3 tangent; vec3 bitangent; vec3 eye; };
 bool isBackFace() { return !gl_FrontFacing; }
 mat4 tc_camera_view() {
-    vec3 forward = normalize(g.fwd.xyz);
-    vec3 right = normalize(cross(forward,vec3(0.0,1.0,0.0)));
-    vec3 up = cross(right,forward);
-    return mat4(vec4(right.x,up.x,-forward.x,0.0),vec4(right.y,up.y,-forward.y,0.0),vec4(right.z,up.z,-forward.z,0.0),vec4(-dot(right,g.eye.xyz),-dot(up,g.eye.xyz),dot(forward,g.eye.xyz),1.0));
+    return tc_params.camera_view;
 }
 vec3 tc_diffuse = vec3(0.0);
 vec3 tc_specular = vec3(0.0);
@@ -50,18 +47,18 @@ float tc_alpha = 1.0;
 vec4 textureSparse(SamplerSparse s, SparseCoord coord) {
     vec2 uv = coord.tex_coord;
     if (s.channel >= 16) return texture(TCInputTexture(s.channel-16),uv);
-    if (s.channel == 0) { return texture(sampler2D(tc_base, tc_sampler), uv); }
-    if (s.channel == 1) { return vec4(texture(sampler2D(tc_orm, tc_sampler), uv).g); }
-    if (s.channel == 2) { return vec4(texture(sampler2D(tc_orm, tc_sampler), uv).b); }
-    if (s.channel == 3) { return vec4(texture(sampler2D(tc_orm, tc_sampler), uv).r); }
-    if (s.channel == 4) { return texture(sampler2D(tc_normal, tc_sampler), uv); }
-    if (s.channel == 5) { return texture(sampler2D(tc_height, tc_sampler), uv); }
-    if (s.channel == 6) { return texture(sampler2D(tc_emissive, tc_sampler), uv); }
-    if (s.channel == 7) { return vec4(texture(sampler2D(tc_base, tc_sampler), uv).a); }
-    if (s.channel == 8) { return vec4(texture(sampler2D(tc_orm, tc_sampler), uv).a); }
-    if (s.channel == 9) { return vec4(texture(sampler2D(tc_maps, tc_sampler), uv).r); }
-    if (s.channel == 10) { return vec4(texture(sampler2D(tc_maps, tc_sampler), uv).g); }
-    if (s.channel == 11) { return vec4(texture(sampler2D(tc_maps, tc_sampler), uv).b); }
+    if (s.channel == 0) { return textureGrad(sampler2D(tc_base, tc_sampler), uv, coord.dx, coord.dy); }
+    if (s.channel == 1) { return vec4(textureGrad(sampler2D(tc_orm, tc_sampler), uv, coord.dx, coord.dy).g); }
+    if (s.channel == 2) { return vec4(textureGrad(sampler2D(tc_orm, tc_sampler), uv, coord.dx, coord.dy).b); }
+    if (s.channel == 3) { return vec4(textureGrad(sampler2D(tc_orm, tc_sampler), uv, coord.dx, coord.dy).r); }
+    if (s.channel == 4) { return textureGrad(sampler2D(tc_normal, tc_sampler), uv, coord.dx, coord.dy); }
+    if (s.channel == 5) { return textureGrad(sampler2D(tc_height, tc_sampler), uv, coord.dx, coord.dy); }
+    if (s.channel == 6) { return textureGrad(sampler2D(tc_emissive, tc_sampler), uv, coord.dx, coord.dy); }
+    if (s.channel == 7) { return vec4(textureGrad(sampler2D(tc_base, tc_sampler), uv, coord.dx, coord.dy).a); }
+    if (s.channel == 8) { return vec4(textureGrad(sampler2D(tc_orm, tc_sampler), uv, coord.dx, coord.dy).a); }
+    if (s.channel == 9) { return vec4(textureGrad(sampler2D(tc_maps, tc_sampler), uv, coord.dx, coord.dy).r); }
+    if (s.channel == 10) { return vec4(textureGrad(sampler2D(tc_maps, tc_sampler), uv, coord.dx, coord.dy).g); }
+    if (s.channel == 11) { return vec4(textureGrad(sampler2D(tc_maps, tc_sampler), uv, coord.dx, coord.dy).b); }
     return vec4(0.0);
 }
 vec4 textureSparse(SamplerSparse s, vec2 uv) { return textureSparse(s, SparseCoord(uv, dFdx(uv), dFdy(uv))); }
@@ -128,7 +125,10 @@ vec3 pbrComputeSpecular(LocalVectors frame,vec3 f0,vec3 f82,float roughness,floa
     return pbrComputeSpecular(frame,mix(f0,f82,grazing),roughness,occlusion,bentNormalSpecularAmount);
 }
 vec3 pbrComputeSpecular(LocalVectors frame,vec3 f0,vec3 f82,float roughness) { return pbrComputeSpecular(frame,f0,f82,roughness,1.0,0.0); }
-vec3 normalUnpack(vec4 value,float y_coeff) { return normalize((value.xyz*2.0-1.0)*vec3(1.0,y_coeff,1.0)); }
+vec3 normalUnpack(vec4 value,float y_coeff) {
+    if (value.a == 0.0) return vec3(0.0,0.0,1.0);
+    return normalize((value.xyz*2.0-1.0)*vec3(1.0,y_coeff,1.0));
+}
 vec3 normalUnpack(vec4 value) { return normalUnpack(value,g.mode.w); }
 vec3 normalBlend(vec3 base,vec3 over) { return normalize(vec3(base.xy+over.xy,base.z*over.z)); }
 vec3 normalBlendOriented(vec3 base,vec3 over) {
@@ -142,7 +142,7 @@ vec3 normalFromHeight(SparseCoord coord,float force) {
     float right=texture(sampler2D(tc_height,tc_sampler),coord.tex_coord+vec2(step_uv.x,0.0)).r;
     float above=texture(sampler2D(tc_height,tc_sampler),coord.tex_coord-vec2(0.0,step_uv.y)).r;
     float below=texture(sampler2D(tc_height,tc_sampler),coord.tex_coord+vec2(0.0,step_uv.y)).r;
-    return normalize(vec3((left-right)*force,(above-below)*force,1.0));
+    return normalize(vec3((left-right)*force,(below-above)*force,1.0));
 }
 vec3 getTSNormal(SparseCoord c) { return normalize(texture(sampler2D(tc_normal,tc_sampler),c.tex_coord).xyz*vec3(1.0,g.mode.w,1.0)); }
 vec3 getTSNormal(SparseCoord c,SamplerSparse s) { return s.channel==4 ? getTSNormal(c) : normalUnpack(textureSparse(s,c)); }
@@ -172,7 +172,7 @@ float getShadowFactor(vec3 position) {
     vec3 projected = clip.xyz / clip.w;
     vec2 uv = projected.xy * vec2(0.5,-0.5) + 0.5;
     if (projected.z < 0.0 || projected.z > 1.0 || any(lessThan(uv,vec2(0.0))) || any(greaterThan(uv,vec2(1.0)))) return 1.0;
-    float visible = texture(sampler2DShadow(tc_shadow_map,tc_shadow_sampler),vec3(uv,projected.z));
+    float visible = textureLod(sampler2DShadow(tc_shadow_map,tc_shadow_sampler),vec3(uv,projected.z),0.0);
     return mix(1.0,visible,g.shadow.w);
 }
 float getShadowFactor() { return getShadowFactor(tc_position); }

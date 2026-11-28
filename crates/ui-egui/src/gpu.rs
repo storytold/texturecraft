@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use rayon::prelude::*;
 use texturecraft_engine::Session;
-use texturecraft_engine::compose::{DisplayKind, ImageRes, kinds_for, tile_bytes};
-use texturecraft_engine::core::{BakedMap, Channel, LayerId};
+use texturecraft_engine::compose::{BakedMaps, DisplayKind, ImageRes, StackKey, kinds_for, tile_bytes};
+use texturecraft_engine::core::{BakedMap, BlockScales, Channel, LayerId};
 use texturecraft_engine::geom::Mesh;
 use texturecraft_render::{BakeVisualization, CageGeometry, Frame, Renderer, wgpu};
 
@@ -102,6 +102,8 @@ pub struct GpuLink {
     env: (String, Option<Weak<ImageRes>>),
     /// What each set's aux texture holds: (view key, revision).
     aux: BTreeMap<usize, (String, u64)>,
+    shader_maps: BTreeMap<usize, ShaderMapsKey>,
+    mask_keys: BTreeMap<usize, MaskKey>,
     /// Image identity without holding its decoded pixels alive.
     aux_image: Option<Weak<ImageRes>>,
     /// Weak identity of the last uploaded ID mask image.
@@ -115,6 +117,40 @@ pub struct GpuLink {
     /// Most tiles waiting to be composited since compositing last caught up (progress).
     composite_total: usize,
     bake_scene: BakeSceneLink,
+}
+
+struct ShaderMapsKey {
+    size: (u32, u32),
+    resolution: u32,
+    scales: BlockScales,
+    baked_resolution: u32,
+    maps: [Option<Weak<Vec<f32>>>; 3],
+}
+
+impl ShaderMapsKey {
+    fn matches(&self, other: &Self) -> bool {
+        self.size == other.size
+            && self.resolution == other.resolution
+            && self.scales == other.scales
+            && self.baked_resolution == other.baked_resolution
+            && self.maps.iter().zip(&other.maps).all(|(old, new)| old.as_ref().map(Weak::as_ptr) == new.as_ref().map(Weak::as_ptr))
+    }
+}
+
+struct MaskKey {
+    resolution: u32,
+    inputs: Option<StackKey>,
+    // Keep baked allocations' identities unique without retaining their pixels.
+    baked: Vec<Weak<Vec<f32>>>,
+}
+
+impl MaskKey {
+    fn matches(&self, other: &Self) -> bool {
+        self.resolution == other.resolution
+            && self.inputs == other.inputs
+            && self.baked.len() == other.baked.len()
+            && self.baked.iter().zip(&other.baked).all(|(old, new)| old.ptr_eq(new))
+    }
 }
 
 /// Compositing time per frame: a full recomposite of a large texture set spreads over frames.
@@ -168,6 +204,8 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         shift: 0,
         env: Default::default(),
         aux: BTreeMap::new(),
+        shader_maps: BTreeMap::new(),
+        mask_keys: BTreeMap::new(),
         aux_image: None,
         aux_id_mask: None,
         sent: HashMap::new(),
@@ -227,6 +265,8 @@ impl GpuLink {
             out.mesh = Some((session.mesh.clone(), session.mesh_id));
             self.mesh_id = session.mesh_id;
             self.aux.clear();
+            self.shader_maps.clear();
+            self.mask_keys.clear();
             self.aux_id_mask = None;
         }
 
@@ -308,15 +348,31 @@ impl GpuLink {
             self.aux_id_mask = None;
         }
 
+        if !matches!(aux_map, Some(AuxView::Mask(_))) {
+            self.mask_keys.clear();
+        }
+        if !matches!(aux_map, Some(AuxView::ShaderMaps)) {
+            self.shader_maps.clear();
+        }
         match aux_map {
             Some(AuxView::ShaderMaps) => {
                 for (index, set) in session.doc.project.texture_sets.iter().enumerate() {
-                    let key = ("shader_maps".to_string(), session.revision);
-                    if self.aux.get(&index) != Some(&key) {
-                        let resolution = texturecraft_render::aux_size(set.size());
-                        let rgba = texturecraft_render::mesh_maps::shader_maps_rgba(session.doc.baked.get(&index), resolution, set.size(), &set.block_scales());
+                    let key = ("shader_maps".to_string(), 0);
+                    let resolution = texturecraft_render::aux_size(set.size());
+                    let baked = session.doc.baked.get(&index);
+                    let inputs = ShaderMapsKey {
+                        size: set.size(),
+                        resolution,
+                        scales: set.block_scales(),
+                        baked_resolution: baked.map_or(0, |b| b.resolution),
+                        maps: [BakedMap::Curvature, BakedMap::Thickness, BakedMap::AmbientOcclusion]
+                            .map(|map| baked.and_then(|b| b.maps.get(&map)).map(Arc::downgrade)),
+                    };
+                    if self.aux.get(&index) != Some(&key) || !self.shader_maps.get(&index).is_some_and(|old| old.matches(&inputs)) {
+                        let rgba = texturecraft_render::mesh_maps::shader_maps_rgba(baked, resolution, inputs.size, &inputs.scales);
                         out.aux.push((index, resolution, rgba));
                         self.aux.insert(index, key);
+                        self.shader_maps.insert(index, inputs);
                     }
                 }
             }
@@ -327,13 +383,23 @@ impl GpuLink {
             }
             Some(AuxView::Mask(id)) => {
                 if let Some((texture_set, _, _)) = session.doc.project.locate(id) {
-                    let key = (format!("mask{}", id.0), session.revision);
-                    if self.aux.get(&texture_set) != Some(&key) && !session.stroke_active() {
-                        let resolution =
-                            session.caches.get(texture_set).map_or(MASK_VIEW_FALLBACK_RESOLUTION, |cache| texturecraft_render::aux_size(cache.size));
+                    let key = (format!("mask{}", id.0), 0);
+                    let resolution = session.caches.get(texture_set).map_or(MASK_VIEW_FALLBACK_RESOLUTION, |cache| texturecraft_render::aux_size(cache.size));
+                    let empty = BakedMaps::default();
+                    let baked = session.doc.baked.get(&texture_set).unwrap_or(&empty);
+                    let roots = &session.doc.project.texture_sets[texture_set].stack;
+                    let inputs = MaskKey {
+                        resolution,
+                        inputs: StackKey::new(&session.doc.project, &session.doc.pixels, baked, &session.images, texture_set, roots),
+                        baked: baked.maps.values().map(Arc::downgrade).collect(),
+                    };
+                    if (self.aux.get(&texture_set) != Some(&key) || !self.mask_keys.get(&texture_set).is_some_and(|old| old.matches(&inputs)))
+                        && !session.stroke_active()
+                    {
                         let rgba = session.mask_view_rgba(id, resolution).unwrap_or_else(|| MASK_VIEW_BLANK.repeat((resolution * resolution) as usize));
                         out.aux.push((texture_set, resolution, rgba));
                         self.aux.insert(texture_set, key);
+                        self.mask_keys.insert(texture_set, inputs);
                     }
                 }
 
@@ -622,6 +688,8 @@ mod tests {
             shift: 0,
             env: Default::default(),
             aux: BTreeMap::new(),
+            shader_maps: BTreeMap::new(),
+            mask_keys: BTreeMap::new(),
             aux_image: None,
             aux_id_mask: None,
             sent: HashMap::new(),
@@ -658,6 +726,10 @@ mod tests {
             assert_eq!(blank, *set != owner, "set {set}: only the other sets are blank");
         }
         drop(out);
+
+        s.camera.yaw += 0.2;
+        s.revision += 1;
+        assert!(gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0).aux.is_empty(), "camera changes reuse mask pixels");
         let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0);
         assert!(out.aux.is_empty(), "nothing is sent again while the view stays");
         drop(out);
@@ -678,6 +750,24 @@ mod tests {
         let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0);
         assert_eq!(out.aux.len(), 1, "re-enabling the mask uploads its values again");
         assert!(out.aux[0].2.chunks(4).any(|pixel| pixel != MASK_VIEW_BLANK));
+    }
+
+    #[test]
+    fn shader_map_uploads_follow_baked_inputs_and_layout_instead_of_camera_changes() {
+        let mut gpu = link();
+        let mut s = session(false);
+        let baked = BakedMaps { resolution: 2, maps: [(BakedMap::Curvature, Arc::new(vec![0.25; 4]))].into() };
+        s.doc.baked.insert(0, baked);
+        let first = gpu.sync(&mut s, Some(AuxView::ShaderMaps), None, 0, 0.0);
+        assert!(!first.aux.is_empty());
+        s.camera.yaw += 0.2;
+        s.revision += 1;
+        assert!(gpu.sync(&mut s, Some(AuxView::ShaderMaps), None, 0, 0.0).aux.is_empty());
+        s.doc.baked.get_mut(&0).unwrap().maps.insert(BakedMap::Curvature, Arc::new(vec![0.75; 4]));
+        let changed = gpu.sync(&mut s, Some(AuxView::ShaderMaps), None, 0, 0.0);
+        assert_ne!(first.aux[0].2, changed.aux[0].2);
+        execute(&mut s, "textureSet.resolution", &json!({"resolution":256})).unwrap();
+        assert!(!gpu.sync(&mut s, Some(AuxView::ShaderMaps), None, 0, 0.0).aux.is_empty());
     }
 
     #[test]

@@ -40,7 +40,9 @@ pub fn import_shader(app: &mut TextureCraftApp, _ctx: &egui::Context) {
 }
 
 fn import_shader_source(app: &mut TextureCraftApp, name: &str, source: &str) {
-    if app.run("shader.import", serde_json::json!({"name":name,"source":source})).is_some() {
+    if let Some(result) = app.run("shader.import", serde_json::json!({"name":name,"source":source}))
+        && let Some(name) = result.get("name").and_then(serde_json::Value::as_str)
+    {
         select_imported_shader(app, name);
     }
 }
@@ -81,10 +83,20 @@ enum Pick {
 /// Files picked in the browser, waiting for the next frame: (file name, bytes, purpose).
 static INBOX: Mutex<Vec<(String, Vec<u8>, Pick)>> = Mutex::new(Vec::new());
 
+#[cfg(target_arch = "wasm32")]
+static PICK_ERRORS: Mutex<Vec<(String, Pick)>> = Mutex::new(Vec::new());
+
 /// Load files that arrived since the last frame. Call once per frame.
 pub fn poll(app: &mut TextureCraftApp) {
     let picked = std::mem::take(&mut *INBOX.lock().unwrap_or_else(PoisonError::into_inner));
     apply_picked(app, picked);
+    #[cfg(target_arch = "wasm32")]
+    for (message, pick) in std::mem::take(&mut *PICK_ERRORS.lock().unwrap_or_else(PoisonError::into_inner)) {
+        if matches!(pick, Pick::Shader(id) if app.session.project_open && id == app.session.project_id) {
+            app.toast(message, true);
+            app.announce_latest_toast();
+        }
+    }
 }
 
 fn apply_picked(app: &mut TextureCraftApp, picked: Vec<(String, Vec<u8>, Pick)>) {
@@ -358,6 +370,10 @@ mod web {
             let dialog = rfd::AsyncFileDialog::new().add_filter(filter, exts);
             let files = if multiple { dialog.pick_files().await.unwrap_or_default() } else { dialog.pick_file().await.into_iter().collect() };
             for file in files {
+                if matches!(kind, Pick::Shader(_)) && file.inner().size() > texturecraft_engine::formats::custom_shader::MAX_SHADER_BYTES as f64 {
+                    PICK_ERRORS.lock().unwrap_or_else(PoisonError::into_inner).push((tr("GLSL shader exceeds 1 MiB"), kind));
+                    continue;
+                }
                 let bytes = file.read().await;
                 INBOX.lock().unwrap_or_else(PoisonError::into_inner).push((file.file_name(), bytes, kind));
             }
@@ -488,6 +504,22 @@ mod tests {
     use super::*;
 
     use egui_kittest::Harness;
+
+    #[test]
+    fn browser_shader_pick_selects_the_normalized_name_and_announces_it() {
+        use egui_kittest::kittest::{NodeT as _, Queryable as _};
+        let session = texturecraft_engine::sample_session(128, 32).unwrap();
+        let mut harness =
+            Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|context| TextureCraftApp::new(context, session));
+        let project = harness.state().session.project_id;
+        apply_picked(
+            harness.state_mut(),
+            vec![(" Banded .glsl".into(), include_bytes!("../../../examples/shaders/banded.glsl").to_vec(), Pick::Shader(project))],
+        );
+        assert_eq!(harness.state().session.doc.project.display.custom_shader.as_deref(), Some("Banded"));
+        harness.run_steps(3);
+        assert!(harness.get_all_by_label("Shader selected: Banded").any(|message| message.accesskit_node().live() == egui::accesskit::Live::Polite));
+    }
 
     #[test]
     fn mesh_picks_only_update_the_current_new_project_request() {

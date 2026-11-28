@@ -30,4 +30,4 @@ layout(set=0,binding=0,std140) uniform TCGlobals {
     vec4 bake_bent_normal;
     vec4 uv_rotation;
 } g;
-layout(set=0,binding=5,std140) uniform TCParameters { vec4 values[128]; } tc_params;
+layout(set=0,binding=5,std140) uniform TCParameters { mat4 camera_view; uvec4 values[128]; } tc_params;

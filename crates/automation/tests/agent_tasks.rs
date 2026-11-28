@@ -347,13 +347,22 @@ async fn paths_outside_the_workspace_are_rejected() {
         tool_err(&c, "project_open", json!({"path": path})).await;
         tool_err(&c, "mesh_import", json!({"path": path})).await;
         tool_err(&c, "resource_import", json!({"path": path})).await;
-        tool_err(&c, "shader_import", json!({"path": path})).await;
+        let error = tool_err(&c, "shader_import", json!({"path": path})).await;
+        assert!(error.contains("path rejected"), "{path}: {error}");
         tool_err(&c, "material_load", json!({"path": path})).await;
         tool_err(&c, "material_save", json!({"path": path})).await;
         tool_err(&c, "project_save", json!({"path": path})).await;
         tool_err(&c, "mesh_export", json!({"path": path})).await;
         tool_err(&c, "mesh_reimport", json!({"path": path})).await;
         tool_err(&c, "bake_mesh_add", json!({"path": path})).await;
+    }
+    std::fs::write(outside.join("outside.glsl"), include_str!("../../../examples/shaders/banded.glsl")).unwrap();
+    std::fs::write(root.join("inside.glsl"), include_str!("../../../examples/shaders/banded.glsl")).unwrap();
+    tool(&c, "shader_import", json!({"path":"inside.glsl"})).await;
+    let shader_abs = outside.join("outside.glsl").display().to_string();
+    for path in ["../outside/outside.glsl", shader_abs.as_str(), "C:/outside.glsl", "a/../../outside/outside.glsl", "a\\..\\outside.glsl"] {
+        let error = tool_err(&c, "shader_import", json!({"path":path})).await;
+        assert!(error.contains("path rejected"), "{path}: {error}");
     }
     let e = tool_err(&c, "textures_export", json!({"dir": "../outside/tex"})).await;
     assert!(e.contains("rejected"), "{e}");
