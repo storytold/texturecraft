@@ -260,15 +260,28 @@ pub(crate) fn history(app: &mut TextureCraftApp, ui: &mut Ui) {
     let tokens = Tokens::get(ui.ctx());
     let (done, undone) = (app.session.history_labels(), app.session.redo_labels());
     let done_count = done.len() as i64;
-    let rows = std::iter::once((tr("Project opened").to_owned(), tokens.text_dim))
-        .chain(done.iter().map(|label| (tr_history(label), tokens.text)))
-        .chain(undone.iter().map(|label| (trf("{action} (undone)", &[("action", &tr_history(label))]), tokens.text_dim)));
+    let total_rows = 1 + done.len() + undone.len();
+
+    // Only new steps or a new container (with its own scroll) bring the current one into view; a tool change keeps the user's scroll
+    let shown = Some((ui.make_persistent_id("history"), done.len(), undone.len(), done.last().cloned()));
+    let follow = app.ui.history_shown != shown;
+    app.ui.history_shown = shown;
 
     // A click on a step goes back (or forward) to it: steps to undo, or to redo when negative
     let mut jump = 0i64;
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        for (row, (name, color)) in rows.enumerate() {
+
+    let area = egui::ScrollArea::vertical().id_salt("history").auto_shrink([false, false]);
+    crate::log_panel::panel_rows(ui, area, HISTORY_ROW_HEIGHT, total_rows, |ui, range| {
+        if follow {
+            let top = ui.max_rect().top() + (done.len() as f32 - range.start as f32) * HISTORY_ROW_HEIGHT;
+            let current = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=top + HISTORY_ROW_HEIGHT);
+            ui.scroll_to_rect_animation(current, None, egui::style::ScrollAnimation::none());
+        }
+
+        // Only the shown rows are translated
+        for row in range {
+            let Some((name, color)) = history_row_name(&done, &undone, row, &tokens) else { continue };
+
             // Each row is the state after that many steps
             let steps = done_count - row as i64;
             if history_row(ui, &tokens, &name, color, steps == 0).on_hover_text(tr("Return to this step")).clicked() {
@@ -289,10 +302,22 @@ pub(crate) fn history(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
 }
 
+/// The name and colour of History row `row`: the opened project, then the done steps, then the undone ones
+fn history_row_name(done: &[String], undone: &[String], row: usize, tokens: &Tokens) -> Option<(String, egui::Color32)> {
+    let Some(step) = row.checked_sub(1) else { return Some((tr("Project opened").to_owned(), tokens.text_dim)) };
+    if let Some(label) = done.get(step) {
+        return Some((tr_history(label), tokens.text));
+    }
+
+    let label = undone.get(step - done.len())?;
+    Some((trf("{action} (undone)", &[("action", &tr_history(label))]), tokens.text_dim))
+}
+
 /// One History row across the panel: a band under the pointer, the current step outlined
 fn history_row(ui: &mut Ui, tokens: &Tokens, name: &str, color: egui::Color32, current: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), HISTORY_ROW_HEIGHT), egui::Sense::click());
     response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, current, name));
+    crate::log_panel::reveal_focused_row(ui, &response, rect);
     if !ui.is_rect_visible(rect) {
         return response;
     }

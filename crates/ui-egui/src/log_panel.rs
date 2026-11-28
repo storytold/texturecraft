@@ -11,6 +11,59 @@ mod log_channel;
 
 pub use log_channel::LogChannel;
 
+/// The width of the History and Log lists' scrollbars
+const LIST_SCROLLBAR_WIDTH: f32 = 8.0;
+const LIST_SCROLLBAR_RADIUS: u8 = 3;
+/// The air between a list's scrollbar and the list's edge, and between the rows and the scrollbar
+const LIST_SCROLLBAR_OUTER_MARGIN: f32 = 2.0;
+const LIST_SCROLLBAR_INNER_MARGIN: f32 = 1.0;
+
+/// A newly focused row of a list scrolls in with a neighbour on each side: only shown rows are laid out, so Tab needs the next one there
+pub(crate) fn reveal_focused_row(ui: &Ui, response: &egui::Response, row: egui::Rect) {
+    if response.gained_focus() {
+        // The shown width, so the list never moves sideways
+        let around = egui::Rect::from_x_y_ranges(ui.clip_rect().x_range(), row.y_range()).expand2(egui::vec2(0.0, row.height()));
+        ui.scroll_to_rect_animation(around, None, egui::style::ScrollAnimation::none());
+    }
+}
+
+/// Show `total_rows` rows of `row_height` in `area` under a solid, always shown, themed scrollbar
+pub(crate) fn panel_rows<R>(
+    ui: &mut Ui,
+    area: egui::ScrollArea,
+    row_height: f32,
+    total_rows: usize,
+    add_rows: impl FnOnce(&mut Ui, std::ops::Range<usize>) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    let tokens = Tokens::get(ui.ctx());
+    let row_visuals = ui.visuals().clone();
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.spacing_mut().scroll = egui::style::ScrollStyle {
+            bar_width: LIST_SCROLLBAR_WIDTH,
+            bar_outer_margin: LIST_SCROLLBAR_OUTER_MARGIN,
+            bar_inner_margin: LIST_SCROLLBAR_INNER_MARGIN,
+            ..egui::style::ScrollStyle::solid()
+        };
+
+        let visuals = ui.visuals_mut();
+        visuals.extreme_bg_color = tokens.field;
+        // The thumb stands 3:1 or more off its track in every theme, brighter under the pointer
+        visuals.widgets.inactive.bg_fill = tokens.text_dim;
+        visuals.widgets.hovered.bg_fill = tokens.text;
+        visuals.widgets.active.bg_fill = tokens.text;
+        for widget in [&mut visuals.widgets.inactive, &mut visuals.widgets.hovered, &mut visuals.widgets.active] {
+            widget.corner_radius = egui::CornerRadius::same(LIST_SCROLLBAR_RADIUS);
+        }
+
+        area.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show_rows(ui, row_height, total_rows, |ui, rows| {
+            *ui.visuals_mut() = row_visuals;
+            add_rows(ui, rows)
+        })
+    })
+    .inner
+}
+
 /// The entries a tab lists, as indices into the session log
 fn listed(app: &TextureCraftApp, channel: LogChannel) -> Vec<usize> {
     app.session.log.iter().enumerate().filter(|(_, entry)| channel_of(entry) == channel).map(|(index, _)| index).collect()
