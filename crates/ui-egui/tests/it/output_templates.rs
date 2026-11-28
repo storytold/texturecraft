@@ -460,21 +460,35 @@ fn the_map_lists_stand_in_three_panes_with_their_groups_and_names() {
     let h = harness(&library);
 
     let input = h.get_by_label("Input maps").rect();
+
     // A built-in template is called "Mesh maps" too: the pane's title comes after the Presets list
     let mesh = h.get_all_by_label("Mesh maps").last().unwrap().rect();
     let converted = h.get_by_label("Converted maps").rect();
 
     assert!(mesh.left() > input.right(), "Mesh maps stand in a column right of Input maps");
     assert!(converted.top() > mesh.bottom() && (converted.left() - mesh.left()).abs() < 2.0, "Converted maps stand below Mesh maps");
-    for group in ["Transmission", "Subsurface", "Sheen", "Thin film", "Other"] {
+    for group in ["Transmission", "Subsurface", "Sheen", "Thin film", "Other", "User"] {
         assert!(h.query_all_by_label(group).next().is_some(), "group {group}");
     }
-    for name in ["Specular level", "Sheen weight", "Coat normal", "Emissive", "World Space Normal", "Bent Normals", "Normal DirectX", "F0 from specular level"]
-    {
+    for name in [
+        "Specular level",
+        "Sheen weight",
+        "Coat normal",
+        "Emissive",
+        "World Space Normal",
+        "Bent Normals",
+        "Normal DirectX",
+        "F0 from specular level",
+        "Base weight",
+        "Coat tangent",
+        "Thin-film weight",
+        "Subsurface radius scale",
+        "User31",
+    ] {
         let entry = h.query_all_by_label(name).next().unwrap_or_else(|| panic!("{name}"));
         assert!(!entry.accesskit_node().is_disabled(), "{name} can be dragged");
     }
-    for name in ["Base weight", "Coat tangent", "Thin film weight", "Subsurface radius"] {
+    for name in ["Coat IOR", "Thin film thickness"] {
         let entry = h.query_all_by_label(name).next().unwrap_or_else(|| panic!("{name}"));
         assert!(entry.accesskit_node().is_disabled(), "{name} is listed greyed");
     }

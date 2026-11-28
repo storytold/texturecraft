@@ -74,6 +74,25 @@ fn a_texture_set_page_shows_what_it_inherits() {
 }
 
 #[test]
+fn rectangular_export_sizes_follow_the_plan_in_settings_and_the_file_list() {
+    let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
+    session.doc.project.texture_sets[0].set_size(256, 128);
+    let mut h = harness_with_session(session);
+
+    assert!(h.query_by_label("256x128 (Texture Set size)").is_some());
+    toggle(&mut h, 2);
+    let size = h.get_all_by_role(egui::Role::ComboBox).find(|node| node.value().as_deref() == Some("256x128 (Texture Set size)")).unwrap();
+    size.click();
+    h.run_steps(4);
+    click(&mut h, "128x64");
+
+    h.state_mut().ui.export.tab = 2;
+    h.run_steps(4);
+
+    assert!(h.query_all_by_label("128x64").next().is_some());
+}
+
+#[test]
 fn an_override_turns_the_row_into_a_list_and_marks_the_set() {
     let mut h = harness();
     let own = h.state().session.doc.project.texture_sets[0].resolution;

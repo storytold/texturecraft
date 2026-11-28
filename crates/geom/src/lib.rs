@@ -13,6 +13,8 @@ pub mod mesh;
 pub mod primitives;
 pub mod triangle_partition;
 pub mod unwrap;
+mod uv_seam;
+mod uv_seam_side;
 
 pub use bvh::{Bvh, Hit};
 pub use camera::{OrbitCamera, Ray};
@@ -20,6 +22,8 @@ pub use gbuffer::{NO_TRI, Surface, UvGBuffer, surface_at};
 pub use glam;
 pub use mesh::{BaseColor, MAX_TRIANGLES, Mesh, SubMesh};
 pub use triangle_partition::TrianglePartition;
+pub use uv_seam::UvSeam;
+pub use uv_seam_side::UvSeamSide;
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum GeomError {

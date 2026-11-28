@@ -57,9 +57,10 @@ fn display_all(session: &mut Session) -> usize {
         let tiles = session.take_uploads(texture_set);
         let baked = session.baked(texture_set).cloned().unwrap_or_default();
         let composite = &session.caches[texture_set].composite;
+        let ao_mixing = session.doc.project.texture_sets[texture_set].ao_mixing;
         bytes += tiles
             .par_iter()
-            .flat_map_iter(|&(tile_x, tile_y)| DisplayKind::ALL.map(|kind| tile_bytes(composite, &baked, kind, tile_x, tile_y).len()))
+            .flat_map_iter(|&(tile_x, tile_y)| DisplayKind::ALL.map(|kind| tile_bytes(composite, &baked, ao_mixing, kind, tile_x, tile_y).len()))
             .sum::<usize>();
     }
 

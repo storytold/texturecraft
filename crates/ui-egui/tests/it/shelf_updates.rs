@@ -113,6 +113,7 @@ fn a_file_that_fails_to_read_is_reported_again_in_the_next_project() {
     harness.run_steps(2);
 
     let mut reported = Vec::new();
+    let mut retained_lists = Vec::new();
     for project in ["first", "second"] {
         if project == "second" {
             harness.state_mut().session = texturecraft_engine::sample_session(256, 64).unwrap();
@@ -127,8 +128,10 @@ fn a_file_that_fails_to_read_is_reported_again_in_the_next_project() {
 
         pass_a_minute(&mut harness);
 
+        retained_lists.push(harness.ctx.data(|data| data.count::<Vec<String>>()));
         reported.push(harness.state().toasts.iter().any(|toast| toast.error && toast.text.starts_with(&format!("{name}:"))));
     }
 
+    assert_eq!(retained_lists[0], retained_lists[1], "a replacement project releases the old missing-file list");
     assert_eq!(reported, [true, true], "each project says once that its file can't be read");
 }

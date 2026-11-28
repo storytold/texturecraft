@@ -81,9 +81,9 @@ fn craft_fonts(dir: &std::path::Path, rel: &str, desktop: &[(&str, &str)], web: 
         let mut path = dir.join(file).canonicalize().map_err(|e| format!("{file}: {e}"))?;
         println!("cargo::rerun-if-changed={}", path.display());
         let tags: Vec<&str> = scripts.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-        // The Latin faces lose their Private Use Area everywhere; a web build also cuts its CJK
-        // faces to the characters the shipped catalogs use. The desktop keeps its CJK faces whole:
-        // the same face draws text the app never ships, a user's Japanese file name.
+
+        // Web CJK faces cover shipped catalogs
+        // Desktop CJK faces also cover user text such as filenames
         let cut = rel == LATIN_MANIFEST || (wasm && !catalogs.is_empty() && tags.iter().any(|tag| CJK_SCRIPTS.contains(tag)));
         if cut {
             let bytes = std::fs::read(&path).map_err(|e| format!("{file}: {e}"))?;

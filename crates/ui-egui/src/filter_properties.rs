@@ -86,7 +86,7 @@ fn attributes(app: &TextureCraftApp, sheet: &mut PropertySheet<'_>, def: Option<
         sheet.attribute(tr("Tags"), &about.tags.iter().map(|tag| tr(tag)).collect::<Vec<_>>().join(", "));
     }
     if let Ok(texture_set) = app.session.doc.project.texture_set(app.session.ts()) {
-        sheet.attribute(tr("Size"), &format!("{0} × {0}", texture_set.resolution));
+        sheet.attribute(tr("Size"), &format!("{} × {}", texture_set.resolution, texture_set.height()));
     }
 }
 

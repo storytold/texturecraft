@@ -103,7 +103,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "List export outputs",
             [],
             None,
-            "{preset?: name or preset object, ts?, format?, bitDepth?, dithering?, size?, colorSpace?, maps?} → [{ts, map, file, tile: UV tile number or null, udimPattern: file pattern with <UDIM> or null, format, bitDepth, dithering, size, sourceSize, warnings, layers: [{map, name}] (a PSD's maps, top first)}] (keeps the first file per case-insensitive name, warns about later duplicates, and rejects file and folder conflicts)",
+            "{preset?: name or preset object, ts?, format?, bitDepth?, dithering?, size?, colorSpace?, maps?} → [{ts, map, file, tile: UV tile number or null, udimPattern: file pattern with <UDIM> or null, format, bitDepth, dithering, size (width), height, sourceSize, sourceHeight, warnings, layers: [{map, name}] (a PSD's maps, top first)}] (keeps the first file per case-insensitive name, warns about later duplicates, and rejects file and folder conflicts)",
             always,
             plan
         ),
@@ -426,6 +426,7 @@ impl Session {
             let files = self.with_export_input(
                 set_index,
                 &mesh_name,
+                options.padding != Padding::None,
                 |grid| Cow::Owned(grid.coverage_mask()),
                 |input| texturecraft_formats::export::render_planned_maps(input, options, plans).map_err(fe),
             )?;
@@ -440,6 +441,7 @@ impl Session {
         &self,
         set_index: usize,
         mesh_name: &str,
+        needs_padding: bool,
         coverage: impl FnOnce(&UvGBuffer) -> Cow<'_, [Coverage]>,
         with: impl FnOnce(&ExportInput<Coverage>) -> Result<T>,
     ) -> Result<T> {
@@ -447,6 +449,11 @@ impl Session {
         let cache = self.caches.get(set_index).ok_or_else(missing)?;
         let composite = self.document_composite(set_index, &cache.covered_tiles).ok_or_else(missing)?;
         let coverage = coverage(&cache.gbuf);
+        let seams = if needs_padding {
+            self.doc.project.texture_sets.get(set_index).and_then(|set| crate::session::padding_seams(&self.mesh, set, &cache.gbuf))
+        } else {
+            None
+        };
         let empty = Default::default();
         let input = ExportInput {
             project: &self.doc.project,
@@ -454,6 +461,7 @@ impl Session {
             composite: &composite,
             baked: self.doc.baked.get(&set_index).unwrap_or(&empty),
             coverage: &coverage,
+            seams: seams.as_ref(),
             mesh_name,
         };
         with(&input)
@@ -472,6 +480,7 @@ impl Session {
         self.with_export_input(
             set_index,
             &mesh_name,
+            false,
             |grid| Cow::Borrowed(&grid.tri),
             |input| MapPreview::sample_triangles(input, &options, map, side).map_err(fe),
         )
@@ -611,7 +620,7 @@ fn preview(session: &mut Session, params: &Value) -> Result<Value> {
 }
 
 fn plan(session: &mut Session, params: &Value) -> Result<Value> {
-    use texturecraft_formats::export::{list_set_outputs, scale_export_side};
+    use texturecraft_formats::export::{list_set_outputs, output_dimensions};
 
     let options = export_options(session, params, "export.plan")?;
     let project = &session.doc.project;
@@ -624,12 +633,15 @@ fn plan(session: &mut Session, params: &Value) -> Result<Value> {
         let Some((set_index, _)) = set_outputs.first() else { continue };
 
         let set = project.texture_set(*set_index).map_err(|error| EngineError::Other(error.to_string()))?;
-        let block_size = set.block_resolution();
         for (_, output) in set_outputs {
-            let source_size = output.tile.map_or(set.resolution, |tile| set.tile_resolution(tile));
+            let source = output_dimensions(set, output.tile, None);
 
-            // A map's own size wins over the export's; a PSD is the size of its largest layer
-            let size = output.maps().map(|map| scale_export_side(source_size, block_size, options.map_size(map))).max().unwrap_or(source_size);
+            // A PSD's canvas takes the largest width and height of its exported layers
+            let (size, height) = output
+                .maps()
+                .map(|map| output_dimensions(set, output.tile, options.map_size(map)))
+                .reduce(|(width, height), (next_width, next_height)| (width.max(next_width), height.max(next_height)))
+                .unwrap_or(source);
 
             files.push(json!({
                 "ts": set_index,
@@ -641,7 +653,9 @@ fn plan(session: &mut Session, params: &Value) -> Result<Value> {
                 "bitDepth": output.bit_depth,
                 "dithering": output.dither,
                 "size": size,
-                "sourceSize": source_size,
+                "height": height,
+                "sourceSize": source.0,
+                "sourceHeight": source.1,
                 "warnings": output.warnings,
                 "layers": output.layers.iter().map(|layer| json!({ "map": layer.map, "name": layer.name })).collect::<Vec<_>>(),
             }));

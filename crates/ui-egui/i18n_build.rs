@@ -10,6 +10,7 @@ pub fn collect(dir: Option<&Path>, required: bool) -> Result<(String, Vec<char>)
         if required {
             return Err("CRAFT_I18N_REQUIRED=1 requires CRAFT_I18N_DIR".into());
         }
+
         source.push_str("];\n");
         return Ok((source, Vec::new()));
     };

@@ -304,7 +304,8 @@ impl UsageError {
     /// The clap error, printed with the usage and exited with 2 like clap's own.
     pub(crate) fn into_clap(self, subcommand: &str) -> clap::Error {
         let mut command = crate::command();
-        // Built, so a subcommand's usage names the program: `texturecraft-cli run`.
+
+        // Built, so a subcommand's usage names the program: `texturecraft-cli run`
         command.build();
         let mut command = command.find_subcommand_mut(subcommand).map_or_else(crate::command, std::mem::take);
         command.error(ErrorKind::ArgumentConflict, self.to_string())
@@ -351,17 +352,21 @@ fn batch_would_replace(a: &BatchArgs) -> Result<(), UsageError> {
     let Ok(text) = std::fs::read_to_string(&a.script) else {
         return Ok(());
     };
+
     let Ok(script) = serde_json::from_str::<Value>(&text) else {
         return Ok(());
     };
+
     let field = |name: &str| script.get(name).and_then(Value::as_str);
     let Some(output) = field("save") else {
         return Ok(());
     };
+
     let input = field("open").unwrap_or("builtin:material_ball");
     if input.starts_with("builtin:") {
         return if a.in_place { Err(UsageError::InPlaceNotUsed) } else { Ok(()) };
     }
+
     let input = Path::new(input);
     let output = Path::new(output);
     match (same_project(output, input), a.in_place) {
@@ -409,14 +414,15 @@ impl Command {
 pub(crate) fn parse(args: &[OsString]) -> Result<Cli, clap::Error> {
     let matches = crate::command().try_get_matches_from(std::iter::once(OsString::from("texturecraft-cli")).chain(args.iter().cloned()))?;
     let cli = Cli::from_arg_matches(&matches)?;
-    // An inherited TEXTURECRAFT_CONTROL_TOKEN must not force --bridge: the variable is how a
-    // client authenticates when --bridge is already set. Only an explicit --token flag requires it.
+
+    // Only an explicit token flag requires bridge mode
     let token_flag_without_bridge = matches
         .subcommand_matches("mcp")
         .is_some_and(|mcp| mcp.value_source("token") == Some(clap::parser::ValueSource::CommandLine) && mcp.get_one::<u16>("bridge").is_none());
     if token_flag_without_bridge {
         return Err(UsageError::TokenNeedsBridge.into_clap("mcp"));
     }
+
     cli.command.check().map_err(|(sub, e)| e.into_clap(sub))?;
     Ok(cli)
 }

@@ -822,6 +822,7 @@ fn assets_pass_two_snapshots() {
             if MATERIALS.iter().filter(|material| material.smart).all(|material| thumbnails.material(&context, material.id).is_some()) {
                 break;
             }
+
             assert!(started.elapsed() < std::time::Duration::from_secs(120), "smart material thumbnails did not arrive");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -864,6 +865,7 @@ fn assets_pass_two_snapshots() {
         // 05: the drag ghost over the layer stack (takes a material) and over Properties (doesn't)
         let viewport_right = harness.state().viewport_rect.max.x;
         let layer = harness.get_all_by_role(Role::ListItem).find(|row| row.rect().min.x > viewport_right).expect("a layer row").rect().center();
+
         // Properties fills the right column under the layer stack, in the window's lower part
         let properties = egui::pos2(layer.x, harness.ctx.content_rect().height() * PROPERTIES_HEIGHT_SHARE);
         let tile = harness.get_all_by_label("Gold Dirty").next().unwrap().rect().center();
@@ -1219,12 +1221,7 @@ fn panel_header_snapshots() {
         save(&mut harness, &output_dir, &format!("panel-header-{name}"));
     }
     harness.state_mut().ui.prefs.brightness = Brightness::MediumDark;
-    let close = harness
-        .get_all_by_label("Close Panel")
-        .map(|node| node.rect())
-        .filter(|rect| rect.min.x > 1200.0)
-        .max_by(|a, b| a.min.y.total_cmp(&b.min.y))
-        .expect("the Properties header's close button");
+    let close = harness.get_by_role_and_label(egui::Role::Button, "Close Properties - Fill").rect();
     harness.hover_at(close.center());
     save(&mut harness, &output_dir, "panel-header-close-hovered");
 }
@@ -1298,12 +1295,7 @@ fn default_layout_snapshots() {
         save(&mut harness, &output_dir, &format!("default-layout-{name}"));
     }
     harness.state_mut().ui.prefs.brightness = Brightness::MediumDark;
-    let properties_close = harness
-        .get_all_by_label("Close Panel")
-        .map(|node| node.rect())
-        .filter(|rect| rect.min.x > 1200.0)
-        .max_by(|a, b| a.min.y.total_cmp(&b.min.y))
-        .expect("the Properties header's close button");
+    let properties_close = harness.get_by_role_and_label(egui::Role::Button, "Close Properties - Fill").rect();
     harness.hover_at(egui::pos2(properties_close.center().x - 120.0, properties_close.min.y - 6.0));
     save(&mut harness, &output_dir, "default-layout-split-hovered");
 }

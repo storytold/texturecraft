@@ -146,6 +146,10 @@ fn reported_failures_id(project_id: u64) -> Id {
     Id::unique(("shelf_updates_reported_failures", project_id))
 }
 
+pub(super) fn forget_reported_failures(ctx: &Context, project_id: u64) {
+    ctx.data_mut(|data| data.remove::<Vec<String>>(reported_failures_id(project_id)));
+}
+
 /// The refresh button with its popup of update settings, opening upward from the toolbar `panel` with its left edge on the panel's
 pub(crate) fn button(app: &mut TextureCraftApp, ui: &mut Ui, size: f32, panel: egui::Rect) {
     let label = tr("Refresh");

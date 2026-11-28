@@ -1119,7 +1119,7 @@ fn planned_outputs(app: &mut TextureCraftApp, params: &Value) -> Result<Vec<Opti
                     _ => display_name.to_owned(),
                 },
                 tiled,
-                size: file.get("size").and_then(Value::as_u64).unwrap_or(0),
+                dimensions: (file["size"].as_u64().unwrap_or(0), file["height"].as_u64().unwrap_or(0)),
                 format: file.get("format").and_then(Value::as_str).and_then(FileFormat::from_extension),
                 bit_depth: file.get("bitDepth").and_then(Value::as_u64).and_then(|depth| u8::try_from(depth).ok()).unwrap_or(0),
                 dithering: file.get("dithering").and_then(Value::as_bool).unwrap_or(false),
@@ -1508,7 +1508,8 @@ fn output_preview(ui: &mut Ui, index: usize, map: &MapSpec, planned: Option<&Pla
 
     let file_type = planned.format.map_or("", FileFormat::extension);
     let depth = crate::export_window::depth_label(planned.format, planned.bit_depth, planned.dithering);
-    let details = if planned.tiled { format!("{file_type} {depth}") } else { format!("{size} x {size} · {file_type} {depth}", size = planned.size) };
+    let (width, height) = planned.dimensions;
+    let details = if planned.tiled { format!("{file_type} {depth}") } else { format!("{width} x {height} · {file_type} {depth}") };
     ui.label(RichText::new(details).color(tokens.text_dim));
 }
 
@@ -1894,6 +1895,7 @@ mod tests {
         let mut harness = Harness::builder().with_context_setup(crate::framework::install_headless).build_eframe(|cc| TextureCraftApp::new(cc, session));
         let app = harness.state_mut();
         let ts = app.session.ts();
+        app.session.doc.project.texture_sets[ts].set_size(256, 128);
         let saved = app.session.export_preset("Unreal Engine (Packed)").unwrap();
         let mut draft = saved.clone();
         draft.maps = vec![saved.maps[1].clone(), new_map(Layout::Gray, "New"), saved.maps[0].clone()];
@@ -1915,7 +1917,7 @@ mod tests {
         let outputs = planned_outputs(app, &params).unwrap();
 
         assert!(outputs[0].is_none(), "the disabled map stays disabled in its new position");
-        assert_eq!(outputs[2].as_ref().unwrap().size, 128);
+        assert_eq!(outputs[2].as_ref().unwrap().dimensions, (128, 64));
         assert_eq!(params["maps"].as_array().unwrap().len(), 2, "the new map and the removed map get no override");
     }
 

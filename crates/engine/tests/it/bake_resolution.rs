@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use texturecraft_engine::bake::Progress;
-use texturecraft_engine::core::BakedMap;
+use texturecraft_engine::core::{AoMixing, BakedMap};
 use texturecraft_engine::geom::{NO_TRI, UvGBuffer, primitives};
 use texturecraft_engine::{Session, execute};
 
@@ -103,8 +103,11 @@ fn imported_mesh_maps_display_and_export_the_entire_overridden_tile() {
     let map = BakedMap::AmbientOcclusion;
     assert!((baked.scalar(map, 248, 120, (256, 128)).unwrap() - 240.0 / 255.0).abs() < 0.001);
     let composite = &session.caches[0].composite;
-    let display = tile_bytes(composite, baked, DisplayKind::Orm, 5, 1);
-    assert_eq!(display[((56 * 64 + 56) * 4) as usize], 240, "the viewport samples the far corner of the smaller working tile");
+    let corner = ((56 * 64 + 56) * 4) as usize;
+    let display = tile_bytes(composite, baked, AoMixing::Multiply, DisplayKind::Orm, 5, 1);
+    assert_eq!(display[corner], 240, "the viewport samples the far corner of the smaller working tile");
+    let unmixed = tile_bytes(composite, baked, AoMixing::None, DisplayKind::Orm, 5, 1);
+    assert!(unmixed[corner] > display[corner], "ambient occlusion mixing None leaves the baked map out of the viewport");
 
     let options = ExportOptions::new(ExportPreset {
         name: "Bake detail".into(),

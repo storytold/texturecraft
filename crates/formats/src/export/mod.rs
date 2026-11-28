@@ -18,8 +18,8 @@ use std::io::Cursor;
 use craft_image_codecs::{ChannelLayout, EncodeOptions, Format as CodecFormat, Image as CodecImage, SampleType};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use texturecraft_compose::{BakedMaps, Composite};
-use texturecraft_core::{AoMixing, BakedMap, BlockScales, Channel, ChannelKind, NormalFormat, NormalMixing, Project, TextureSet};
+use texturecraft_compose::{BakedMaps, Composite, SeamPaddingInput};
+use texturecraft_core::{AoMixing, BakedMap, BlockScales, Channel, ChannelKind, NormalFormat, Project, TextureSet};
 use texturecraft_geom::glam::Vec3;
 use texturecraft_texel::{ColorSpace, linear_to_srgb};
 
@@ -50,8 +50,8 @@ const PSD_MAX_SIDE_PIXELS: u32 = 30_000;
 const PSD_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Planes of a PSD image or layer: red, green, blue and alpha
 const PSD_RGBA_PLANES: usize = 4;
-/// Preset limits (user presets are untrusted JSON).
-const MAX_MAPS: usize = 64;
+/// Preset limits (user presets are untrusted JSON); maps leave room for one per channel plus packed maps
+const MAX_MAPS: usize = 128;
 const MAX_TEMPLATE: usize = 256;
 const MAX_STEM: usize = 200;
 /// Longest preset name.
@@ -309,6 +309,16 @@ impl SourceRef {
         self.raw_component().min(2)
     }
 
+    /// Whether the source is a tangent-space normal, which pads in 2D whatever the set's UV padding
+    fn pads_flat(&self) -> bool {
+        match self {
+            SourceRef::Channel { channel, .. } => channel.kind() == ChannelKind::NormalMap,
+            SourceRef::Virtual { map, .. } => matches!(map, VirtualMap::NormalOpenGl | VirtualMap::NormalDirectX | VirtualMap::HeightNormal),
+            SourceRef::Baked { map, .. } => matches!(map, BakedMap::Normal | BakedMap::BentNormal),
+            SourceRef::Constant(_) => false,
+        }
+    }
+
     /// Components the source has (1 or 3; constants are 1).
     pub fn components(&self) -> usize {
         match self {
@@ -518,6 +528,8 @@ pub struct ExportInput<'a, Coverage = bool> {
     pub composite: &'a Composite,
     pub baked: &'a BakedMaps,
     pub coverage: &'a [Coverage],
+    /// The set's UV seams, which padding across seams (3D) crosses
+    pub seams: Option<&'a SeamPaddingInput<'a>>,
     pub mesh_name: &'a str,
 }
 
@@ -767,10 +779,14 @@ fn plan_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &ExportOpti
 
     // Bucket layers in tile order to move their names into the corresponding PSD
     let mut psd_layers = Vec::new();
+
+    // A PSD map scaled past the largest side fails only the set's PSDs, as their other planning failures do
+    let mut psd_too_large = None;
     let project_stem = project.name.replace('/', "_");
     let mesh_stem = mesh_name.replace('/', "_");
     let set_stem = set.name.replace('/', "_");
     let tiles: Vec<Option<u32>> = if set.uv_tiles.is_empty() || opts.atlas { vec![None] } else { set.uv_tiles.iter().copied().map(Some).collect() };
+    let (block_width, block_height) = set.block_size();
     for (map_index, map) in opts.preset.maps.iter().enumerate() {
         if !map.is_available_for(set) {
             continue;
@@ -779,6 +795,19 @@ fn plan_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &ExportOpti
         let own = opts.maps.get(&map_index);
         let (format, bit_depth, dither) = opts.map_file_type(map_index, map);
         let enabled = own.is_none_or(|o| o.enabled);
+        if enabled && let Err(error) = check_scaled_block(set, (block_width, block_height), opts.map_size(map_index)) {
+            if format != FileFormat::Psd {
+                return Err(error);
+            }
+
+            if psd_too_large.is_none() {
+                psd_too_large = Some(match error {
+                    FormatError::Invalid(reason) => reason,
+                    other => other.to_string(),
+                });
+            }
+        }
+
         let space = opts.space_for_map(map, format, bit_depth);
         let requested_space = opts.space_for_depth(format, bit_depth);
         let color_map = map.is_color();
@@ -909,6 +938,10 @@ fn plan_outputs(project: &Project, ts: usize, mesh_name: &str, opts: &ExportOpti
             (untiled_psd_stem(project, mesh_name, ts, set, opts.atlas), None)
         };
         let (name, renamed) = unique_name(&mut used, &stem, ext, &mut warnings);
+        if let Some(reason) = &psd_too_large {
+            psd_failures.push((name, FormatError::Invalid(reason.clone())));
+            continue;
+        }
         if let Err(error) = layered_psd::preflight(set, opts, tile, bit_depth, layers.iter(), budget.working_bytes) {
             psd_failures.push((name, error));
             continue;
@@ -989,23 +1022,19 @@ pub fn validate_export_paths<'a>(names: impl IntoIterator<Item = &'a str>) -> Re
     Ok(())
 }
 
-/// The size of a PSD layer of a texture set at `export_size` for `tile` (None: the whole set, an atlas of a UV-tiled one)
-fn psd_size(set: &TextureSet, tile: Option<u32>, export_size: Option<u32>) -> (u32, u32) {
-    let block_resolution = set.block_resolution();
-    match (tile, set.tile_grid()) {
-        (Some(tile), Some(_)) => {
-            let side = scale_export_side(tile_side(set, tile, block_resolution), block_resolution, export_size);
+/// The dimensions of a file or PSD layer, scaling relative to the width of one atlas block.
+pub fn output_dimensions(set: &TextureSet, tile: Option<u32>, export_size: Option<u32>) -> (u32, u32) {
+    let (block_width, block_height) = set.block_size();
+    let (width, height) = match (tile, set.tile_grid()) {
+        (Some(tile), Some(_)) if !set.tile_resolutions.is_empty() => {
+            let side = tile_side(set, tile, block_width);
             (side, side)
         }
-        (_, Some(grid)) => {
-            let side = export_size.unwrap_or(block_resolution);
-            (side.saturating_mul(grid.cols), side.saturating_mul(grid.rows))
-        }
-        (_, None) => {
-            let side = export_size.unwrap_or(block_resolution);
-            (side, side)
-        }
-    }
+        (Some(_), Some(_)) | (_, None) => (block_width, block_height),
+        (None, Some(grid)) => (block_width.saturating_mul(grid.cols), block_height.saturating_mul(grid.rows)),
+    };
+
+    (scale_export_side(width, block_width, export_size), scale_export_side(height, block_width, export_size))
 }
 
 /// Plan a selection in export order, keeping only the first case-insensitive use of a name.
@@ -1053,9 +1082,8 @@ struct Sampler<'a, Coverage = bool> {
     uncovered: Coverage,
     /// Composite width.
     res: u32,
-    /// Texels per atlas block (`res` for a classic set): the height slope and the Sobel window
-    /// follow the block.
-    tile_res: u32,
+    /// Texels across and down an atlas block (the composite for a classic set), which the height slope follows
+    block: (u32, u32),
     /// The share of its block each tile fills: a smaller tile's height slope shrinks with it.
     scales: BlockScales,
     /// Normal convention overriding every normal output.
@@ -1076,8 +1104,8 @@ pub fn rnm(base: Vec3, detail: Vec3) -> Vec3 {
 }
 
 impl<'a, Coverage> Sampler<'a, Coverage> {
-    /// The sampler of `input`'s texture set `set`, whose atlas blocks are `tile_res` texels wide
-    fn new(input: &ExportInput<'a, Coverage>, options: &ExportOptions, set: &'a TextureSet, tile_res: u32, uncovered: Coverage) -> Self {
+    /// The sampler of `input`'s texture set `set`, with the given atlas block dimensions
+    fn new(input: &ExportInput<'a, Coverage>, options: &ExportOptions, set: &'a TextureSet, block: (u32, u32), uncovered: Coverage) -> Self {
         Sampler {
             set,
             comp: input.composite,
@@ -1085,7 +1113,7 @@ impl<'a, Coverage> Sampler<'a, Coverage> {
             coverage: input.coverage,
             uncovered,
             res: input.composite.resolution,
-            tile_res,
+            block,
             scales: set.block_scales(),
             normal_override: options.normal_format,
             project_normal: input.project.normal_format,
@@ -1115,29 +1143,35 @@ impl<Coverage: PartialEq> Sampler<'_, Coverage> {
         self.coverage.get((y as usize) * self.res as usize + x as usize).is_some_and(|sample| sample != &self.uncovered)
     }
 
-    /// Normal from the height channel (3×3 Sobel; uncovered neighbours repeat the centre).
+    /// Normal from the height channel (the set's height to normal method; uncovered neighbours repeat the centre)
     fn height_normal(&self, x: u32, y: u32) -> Vec3 {
         let center = self.channel(Channel::Height, At::Texel(x, y))[0];
-        // Clamped to the texel's UV tile.
-        let t = self.tile_res.max(1);
-        let (x0, y0, last) = ((x / t * t) as i64, (y / t * t) as i64, t as i64 - 1);
-        let h = |dx: i64, dy: i64| {
-            let (sx, sy) = ((x as i64 + dx).clamp(x0, x0 + last) as u32, (y as i64 + dy).clamp(y0, y0 + last) as u32);
+
+        // Use the current tile's edge values instead of sampling its neighbors
+        let (block_width, block_height) = (self.block.0.max(1), self.block.1.max(1));
+        let (x0, y0) = ((x / block_width * block_width) as i64, (y / block_height * block_height) as i64);
+        let h = |dx: i32, dy: i32| {
+            let sx = (x as i64 + dx as i64).clamp(x0, x0 + block_width as i64 - 1) as u32;
+            let sy = (y as i64 + dy as i64).clamp(y0, y0 + block_height as i64 - 1) as u32;
             if self.covered(sx, sy) { self.channel(Channel::Height, At::Texel(sx, sy))[0] } else { center }
         };
-        let gx = (h(1, -1) + 2.0 * h(1, 0) + h(1, 1) - h(-1, -1) - 2.0 * h(-1, 0) - h(-1, 1)) / 8.0;
-        let gy = (h(-1, 1) + 2.0 * h(0, 1) + h(1, 1) - h(-1, -1) - 2.0 * h(0, -1) - h(1, -1)) / 8.0;
-        let s = self.set.height_strength * self.tile_res as f32 * self.scales.at(x, y) / HEIGHT_SPAN;
-        // Image y points down; OpenGL normals have +Y up the image.
-        Vec3::new(-gx * s, gy * s, 1.0).try_normalize().unwrap_or(Vec3::Z)
+        let [gx, gy] = self.set.height_to_normal.slope(h);
+
+        // Slopes per texel become slopes across the tile along each side
+        let strength = self.set.height_strength * self.scales.at(x, y) / HEIGHT_SPAN;
+        let (scale_x, scale_y) = (strength * block_width as f32, strength * block_height as f32);
+
+        // OpenGL normal Y points up as image rows advance down
+        Vec3::new(-gx * scale_x, gy * scale_y, 1.0).try_normalize().unwrap_or(Vec3::Z)
     }
 
     /// The final tangent-space normal (OpenGL): baked normal ⊕ (height ⊕ normal channel).
     fn final_normal(&self, at: At) -> Vec3 {
         let At::Texel(x, y) = at else { return Vec3::Z };
+
         let base = if self.set.baked.contains(&BakedMap::Normal) { unpack(self.baked(BakedMap::Normal, at)) } else { Vec3::Z };
         let mut detail = if self.set.has_channel(Channel::Normal) { unpack(self.channel(Channel::Normal, at)) } else { Vec3::Z };
-        if self.set.normal_mixing == NormalMixing::Combine && self.set.has_channel(Channel::Height) && self.set.height_strength != 0.0 {
+        if self.set.height_in_normal() && self.set.has_channel(Channel::Height) && self.set.height_strength != 0.0 {
             detail = rnm(self.height_normal(x, y), detail);
         }
         rnm(base, detail)
@@ -1185,6 +1219,7 @@ impl<Coverage: PartialEq> Sampler<'_, Coverage> {
             },
             SourceRef::Baked { map, .. } => {
                 let v = self.baked(*map, at);
+
                 // Tangent-space maps are stored with OpenGL green, like the normal map: write the format of the export
                 if matches!(map, BakedMap::Normal | BakedMap::BentNormal) && self.normal_override.unwrap_or(self.project_normal) == NormalFormat::DirectX {
                     [v[0], 1.0 - v[1], v[2]]
@@ -1267,7 +1302,7 @@ fn render_planned_maps_within(input: &ExportInput, options: &ExportOptions, plan
         }
     }
 
-    let renderer = MapRenderer::new(input, options)?;
+    let renderer = MapRenderer::new(input, options, &planned)?;
     planned
         .into_iter()
         .zip(psd_sizes.into_iter().chain(std::iter::repeat(None)))
@@ -1289,6 +1324,18 @@ fn tile_side(set: &TextureSet, tile: u32, block_resolution: u32) -> u32 {
     ((block_resolution as f32 * set.tile_scale(tile)).round() as u32).clamp(1, block_resolution.max(1))
 }
 
+/// Refuse an export size that scales a non-square set's UV tile past the largest image side
+fn check_scaled_block(set: &TextureSet, (block_width, block_height): (u32, u32), export_size: Option<u32>) -> Result<()> {
+    let width = export_size.unwrap_or(block_width);
+    let height = scale_export_side(block_height, block_width, export_size);
+
+    if width.max(height) > MAX_IMAGE_SIZE {
+        return Err(FormatError::Invalid(format!("export size makes texture set \"{}\" {width}×{height}, over {MAX_IMAGE_SIZE} texels a side", set.name)));
+    }
+
+    Ok(())
+}
+
 /// Scale an image side relative to the source block, keeping a pixel for any nonempty source.
 pub fn scale_export_side(source_side: u32, block_resolution: u32, export_size: Option<u32>) -> u32 {
     let export_size = export_size.unwrap_or(block_resolution);
@@ -1302,13 +1349,13 @@ fn diffuse_blocks(
     channels: usize,
     dilation: &texturecraft_texel::DilationMap,
     (origin_x, origin_y): (usize, usize),
-    block: usize,
+    (step_x, step_y): (usize, usize),
 ) {
     use texturecraft_texel::dilate::NONE;
 
-    for block_y in (0..height).step_by(block) {
-        for block_x in (0..width).step_by(block) {
-            let (block_width, block_height) = (block.min(width - block_x), block.min(height - block_y));
+    for block_y in (0..height).step_by(step_y) {
+        for block_x in (0..width).step_by(step_x) {
+            let (block_width, block_height) = (step_x.min(width - block_x), step_y.min(height - block_y));
             let source_rows = (origin_y + block_y..origin_y + block_y + block_height).map(|y| {
                 let start = y * dilation.width as usize + origin_x + block_x;
                 &dilation.src[start..start + block_width]

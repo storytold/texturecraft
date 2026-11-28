@@ -400,9 +400,15 @@ fn size_label(size: u32) -> String {
     }
 }
 
-/// A size as a texture set page shows it: "1024x1024", marked when it is the set's own
-fn set_size_label(size: u32, own: u32) -> String {
-    if size == own { trf("{n}x{n} (Texture Set size)", &[("n", &size)]) } else { format!("{size}x{size}") }
+/// The displayed block dimensions at an export width
+fn scaled_block_size(width: u32, native: (u32, u32)) -> (u32, u32) {
+    (width, texturecraft_engine::formats::export::scale_export_side(native.1, native.0, Some(width)))
+}
+
+/// Display both dimensions and mark the texture set's own size
+fn set_size_label(size: (u32, u32), native: (u32, u32)) -> String {
+    let (width, height) = size;
+    if size == native { trf("{width}x{height} (Texture Set size)", &[("width", &width), ("height", &height)]) } else { format!("{width}x{height}") }
 }
 
 /// The largest texture set's resolution
@@ -493,8 +499,8 @@ fn planned_names(plan: &serde_json::Value) -> impl Iterator<Item = &str> {
     plan.as_array().into_iter().flatten().filter_map(|file| file.get("file").and_then(serde_json::Value::as_str))
 }
 
-fn planned_file_shapes(plan: &serde_json::Value) -> impl Iterator<Item = (&serde_json::Value, &serde_json::Value)> {
-    plan.as_array().into_iter().flatten().map(|file| (&file["file"], &file["size"]))
+fn planned_file_shapes(plan: &serde_json::Value) -> impl Iterator<Item = [&serde_json::Value; 3]> {
+    plan.as_array().into_iter().flatten().map(|file| [&file["file"], &file["size"], &file["height"]])
 }
 
 /// In the browser the textures download (one zip for several files).
@@ -774,6 +780,8 @@ fn map_rows(app: &TextureCraftApp, ts: usize) -> Vec<MapRow> {
 /// The Output maps section of texture set `ts`'s page: its header, then its rows scrolling in `area`
 fn output_maps(app: &mut TextureCraftApp, ui: &mut Ui, ts: usize, place: PagePlace, area: egui::Rect) {
     let look = ExportLook::get(ui.ctx());
+    let Some(set) = app.session.doc.project.texture_sets.get(ts) else { return };
+    let native = set.block_size();
     let rows = map_rows(app, ts);
     let template = set_template(app, ts);
     let overrides = app.ui.export.sets.entry(ts).or_default();
@@ -806,7 +814,7 @@ fn output_maps(app: &mut TextureCraftApp, ui: &mut Ui, ts: usize, place: PagePla
             let (rows_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), egui::Sense::hover());
             for (index, row) in rows.iter().enumerate() {
                 let y = rows_rect.top() + (index as f32 + 0.5) * MAP_ROW_PITCH;
-                map_row(ui, place, y, ts, row, overrides.maps.entry(row.map).or_default());
+                map_row(ui, place, y, ts, native, row, overrides.maps.entry(row.map).or_default());
             }
         });
     });
@@ -826,7 +834,7 @@ fn output_maps(app: &mut TextureCraftApp, ui: &mut Ui, ts: usize, place: PagePla
 }
 
 /// One Output maps row at `y`: tick, file name cut at the front, override pen, file type, the map's own size
-fn map_row(ui: &mut Ui, place: PagePlace, y: f32, ts: usize, row: &MapRow, map_export: &mut MapExport) {
+fn map_row(ui: &mut Ui, place: PagePlace, y: f32, ts: usize, native: (u32, u32), row: &MapRow, map_export: &mut MapExport) {
     let look = ExportLook::get(ui.ctx());
     let check_left = place.x(MAP_CHECK_LEFT);
     let hit = egui::Rect::from_center_size(egui::pos2(check_left + CHECK_HIT_SIZE / 2.0 - CHECK_HIT_OVERHANG, y), vec2(CHECK_HIT_SIZE, CHECK_HIT_SIZE));
@@ -853,7 +861,7 @@ fn map_row(ui: &mut Ui, place: PagePlace, y: f32, ts: usize, row: &MapRow, map_e
         }
         None => inherited_file_type(ui, place, y, &row.inherited),
     }
-    map_size_combo(ui, size_rect, ("exp_map_size", ts, row.map), &mut map_export.size);
+    map_size_combo(ui, size_rect, ("exp_map_size", ts, row.map), native, &mut map_export.size);
 }
 
 /// A map's inherited file type: "png" and "8 bits" in their columns, one text to assistive technology
@@ -869,13 +877,17 @@ fn inherited_file_type(ui: &mut Ui, place: PagePlace, y: f32, inherited: &FileTy
 }
 
 /// An output map's size in `rect`: the export's, or its own, which wins over it
-fn map_size_combo(ui: &mut Ui, rect: egui::Rect, id: (&str, usize, usize), size: &mut Option<u32>) {
-    let shown = size.map_or_else(|| tr("Export size").to_string(), |side| format!("{side}x{side}"));
+fn map_size_combo(ui: &mut Ui, rect: egui::Rect, id: (&str, usize, usize), native: (u32, u32), size: &mut Option<u32>) {
+    let label = |width| {
+        let (_, height) = scaled_block_size(width, native);
+        format!("{width}x{height}")
+    };
+    let shown = size.map_or_else(|| tr("Export size").to_string(), label);
     drawn::combo(ui, rect, id, shown, |ui| {
         ui.selectable_value(size, None, tr("Export size"));
         ui.separator();
         for side in SIZES {
-            ui.selectable_value(size, Some(side), format!("{side}x{side}"));
+            ui.selectable_value(size, Some(side), label(side));
         }
     })
     .response
@@ -1227,17 +1239,14 @@ fn toggle(o: &mut SetExport, row: usize, from: &InheritedSettings) {
 /// A texture set's page from `place`: its overrides, then its output maps scrolling down to `bottom`
 fn set_page(app: &mut TextureCraftApp, ui: &mut Ui, ts: usize, place: PagePlace, bottom: f32, builtins: &[ExportPreset]) {
     let Some(set) = app.session.doc.project.texture_sets.get(ts) else { return };
-    let own = set.block_resolution();
-    let mut from = InheritedSettings::for_texture_set(app, own);
+    let native = set.block_size();
+    let mut from = InheritedSettings::for_texture_set(app, native.0);
 
     let (first, rest) = template_groups(app, builtins);
     let first: Vec<(&str, bool)> = first.into_iter().filter(|(name, _)| !NOT_PER_SET.contains(name)).collect();
     let global = &app.ui.export;
     let inherited_file_type = if global.format.is_empty() { tr("Based on output template").to_string() } else { file_type_text(&from.file_type) };
-    let inherited_size = match global.size {
-        0 => set_size_label(own, own),
-        _ => set_size_label(from.size, own),
-    };
+    let inherited_size = set_size_label(scaled_block_size(from.size, native), native);
     let inherited_padding = tr(padding_label(&global.padding)).to_string();
 
     let look = ExportLook::get(ui.ctx());
@@ -1274,9 +1283,9 @@ fn set_page(app: &mut TextureCraftApp, ui: &mut Ui, ts: usize, place: PagePlace,
     }
     if override_row(ui, place, row_y(2), tr("Size"), overrides.size.is_some(), &inherited_size, |ui, rect| {
         if let Some(size) = &mut overrides.size {
-            drawn::combo(ui, rect, "exp_set_size", set_size_label(*size, own), |ui| {
+            drawn::combo(ui, rect, "exp_set_size", set_size_label(scaled_block_size(*size, native), native), |ui| {
                 for side in SIZES {
-                    ui.selectable_value(size, side, set_size_label(side, own));
+                    ui.selectable_value(size, side, set_size_label(scaled_block_size(side, native), native));
                 }
             });
         }
@@ -1491,8 +1500,10 @@ fn tree_files(set: &ExportSetPlan, directory: &str) -> Vec<TreeFile> {
         let format = FileFormat::from_extension(output.get("format").and_then(serde_json::Value::as_str).unwrap_or_default());
         let depth = output.get("bitDepth").and_then(serde_json::Value::as_u64).unwrap_or(8) as u8;
         let dithering = output.get("dithering").and_then(serde_json::Value::as_bool).unwrap_or(false);
-        let size = output["size"].as_u64().unwrap_or_default() as u32;
-        let source_size = output["sourceSize"].as_u64().unwrap_or_default() as u32;
+        let dimension = |key: &str| output[key].as_u64().unwrap_or_default() as u32;
+        let size = (dimension("size"), dimension("height"));
+        let source_size = (dimension("sourceSize"), dimension("sourceHeight"));
+
         TreeFile {
             name: file.to_string(),
             size: set_size_label(size, source_size),

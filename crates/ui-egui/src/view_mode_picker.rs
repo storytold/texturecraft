@@ -70,7 +70,6 @@ pub(crate) fn show(app: &mut TextureCraftApp, child: &mut Ui, id_salt: &str, wid
         ViewMode::Image => app.session.view_image.clone().unwrap_or_else(|| tr(OTHER).to_owned()),
         _ => tr(&app.session.view.label()).to_owned(),
     };
-    let channels = app.session.doc.project.texture_set(app.session.ts()).map(|texture_set| texture_set.channel_list()).unwrap_or_default();
     let popup_id = child.make_persistent_id((id_salt, "other"));
 
     // The picker stays greyed without project maps
@@ -112,11 +111,18 @@ pub(crate) fn show(app: &mut TextureCraftApp, child: &mut Ui, id_salt: &str, wid
                 }
 
                 section(ui, "Single channel");
+                let channels = app.session.doc.project.texture_sets.get(app.session.ts()).into_iter().flat_map(|set| set.viewport_channels());
+                let mut picked_channel = None;
                 for channel in channels {
                     if ui.selectable_label(app.session.view == ViewMode::Channel(channel), tr(channel_label(channel))).clicked() {
-                        app.run("viewport.view", json!({"mode": channel.id()}));
+                        picked_channel = Some(channel);
                     }
                 }
+
+                if let Some(channel) = picked_channel {
+                    app.run("viewport.view", json!({"mode": channel.id()}));
+                }
+
                 if ui.selectable_label(app.session.view == ViewMode::NormalHeightMesh, tr(texturecraft_engine::NORMAL_HEIGHT_MESH_LABEL)).clicked() {
                     app.run("viewport.view", json!({"mode": "normalHeightMesh"}));
                 }

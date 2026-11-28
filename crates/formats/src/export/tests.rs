@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use image::{DynamicImage, GenericImageView, ImageFormat};
-use texturecraft_core::{ChannelFormat, Project, TextureSet};
+use texturecraft_core::{ChannelFormat, Project, TextureSet, UvPaddingMode};
 use texturecraft_texel::{to_u16, to_u16_signed};
 
 use super::*;
@@ -50,7 +50,7 @@ impl Fx {
     }
 
     fn input(&self) -> ExportInput<'_> {
-        ExportInput { project: &self.project, ts: 0, composite: &self.comp, baked: &self.baked, coverage: &self.coverage, mesh_name: "sphere" }
+        ExportInput { project: &self.project, ts: 0, composite: &self.comp, baked: &self.baked, coverage: &self.coverage, seams: None, mesh_name: "sphere" }
     }
 
     fn render(&self, opts: &ExportOptions) -> Vec<ExportedFile> {
@@ -221,6 +221,20 @@ fn height_becomes_normal_detail() {
     fx.project.texture_sets[0].height_strength = 0.0;
     let flat = decode(find(&fx.render_preset("Separate maps"), "_normal.png")).to_rgb8();
     assert_eq!(flat.get_pixel(30, 30).0, [128, 128, 255]);
+}
+
+#[test]
+fn height_to_normal_method_smooth_reaches_the_diagonal_neighbours() {
+    let mut fx = Fx::new(&[Channel::BaseColor, Channel::Height]);
+    fx.set(Channel::Height, 30, 30, [1.0; 3]);
+    let normal_at = |fx: &Fx, x: u32, y: u32| decode(find(&fx.render_preset("Separate maps"), "_normal.png")).to_rgb8().get_pixel(x, y).0;
+    let flat = [128, 128, 255];
+
+    assert_eq!(fx.project.texture_sets[0].height_to_normal, texturecraft_core::HeightToNormalMethod::Smooth);
+    assert_ne!(normal_at(&fx, 31, 31), flat, "Sobel reads the bump from the diagonal");
+    fx.project.texture_sets[0].height_to_normal = texturecraft_core::HeightToNormalMethod::Sharp;
+    assert_eq!(normal_at(&fx, 31, 31), flat, "Sharp only reads the neighbours across");
+    assert_ne!(normal_at(&fx, 31, 30), flat, "Sharp still tilts beside the bump");
 }
 
 #[test]
@@ -670,7 +684,8 @@ fn uv_tiles_export_one_file_per_tile_without_padding_across() {
             }
         }
     }
-    let input = ExportInput { project: &project, ts: 0, composite: &comp, baked: &BakedMaps::default(), coverage: &coverage, mesh_name: "udim_plane" };
+    let input =
+        ExportInput { project: &project, ts: 0, composite: &comp, baked: &BakedMaps::default(), coverage: &coverage, seams: None, mesh_name: "udim_plane" };
     let preset = ExportPreset {
         name: "t".into(),
         maps: vec![MapSpec {
@@ -721,7 +736,7 @@ fn small_export_size_keeps_each_nonempty_udim_tile_one_pixel_or_larger() {
     project.texture_sets.push(set);
     let composite = Composite::with_size(&[Channel::Roughness], 1024, 512);
     let coverage = vec![true; 1024 * 512];
-    let input = ExportInput { project: &project, ts: 0, composite: &composite, baked: &BakedMaps::default(), coverage: &coverage, mesh_name: "m" };
+    let input = ExportInput { project: &project, ts: 0, composite: &composite, baked: &BakedMaps::default(), coverage: &coverage, seams: None, mesh_name: "m" };
 
     for format in [FileFormat::Png, FileFormat::Psd] {
         let opts = ExportOptions { size: Some(2), padding: Padding::None, ..one_map(format, 8, roughness()) };
@@ -1262,6 +1277,41 @@ fn psd_layer_groups_follow_the_slashes_of_their_names() {
 }
 
 #[test]
+fn an_export_size_that_scales_a_tall_set_past_the_largest_side_is_refused() {
+    let mut fx = Fx::new(&default_channels());
+    fx.project.texture_sets[0].set_size(RES, RES * 4);
+    let mut options = one_map(FileFormat::Png, 8, roughness());
+    options.size = Some(MAX_IMAGE_SIZE / 2);
+    assert!(list_outputs(&fx.project, 0, "sphere", &options).is_err(), "the height would be twice the largest side");
+
+    options.size = Some(MAX_IMAGE_SIZE / 4);
+    assert_eq!(list_outputs(&fx.project, 0, "sphere", &options).unwrap().len(), 1, "a tall export within the largest side is kept");
+
+    options.maps.insert(0, MapOverride { size: Some(MAX_IMAGE_SIZE / 2), ..MapOverride::default() });
+
+    assert!(list_outputs(&fx.project, 0, "sphere", &options).is_err(), "a map's own size must pass the same limit");
+    options.maps.get_mut(&0).unwrap().enabled = false;
+    assert!(list_outputs(&fx.project, 0, "sphere", &options).unwrap().is_empty(), "a disabled map never allocates an image");
+}
+
+#[test]
+fn a_psd_scaled_past_the_largest_side_leaves_the_sets_other_maps() {
+    let mut fx = Fx::new(&default_channels());
+    fx.project.texture_sets[0].set_size(RES, RES * 4);
+    let mut options = one_map(FileFormat::Png, 8, roughness());
+    let mut psd = options.preset.maps[0].clone();
+    (psd.file, psd.format, psd.bit_depth, psd.channels) = ("layered".into(), FileFormat::Psd, 8, rgba_half_alpha());
+    options.preset.maps.push(psd);
+    options.size = Some(MAX_IMAGE_SIZE / 2);
+    options.maps.insert(0, MapOverride { size: Some(MAX_IMAGE_SIZE / 4), ..MapOverride::default() });
+
+    let plan = list_outputs(&fx.project, 0, "sphere", &options).unwrap();
+
+    assert!(plan.len() == 1 && plan[0].format == FileFormat::Png, "{plan:?}");
+    assert!(plan[0].warnings.iter().any(|warning| is_set_warning(warning)), "{:?}", plan[0].warnings);
+}
+
+#[test]
 fn psd_plan_rejects_a_version_one_atlas_over_its_dimension_limit() {
     let mut fx = Fx::new(&default_channels());
 
@@ -1550,6 +1600,45 @@ fn dithering_is_ordered_and_keeps_the_average() {
     assert_eq!(decode(&fx.render(&own)[0]).to_rgba8(), a);
     let wide = ExportOptions { bit_depth_override: Some(16), ..dithered.clone() };
     assert!(list_outputs(&fx.project, 0, "sphere", &wide).unwrap().iter().all(|p| !p.dither));
+}
+
+#[test]
+fn padding_past_a_seam_takes_the_far_island_except_for_normals() {
+    // Two islands of one 3D edge: the left one's right side (x = 12) is the right one's left side (x = 20)
+    let mut fx = Fx::new(&default_channels());
+    fx.coverage = (0..RES * RES).map(|i| matches!(i % RES, 4..=11 | 20..=27)).collect();
+    fx.set_all(Channel::Roughness, |x, _| [if x < 16 { 0.2 } else { 0.8 }; 3]);
+    fx.set_all(Channel::Normal, |x, _| if x < 16 { [0.3, 0.5, 0.9] } else { [0.7, 0.5, 0.9] });
+    let at = |x: f32, y: f32| texturecraft_geom::glam::Vec2::new(x, y) / RES as f32;
+    let left = texturecraft_geom::UvSeamSide { triangle: 0, start: at(12.0, 0.0), end: at(12.0, 64.0), interior: at(4.0, 0.0) };
+    let right = texturecraft_geom::UvSeamSide { triangle: 1, start: at(20.0, 0.0), end: at(20.0, 64.0), interior: at(28.0, 0.0) };
+    let triangles: Vec<_> = (0..RES * RES)
+        .map(|pixel| match pixel % RES {
+            4..=11 => 0,
+            20..=27 => 1,
+            _ => texturecraft_geom::NO_TRI,
+        })
+        .collect();
+    let mesh = texturecraft_geom::primitives::plane(1.0, 1);
+    let partition = texturecraft_geom::TrianglePartition::new(&mesh, 0, |_, _| Vec::<u32>::new());
+    let seams = SeamPaddingInput::new(vec![texturecraft_geom::UvSeam { sides: [left, right] }], &triangles, partition);
+    let bent: Vec<f32> = (0..RES * RES).flat_map(|i| if i % RES < 16 { [0.3, 0.5, 0.9] } else { [0.7, 0.5, 0.9] }).collect();
+    fx.baked = BakedMaps { resolution: RES, maps: [(BakedMap::BentNormal, std::sync::Arc::new(bent))].into() };
+    fx.project.texture_sets[0].baked.insert(BakedMap::BentNormal);
+    let normal_x = SourceRef::Channel { channel: Channel::Normal, component: 0 };
+    let bent_x = SourceRef::Baked { map: BakedMap::BentNormal, component: 0 };
+    let mut options = one_map(FileFormat::Png, 16, vec![(Dest::R, roughness()[0].1.clone()), (Dest::G, normal_x), (Dest::B, bent_x)]);
+    options.padding = Padding::Dilation(4);
+    let render = |fx: &Fx| decode(&render_maps(&ExportInput { seams: Some(&seams), ..fx.input() }, &options).unwrap()[0]).to_rgb16();
+
+    // Just right of the left island: roughness continues from the right island, the normal and bent normal stay the left island's
+    let space_3d = render(&fx);
+    let (outside, near, far) = (space_3d.get_pixel(13, 30), space_3d.get_pixel(8, 30), space_3d.get_pixel(24, 30));
+    assert_eq!((outside[0], outside[1], outside[2]), (far[0], near[1], near[2]));
+
+    fx.project.texture_sets[0].uv_padding = UvPaddingMode::Space2d;
+    let space_2d = render(&fx);
+    assert_eq!(space_2d.get_pixel(13, 30), space_2d.get_pixel(8, 30));
 }
 
 #[test]
@@ -1991,8 +2080,15 @@ fn triangle_coverage_preserves_uncovered_texels_and_height_normal_neighbours_in_
     }
     let triangles: Vec<_> = fixture.coverage.iter().map(|covered| if *covered { 0 } else { texturecraft_geom::NO_TRI }).collect();
     let input = fixture.input();
-    let triangle_input =
-        ExportInput { project: input.project, ts: input.ts, composite: input.composite, baked: input.baked, coverage: &triangles, mesh_name: input.mesh_name };
+    let triangle_input = ExportInput {
+        project: input.project,
+        ts: input.ts,
+        composite: input.composite,
+        baked: input.baked,
+        coverage: &triangles,
+        seams: input.seams,
+        mesh_name: input.mesh_name,
+    };
     let options = ExportOptions::new(builtin_preset("glTF PBR Metal Roughness").unwrap());
 
     for map in 0..3 {

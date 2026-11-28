@@ -42,20 +42,22 @@ impl Session {
         let (width, height, values) = atlas;
         let set = self.doc.project.texture_set(ts).map_err(|e| EngineError::Other(e.to_string()))?;
         let Some(grid) = set.tile_grid().filter(|_| per_tile) else { return Ok(vec![MaskBitmap { tile: None, width, height, values }]) };
-        let block = set.block_resolution();
+        let (block_width, block_height) = set.block_size();
         set.uv_tiles
             .iter()
             .map(|&tile| {
                 let (block_x, block_y) = grid.block(tile).ok_or_else(|| EngineError::Other(format!("UV tile {tile} is not in the set's grid")))?;
 
                 // A tile smaller than its block fills the block's top-left corner
-                let side = ((block as f32 * set.tile_scale(tile)).round() as u32).clamp(1, block);
-                let mut tile_values = Vec::with_capacity(side as usize * side as usize);
-                for row in 0..side {
-                    let start = ((block_y * block + row) as usize) * width as usize + (block_x * block) as usize;
-                    tile_values.extend_from_slice(values.get(start..start + side as usize).unwrap_or(&[]));
+                let scale = set.tile_scale(tile);
+                let tile_width = ((block_width as f32 * scale).round() as u32).clamp(1, block_width);
+                let tile_height = ((block_height as f32 * scale).round() as u32).clamp(1, block_height);
+                let mut tile_values = Vec::with_capacity(tile_width as usize * tile_height as usize);
+                for row in 0..tile_height {
+                    let start = ((block_y * block_height + row) as usize) * width as usize + (block_x * block_width) as usize;
+                    tile_values.extend_from_slice(values.get(start..start + tile_width as usize).unwrap_or(&[]));
                 }
-                Ok(MaskBitmap { tile: Some(tile), width: side, height: side, values: tile_values })
+                Ok(MaskBitmap { tile: Some(tile), width: tile_width, height: tile_height, values: tile_values })
             })
             .collect()
     }

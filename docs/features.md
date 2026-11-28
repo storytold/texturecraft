@@ -146,8 +146,14 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **UDIM / UV tiles:** detected on import or switched on later, with a resolution per tile (blurs,
   other filters and height-to-normal slopes keep their size in UV space at any tile resolution)
   and one texture per tile on export (`$udim`).
-- **Texture sets** from 128 to 8192 px per material, resampled when you change them, with 21
-  channel types to add or remove. Show, hide or invert them all at once, or **focus** on the
+- **Texture sets** from 128 to 8192 px per material, square or with a height of their own
+  (`textureSet.resolution {resolution, height}`), resampled when you change them, with 72 channel
+  types to add or remove: the 21 the shader reads, more material channels that are stored and
+  exported, and User0 to User31 (*Add or remove channels*, `textureSet.channels`). Each channel
+  has a storage format (`textureSet.channel.format`), and each set its normal mixing, ambient
+  occlusion mixing, height to normal method and UV padding, across seams (3D) or from island
+  edges (2D) (`textureSet.settings`). Rename a set in the list, or reset it to the mesh
+  material's name. Show, hide or invert them all at once, or **focus** on the
   active one. The project's **normal map format** (OpenGL or DirectX, in Texture Set Settings)
   says how a normal map image set as a mesh map is read, and is the default for export.
 - **Projects** are a single `.tcraft` file: the mesh (with its generated UV layout when *Rebuild mesh UVs* was chosen), every layer (sparse and lossless), baked maps

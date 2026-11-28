@@ -75,6 +75,7 @@ pub fn server_token(port: u16) -> Result<(String, Option<PathBuf>), AutomationEr
         validate_token(t.trim())?;
         return Ok((t.trim().to_string(), None));
     }
+
     let token = generate_token()?;
     let path = token_file(port);
     write_token_file(&path, &token).map_err(|e| {
@@ -237,9 +238,7 @@ mod tests {
 
     #[test]
     fn a_blank_token_counts_as_not_given() {
-        // No token anywhere (the port has no token file): the error says what to set, not that a
-        // blank token is invalid. A non-blank inherited TOKEN_ENV can still satisfy the client
-        // after a blank supplied value, so do not unwrap_err() first.
+        // A blank supplied token can fall back to a nonblank inherited token
         match client_token(1, Some("  ".into())) {
             Err(error) => {
                 if std::env::var_os(TOKEN_ENV).is_none() {

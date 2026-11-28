@@ -233,6 +233,21 @@ fn the_settings_at_export_are_kept_while_it_runs() {
 }
 
 #[test]
+fn changing_only_the_height_stops_a_frozen_export_before_writing() {
+    let (mut h, directory) = harness("height-change");
+    click(&mut h, "Export");
+    let next_set = h.state().ui.export.job.as_ref().unwrap().pending[0].0;
+    let set = &mut h.state_mut().session.doc.project.texture_sets[next_set];
+    set.set_size(set.resolution, 128);
+
+    finish(&mut h);
+
+    assert_eq!(exports(&h), 0);
+    assert!(console(&h).iter().any(|line| line.contains("planned files") && line.contains("changed")));
+    assert!(!directory.exists());
+}
+
+#[test]
 fn texture_sets_writing_the_same_file_name_do_not_start_an_export() {
     let (mut h, dir) = harness("clash");
 

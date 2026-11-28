@@ -280,8 +280,7 @@ mod tests {
         assert_eq!(Script::of_language("de"), None);
         assert_eq!(Script::of_language("ru"), None);
         for l in &crate::i18n::LANGUAGES {
-            // Past the Latin blocks and their diacritics. Cyrillic needs no fallback: the UI fonts
-            // themselves carry it (egui's Ubuntu and craft-fonts' Inter).
+            // Both UI fonts already cover Cyrillic
             let other_script = l.name.chars().any(|c| c > '\u{036F}' && !('\u{0400}'..='\u{04FF}').contains(&c));
             assert_eq!(other_script, Script::of_language(l.code).is_some(), "{}", l.code);
         }

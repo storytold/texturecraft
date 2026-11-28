@@ -57,6 +57,7 @@ pub(crate) fn field_identity(inputs: &Inputs) -> u64 {
         mesh.submeshes.iter().for_each(|part| (part.material, part.start, part.count).hash(&mut hash));
         set.uv_tiles.hash(&mut hash);
         set.resolution.hash(&mut hash);
+        set.resolution_height.hash(&mut hash);
         set.tile_resolutions.hash(&mut hash);
     }
 

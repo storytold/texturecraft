@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BakeSettings, BakeSource, BakeSyncGroup, BakedMap, Channel, ChannelFormat, ContentsOffset, CoreError, Effect, Layer, LayerId, LayerKind, Result};
+use crate::{
+    BakeSettings, BakeSource, BakeSyncGroup, BakedMap, Channel, ChannelFormat, ContentsOffset, CoreError, Effect, HeightToNormalMethod, Layer, LayerId,
+    LayerKind, Result, UvPaddingMode,
+};
 
 pub use crate::env_alignment::EnvAlignment;
 pub use crate::shadow_mode::ShadowMode;
@@ -38,11 +41,43 @@ pub enum NormalMixing {
     Replace,
 }
 
+impl NormalMixing {
+    pub const ALL: [NormalMixing; 2] = [NormalMixing::Combine, NormalMixing::Replace];
+
+    /// Stable id for commands and inspect
+    pub fn id(self) -> &'static str {
+        match self {
+            NormalMixing::Combine => "combine",
+            NormalMixing::Replace => "replace",
+        }
+    }
+
+    pub fn parse(id: &str) -> Option<NormalMixing> {
+        NormalMixing::ALL.into_iter().find(|mixing| mixing.id() == id)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AoMixing {
     #[default]
     Multiply,
     None,
+}
+
+impl AoMixing {
+    pub const ALL: [AoMixing; 2] = [AoMixing::Multiply, AoMixing::None];
+
+    /// Stable id for commands and inspect
+    pub fn id(self) -> &'static str {
+        match self {
+            AoMixing::Multiply => "multiply",
+            AoMixing::None => "none",
+        }
+    }
+
+    pub fn parse(id: &str) -> Option<AoMixing> {
+        AoMixing::ALL.into_iter().find(|mixing| mixing.id() == id)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -52,15 +87,28 @@ pub struct TextureSet {
     pub description: String,
     /// Material index in the mesh this set paints.
     pub material: usize,
-    /// Power of two, 128..=8192.
+    /// Texels across: a power of two, 128..=8192 (the side of a square set)
     pub resolution: u32,
+    /// Texels down when they differ from `resolution` (a power of two, 128..=8192); sets with per-tile resolutions stay square
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_height: Option<u32>,
+    /// Channels and their storage formats; see [`TextureSet::formats`] for what they hold
     pub channels: Vec<(Channel, ChannelFormat)>,
+    /// Whether channels hold their formats' precision; until a format is set every channel keeps 16 bits, what TextureCraft always stored
+    #[serde(default)]
+    pub format_precision: bool,
     /// Top-level layers, bottom → top.
     pub stack: Vec<LayerId>,
     #[serde(default)]
     pub normal_mixing: NormalMixing,
     #[serde(default)]
     pub ao_mixing: AoMixing,
+    /// Height to normal method; projects without it keep Smooth, the filter their exports already used
+    #[serde(default)]
+    pub height_to_normal: HeightToNormalMethod,
+    /// UV padding; projects without it keep padding from island edges (2D), the padding they were made with
+    #[serde(default)]
+    pub uv_padding: UvPaddingMode,
     /// Height-to-normal strength.
     #[serde(default = "one")]
     pub height_strength: f32,
@@ -170,10 +218,14 @@ impl TextureSet {
             description: String::new(),
             material,
             resolution,
+            resolution_height: None,
             channels: Channel::DEFAULT_SET.iter().map(|c| (*c, ChannelFormat::default_for(*c))).collect(),
+            format_precision: false,
             stack: Vec::new(),
             normal_mixing: NormalMixing::Combine,
             ao_mixing: AoMixing::Multiply,
+            height_to_normal: HeightToNormalMethod::Smooth,
+            uv_padding: UvPaddingMode::Space3d,
             height_strength: 1.0,
             bake: BakeSettings::default(),
             baked: BTreeSet::new(),
@@ -214,11 +266,42 @@ impl TextureSet {
         self.height_strength / self.tile_grid().map_or(1.0, |g| g.cols as f32)
     }
 
-    /// Texels across and down: [`TextureSet::block_resolution`] per block of the atlas grid.
+    /// Columns over rows of the atlas grid (1 for a classic set): how much more slopes down the texture tilt than across it, as in export per block
+    pub fn atlas_height_y_factor(&self) -> f32 {
+        self.tile_grid().map_or(1.0, |g| g.cols as f32 / g.rows.max(1) as f32)
+    }
+
+    /// Whether the height slope joins the shaded normal ([`NormalMixing::Replace`] leaves it out)
+    pub fn height_in_normal(&self) -> bool {
+        self.normal_mixing == NormalMixing::Combine
+    }
+
+    /// Texels across and down: [`TextureSet::block_size`] per block of the atlas grid
     pub fn size(&self) -> (u32, u32) {
         let (cols, rows) = self.tile_grid().map_or((1, 1), |g| (g.cols, g.rows));
+        let (width, height) = self.block_size();
+        (width.saturating_mul(cols), height.saturating_mul(rows))
+    }
+
+    /// Texels down of the set's size (`resolution` for a square set)
+    pub fn height(&self) -> u32 {
+        self.resolution_height.unwrap_or(self.resolution)
+    }
+
+    /// Set the size to `width × height` (`height` stored only when it differs)
+    pub fn set_size(&mut self, width: u32, height: u32) {
+        self.resolution = width;
+        self.resolution_height = (height != width).then_some(height);
+    }
+
+    /// Texels across and down of an atlas block: the set's size, or the largest tile resolution square when tiles have their own
+    pub fn block_size(&self) -> (u32, u32) {
+        if self.tile_resolutions.is_empty() {
+            return (self.resolution, self.height());
+        }
+
         let block = self.block_resolution();
-        (block.saturating_mul(cols), block.saturating_mul(rows))
+        (block, block)
     }
 
     /// Texels per side of UV tile `udim` (its override, else `resolution`).
@@ -226,12 +309,12 @@ impl TextureSet {
         self.tile_resolutions.get(&udim).copied().unwrap_or(self.resolution)
     }
 
-    /// Texels per side of an atlas block: the largest tile resolution (`resolution` for a
-    /// classic set or one without overrides).
+    /// Texels across an atlas block: the largest tile resolution (`resolution` without overrides); see [`TextureSet::block_size`]
     pub fn block_resolution(&self) -> u32 {
         if self.tile_resolutions.is_empty() {
             return self.resolution;
         }
+
         self.uv_tiles.iter().map(|t| self.tile_resolution(*t)).max().unwrap_or(self.resolution)
     }
 
@@ -246,9 +329,20 @@ impl TextureSet {
 
     /// [`TextureSet::tile_scale`] of every atlas block, to look up by atlas texel.
     pub fn block_scales(&self) -> BlockScales {
-        let Some(g) = self.tile_grid().filter(|_| !self.tile_resolutions.is_empty()) else { return BlockScales::default() };
-        let scales = (0..g.rows).flat_map(|by| (0..g.cols).map(move |bx| g.udim(bx, by))).map(|u| self.tile_scale(u)).collect();
-        BlockScales { block: self.block_resolution(), cols: g.cols, scales }
+        if self.tile_resolutions.is_empty() {
+            return BlockScales::default();
+        }
+
+        let Some(grid) = self.tile_grid() else { return BlockScales::default() };
+        let block = self.block_resolution();
+        let mut scales = vec![1.0; (grid.rows * grid.cols) as usize];
+        for &tile in &self.uv_tiles {
+            if let Some((column, row)) = grid.block(tile) {
+                scales[(row * grid.cols + column) as usize] = (self.tile_resolution(tile) as f32 / block.max(1) as f32).clamp(1e-3, 1.0);
+            }
+        }
+
+        BlockScales { block, cols: grid.cols, scales }
     }
 
     /// Scale of the tile holding mesh UV `uv` (v down) and that tile's origin corner.
@@ -282,6 +376,45 @@ impl TextureSet {
 
     pub fn channel_list(&self) -> Vec<Channel> {
         self.channels.iter().map(|(c, _)| *c).collect()
+    }
+
+    /// Channels the viewport can display individually, in texture-set order.
+    pub fn viewport_channels(&self) -> impl Iterator<Item = Channel> + '_ {
+        self.channels.iter().map(|(channel, _)| *channel).filter(|channel| channel.is_shaded())
+    }
+
+    /// The channels with the formats they are stored in (8-bit ones read as 16-bit without `format_precision`)
+    pub fn formats(&self) -> Vec<(Channel, ChannelFormat)> {
+        let held = |format: ChannelFormat| if self.format_precision { format } else { format.at_least_16_bit() };
+        self.channels.iter().map(|(channel, format)| (*channel, held(*format))).collect()
+    }
+
+    /// Add channel `c` in its default format (16-bit or more until a format is set, see [`TextureSet::formats`]); false when present
+    pub fn add_channel(&mut self, c: Channel) -> bool {
+        if self.has_channel(c) {
+            return false;
+        }
+
+        let format = ChannelFormat::default_for(c);
+        self.channels.push((c, if self.format_precision { format.at_least_16_bit() } else { format }));
+        self.channels.sort_by_key(|(c, _)| c.index());
+        true
+    }
+
+    /// Store channel `target` in `format` (false when the set lacks it); the other channels keep what they hold
+    pub fn set_channel_format(&mut self, target: Channel, format: ChannelFormat) -> bool {
+        if !self.has_channel(target) {
+            return false;
+        }
+
+        self.channels = self.formats();
+        self.format_precision = true;
+        for (channel, stored) in &mut self.channels {
+            if *channel == target {
+                *stored = format;
+            }
+        }
+        true
     }
 }
 
@@ -424,6 +557,7 @@ impl DisplaySettings {
         }
 
         const AIR_INDEX_OF_REFRACTION: f32 = 1.0;
+
         // Specular Level 0.5 corresponds to OpenPBR specular weight 1
         const SPECULAR_LEVEL_TO_WEIGHT_SCALE: f32 = 2.0;
         let ior = self.ior.clamp(MIN_INDEX_OF_REFRACTION, MAX_INDEX_OF_REFRACTION);
@@ -761,24 +895,37 @@ impl Project {
         if self.format_version > FORMAT_VERSION {
             return Err(CoreError::Invalid(format!("project format {} is newer than this TextureCraft supports ({FORMAT_VERSION})", self.format_version)));
         }
+
         if let Some(t) = self.texture_sets.iter().find(|t| !t.uv_tiles.is_empty() && (t.tile_grid().is_none() || !t.uv_tiles.is_sorted_by(|a, b| a < b))) {
             return Err(CoreError::Invalid(format!("texture set \"{}\" has invalid UV tiles {:?}", t.name, t.uv_tiles)));
         }
+
         let bad_tile_res = |t: &TextureSet| {
             t.tile_resolutions.iter().any(|(u, r)| !t.uv_tiles.contains(u) || !r.is_power_of_two() || !(MIN_RESOLUTION..=MAX_RESOLUTION).contains(r))
         };
         if let Some(t) = self.texture_sets.iter().find(|t| bad_tile_res(t)) {
             return Err(CoreError::Invalid(format!("texture set \"{}\" has invalid UV tile resolutions {:?}", t.name, t.tile_resolutions)));
         }
+
+        let bad_height = |set: &TextureSet| {
+            set.resolution_height
+                .is_some_and(|height| !height.is_power_of_two() || !(MIN_RESOLUTION..=MAX_RESOLUTION).contains(&height) || !set.tile_resolutions.is_empty())
+        };
+        if let Some(set) = self.texture_sets.iter().find(|set| bad_height(set)) {
+            return Err(CoreError::Invalid(format!("texture set \"{}\" has an invalid height {:?}", set.name, set.resolution_height)));
+        }
+
         let mut seen = BTreeSet::new();
         for ts in 0..self.texture_sets.len() {
             for (id, depth) in self.walk(ts) {
                 if depth > MAX_DEPTH {
                     return Err(CoreError::Invalid("layer groups nested too deeply".into()));
                 }
+
                 if !self.layers.contains_key(&id) {
                     return Err(CoreError::Invalid(format!("stack references missing layer {}", id.0)));
                 }
+
                 if !seen.insert(id) {
                     return Err(CoreError::Invalid(format!("layer {} appears twice", id.0)));
                 }
@@ -868,6 +1015,37 @@ mod tests {
         let mut p = Project::new("t", "builtin:sphere");
         p.texture_sets.push(TextureSet::new("Body", 0, 512));
         p
+    }
+
+    #[test]
+    fn older_sets_without_the_new_fields_open_square_with_2d_padding_and_smooth_normals() {
+        let mut v = serde_json::to_value(TextureSet::new("a", 0, 256)).unwrap();
+        for field in ["resolution_height", "format_precision", "height_to_normal", "uv_padding"] {
+            v.as_object_mut().unwrap().remove(field);
+        }
+
+        let old: TextureSet = serde_json::from_value(v).unwrap();
+
+        assert_eq!(old.size(), (256, 256));
+        assert_eq!((old.uv_padding, old.height_to_normal), (UvPaddingMode::Space2d, HeightToNormalMethod::Smooth));
+    }
+
+    #[test]
+    fn sets_keep_16_bits_until_a_format_is_set_also_in_older_files() {
+        let new = TextureSet::new("a", 0, 128);
+        let mut v = serde_json::to_value(&new).unwrap();
+        v.as_object_mut().unwrap().remove("format_precision");
+        let mut old: TextureSet = serde_json::from_value(v).unwrap();
+        let format = |t: &TextureSet, c: Channel| t.formats().into_iter().find(|(x, _)| *x == c).map(|(_, f)| f);
+
+        assert_eq!(format(&new, Channel::Roughness), Some(ChannelFormat::L16));
+        assert_eq!(format(&old, Channel::Roughness), Some(ChannelFormat::L16));
+        assert_eq!(format(&old, Channel::BaseColor), Some(ChannelFormat::Rgb16));
+
+        assert!(old.set_channel_format(Channel::Metallic, ChannelFormat::L8));
+        assert_eq!(format(&old, Channel::Metallic), Some(ChannelFormat::L8));
+        assert_eq!(format(&old, Channel::Roughness), Some(ChannelFormat::L16), "the other channels keep their precision");
+        assert!(!old.set_channel_format(Channel::Emissive, ChannelFormat::L8), "a channel the set lacks");
     }
 
     #[test]
@@ -1122,6 +1300,50 @@ mod tests {
             q.texture_sets[0].tile_resolutions = [bad].into_iter().collect();
             assert!(q.validate().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn atlas_slopes_along_each_side_match_a_block_in_wide_tall_and_square_grids() {
+        let mut t = TextureSet::new("a", 0, 256);
+        t.height_strength = 3.0;
+        for tiles in [vec![1001, 1002], vec![1001, 1011], vec![1001, 1002, 1011, 1012], vec![1001, 1002, 1003]] {
+            t.uv_tiles = tiles;
+            let ((width, height), (block_width, block_height)) = (t.size(), t.block_size());
+
+            let across = t.atlas_height_strength() * width as f32;
+            let down = t.atlas_height_strength() * t.atlas_height_y_factor() * height as f32;
+
+            assert_eq!(across, t.height_strength * block_width as f32, "{:?}", t.uv_tiles);
+            assert_eq!(down, t.height_strength * block_height as f32, "{:?}", t.uv_tiles);
+        }
+    }
+
+    #[test]
+    fn non_square_sets_are_wider_than_tall_per_block_and_stay_square_with_tile_sizes() {
+        let mut p = project();
+        let t = &mut p.texture_sets[0];
+        t.set_size(1024, 256);
+        let (w, h) = t.size();
+        assert!(w > h, "{:?}", t.size());
+        t.uv_tiles = vec![1001, 1011];
+
+        // Tiles stack down, each block keeping the set's shape
+        assert_eq!(t.size(), (w, h * 2));
+        p.validate().unwrap();
+
+        // A height must be a valid size, and per-tile sizes need a square set
+        for bad in [Some(100), Some(16384)] {
+            let mut q = p.clone();
+            q.texture_sets[0].resolution_height = bad;
+            assert!(q.validate().is_err(), "{bad:?}");
+        }
+        let mut q = p.clone();
+        q.texture_sets[0].tile_resolutions.insert(1011, 128);
+        assert!(q.validate().is_err());
+
+        // The same size both ways is stored as square
+        p.texture_sets[0].set_size(512, 512);
+        assert_eq!(p.texture_sets[0].resolution_height, None);
     }
 
     #[test]

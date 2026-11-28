@@ -72,7 +72,8 @@ where
         outln!(err, "error: `{flag}` is a TextureCraft desktop launch option, not a CLI argument");
         return 2;
     }
-    // Help and the version (`help`, `-h`, `<subcommand> --help`, `-V`) come back as errors too.
+
+    // Help and the version (`help`, `-h`, `<subcommand> --help`, `-V`) come back as errors too
     let cli = match parse(&args) {
         Ok(cli) => cli,
         Err(e) => {
@@ -147,6 +148,7 @@ fn info(a: &InfoArgs, out: &mut dyn Write) -> Result<(), CliError> {
         );
         return Ok(());
     }
+
     if !is_project(&a.input) {
         let m = import_mesh(&a.input).map_err(|e| CliError::Read { path: a.input.clone(), message: e.to_string() })?;
         print(
@@ -158,11 +160,13 @@ fn info(a: &InfoArgs, out: &mut dyn Write) -> Result<(), CliError> {
         );
         return Ok(());
     }
+
     let h = open(&a.input, None)?;
     let mut v = h.inspect();
     v["file"] = json!(file);
     v["kind"] = json!("project");
-    // The embedded mesh is re-imported for its UV report (built-in meshes have none).
+
+    // The embedded mesh is re-imported for its UV report (built-in meshes have none)
     v["uv"] = match &h.session.mesh_source {
         Some((ext, bytes)) => {
             let m = import_mesh_bytes(&format!("mesh.{ext}"), bytes).map_err(|e| CliError::Read { path: a.input.clone(), message: e.to_string() })?;
@@ -181,6 +185,7 @@ fn commands(a: &CommandsArgs, out: &mut dyn Write) -> Result<(), CliError> {
         print(out, &list);
         return Ok(());
     }
+
     for c in list.as_array().into_iter().flatten() {
         let f = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
         outln!(out, "{:<28} {:<36} {}", f("id"), f("label"), f("params"));
@@ -221,6 +226,7 @@ fn batch(a: &BatchArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), 
             message: failure["error"].as_str().unwrap_or_default().to_string(),
         });
     }
+
     match output {
         Some(path) => save(&mut h, Path::new(path), err),
         None => Ok(()),
@@ -228,7 +234,7 @@ fn batch(a: &BatchArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), 
 }
 
 fn bake(a: &BakeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), CliError> {
-    // `check` has seen to it: a project without -o is saved in place (--in-place), a mesh has -o.
+    // `check` has seen to it: a project without -o is saved in place (--in-place), a mesh has -o
     let target = a.output.as_deref().unwrap_or(&a.input);
     let mut p = json!({"ts": "all"});
     if let Some(r) = a.resolution {
@@ -292,6 +298,7 @@ fn new(a: &NewArgs, err: &mut dyn Write) -> Result<(), CliError> {
     if is_project(&a.input) {
         return Err(CliError::AlreadyProject(a.input.clone()));
     }
+
     let mut h = open(&a.input, a.resolution)?;
     if a.sample {
         let bake_res = h.session.doc.project.texture_sets.first().map_or(1024, |t| t.resolution.min(1024));
@@ -310,6 +317,7 @@ fn workspace(roots: &RootArgs) -> Result<Filesystem, CliError> {
     if roots.read_root.is_none() && roots.write_root.is_none() {
         return Ok(Filesystem::Denied);
     }
+
     Ok(Filesystem::Workspace(AuthorizedWorkspace::new(roots.read_root.as_deref(), roots.write_root.as_deref())?))
 }
 
@@ -327,7 +335,7 @@ fn serve(a: &ServeArgs, err: &mut dyn Write) -> Result<(), CliError> {
     match a.port {
         None => rpc::serve_lines(&h, std::io::stdin().lock(), std::io::stdout().lock()).map_err(CliError::Serve)?,
         Some(port) => {
-            // Bind first: a port in use must not replace its server's token file.
+            // Bind first: a port in use must not replace its server's token file
             let listener = rpc::bind_tcp(port)?;
             let addr = listener.local_addr().map_err(CliError::Serve)?;
             let (token, file) = server_token(addr.port())?;

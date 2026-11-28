@@ -22,12 +22,15 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 use texturecraft_compose::{Composite, ImageRes};
-use texturecraft_core::Channel;
 use texturecraft_core::project::{DisplaySettings, EnvAlignment, LEGACY_DIELECTRIC_F0_SCALE, ToneMapping};
+use texturecraft_core::{Channel, HeightToNormalMethod};
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera};
 
 use crate::ibl::EnvImage;
+
+/// A unit height over this share of a side tilts the normal 45°, as in export
+const HEIGHT_SPAN: f32 = 16.0;
 
 /// One texture set's composited channels.
 #[derive(Clone)]
@@ -35,7 +38,19 @@ pub struct TraceSet {
     /// Mesh material the set covers.
     pub material: usize,
     pub composite: Composite,
+    /// Height displacement and, with `height_in_normal`, height-to-normal strength
     pub height_strength: f32,
+    /// How much more the height slope tilts down the texture than across it ([`texturecraft_core::TextureSet::atlas_height_y_factor`])
+    pub height_y_factor: f32,
+    pub height_in_normal: bool,
+    pub height_to_normal: HeightToNormalMethod,
+}
+
+impl TraceSet {
+    /// The strength of the height slope in the shaded normal (0 when normal mixing replaces it)
+    pub fn normal_height_strength(&self) -> f32 {
+        if self.height_in_normal { self.height_strength } else { 0.0 }
+    }
 }
 
 /// Everything a pass reads (cheap to clone: shared or copy-on-write data).
@@ -554,7 +569,6 @@ fn surface(scene: &TraceScene, triangle: u32, u: f32, v: f32, origin: Vec3, dire
     // Match the minimum roughness in the GPU tracer
     const SPECULAR_ROUGHNESS_FLOOR: f32 = 0.045;
     const SHEEN_ROUGHNESS_FLOOR: f32 = 0.07;
-    const HEIGHT_SLOPE_UV_DIVISOR: f32 = 16.0;
 
     let mesh = &scene.mesh;
     let first_index = triangle as usize * 3;
@@ -588,21 +602,20 @@ fn surface(scene: &TraceScene, triangle: u32, u: f32, v: f32, origin: Vec3, dire
     let sample_channel = |channel: Channel| surface_texel.map_or_else(|| channel.default_value(), |(set, _, [x, y])| set.composite.value(channel, x, y));
     let base = Vec3::from(sample_channel(Channel::BaseColor));
 
-    // A unit height across one sixteenth of the UV width tilts 45°
-    // A smaller tile reduces the number of texels across that span
+    // A unit height over a sixteenth of either UV axis tilts 45°
     let height_normal = surface_texel.map_or(Vec3::Z, |(set, [width, height], [x, y])| {
-        let strength = set.height_strength * set.composite.resolution as f32 / HEIGHT_SLOPE_UV_DIVISOR * set.composite.block_scales.at(x, y);
+        let strength = set.normal_height_strength() / HEIGHT_SPAN * set.composite.block_scales.at(x, y);
         if strength == 0.0 {
             return Vec3::Z;
         }
 
-        // Neighbors wrap independently across each axis
-        let previous = |position, size| if position == 0 { size - 1 } else { position - 1 };
-        let next = |position, size| if position + 1 == size { 0 } else { position + 1 };
-        let height_at = |x, y| set.composite.value(Channel::Height, x, y)[0];
-        let slope_x = height_at(next(x, width), y) - height_at(previous(x, width), y);
-        let slope_y = height_at(x, next(y, height)) - height_at(x, previous(y, height));
-        Vec3::new(-slope_x * 0.5 * strength, slope_y * 0.5 * strength, 1.0).normalize_or(Vec3::Z)
+        let [slope_x, slope_y] = set.height_to_normal.slope(|dx, dy| {
+            let x = (x as i32 + dx).rem_euclid(width as i32) as u32;
+            let y = (y as i32 + dy).rem_euclid(height as i32) as u32;
+            set.composite.value(Channel::Height, x, y)[0]
+        });
+        let scale_y = height as f32 * set.height_y_factor;
+        Vec3::new(-slope_x * width as f32 * strength, slope_y * scale_y * strength, 1.0).normalize_or(Vec3::Z)
     });
 
     let detail = (Vec3::from(sample_channel(Channel::Normal)) * 2.0 - Vec3::ONE).normalize_or(Vec3::Z);
@@ -1259,7 +1272,72 @@ mod tests {
                 }
             }
         }
-        TraceScene::new(mesh, bvh, vec![TraceSet { material: 0, composite, height_strength: 0.0 }], env, 0.0)
+        TraceScene::new(
+            mesh,
+            bvh,
+            vec![TraceSet {
+                material: 0,
+                composite,
+                height_strength: 0.0,
+                height_y_factor: 1.0,
+                height_in_normal: true,
+                height_to_normal: texturecraft_core::HeightToNormalMethod::Smooth,
+            }],
+            env,
+            0.0,
+        )
+    }
+
+    /// How far the shaded normal of a plane leans from straight up under a height ramp along x or along y over `texture_set`'s atlas
+    fn ramp_tilt(texture_set: &texturecraft_core::TextureSet, along_x: bool) -> f32 {
+        let mesh = Arc::new(primitives::plane(2.0, 1));
+        let bvh = Arc::new(Bvh::new(&mesh));
+        let ((width, height), (block_width, block_height)) = (texture_set.size(), texture_set.block_size());
+        let mut composite = Composite::with_size(&[Channel::Height], width, height);
+        let img = composite.channels.get_mut(&Channel::Height).unwrap();
+        for y in 0..height {
+            for x in 0..width {
+                // The same rise per block side along either side
+                let rise = if along_x { x as f32 / block_width as f32 } else { y as f32 / block_height as f32 };
+                img.set(x, y, &[texturecraft_texel::to_u16(rise * 0.5)]);
+            }
+        }
+        let set = TraceSet {
+            material: 0,
+            composite,
+            height_strength: texture_set.atlas_height_strength(),
+            height_y_factor: texture_set.atlas_height_y_factor(),
+            height_in_normal: true,
+            height_to_normal: HeightToNormalMethod::Sharp,
+        };
+        let env = Arc::new(EnvImage { width: 8, height: 4, data: vec![[1.0; 3]; 32] });
+        let s = TraceScene::new(mesh, bvh, vec![set], env, 0.0);
+        let (o, d) = (Vec3::new(0.1, 1.0, 0.1), Vec3::NEG_Y);
+        let hit = s.bvh.closest(o, d, f32::MAX).unwrap();
+        let surf = surface(&s, hit.tri, hit.u, hit.v, o, d, hit.t).unwrap();
+        surf.n.angle_between(Vec3::Y)
+    }
+
+    #[test]
+    fn a_wide_set_tilts_the_normal_alike_for_the_same_rise_along_either_side() {
+        let mut wide = texturecraft_core::TextureSet::new("wide", 0, 128);
+        wide.set_size(128, 64);
+
+        let (across, down) = (ramp_tilt(&wide, true), ramp_tilt(&wide, false));
+
+        assert!(across > 0.05, "the ramp tilts the normal: {across}");
+        assert!((across - down).abs() < 0.1 * across, "across {across} down {down}");
+    }
+
+    #[test]
+    fn a_uv_tile_row_tilts_the_normal_alike_for_the_same_rise_along_either_side_of_a_tile() {
+        let mut row = texturecraft_core::TextureSet::new("row", 0, 64);
+        row.uv_tiles = vec![1001, 1002];
+
+        let (across, down) = (ramp_tilt(&row, true), ramp_tilt(&row, false));
+
+        assert!(across > 0.05, "the ramp tilts the normal: {across}");
+        assert!((across - down).abs() < 0.1 * across, "across {across} down {down}");
     }
 
     /// Mean radiance of parallel rays over the whole disc of the sphere (grazing hits included)
@@ -1475,7 +1553,14 @@ mod tests {
     fn dielectric_scene(display: &DisplaySettings) -> TraceScene {
         let mesh = Arc::new(primitives::sphere(1.0, 32, 16));
         let bvh = Arc::new(Bvh::new(&mesh));
-        let sets = vec![TraceSet { material: 0, composite: dielectric_composite(), height_strength: 0.0 }];
+        let sets = vec![TraceSet {
+            material: 0,
+            composite: dielectric_composite(),
+            height_strength: 0.0,
+            height_y_factor: 1.0,
+            height_in_normal: true,
+            height_to_normal: HeightToNormalMethod::Sharp,
+        }];
         TraceScene::for_display_env(mesh, bvh, sets, display, Arc::new(crate::ibl::environment("Studio Soft", 32)))
     }
 
@@ -1497,7 +1582,14 @@ mod tests {
         let height = composite.channels.get_mut(&Channel::Height).unwrap();
         height.set(3, 0, &[u16::MAX]);
         height.set(0, 4, &[u16::MAX]);
-        let sets = vec![TraceSet { material: 0, composite, height_strength: 1.0 }];
+        let sets = vec![TraceSet {
+            material: 0,
+            composite,
+            height_strength: 1.0,
+            height_y_factor: 1.0,
+            height_in_normal: true,
+            height_to_normal: HeightToNormalMethod::Sharp,
+        }];
         let scene = TraceScene::new(mesh, bvh, sets, Arc::new(crate::ibl::environment("Studio Soft", 8)), 0.0);
 
         let normal = surface(&scene, 0, 0.25, 0.25, Vec3::Y, Vec3::NEG_Y, 1.0).unwrap().n;
@@ -1516,7 +1608,8 @@ mod tests {
         project.texture_sets.push(set);
         project.display = display.clone();
         let coverage = vec![true; (composite.resolution * composite.resolution) as usize];
-        let input = ExportInput { project: &project, ts: 0, composite: &composite, baked: &Default::default(), coverage: &coverage, mesh_name: "sphere" };
+        let input =
+            ExportInput { project: &project, ts: 0, composite: &composite, baked: &Default::default(), coverage: &coverage, seams: None, mesh_name: "sphere" };
         let f0 = |component| SourceRef::Virtual { map: VirtualMap::F0, component };
         let channels = vec![(Dest::R, f0(0)), (Dest::G, f0(1)), (Dest::B, f0(2))];
         let map = MapSpec { file: "f0".into(), format: FileFormat::Exr, bit_depth: 32, channels, inverted: Vec::new() };

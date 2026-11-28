@@ -315,6 +315,7 @@ pub fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
         && folder.len() <= 2
         && folder.iter().zip([crate::shelf_entry::USER, "Brushes"]).all(|(selected, part)| selected == part);
     let mut entries: Vec<ShelfEntry> = matching.into_iter().filter(|entry| crate::shelf_tabs::shows(tab, entry.tab())).collect();
+
     // Favorites first, the most recently added first, then by name
     let favorites = &app.ui.shelf_favorites;
     entries.sort_by_cached_key(|entry| (crate::shelf_favorite::rank(favorites, entry).unwrap_or(usize::MAX), entry.label().to_lowercase()));

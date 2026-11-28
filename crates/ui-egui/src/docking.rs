@@ -30,6 +30,7 @@ pub enum Panel {
     Assets,
     /// A second Assets panel with its own search, type and folder (the Assets panel's folder button)
     AssetsSecond,
+
     // Saved layouts name the bake panels by their earlier names
     #[serde(rename = "BakeMaps")]
     MeshMapSettings,
@@ -115,6 +116,7 @@ impl Panel {
         match self {
             Panel::Viewport => "Viewport",
             Panel::Assets => "Assets",
+
             // The second panel shows every type at first, so it's named for that, as the reference names it
             Panel::AssetsSecond => "All",
             Panel::MeshMapSettings => "Mesh Map Settings",
@@ -173,10 +175,12 @@ pub fn default_workspace() -> Workspace {
     // The Assets split keeps four tiles visible at the reference window width
     const ASSETS_SPLIT_RATIO: f32 = 0.16;
     const VIEWPORT_SPLIT_RATIO: f32 = 0.80;
-    const TEXTURE_SET_SPLIT_RATIO: f32 = 0.125;
+
+    // Three texture set rows show at the default window height
+    const TEXTURE_SET_SPLIT_RATIO: f32 = 0.2;
 
     // Leave room for three layer rows and the fill's channel controls
-    const LAYERS_SPLIT_RATIO: f32 = 0.31;
+    const LAYERS_SPLIT_RATIO: f32 = 0.34;
 
     let column = split(
         Axis::Y,

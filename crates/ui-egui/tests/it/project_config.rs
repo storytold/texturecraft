@@ -526,7 +526,8 @@ fn the_normal_map_format_changes_on_ok_and_shows_in_the_texture_set_panel() {
     h.state_mut().ui.dock.focus(texturecraft_ui_egui::docking::Panel::TextureSetSettings);
     h.run_steps(3);
 
-    assert!(h.query_all_by_value("DirectX").next().is_some(), "the Texture Set Settings panel shows the project's format");
+    // The panel's dropdown shows the project's format (the project window is closed by now)
+    assert!(h.query_all_by_role_and_label(Role::ComboBox, "DirectX").next().is_some(), "the Texture Set Settings panel shows the project's format");
 
     // One undo step puts it back
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
@@ -570,7 +571,9 @@ fn uv_tiles_are_shown_read_only() {
 
     hover_uv_tile_box(&mut h);
     assert!(h.query_by_label_contains("No UV tiles").is_none());
-    assert!(h.query_by_label_contains("1001").is_some(), "the tile list of a UDIM project");
+
+    // The hint's own text, not the Texture Sets list's tile rows
+    assert!(h.query_all_by_label_contains("1001").any(|node| node.accesskit_node().role() == Role::Label), "the tile list of a UDIM project");
 }
 
 /// Hover the disabled Use UV Tile workflow box, whose hint lists the project's UV tiles.

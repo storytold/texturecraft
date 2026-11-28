@@ -62,6 +62,7 @@ mod tests;
 pub(crate) use action_row_response::ActionRowResponse;
 pub(crate) use band_response::BandResponse;
 pub(crate) use button_icon::ButtonIcon;
+pub(crate) use choice::option_row;
 pub(crate) use compare_row_response::CompareRowResponse;
 pub(crate) use file_list_add::FileListAdd;
 pub(crate) use file_list_response::FileListResponse;

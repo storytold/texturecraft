@@ -19,6 +19,7 @@ fn main() -> ExitCode {
         eprintln!("usage: man-and-completions <out-dir>");
         return ExitCode::from(2);
     };
+
     let dir = Path::new(&dir);
     match generate(dir) {
         Ok(()) => ExitCode::SUCCESS,
@@ -36,7 +37,7 @@ pub(crate) fn generate(dir: &Path) -> std::io::Result<()> {
     for &shell in Shell::value_variants() {
         clap_complete::generate_to(shell, &mut cmd, "texturecraft-cli", dir)?;
     }
-    // A fresh command: `clap_complete::generate_to` built `cmd`, adding the `help` subcommand,
-    // which `clap_mangen` would otherwise give pages of its own (`texturecraft-cli-help-convert.1`).
+
+    // Build a fresh command to keep generated help subcommands out of the manual
     clap_mangen::generate_to(texturecraft_cli::command(), dir)
 }

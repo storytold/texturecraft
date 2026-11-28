@@ -71,6 +71,32 @@ fn planned_uv_tile_sizes_match_the_written_files() {
 }
 
 #[test]
+fn rectangular_map_overrides_plan_the_dimensions_written_by_png_and_psd() {
+    let mut session = session();
+    execute(&mut session, "textureSet.resolution", &json!({"ts": 0, "resolution": 128, "height": 256})).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let preset = json!({"name": "Mixed", "maps": [
+        {"file": "one", "format": "Png", "bit_depth": 8, "channels": [["L", {"Channel": {"channel": "Roughness"}}]]},
+        {"file": "two", "format": "Psd", "bit_depth": 8, "channels": [["L", {"Channel": {"channel": "Roughness"}}]]}
+    ]});
+    let params = json!({"dir": directory.path(), "ts": 0, "preset": preset, "size": 256, "maps": [{"map": 0, "size": 128}, {"map": 1, "size": 128}]});
+
+    let files = execute(&mut session, "export.plan", &params).unwrap();
+    execute(&mut session, "file.exportTextures", &params).unwrap();
+
+    let files = files.as_array().unwrap();
+    assert_eq!(files.len(), 2, "{files:?}");
+    for file in files {
+        let bytes = std::fs::read(directory.path().join(file["file"].as_str().unwrap())).unwrap();
+        let (width_bytes, height_bytes) = if file["format"] == "psd" { (&bytes[18..22], &bytes[14..18]) } else { (&bytes[16..20], &bytes[20..24]) };
+        let (width, height) = (u32::from_be_bytes(width_bytes.try_into().unwrap()), u32::from_be_bytes(height_bytes.try_into().unwrap()));
+        assert_eq!(height, 2 * width, "{file}");
+        assert_eq!((file["size"].as_u64(), file["height"].as_u64()), (Some(u64::from(width)), Some(u64::from(height))), "{file}");
+        assert_eq!(file["size"], file["sourceSize"], "both maps override the export width with the source width");
+    }
+}
+
+#[test]
 fn a_file_name_an_earlier_texture_set_exports_is_not_overwritten() {
     let mut s = session();
     assert!(s.set_count() >= 2);

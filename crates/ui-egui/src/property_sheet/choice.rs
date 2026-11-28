@@ -77,6 +77,36 @@ const CHOSEN_BAR_RADIUS: u8 = 1;
 /// The hovered option's eye glyph size
 const EYE_SIZE: f32 = 13.0;
 
+/// An option's hover fill, the chosen one's accent bar and its keyboard focus outline
+fn paint_option(painter: &Painter, rect: Rect, response: &Response, chosen: bool, tokens: &crate::theme::Tokens) {
+    if response.hovered() {
+        let fill = Rect::from_min_max(pos2(rect.left() + HOVER_INSET, rect.top()), pos2(rect.right() - HOVER_INSET, rect.bottom() - HOVER_BOTTOM_GAP));
+        painter.rect_filled(fill, CornerRadius::same(CONTROL_RADIUS), tokens.button);
+    }
+    if chosen {
+        let bar = Rect::from_min_max(
+            pos2(rect.left() + CHOSEN_BAR_LEFT, rect.top() + CHOSEN_BAR_TOP),
+            pos2(rect.left() + CHOSEN_BAR_RIGHT, rect.bottom() - CHOSEN_BAR_BOTTOM),
+        );
+        painter.rect_filled(bar, CornerRadius::same(CHOSEN_BAR_RADIUS), tokens.accent);
+    }
+    if response.has_focus() {
+        painter.rect_stroke(rect, CornerRadius::same(CONTROL_RADIUS), Stroke::new(OPTION_FOCUS_WIDTH, tokens.text_strong), StrokeKind::Inside);
+    }
+}
+
+/// One option of a list drawn outside a sheet (a menu popup), the full width of `ui`, looking like a sheet dropdown's option
+pub(crate) fn option_row(ui: &mut egui::Ui, text: &str, chosen: bool) -> Response {
+    let tokens = crate::theme::Tokens::get(ui.ctx());
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), OPTION_HEIGHT), Sense::click());
+    response.widget_info(|| WidgetInfo::selected(Role::ListBoxOption, true, chosen, text));
+    let painter = ui.painter();
+    paint_option(painter, rect, &response, chosen, &tokens);
+    let font = if chosen { semibold(TEXT_SIZE) } else { FontId::proportional(TEXT_SIZE) };
+    painter.text(pos2(rect.left() + VALUE_INSET, rect.top() + OPTION_HEIGHT / 2.0 - OPTION_TEXT_LIFT), Align2::LEFT_CENTER, text, font, tokens.text);
+    response
+}
+
 impl PropertySheet<'_> {
     /// A set-once choice whose list hangs from its button; returns the picked and the hovered option
     pub(crate) fn dropdown<T: Copy + PartialEq>(
@@ -225,20 +255,8 @@ impl PropertySheet<'_> {
                     response.widget_info(|| WidgetInfo::selected(Role::ListBoxOption, true, chosen, name(option)));
                     if response.hovered() {
                         hovered = Some(option);
-                        let fill =
-                            Rect::from_min_max(pos2(rect.left() + HOVER_INSET, rect.top()), pos2(rect.right() - HOVER_INSET, rect.bottom() - HOVER_BOTTOM_GAP));
-                        painter.rect_filled(fill, CornerRadius::same(CONTROL_RADIUS), tokens.button);
                     }
-                    if chosen {
-                        let bar = Rect::from_min_max(
-                            pos2(rect.left() + CHOSEN_BAR_LEFT, rect.top() + CHOSEN_BAR_TOP),
-                            pos2(rect.left() + CHOSEN_BAR_RIGHT, rect.bottom() - CHOSEN_BAR_BOTTOM),
-                        );
-                        painter.rect_filled(bar, CornerRadius::same(CHOSEN_BAR_RADIUS), tokens.accent);
-                    }
-                    if response.has_focus() {
-                        painter.rect_stroke(rect, CornerRadius::same(CONTROL_RADIUS), Stroke::new(OPTION_FOCUS_WIDTH, tokens.text_strong), StrokeKind::Inside);
-                    }
+                    paint_option(painter, rect, &response, chosen, &tokens);
 
                     // Align the option text and picture with the button despite the list border
                     let button_left = rect.left() - LIST_BORDER;

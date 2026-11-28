@@ -7,7 +7,7 @@ use texturecraft_texel::linear_to_srgb;
 use super::encoding::Encoding;
 use super::map_renderer::MapRenderer;
 use super::{
-    ExportOptions, ExportedFile, FileFormat, PSD_MAX_FILE_BYTES, PSD_RGBA_PLANES, Padding, PlannedFile, PlannedLayer, check_psd_size, psd_size,
+    ExportOptions, ExportedFile, FileFormat, PSD_MAX_FILE_BYTES, PSD_RGBA_PLANES, Padding, PlannedFile, PlannedLayer, check_psd_size, output_dimensions,
     quantize_integer, quantize_u8, quantize_u16,
 };
 use crate::{FormatError, Result};
@@ -45,10 +45,10 @@ fn working_set<'a>(
 ) -> Result<((u32, u32), u64, u64)> {
     let texels = |(width, height)| u64::from(width) * u64::from(height);
     let folder_count = layers.clone().map(|layer| layer.name.matches('/').count()).sum();
-    let sizes = layers.map(|layer| psd_size(set, tile, options.map_size(layer.map)));
+    let sizes = layers.map(|layer| output_dimensions(set, tile, options.map_size(layer.map)));
     let (canvas, file_bytes) = check_psd_size(sizes.clone(), folder_count, depth)?;
     let float_bytes_per_texel = (PSD_RGBA_PLANES * size_of::<f32>()) as u64;
-    let source_bytes = texels(psd_size(set, tile, None)).saturating_mul(float_bytes_per_texel);
+    let source_bytes = texels(output_dimensions(set, tile, None)).saturating_mul(float_bytes_per_texel);
     let largest_layer_bytes = sizes.map(texels).max().unwrap_or(0) * float_bytes_per_texel;
 
     // The merged image is built a row at a time: a canvas row and a layer row in floating point

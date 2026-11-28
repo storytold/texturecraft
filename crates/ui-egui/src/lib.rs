@@ -20,6 +20,7 @@ pub mod bake_presets;
 mod bake_report;
 mod bake_scene;
 pub mod baking_log;
+mod channel_manager;
 mod color_management;
 mod color_picker;
 mod color_selection_editor;
@@ -187,6 +188,8 @@ mod source_slot;
 pub mod state;
 mod surface_paint_point;
 pub mod symmetry;
+mod texture_set_list;
+mod texture_set_settings;
 pub mod theme;
 pub mod thumbs;
 mod tile_edits;
@@ -330,8 +333,8 @@ pub struct TextureCraftApp {
     hovered_texture_set: Option<(u64, usize)>,
     /// The set under the pointer in this pass, independent of dock drawing order.
     next_hovered_texture_set: Option<(u64, usize)>,
-    /// Project identity of the current inline rename buffer.
-    rename_project_id: u64,
+    /// Project identity for the inline rename and resource-warning state.
+    ui_project_id: u64,
     pub fps: f32,
     /// User smart materials found in the library folder (refreshed on demand).
     pub library: Option<Vec<std::path::PathBuf>>,
@@ -508,7 +511,7 @@ impl TextureCraftApp {
             viewport_rect: egui::Rect::NOTHING,
             hovered_texture_set: None,
             next_hovered_texture_set: None,
-            rename_project_id: project_id,
+            ui_project_id: project_id,
             fps: 0.0,
             ui_ms: 0.0,
             profiler: profile::Profiler::default(),
@@ -1066,14 +1069,22 @@ impl TextureCraftApp {
         }
     }
 
-    /// Resize texture set `ts` to `resolution` on a worker thread (the document changes when
-    /// it is done, as one undo step).
-    pub fn start_resize(&mut self, ts: usize, resolution: u32) {
+    /// Resize texture set `ts` to `width` texels across on a worker thread, keeping its shape: one undo step once done
+    pub fn start_resize(&mut self, ts: usize, width: u32) {
+        let height = self.session.doc.project.texture_set(ts).map_or(width, |set| {
+            let scaled = u64::from(set.height()) * u64::from(width) / u64::from(set.resolution.max(1));
+            u32::try_from(scaled).unwrap_or(u32::MAX)
+        });
+        self.start_resize_to(ts, width, height);
+    }
+
+    /// [`Self::start_resize`] to `width` by `height`
+    pub fn start_resize_to(&mut self, ts: usize, width: u32, height: u32) {
         if self.resize.is_some() {
             return;
         }
 
-        match self.session.resize_task(ts, resolution) {
+        match self.session.resize_task_to(ts, width, height) {
             Ok(task) => {
                 let progress = Arc::new(Progress::new());
                 let p = progress.clone();
@@ -1436,10 +1447,11 @@ impl eframe::App for TextureCraftApp {
         let hide_ui = self.ui.hide_ui;
         let tokens = theme::Tokens::get(&ctx);
 
-        // Layer and effect IDs can repeat in a replacement project
-        if self.rename_project_id != self.session.project_id {
+        // A replacement project can reuse layer IDs and missing resource names
+        if self.ui_project_id != self.session.project_id {
+            shelf_updates::forget_reported_failures(&ctx, self.ui_project_id);
             self.ui.rename = None;
-            self.rename_project_id = self.session.project_id;
+            self.ui_project_id = self.session.project_id;
         }
 
         // The dock keeps the cards' gutter from the bars and rails around it

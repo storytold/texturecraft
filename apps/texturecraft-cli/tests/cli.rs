@@ -188,18 +188,21 @@ fn render_writes_a_png() {
 fn path_traced_render_needs_no_gpu() {
     let d = tmp("trace");
     let out = d.join("ball.png");
-    // On the GPU where it has compute shaders, then forced onto the CPU.
+
+    // On the GPU where it has compute shaders, then forced onto the CPU
     for extra in [None, Some("--cpu")] {
         let mut args = vec!["render", "builtin:material_ball", p(&out), "--size", "96x64", "--samples", "4"];
         args.extend(extra);
         ok(&args);
         let img = image::open(&out).unwrap().to_rgb8();
         assert_eq!(img.dimensions(), (96, 64));
-        // The lit ball in the middle is brighter than the dark backdrop corner.
+
+        // The lit ball in the middle is brighter than the dark backdrop corner
         let lum = |x, y| img.get_pixel(x, y).0.iter().map(|v| *v as u32).sum::<u32>();
         assert!(lum(48, 28) > lum(1, 1) + 60);
     }
-    // --camera looks through a camera saved in the project; an unknown name is an error.
+
+    // --camera looks through a camera saved in the project; an unknown name is an error
     let proj = d.join("cams.tcraft");
     ok(&["run", "builtin:cube", "camera.set", r#"{"yaw": 80, "distance": 9}"#, "-o", p(&proj)]);
     ok(&["run", p(&proj), "camera.add", r#"{"name": "Side"}"#, "-o", p(&proj), "--in-place"]);

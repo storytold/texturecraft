@@ -341,6 +341,7 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
     if to == name {
         return Ok(json!({ "name": name }));
     }
+
     if s.doc.resources.contains_key(&to) || crate::fill_alpha::library_alpha_of(&to).is_some() {
         return Err(bad(command, format!("a resource named `{to}` exists already")));
     }
@@ -348,6 +349,7 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit("Rename resource", |s| {
         let bytes = s.doc.resources.remove(&name).ok_or_else(|| bad(command, format!("no resource `{name}`")))?;
         s.doc.resources.insert(to.clone(), bytes);
+
         // The Resources Updater keeps following the file the image came from
         if let Some(source) = s.doc.project.resource_sources.remove(&name) {
             s.doc.project.resource_sources.insert(to.clone(), source);
@@ -538,6 +540,7 @@ mod tests {
 
         let renamed = crate::execute(&mut session, "resource.rename", &json!({"name": name, "to": "stone"})).unwrap()["name"].as_str().unwrap().to_string();
         std::fs::write(&path, texturecraft_formats::gray16_png(1, 1, [0.75].into_iter()).unwrap()).unwrap();
+
         // An equal-size file counts as changed once its time moved, as a later save's does
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();

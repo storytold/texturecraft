@@ -130,7 +130,7 @@ fn bad_values_conflicts_and_missing_arguments_are_refused_before_any_file_is_wri
 
 #[test]
 fn loopback_ports_take_the_host_prefix_and_a_dashed_name_follows_a_double_dash() {
-    // `--bridge 127.0.0.1:PORT` and `localhost:PORT` are still ports: the failure is the missing token.
+    // `--bridge 127.0.0.1:PORT` and `localhost:PORT` are still ports: the failure is the missing token
     for bridge in ["127.0.0.1:9", "localhost:9"] {
         let got = invoke(["mcp", "--bridge", bridge, "--token", "short"]);
         assert_eq!(got.code, 1, "{bridge}: {}", got.err);
@@ -201,7 +201,8 @@ fn an_output_that_would_replace_an_input_is_refused_without_in_place() {
         assert!(message.contains("--in-place") || message.contains("would replace"), "{args:?}: {message}");
     }
     assert_eq!(std::fs::read(&source).unwrap(), before, "a refused command changes nothing");
-    // `--in-place` lets only a project be replaced, and only by itself.
+
+    // `--in-place` lets only a project be replaced, and only by itself
     let got = invoke(["run", a, "layer.add.fill", "{}", "-o", a, "--in-place"]);
     assert_eq!(got.code, 0, "{}", got.err);
     let got = invoke(["bake", a, "--in-place", "--resolution", "128", "--maps", "ambientOcclusion"]);
@@ -210,7 +211,8 @@ fn an_output_that_would_replace_an_input_is_refused_without_in_place() {
     assert!(usage_error(&["run", a, "layer.add.fill", "{}", "-o", elsewhere.to_str().unwrap(), "--in-place"]).contains("--in-place"));
     assert!(usage_error(&["bake", a, "-o", elsewhere.to_str().unwrap(), "--in-place"]).contains("--in-place"));
     assert!(!elsewhere.exists());
-    // Headless::save appends .tcraft, so `-o scene` would replace scene.tcraft.
+
+    // Headless::save appends .tcraft, so `-o scene` would replace scene.tcraft
     let unsuffixed = dir.join("a");
     let unsuffixed = unsuffixed.to_str().unwrap();
     let after_in_place = std::fs::read(&source).unwrap();
@@ -244,7 +246,8 @@ fn batch_runs_a_script_and_a_failing_step_fails_the_command() {
     let got = invoke(argv(&[&"batch", &dir.join("missing.json")]));
     assert_eq!(got.code, 1);
     assert!(got.err.contains("missing.json"), "{}", got.err);
-    // A script that saves over the project it opened needs --in-place, and must not have run.
+
+    // A script that saves over the project it opened needs --in-place, and must not have run
     let opened = project(&dir, "opened.tcraft");
     let before = std::fs::read(&opened).unwrap();
     let overwrite = dir.join("overwrite.json");
@@ -291,7 +294,8 @@ fn the_desktop_launch_options_are_refused_before_any_subcommand() {
 fn a_path_that_is_not_valid_unicode_is_named_in_the_error() {
     use std::os::unix::ffi::OsStringExt;
     let dir = workdir("non-unicode");
-    // The engine's commands take their paths as JSON text: the command says so and names the file.
+
+    // The engine's commands take their paths as JSON text: the command says so and names the file
     let input = dir.join(OsString::from_vec(b"in-\xff.tcraft".to_vec()));
     let got = invoke(argv(&[&"info", &input]));
     assert_eq!(got.code, 1);

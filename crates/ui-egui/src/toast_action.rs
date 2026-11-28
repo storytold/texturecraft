@@ -33,6 +33,7 @@ impl ToastAction {
             ToastAction::UpdateResources { project } if project != app.session.project_id => {}
             #[cfg(not(target_arch = "wasm32"))]
             ToastAction::UpdateResources { .. } => crate::resources_updater::update(app, None),
+
             // The browser has no files to read again
             #[cfg(target_arch = "wasm32")]
             ToastAction::UpdateResources { .. } => {}

@@ -51,12 +51,15 @@ pub fn headless_of(id: &str, in_engine: bool) -> (&'static str, Option<&'static 
     if in_engine {
         return ("yes", None, "");
     }
+
     if let Some(m) = HEADLESS.iter().find(|m| m.0 == id) {
         return (m.1, Some(m.2), m.3);
     }
+
     if WINDOW_PREFIXES.iter().any(|p| id.starts_with(p)) {
         return ("no", Some("window"), "a desktop panel or toolbar");
     }
+
     ("unknown", None, "")
 }
 

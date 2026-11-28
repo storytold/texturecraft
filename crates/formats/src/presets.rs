@@ -87,9 +87,12 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
     vec![
         preset(DEFAULT_PRESET, {
             let mut maps: Vec<MapSpec> =
-                Channel::ALL.into_iter().filter(|c| !matches!(c, Channel::Normal | Channel::AmbientOcclusion)).map(channel_map).collect();
+                Channel::ALL.into_iter().filter(|c| c.is_shaded() && !matches!(c, Channel::Normal | Channel::AmbientOcclusion)).map(channel_map).collect();
             maps.push(map("normal", 8, rgb(|k| ch(Channel::Normal, k))));
             maps.push(map("ambientOcclusion", 8, gray(virt(VirtualMap::AoMixed, 0))));
+
+            // Later channels come last, so the maps automation addresses by index keep their place
+            maps.extend(Channel::ALL.into_iter().filter(|c| !c.is_shaded()).map(channel_map));
             maps
         }),
         // Spec: https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#metallic-roughness-material

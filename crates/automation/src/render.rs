@@ -6,6 +6,7 @@ use std::sync::{Arc, Weak};
 
 use rayon::prelude::*;
 use texturecraft_engine::compose::{DisplayKind, ImageRes, all_tiles, tile_bytes};
+use texturecraft_engine::core::AoMixing;
 use texturecraft_engine::{Session, ViewMode};
 use texturecraft_render::displace::trace_geometry;
 use texturecraft_render::gpu_trace::GpuTracer;
@@ -67,6 +68,7 @@ impl Gpu {
             let empty = Default::default();
             let baked = session.doc.baked.get(&set_index).unwrap_or(&empty);
             let composite = &cache.composite;
+            let ao_mixing = session.doc.project.texture_sets.get(set_index).map_or(AoMixing::Multiply, |set| set.ao_mixing);
 
             // Limit live converted pixels while retaining parallel conversion within each batch
             const UPLOAD_TILES_PER_BATCH: usize = 64;
@@ -74,7 +76,7 @@ impl Gpu {
                 let bytes: Vec<_> = batch
                     .par_iter()
                     .flat_map_iter(|&(tile_x, tile_y)| DisplayKind::ALL.into_iter().map(move |kind| (kind, tile_x, tile_y)))
-                    .map(|(kind, tile_x, tile_y)| (kind, tile_x, tile_y, tile_bytes(composite, baked, kind, tile_x, tile_y)))
+                    .map(|(kind, tile_x, tile_y)| (kind, tile_x, tile_y, tile_bytes(composite, baked, ao_mixing, kind, tile_x, tile_y)))
                     .collect();
                 for (kind, tile_x, tile_y, pixels) in bytes {
                     headless.renderer.upload_tile(&headless.device, &headless.queue, set_index, kind, tile_x, tile_y, &pixels);
@@ -162,7 +164,14 @@ fn trace_inputs(s: &mut Session) -> (TraceScene, TraceDisplay) {
         .texture_sets
         .iter()
         .zip(&s.caches)
-        .map(|(ts, c)| TraceSet { material: ts.material, composite: c.composite.clone(), height_strength: ts.atlas_height_strength() })
+        .map(|(ts, c)| TraceSet {
+            material: ts.material,
+            composite: c.composite.clone(),
+            height_strength: ts.atlas_height_strength(),
+            height_y_factor: ts.atlas_height_y_factor(),
+            height_in_normal: ts.height_in_normal(),
+            height_to_normal: ts.height_to_normal,
+        })
         .collect();
     let d = &s.doc.project.display;
     let env_image = d.environment_resource().and_then(|n| s.images.get(n));
@@ -197,10 +206,15 @@ pub fn shade(s: &Session) -> Shade {
         ViewMode::UvChecker => (3, 0),
         ViewMode::NormalHeightMesh => (4, 0),
     };
+    let active_set = s.doc.project.texture_sets.get(s.ts());
     Shade {
-        height_strength: s.doc.project.texture_sets.get(s.ts()).map(|t| t.atlas_height_strength()).unwrap_or(1.0),
+        height_strength: active_set.map_or(1.0, |t| t.atlas_height_strength()),
+        height_y_factor: active_set.map_or(1.0, |t| t.atlas_height_y_factor()),
+        height_in_normal: active_set.is_none_or(|t| t.height_in_normal()),
+        height_to_normal: active_set.map_or_else(Default::default, |t| t.height_to_normal),
         view_mode,
         channel,
+
         // Only the 2D view uses this default
         wireframe: true,
         ..Shade::from_project(&s.doc.project)

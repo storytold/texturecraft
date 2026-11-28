@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 use texturecraft_core::{
-    AnisotropicKuwahara, BakedMap, Bevel, BevelSmooth, BlendMode, BlockScales, Channel, ChannelKind, ColorMatch, CompareSource, ContentsOffset,
+    AnisotropicKuwahara, BakedMap, Bevel, BevelSmooth, BlendMode, BlockScales, Channel, ChannelFormat, ChannelKind, ColorMatch, CompareSource, ContentsOffset,
     CurvatureDetail, CurvatureMode, Effect, EffectKind, FLAT_CURVATURE, Fill, Filter, Filtering, Generator, GeneratorGlobal, GeneratorKind,
     GrayscaleConversionParameters, HeightMask, HeightToNormal, HighpassSpace, ImageInput, KindControls, Layer, LayerId, LayerKind, Mask, MaskBackground,
     MaskOutline, Mirror, NormalFormat, PreparedColorMatch, PreparedGradient, Project, Projection, RepeatMode, Sampling, SectionParameters, ShapeCrop, Source,
@@ -21,7 +21,7 @@ use texturecraft_core::{
 };
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, NO_TRI, Surface, UvGBuffer};
-use texturecraft_texel::{DilationMap, TILE, TILE_AREA, TileImage, from_u16, noise, to_u16, to_u16_signed};
+use texturecraft_texel::{TILE, TILE_AREA, TileImage, from_u16, noise, to_u16, to_u16_signed};
 
 use crate::ProjectorDepthCache;
 use crate::below::{Band, BelowCache, Level, StackKey};
@@ -169,6 +169,12 @@ impl Inputs<'_> {
     /// with it, and with the tile's share of its block.
     fn tile_res(&self) -> u32 {
         self.gbuf.width / self.tile_grid().map_or(1, |g| g.cols.max(1))
+    }
+
+    /// Texels across and down an atlas block
+    fn block_size(&self) -> [u32; 2] {
+        let (cols, rows) = self.tile_grid().map_or((1, 1), |g| (g.cols.max(1), g.rows.max(1)));
+        [self.gbuf.width / cols, self.gbuf.height / rows]
     }
 
     /// The current UV tile can occupy only part of its atlas block
@@ -438,10 +444,10 @@ enum Op {
     Halo,
     /// The shapes moved by `offset` (whole texels), box blurred and laid under them
     Shadow { offset: [i32; 2] },
-    /// Each UV tile's texels read from where `mirror` sends them in their tile (`block` texels across the set's atlas blocks)
-    Mirror { mirror: Mirror, block: u32 },
+    /// Each UV tile's texels read from where `mirror` sends them in their tile
+    Mirror { mirror: Mirror },
     /// Each UV tile's texels read from where `transform` sends them (its `affine`, worked out once), repeating round the tile or empty past it
-    Transform { transform: TileTransform, affine: ([[f32; 2]; 2], [f32; 2]), block: u32 },
+    Transform { transform: TileTransform, affine: ([[f32; 2]; 2], [f32; 2]) },
     /// A band along the edge of the shapes past a threshold, from the box blur of the shapes
     Outline(MaskOutline),
     /// Drawn from the distance to the shapes' edge (see [`distance_filter`])
@@ -498,11 +504,13 @@ fn neighbourhood_filters(effects: &[Effect], res: u32, channel: Option<Channel>)
             }
             EffectKind::Filter(Filter::HighPass { radius, space, alpha }) => Some((index, texels(*radius), Op::HighPass { space: *space, alpha: *alpha })),
             EffectKind::Filter(Filter::EdgeDetect { width }) => Some((index, texels(*width), Op::Edge)),
+
             // Three box passes ramp an edge over about twice their radius
             EffectKind::Filter(Filter::Bevel { width, .. }) => Some((index, texels(*width * 0.5), Op::Bevel)),
             EffectKind::Filter(Filter::Glow { radius, amount }) => Some((index, texels(*radius), Op::Glow(*amount))),
             EffectKind::Filter(Filter::Mosaic { size, alpha }) => Some((index, texels(*size), Op::Mosaic { alpha: *alpha })),
             EffectKind::Filter(Filter::Fxaa { alpha }) => Some((index, FXAA_SEARCH as f32 + 1.0, Op::Fxaa { alpha: *alpha })),
+
             // Both the direction search and the ellipse can reach twice the radius
             EffectKind::Filter(Filter::AnisotropicKuwahara(kuwahara)) if kuwahara.radius > 0.0 => {
                 Some((index, texels(kuwahara.radius.min(AnisotropicKuwahara::MAX_RADIUS)) * (2.0 + kuwahara.tensor_reach()) + 1.0, Op::Kuwahara(*kuwahara)))
@@ -529,10 +537,11 @@ fn neighbourhood_filters(effects: &[Effect], res: u32, channel: Option<Channel>)
             }
 
             // A mirror reads anywhere in its UV tile
-            EffectKind::Filter(Filter::Mirror(mirror)) => Some((index, res as f32, Op::Mirror { mirror: *mirror, block: res })),
+            EffectKind::Filter(Filter::Mirror(mirror)) => Some((index, res as f32, Op::Mirror { mirror: *mirror })),
+
             // A transform reads anywhere in its UV tile; one that changes nothing is skipped
             EffectKind::Filter(Filter::Transform(transform)) if !transform.is_identity() => {
-                Some((index, res as f32, Op::Transform { transform: *transform, affine: transform.affine(), block: res }))
+                Some((index, res as f32, Op::Transform { transform: *transform, affine: transform.affine() }))
             }
 
             // Three box passes reach the band's width
@@ -771,10 +780,10 @@ fn gather(
                         keep_coverage(&mut acc, comps, center.get(3));
                     }
                 }
-                Op::Mirror { mirror, block } => {
-                    mirror_texel(&mirror, (x, y), (block, res), comps, orig.get((row * width + col) * comps + comps - 1), &mut acc, &sample)
+                Op::Mirror { mirror } => {
+                    mirror_texel(&mirror, (x, y), (block_size, tile_size), comps, orig.get((row * width + col) * comps + comps - 1), &mut acc, &sample)
                 }
-                Op::Transform { transform, affine, block } => transform_texel(&transform, affine, (x, y), (block, res), &mut acc, &sample),
+                Op::Transform { transform, affine } => transform_texel(&transform, affine, (x, y), (block_size, tile_size), &mut acc, &sample),
                 Op::SourceWarp(warp) => warp_texel((&warp, &warp_directions), (x, y), (res, comps), (block_size, tile_size), &mut acc, (&sample, &input)),
                 Op::SourceSlopeBlur(slope) => slope_texel(&slope, (x, y), (res, comps), (block_size, tile_size), &mut acc, (&sample, &input)),
                 Op::HeightToNormal(filter) => {
@@ -1164,21 +1173,14 @@ fn fxaa_texel((x, y): (f32, f32), comps: usize, center: &[f32], acc: &mut [f32; 
 fn mirror_texel(
     mirror: &Mirror,
     (x, y): (f32, f32),
-    (block, res): (u32, u32),
+    (block, tile): ([u32; 2], [u32; 2]),
     comps: usize,
     alpha: Option<&f32>,
     acc: &mut [f32; 5],
     sample: &dyn Fn(f32, f32, &mut [f32; 5]),
 ) {
-    let (block, size) = (block.max(1) as f32, res.max(1) as f32);
-    let (origin_x, origin_y) = ((x / block).floor() * block, (y / block).floor() * block);
-    let (local_x, local_y) = (x - origin_x, y - origin_y);
-    if local_x >= size || local_y >= size {
-        return;
-    }
-
-    let uv = [(local_x + 0.5) / size, (local_y + 0.5) / size];
-    let line = (Mirror::DEBUG_HALF_WIDTH * size / FILTER_SIZE_RESOLUTION).max(MIN_FILTER_RADIUS) / size;
+    let Some(([origin_x, origin_y], uv, size)) = tile_local((x, y), (block, tile)) else { return };
+    let line = (Mirror::DEBUG_HALF_WIDTH * size[0] / FILTER_SIZE_RESOLUTION).max(MIN_FILTER_RADIUS) / size[0];
     if mirror.debug && mirror.on_axis(uv, line) {
         // Content stays premultiplied by its own coverage; masks are one value
         let cover = if comps == 4 { alpha.copied().unwrap_or(0.0) } else { 1.0 };
@@ -1192,30 +1194,35 @@ fn mirror_texel(
     let [u, v] = mirror.source(uv);
 
     // Whole texels, so an even mirror copies texels exactly
-    let at = |origin: f32, along: f32| origin + (along * size - 0.5).round().clamp(0.0, size - 1.0);
-    sample(at(origin_x, u), at(origin_y, v), acc);
+    let at = |origin: f32, along: f32, extent: f32| origin + (along * extent - 0.5).round().clamp(0.0, extent - 1.0);
+    sample(at(origin_x, u, size[0]), at(origin_y, v, size[1]), acc);
 }
 
-/// Transform `transform` (whose read is `affine`) at texel `(x, y)` into `acc`: bilinear between the four texels round where it reads in its UV tile (`res` texels from its `block`'s top left), each wrapped round the tile; where it does not repeat, a read past the tile counts as empty
+/// The top left of texel `(x, y)`'s UV tile (`tile` texels at its `block`'s top left), the texel centre's UV in it and the tile's size, None past the tile
+fn tile_local((x, y): (f32, f32), (block, tile): ([u32; 2], [u32; 2])) -> Option<([f32; 2], [f32; 2], [f32; 2])> {
+    let (block, size) = (block.map(|b| b.max(1) as f32), tile.map(|t| t.max(1) as f32));
+    let origin = [(x / block[0]).floor() * block[0], (y / block[1]).floor() * block[1]];
+    let local = [x - origin[0], y - origin[1]];
+    if local[0] >= size[0] || local[1] >= size[1] {
+        return None;
+    }
+
+    Some((origin, [(local[0] + 0.5) / size[0], (local[1] + 0.5) / size[1]], size))
+}
+
+/// Transform `transform` (whose read is `affine`) at texel `(x, y)` into `acc`: bilinear between the four texels round where it reads in its UV tile (`tile` texels per axis from its block's top left), each wrapped round the tile; where it does not repeat, a read past the tile counts as empty
 fn transform_texel(
     transform: &TileTransform,
     (columns, shift): ([[f32; 2]; 2], [f32; 2]),
     (x, y): (f32, f32),
-    (block, res): (u32, u32),
+    (block, tile): ([u32; 2], [u32; 2]),
     acc: &mut [f32; 5],
     sample: &dyn Fn(f32, f32, &mut [f32; 5]),
 ) {
-    let (block, size) = (block.max(1) as f32, res.max(1) as f32);
-    let (origin_x, origin_y) = ((x / block).floor() * block, (y / block).floor() * block);
-    let (local_x, local_y) = (x - origin_x, y - origin_y);
-    if local_x >= size || local_y >= size {
-        return;
-    }
-
-    let uv = [(local_x + 0.5) / size, (local_y + 0.5) / size];
+    let Some(([origin_x, origin_y], uv, size)) = tile_local((x, y), (block, tile)) else { return };
 
     // Texel space of the tile, centres at whole numbers
-    let at = [0, 1].map(|axis| (columns[0][axis] * uv[0] + columns[1][axis] * uv[1] + shift[axis]) * size - 0.5);
+    let at = [0, 1].map(|axis| (columns[0][axis] * uv[0] + columns[1][axis] * uv[1] + shift[axis]) * size[axis] - 0.5);
     if !at.iter().all(|a| a.is_finite()) {
         return;
     }
@@ -1230,7 +1237,7 @@ fn transform_texel(
         }
 
         let (cx, cy) = (base_x + dx, base_y + dy);
-        let inside = (0.0..size).contains(&cx) && (0.0..size).contains(&cy);
+        let inside = (0.0..size[0]).contains(&cx) && (0.0..size[1]).contains(&cy);
         if !repeat && !inside {
             // Empty: no value, full weight
             total[4] += k;
@@ -1239,7 +1246,7 @@ fn transform_texel(
 
         // One whole texel: the sample's own weights, so this matches its bilinear read
         let mut one = [0.0f32; 5];
-        sample(origin_x + cx.rem_euclid(size), origin_y + cy.rem_euclid(size), &mut one);
+        sample(origin_x + cx.rem_euclid(size[0]), origin_y + cy.rem_euclid(size[1]), &mut one);
         for (slot, value) in total.iter_mut().zip(one) {
             *slot += value * k;
         }
@@ -1596,11 +1603,17 @@ fn unpad(data: &[f32], comps: usize, (w, h): (usize, usize), (pad_x, pad_y): (us
 /// A neighbourhood filter's radius in whole texels and how many texels around a texel it reads
 fn filter_extent(radius: f32, op: Op, inputs: &Inputs) -> (u32, u32) {
     let longest_side = inputs.gbuf.width.max(inputs.gbuf.height);
+
     // Clamped so a hostile radius can't overflow the region arithmetic
     let radius_texels = radius.round().clamp(1.0, longest_side as f32) as u32;
 
-    // Three box passes reach three radii; the gathering filters one radius plus a bilinear texel
-    let reach = if is_box_blur(op) { 3 * radius_texels } else { radius_texels + 1 };
+    // Three box passes reach three radii and gathering filters reach one radius plus a bilinear texel
+    // Mirror and transform can read across the whole block
+    let reach = match op {
+        Op::Mirror { .. } | Op::Transform { .. } => (radius_texels + 1).max(inputs.block_size().into_iter().max().unwrap_or(0)),
+        _ if is_box_blur(op) => 3 * radius_texels,
+        _ => radius_texels + 1,
+    };
 
     // A shadow also reads the shapes it was moved from
     let moved = match op {
@@ -1615,7 +1628,7 @@ fn filter_extent(radius: f32, op: Op, inputs: &Inputs) -> (u32, u32) {
         _ => None,
     };
     let source_reach = if tiled_source.is_some_and(|source| source.mode != WarpSourceMode::DefaultNoise && source.tiling_factor() != 1.0) {
-        inputs.tile_grid().map_or(longest_side, |_| inputs.tile_res())
+        inputs.tile_grid().map_or(longest_side, |_| inputs.block_size().into_iter().max().unwrap_or(0))
     } else {
         0
     };
@@ -1825,7 +1838,7 @@ fn filter_region(
 
     // A smaller UV tile has fewer texels per UV unit, so its filters reach fewer texels
     let (block_size, tiled) = match inputs.tile_grid() {
-        Some(_) => ([inputs.tile_res(); 2], true),
+        Some(_) => (inputs.block_size(), true),
         None => ([inputs.gbuf.width, inputs.gbuf.height], false),
     };
     let filtered = |scale: f32| -> Vec<f32> {
@@ -1838,7 +1851,7 @@ fn filter_region(
         let scaled = neighbourhood_filters(effects, tile_resolution, channel).find(|filter| filter.0 == index);
         let scaled_radius = scaled.map_or(radius_texels, |filter| filter.1.round().clamp(1.0, radius_texels as f32) as u32);
         if !is_box_blur(op) {
-            let tile_size = if tiled { [tile_resolution; 2] } else { block_size };
+            let tile_size = if tiled { block_size.map(|side| ((side as f32 * scale).round() as u32).max(1)) } else { block_size };
             return gather(
                 op,
                 (&stack_values, &cover, &grays),
@@ -4672,13 +4685,15 @@ fn composite_block(
     quota: usize,
     fields: &Fields,
 ) -> Vec<((u32, u32), Vec<Band>)> {
-    let channels: Vec<Channel> = inp.project.texture_set(inp.ts).map(|s| s.channel_list()).unwrap_or_default();
+    let formats: Vec<(Channel, ChannelFormat)> = inp.project.texture_set(inp.ts).map(TextureSet::formats).unwrap_or_default();
+    let channels: Vec<Channel> = formats.iter().map(|(c, _)| *c).collect();
     let (w, h) = (out.resolution, out.height);
     let split = below.map(|(_, l)| l);
     let cached = |t: (u32, u32)| below.and_then(|(b, _)| b.tile(t));
     let fresh: Vec<(u32, u32)> = tiles.iter().copied().filter(|t| cached(*t).is_none()).collect();
     let recorded: std::collections::BTreeSet<(u32, u32)> = if split.is_some() { fresh.iter().copied().take(quota).collect() } else { Default::default() };
-    let lanes: Vec<Lane> = channels.iter().map(|c| Lane { ch: c.index(), n: c.components(), signed: c.kind() == ChannelKind::Signed }).collect();
+    let lanes: Vec<Lane> =
+        formats.iter().map(|(c, f)| Lane { ch: c.index(), n: c.components(), signed: c.kind() == ChannelKind::Signed, format: *f }).collect();
     let stride: usize = lanes.iter().map(|l| l.n).sum();
     let level_count = split.map_or(0, <[Level]>::len);
     let defaults: Acc = Channel::ALL.map(Channel::default_value);
@@ -4767,7 +4782,7 @@ fn composite_block(
                         anchors.clear();
                     }
                     for (l, buf) in lanes.iter().zip(&mut channel_buffers) {
-                        let v = acc.get(l.ch).copied().unwrap_or([0.0; 3]);
+                        let v = crate::channel_store::stored(l.format, l.signed, acc.get(l.ch).copied().unwrap_or([0.0; 3]), l.n);
                         for (k, x) in v.iter().take(l.n).enumerate() {
                             let encoded = if l.signed { to_u16_signed(*x) } else { to_u16(*x) };
                             if let Some(slot) = buf.get_mut(band_offset * l.n + k) {
@@ -4845,6 +4860,8 @@ struct Lane {
     ch: usize,
     n: usize,
     signed: bool,
+    /// What the channel is stored in
+    format: ChannelFormat,
 }
 
 /// Restore the cached stack value of slot `o` (a texel at one nesting level). Scalars are
@@ -4874,37 +4891,42 @@ fn store_below(cache: &mut [f32], lanes: &[Lane], stride: usize, o: usize, acc: 
     }
 }
 
-/// UV padding for display: fill uncovered texels in `tiles` and their neighbours from their
-/// nearest covered texel. Returns the tiles it wrote.
-pub fn pad_tiles(out: &mut Composite, dmap: &DilationMap, tiles: &[(u32, u32)]) -> std::collections::BTreeSet<(u32, u32)> {
+/// UV padding for display: fill uncovered texels in `tiles`, their neighbours and the tiles padding continues into across a seam from the covered texel `padding` gives each, returning the tiles written
+pub fn pad_tiles(out: &mut Composite, padding: &crate::PaddingMaps, tiles: &[(u32, u32)]) -> std::collections::BTreeSet<(u32, u32)> {
     let mut written = std::collections::BTreeSet::new();
     let (w, h) = (out.resolution, out.height);
-    if (dmap.width, dmap.height) != (w, h) {
+    if padding.size() != (w, h) {
         return written;
     }
 
-    let (nx, ny) = (w.div_ceil(TILE) as i64, h.div_ceil(TILE) as i64);
-    let mut set = std::collections::BTreeSet::new();
+    // The tiles and their neighbours, which padding reaches into
+    let (tiles_across, tiles_down) = (w.div_ceil(TILE) as i64, h.div_ceil(TILE) as i64);
+    let mut near_tiles = std::collections::BTreeSet::new();
     for &(tx, ty) in tiles {
         for dy in -1..=1i64 {
             for dx in -1..=1i64 {
                 let (x, y) = (tx as i64 + dx, ty as i64 + dy);
-                if x >= 0 && y >= 0 && x < nx && y < ny {
-                    set.insert((x as u32, y as u32));
+                if x >= 0 && y >= 0 && x < tiles_across && y < tiles_down {
+                    near_tiles.insert((x as u32, y as u32));
                 }
             }
         }
+
+        // Padding across a seam can continue from this tile into one far away
+        near_tiles.extend(padding.tiles_crossed_from((tx, ty)));
     }
-    let set: Vec<(u32, u32)> = set.into_iter().collect();
-    for img in out.channels.values_mut() {
+    let near_tiles: Vec<(u32, u32)> = near_tiles.into_iter().collect();
+
+    for (channel, img) in out.channels.iter_mut() {
         let comps = img.comps();
         let src: &TileImage = img;
+        let across_seams = crate::PaddingMaps::crosses_seams(*channel);
 
         // Each tile pads from the original image, so parallel writes stay independent
-        let padded: Vec<((u32, u32), Vec<u16>)> = set
+        let padded: Vec<((u32, u32), Vec<u16>)> = near_tiles
             .par_iter()
             .filter_map(|&(tx, ty)| {
-                let mut data: Option<Vec<u16>> = None;
+                let mut padded_tile: Option<Vec<u16>> = None;
                 for ly in 0..TILE {
                     for lx in 0..TILE {
                         let (x, y) = (tx * TILE + lx, ty * TILE + ly);
@@ -4912,24 +4934,25 @@ pub fn pad_tiles(out: &mut Composite, dmap: &DilationMap, tiles: &[(u32, u32)]) 
                             continue;
                         }
 
-                        let Some((sx, sy)) = dmap.source(x, y) else { continue };
+                        let Some((sx, sy)) = padding.source(across_seams, x, y) else { continue };
+
                         if (sx, sy) == (x, y) {
                             continue;
                         }
 
-                        let v = src.get(sx, sy);
-                        let d = data.get_or_insert_with(|| src.tile(tx, ty).map_or_else(|| vec![0; TILE_AREA * comps], <[u16]>::to_vec));
-                        let o = (ly * TILE + lx) as usize * comps;
-                        if let Some(px) = d.get_mut(o..o + comps) {
-                            px.copy_from_slice(&v[..comps]);
+                        let source_texel = src.get(sx, sy);
+                        let tile_data = padded_tile.get_or_insert_with(|| src.tile(tx, ty).map_or_else(|| vec![0; TILE_AREA * comps], <[u16]>::to_vec));
+                        let offset = (ly * TILE + lx) as usize * comps;
+                        if let Some(texel) = tile_data.get_mut(offset..offset + comps) {
+                            texel.copy_from_slice(&source_texel[..comps]);
                         }
                     }
                 }
-                Some(((tx, ty), data?))
+                Some(((tx, ty), padded_tile?))
             })
             .collect();
-        for ((tx, ty), d) in padded {
-            img.set_tile(tx, ty, Some(std::sync::Arc::new(d)));
+        for ((tx, ty), tile_data) in padded {
+            img.set_tile(tx, ty, Some(std::sync::Arc::new(tile_data)));
             written.insert((tx, ty));
         }
     }
@@ -5522,6 +5545,17 @@ mod tests {
 
     fn run(f: &Fixture, preview: Option<&StrokePreview>) -> Composite {
         run_with_images(f, preview, &ImageStore::default())
+    }
+
+    #[test]
+    fn a_mirror_on_a_wide_set_reflects_across_its_own_height() {
+        let mirror = Mirror { mode: texturecraft_core::MirrorMode::AxisY, ..Mirror::LIBRARY };
+        let (size, near_bottom) = ([256, 128], 120.0);
+        let read = std::cell::Cell::new(None);
+        mirror_texel(&mirror, (10.0, near_bottom), (size, size), 4, None, &mut [0.0; 5], &|x, y, _| read.set(Some((x, y))));
+        let (x, y) = read.get().unwrap();
+        assert_eq!(x, 10.0);
+        assert!(y < size[1] as f32 / 2.0, "the bottom half copies the top half: read row {y}");
     }
 
     #[test]
@@ -6417,10 +6451,59 @@ soft {soft:?}"
         out.channels.get_mut(&Channel::Roughness).unwrap().set(10, 10, &[to_u16(0.9)]);
         let mut covered = vec![false; 64 * 64];
         covered[10 * 64 + 10] = true;
-        let dmap = DilationMap::new(&covered, 64, 64, Some(4));
-        pad_tiles(&mut out, &dmap, &[(0, 0)]);
+        let padding = crate::PaddingMaps {
+            flat: texturecraft_texel::DilationMap::new(&covered, 64, 64, Some(4)),
+            crossed: Vec::new(),
+            row_starts: Vec::new(),
+            crossed_into: Default::default(),
+        };
+        pad_tiles(&mut out, &padding, &[(0, 0)]);
         assert!((out.value(Channel::Roughness, 12, 12)[0] - 0.9).abs() < 1e-3);
         assert!(out.value(Channel::Roughness, 30, 30)[0] < 0.1 || !out.channels[&Channel::Roughness].is_allocated(0, 0));
+    }
+
+    /// Two islands of one 3D edge, tiles apart: repainting the far island repads the near island's padding past the seam
+    #[test]
+    fn padding_past_a_seam_follows_a_change_to_its_other_side_tiles_away() {
+        use texturecraft_geom::{UvSeam, UvSeamSide};
+        let (width, height) = (8 * TILE, TILE);
+        let (left, right) = (4..=59u32, 404..=460u32);
+        let covered: Vec<bool> = (0..width * height).map(|i| left.contains(&(i % width)) || right.contains(&(i % width))).collect();
+        let at = |x: f32, y: f32| Vec2::new(x / width as f32, y / height as f32);
+        let seam = UvSeam {
+            sides: [
+                UvSeamSide { triangle: 0, start: at(60.0, 0.0), end: at(60.0, height as f32), interior: at(4.0, 0.0) },
+                UvSeamSide { triangle: 1, start: at(404.0, 0.0), end: at(404.0, height as f32), interior: at(460.0, 0.0) },
+            ],
+        };
+        let triangles: Vec<_> = covered
+            .iter()
+            .enumerate()
+            .map(|(pixel, covered)| if *covered { u32::from(pixel % width as usize > 400) } else { texturecraft_geom::NO_TRI })
+            .collect();
+        let mesh = texturecraft_geom::primitives::plane(1.0, 1);
+        let partition = texturecraft_geom::TrianglePartition::new(&mesh, 0, |_, _| Vec::<u32>::new());
+        let seam_input = crate::SeamPaddingInput::new(vec![seam], &triangles, partition);
+
+        let padding = crate::PaddingMaps::new(texturecraft_core::UvPaddingMode::Space3d, &covered, (width, height), Some(4), (0, 0), Some(&seam_input));
+
+        let mut out = Composite::with_size(&[Channel::Roughness], width, height);
+        let paint = |out: &mut Composite, xs: std::ops::RangeInclusive<u32>, value: f32| {
+            for y in 0..height {
+                for x in xs.clone() {
+                    out.channels.get_mut(&Channel::Roughness).unwrap().set(x, y, &[to_u16(value)]);
+                }
+            }
+        };
+        paint(&mut out, left.clone(), 0.2);
+        paint(&mut out, right.clone(), 0.2);
+        pad_tiles(&mut out, &padding, &all_tiles(width, height));
+
+        // Past the left island's seam edge, padding continues from the right island six tiles away
+        paint(&mut out, right, 0.9);
+        let written = pad_tiles(&mut out, &padding, &[(404 / TILE, 0)]);
+        assert!((out.value(Channel::Roughness, 61, 3)[0] - 0.9).abs() < 1e-3, "{:?}", out.value(Channel::Roughness, 61, 3));
+        assert!(written.contains(&(0, 0)), "the repadded tile is uploaded: {written:?}");
     }
 
     fn content_fx(f: &mut Fixture, id: LayerId, kind: EffectKind) -> LayerId {
@@ -6659,6 +6742,33 @@ soft {soft:?}"
             let label = filter.label();
             assert!((0..TILE as usize).all(|x| (edge_tile[x] - whole[x]).abs() < 1e-3), "{label}: the edge tile alone\n{edge_tile:?}\nwhole\n{whole:?}");
             assert!((0..WIDTH as usize - period).all(|x| (whole[x] - whole[x + period]).abs() < 0.02), "{label} keeps tiling: {whole:?}");
+        }
+    }
+
+    /// A set taller than wide: a mirror or transform reads anywhere down its block, so a tile composited alone near the bottom matches the whole set
+    #[test]
+    fn a_tile_alone_on_a_tall_set_reads_a_mirror_or_transform_from_the_far_end() {
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 256;
+        let column_of = |out: &Composite| (HEIGHT - TILE..HEIGHT).map(|y| out.value(Channel::Roughness, 20, y)[0]).collect::<Vec<f32>>();
+        let composite = |filter: &Filter, tiles: &[(u32, u32)]| {
+            let mut f = fixture();
+            f.gbuf = UvGBuffer::new(&f.mesh, 0, WIDTH, HEIGHT);
+            f.project.texture_sets[0].set_size(WIDTH, HEIGHT);
+            checker_roughness(&mut f, Some(filter.clone()));
+            let images = ImageStore::default();
+            let mut out = Composite::with_size(&f.project.texture_sets[0].channel_list(), WIDTH, HEIGHT);
+            composite_tiles(&inputs(&f, &images, None), &mut out, tiles);
+            column_of(&out)
+        };
+
+        let mirror = Filter::Mirror(Mirror { mode: texturecraft_core::MirrorMode::AxisY, ..Mirror::LIBRARY });
+        let shift = Filter::Transform(TileTransform { offset: [0.0, 0.25], ..TileTransform::LIBRARY });
+        for filter in [mirror, shift] {
+            let whole = composite(&filter, &all_tiles(WIDTH, HEIGHT));
+            let bottom_tile = composite(&filter, &[(0, HEIGHT / TILE - 1)]);
+            let label = filter.label();
+            assert!(whole.iter().zip(&bottom_tile).all(|(a, b)| (a - b).abs() < 1e-3), "{label}: the bottom tile alone\n{bottom_tile:?}\nwhole\n{whole:?}");
         }
     }
 

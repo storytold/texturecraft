@@ -28,40 +28,56 @@ fn missing(name: &'static str) -> MapEntry {
 /// Input maps in the OpenPBR parameter groups, then TextureCraft's channels outside OpenPBR
 pub static INPUT_MAPS: LazyLock<Vec<MapGroup>> = LazyLock::new(|| {
     vec![
-        (n_("Base"), vec![missing(n_("Base weight")), channel(Channel::BaseColor), channel(Channel::Metallic), missing(n_("Base diffuse roughness"))]),
+        (n_("Base"), vec![channel(Channel::BaseWeight), channel(Channel::BaseColor), channel(Channel::Metallic), channel(Channel::BaseDiffuseRoughness)]),
         (
             n_("Specular"),
             vec![
-                missing(n_("Specular weight")),
-                missing(n_("Specular color")),
+                channel(Channel::SpecularWeight),
+                channel(Channel::SpecularColor),
                 channel(Channel::Roughness),
                 channel(Channel::SpecularLevel),
                 channel(Channel::AnisotropyLevel),
                 channel(Channel::AnisotropyAngle),
             ],
         ),
-        (n_("Transmission"), vec![channel(Channel::Transmission), missing(n_("Transmission color"))]),
-        (n_("Subsurface"), vec![channel(Channel::ScatterWeight), missing(n_("Subsurface color")), missing(n_("Subsurface radius"))]),
+        (n_("Transmission"), vec![channel(Channel::Transmission), channel(Channel::TransmissionColor)]),
+        (n_("Subsurface"), vec![channel(Channel::ScatterWeight), channel(Channel::SubsurfaceColor), channel(Channel::SubsurfaceRadiusScale)]),
         (
             n_("Coat"),
             vec![
                 channel(Channel::CoatWeight),
-                missing(n_("Coat color")),
+                channel(Channel::CoatColor),
                 channel(Channel::CoatRoughness),
-                missing(n_("Coat roughness anisotropy")),
+                channel(Channel::CoatAnisotropy),
                 missing(n_("Coat IOR")),
+                channel(Channel::CoatSpecularLevel),
                 channel(Channel::CoatNormal),
-                missing(n_("Coat tangent")),
+                channel(Channel::CoatTangent),
             ],
         ),
         (n_("Sheen"), vec![channel(Channel::SheenWeight), channel(Channel::SheenColor), channel(Channel::SheenRoughness)]),
         (n_("Emission"), vec![channel(Channel::Emissive)]),
-        (n_("Thin film"), vec![missing(n_("Thin film weight")), missing(n_("Thin film thickness"))]),
+        (n_("Thin film"), vec![channel(Channel::ThinFilmWeight), missing(n_("Thin film thickness"))]),
         (
             n_("Geometry"),
-            vec![channel(Channel::Opacity), channel(Channel::Height), channel(Channel::Normal), missing(n_("Tangent")), channel(Channel::AmbientOcclusion)],
+            vec![channel(Channel::Opacity), channel(Channel::Height), channel(Channel::Normal), channel(Channel::Tangent), channel(Channel::AmbientOcclusion)],
         ),
-        (n_("Other"), vec![channel(Channel::Glossiness), channel(Channel::Specular)]),
+        (
+            n_("Other"),
+            [
+                Channel::BlendingMask,
+                Channel::Diffuse,
+                Channel::Displacement,
+                Channel::Glossiness,
+                Channel::Ior,
+                Channel::Reflection,
+                Channel::Specular,
+                Channel::Transmissive,
+            ]
+            .map(channel)
+            .to_vec(),
+        ),
+        (n_("User"), Channel::ALL.into_iter().filter(|c| c.id().starts_with("user")).map(channel).collect()),
     ]
 });
 

@@ -877,6 +877,7 @@ fn bake_run(session: &mut Session, params: &Value) -> Result<Value> {
                 Ok(tracer) => tracers.push(tracer),
                 Err(error) => {
                     session.bake_log.set_failed(index, &error.to_string());
+
                     // The edit rolls back the sets baked before this one too
                     session.bake_log.discard();
                     return Err(error);

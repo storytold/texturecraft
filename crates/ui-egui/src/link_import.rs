@@ -18,7 +18,8 @@ pub(super) struct LinkImport {
     mesh: u64,
     canceled: Arc<AtomicBool>,
     set: usize,
-    resolution: u32,
+    /// The set's size when the import started: a resize cancels it
+    size: (u32, u32),
     place: Place,
     result: Receiver<texturecraft_engine::Result<ImportedMaterial>>,
 }
@@ -53,7 +54,7 @@ impl TextureCraftApp {
             ),
             explicit => explicit,
         };
-        let resolution = texture_set.resolution;
+        let (resolution, size) = (texture_set.resolution, texture_set.size());
         let baked = self.session.baked(set).cloned();
         let path = PathBuf::from(path);
         let canceled = Arc::new(AtomicBool::new(false));
@@ -65,7 +66,7 @@ impl TextureCraftApp {
             // A pending installation only needs its source package and cooked outputs
             Ok((source.package, source.source_ext, cooked))
         });
-        self.link_imports.push(LinkImport { project: self.session.project_id, mesh: self.session.mesh_id, canceled, set, resolution, place, result: rx });
+        self.link_imports.push(LinkImport { project: self.session.project_id, mesh: self.session.mesh_id, canceled, set, size, place, result: rx });
         self.toast("Cooking MaterialCraft material", false);
         Some(json!({"pending":true}))
     }
@@ -83,7 +84,7 @@ impl TextureCraftApp {
         for mut job in std::mem::take(&mut self.link_imports) {
             if job.project != self.session.project_id
                 || job.mesh != self.session.mesh_id
-                || !self.session.doc.project.texture_set(job.set).is_ok_and(|set| set.resolution == job.resolution)
+                || !self.session.doc.project.texture_set(job.set).is_ok_and(|set| set.size() == job.size)
             {
                 self.toast("Material import canceled because the target texture set changed", true);
                 continue;

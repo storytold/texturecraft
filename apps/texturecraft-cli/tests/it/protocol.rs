@@ -37,7 +37,8 @@ fn serve_writes_nothing_but_json_lines_to_stdout() {
 fn serve_ends_quietly_and_mcp_reports_it_when_stdin_is_closed() {
     let output = binary().arg("serve").stdin(Stdio::null()).output().unwrap();
     assert_eq!((output.status.code(), output.stdout.is_empty(), output.stderr.is_empty()), (Some(0), true, true));
-    // An MCP client must open with `initialize`; end of input before it is a failed start.
+
+    // An MCP client must open with `initialize`; end of input before it is a failed start
     let dir = std::env::temp_dir().join(format!("tc-mcp-stdio-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let output = binary().args(["mcp", "--read-root", dir.to_str().unwrap(), "--write-root", dir.to_str().unwrap()]).stdin(Stdio::null()).output().unwrap();
@@ -62,21 +63,25 @@ fn bridge(token_flag: Option<&str>, env: Option<&str>) -> Output {
 #[test]
 fn the_control_token_variable_is_a_fallback_the_flag_wins_and_an_empty_one_is_unset() {
     let secret = "env-token-0123456789-secret";
-    // Empty or blank counts as unset: the error says to set one, as when there is none.
+
+    // Empty or blank counts as unset: the error says to set one, as when there is none
     for blank in ["", "   "] {
         let output = bridge(None, Some(blank));
         let err = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{err}");
         assert!(err.contains("no control token: set TEXTURECRAFT_CONTROL_TOKEN"), "{err}");
     }
-    // The variable is used when there is no flag: a good token gets as far as connecting.
+
+    // The variable is used when there is no flag: a good token gets as far as connecting
     let err = String::from_utf8_lossy(&bridge(None, Some(secret)).stderr).into_owned();
     assert!(!err.contains("16 to 1024") && !err.contains(secret), "{err}");
-    // The flag wins over a good variable: its bad value is what is reported, without echoing either.
+
+    // The flag wins over a good variable: its bad value is what is reported, without echoing either
     let err = String::from_utf8_lossy(&bridge(Some("short"), Some(secret)).stderr).into_owned();
     assert!(err.contains("control token must be 16 to 1024"), "{err}");
     assert!(!err.contains(secret) && !err.contains("short\n"), "{err}");
-    // A bad value in the variable is refused too, and its value stays out of the message.
+
+    // A bad value in the variable is refused too, and its value stays out of the message
     let err = String::from_utf8_lossy(&bridge(None, Some("bad token")).stderr).into_owned();
     assert!(err.contains("control token must be 16 to 1024") && !err.contains("bad token"), "{err}");
 }
@@ -90,7 +95,7 @@ fn help_lists_the_variable_but_never_its_value() {
 
 #[test]
 fn a_variable_alone_grants_no_file_access() {
-    // The token variable is for authentication only: a headless server with no roots still refuses files.
+    // The token variable is for authentication only: a headless server with no roots still refuses files
     let mut child =
         binary().arg("serve").env("TEXTURECRAFT_CONTROL_TOKEN", "env-token-0123456789-secret").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
@@ -103,8 +108,7 @@ fn a_variable_alone_grants_no_file_access() {
 
 #[test]
 fn a_token_in_the_environment_does_not_require_bridge() {
-    // Headless MCP must parse even when TEXTURECRAFT_CONTROL_TOKEN is set; only --token on the
-    // command line requires --bridge.
+    // An inherited control token also permits headless startup
     let output = binary().args(["mcp", "--fromat"]).env("TEXTURECRAFT_CONTROL_TOKEN", "env-token-0123456789-secret").output().unwrap();
     let err = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{err}");

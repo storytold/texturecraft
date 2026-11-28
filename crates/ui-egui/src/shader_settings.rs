@@ -42,8 +42,8 @@ pub const SHADER_TYPES: [&str; 17] = [
 /// The shader choice's search starts as the reference's: shaders only
 pub const SHADER_QUERY: &str = "u:shader";
 
-/// The reference's default instance name
-const INSTANCE_NAME: &str = "Main shader";
+/// The reference's default instance name: the project's one shader, which every set uses
+pub(crate) const INSTANCE_NAME: &str = "Main shader";
 
 /// Wide enough for the longer shader model name
 const SHADER_MODEL_COMBO_WIDTH: f32 = 260.0;

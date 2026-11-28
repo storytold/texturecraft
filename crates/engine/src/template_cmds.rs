@@ -32,6 +32,8 @@ pub struct ProjectTemplate {
     pub normal_format: NormalFormat,
     /// Channels of every texture set, with their formats.
     pub channels: Vec<(Channel, ChannelFormat)>,
+    /// Whether the channels hold their formats' precision ([`texturecraft_core::TextureSet::format_precision`]); older templates keep 16 bits
+    pub format_precision: bool,
     /// Shader: PBR specular/glossiness instead of metallic/roughness.
     pub spec_gloss: bool,
     pub parallax: bool,
@@ -49,6 +51,7 @@ impl Default for ProjectTemplate {
             resolution: 2048,
             normal_format: NormalFormat::OpenGl,
             channels: with_formats(&Channel::DEFAULT_SET),
+            format_precision: false,
             spec_gloss: d.spec_gloss,
             parallax: d.parallax,
             ior: d.ior,
@@ -208,6 +211,7 @@ impl Session {
         for set_index in 0..project.texture_sets.len() {
             if let Some(set) = project.texture_sets.get_mut(set_index) {
                 set.channels = template.channels.clone();
+                set.format_precision = template.format_precision;
             }
 
             for (id, _) in project.walk(set_index) {
@@ -304,6 +308,7 @@ fn save(session: &mut Session, params: &Value) -> Result<Value> {
         resolution: set.resolution,
         normal_format: project.normal_format,
         channels: set.channels.clone(),
+        format_precision: set.format_precision,
         spec_gloss: display.spec_gloss,
         parallax: display.parallax,
         ior: display.ior,
@@ -441,6 +446,25 @@ mod tests {
         assert_eq!(s.doc.project.texture_sets[0].resolution, 2048);
         assert!(s.doc.project.display.spec_gloss);
         assert!(execute(&mut s, "project.new", &json!({"template": "nope"})).is_err());
+    }
+
+    #[test]
+    fn a_template_keeps_the_channel_formats_picked_in_the_set_it_was_saved_from() {
+        let dir = std::env::temp_dir().join(format!("tc_template_formats_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Session::new_project("t", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        s.load_templates(dir.clone());
+        execute(&mut s, "textureSet.channel.format", &json!({"channel": "roughness", "format": "L8"})).unwrap();
+        execute(&mut s, "project.template.save", &json!({"name": "Eight bit roughness"})).unwrap();
+
+        let mut fresh = Session::new_project("f", texturecraft_geom::primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        fresh.load_templates(dir.clone());
+        execute(&mut fresh, "project.new", &json!({"template": "Eight bit roughness"})).unwrap();
+        let held = |session: &Session, channel: Channel| session.doc.project.texture_sets[0].formats().into_iter().find(|(c, _)| *c == channel).map(|(_, f)| f);
+
+        assert_eq!(held(&fresh, Channel::Roughness), held(&s, Channel::Roughness));
+        assert_eq!(held(&fresh, Channel::Metallic), held(&s, Channel::Metallic), "the other channels keep 16 bits");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

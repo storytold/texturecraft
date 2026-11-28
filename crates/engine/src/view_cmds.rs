@@ -42,7 +42,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set view mode",
             [],
             None,
-            "{mode: material|uvChecker|normalHeightMesh (the normal the shading uses: mesh normal, Height channel slope and Normal channel; 2D view: the tangent-space normal)|image (an image resource shown as it is on the mesh and in the 2D view)|mask|<channel id>|map:<mesh map id>, image? (the resource, for image), layer? (for mask)}",
+            "{mode: material|uvChecker|normalHeightMesh (the normal the shading uses: mesh normal, Height channel slope and Normal channel; 2D view: the tangent-space normal)|image (an image resource shown as it is on the mesh and in the 2D view)|mask|<shaded channel id>|map:<mesh map id>, image? (the resource, for image), layer? (for mask)}",
             always,
             view
         ),
@@ -161,7 +161,7 @@ fn set_view(s: &mut Session, v: ViewMode) -> Result<Value> {
 
 /// C and Shift+C: the set's channels, then "Normal+height+mesh", then round again
 fn cycle_channel(s: &mut Session, d: i64) -> Result<Value> {
-    let mut views: Vec<ViewMode> = s.doc.project.texture_set(s.ts()).map(|t| t.channel_list()).unwrap_or_default().into_iter().map(ViewMode::Channel).collect();
+    let mut views: Vec<_> = s.doc.project.texture_sets.get(s.ts()).into_iter().flat_map(|set| set.viewport_channels()).map(ViewMode::Channel).collect();
     if views.is_empty() {
         return set_view(s, ViewMode::Material);
     }
@@ -217,7 +217,14 @@ fn view(s: &mut Session, p: &Value) -> Result<Value> {
         }
         _ => match m.strip_prefix("map:") {
             Some(id) => ViewMode::MeshMap(BakedMap::parse(id).ok_or_else(|| bad("viewport.view", format!("unknown mesh map `{id}`")))?),
-            None => ViewMode::Channel(Channel::parse(m).ok_or_else(|| bad("viewport.view", format!("unknown view mode `{m}`")))?),
+            None => {
+                let channel = Channel::parse(m).ok_or_else(|| bad("viewport.view", format!("unknown view mode `{m}`")))?;
+                if !channel.is_shaded() {
+                    return Err(bad("viewport.view", format!("{} is stored for export and has no viewport view", channel.label())));
+                }
+
+                ViewMode::Channel(channel)
+            }
         },
     };
     set_view(s, v)
@@ -467,14 +474,22 @@ mod tests {
         assert!(channels.len() > 2);
         assert_eq!(s.view, ViewMode::Material);
 
+        execute(&mut s, "textureSet.channel.add", &json!({"channel": "user31"})).unwrap();
+
+        let result = execute(&mut s, "viewport.view", &json!({"mode": "user31"}));
+        assert!(result.is_err(), "the viewport cannot display an export-only channel");
+        assert_eq!(s.view, ViewMode::Material);
+
         // From the material C starts at the first channel
         let mut seen = Vec::new();
         for _ in 0..channels.len() + 2 {
             seen.push(pressed(&mut s, "viewport.nextChannel"));
         }
+
         let mut expected = channels.clone();
         expected.push(ViewMode::NormalHeightMesh);
         expected.push(channels[0]);
+
         assert_eq!(seen, expected, "channels, then Normal+height+mesh, then round again");
 
         // Shift+C walks it backwards, and from the material starts at the last entry

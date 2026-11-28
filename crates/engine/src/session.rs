@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use texturecraft_compose::{
-    BakedMaps, BelowCache, Composite, PaintTarget, PixelStore, StackKey, StrokePreview, covered_tiles, pad_tiles, stack_reads_neighbours,
+    BakedMaps, BelowCache, Composite, PaddingMaps, PaintTarget, PixelStore, SeamPaddingInput, StackKey, StrokePreview, covered_tiles, pad_tiles,
+    stack_reads_neighbours,
 };
-use texturecraft_core::{Channel, Layer, LayerId, LayerKind, Project, TextureSet};
+use texturecraft_core::{Channel, ChannelFormat, Layer, LayerId, LayerKind, Project, TextureSet, UvPaddingMode};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera, UvGBuffer};
 use texturecraft_paint::{BrushSettings, EyeDepth, Stroke, StrokeCanvas};
-use texturecraft_texel::DilationMap;
 
 use crate::fill_mode::FillMode;
 pub use crate::stencil_look::StencilLook;
@@ -43,7 +43,11 @@ pub struct SetCache {
     /// Texels across and down (`TextureSet::size`).
     pub size: (u32, u32),
     pub gbuf: Arc<UvGBuffer>,
-    pub dilation: Arc<DilationMap>,
+    /// The set's UV padding mode and the display padding it gives
+    pub uv_padding: UvPaddingMode,
+    pub padding: Arc<PaddingMaps>,
+    /// The channels' storage formats the composite was made with
+    pub formats: Vec<(Channel, ChannelFormat)>,
     pub covered_tiles: Arc<Vec<(u32, u32)>>,
     pub composite: Composite,
     /// Tiles to recomposite.
@@ -65,15 +69,15 @@ impl SetCache {
     pub(crate) fn new(mesh: &Mesh, ts: &TextureSet) -> SetCache {
         let (w, h) = ts.size();
         let gbuf = UvGBuffer::new(mesh, ts.material, w, h);
-
-        // Padding stays inside each UV tile
-        let dilation = DilationMap::in_blocks(&gbuf.coverage_mask(), w, h, Some(DISPLAY_PADDING), ts.block_resolution());
+        let padding = display_padding(mesh, ts, &gbuf);
         let covered = covered_tiles(&gbuf);
         let all: BTreeSet<(u32, u32)> = texturecraft_compose::all_tiles(w, h).into_iter().collect();
         SetCache {
             size: (w, h),
             gbuf: Arc::new(gbuf),
-            dilation: Arc::new(dilation),
+            uv_padding: ts.uv_padding,
+            padding: Arc::new(padding),
+            formats: ts.formats(),
             covered_tiles: Arc::new(covered),
             composite: Composite { block_scales: ts.block_scales(), ..Composite::with_size(&ts.channel_list(), w, h) },
             dirty: all.clone(),
@@ -88,6 +92,21 @@ impl SetCache {
     pub fn invalidate_all(&mut self) {
         self.dirty.extend(self.covered_tiles.iter().copied());
     }
+}
+
+/// The geometry needed to continue UV padding across the seams of this set
+pub(crate) fn padding_seams<'a>(mesh: &'a Mesh, set: &TextureSet, grid: &'a UvGBuffer) -> Option<SeamPaddingInput<'a>> {
+    if set.uv_padding == UvPaddingMode::Space2d {
+        return None;
+    }
+
+    SeamPaddingInput::of_material(mesh, set.material, &grid.tri)
+}
+
+/// The viewport's padding of `set`, which stays inside each UV tile
+fn display_padding(mesh: &Mesh, set: &TextureSet, grid: &UvGBuffer) -> PaddingMaps {
+    let seams = padding_seams(mesh, set, grid);
+    PaddingMaps::new(set.uv_padding, &grid.coverage_mask(), (grid.width, grid.height), Some(DISPLAY_PADDING), set.block_size(), seams.as_ref())
 }
 
 /// Active tool.
@@ -846,6 +865,12 @@ impl Session {
             )
         };
         for (texture_set_index, cache) in self.caches.iter_mut().enumerate() {
+            // Display-only settings change the uploaded textures, not the composite
+            let ao_mixing = |document: &Document| document.project.texture_sets.get(texture_set_index).map(|set| set.ao_mixing);
+            if ao_mixing(previous_document) != ao_mixing(&self.doc) {
+                cache.upload.extend(texturecraft_compose::all_tiles(cache.size.0, cache.size.1));
+            }
+
             if uses_added_resource(texture_set_index) {
                 cache.invalidate_all();
                 continue;
@@ -921,11 +946,22 @@ impl Session {
 
     /// Make caches agree with the project's texture sets (resolution or channel changes).
     pub fn sync_caches(&mut self) {
-        let sets = self.doc.project.texture_sets.clone();
+        let sets = &self.doc.project.texture_sets;
         self.caches.truncate(sets.len());
         for (i, ts) in sets.iter().enumerate() {
             match self.caches.get_mut(i) {
                 Some(c) if c.size == ts.size() => {
+                    if c.uv_padding != ts.uv_padding {
+                        c.uv_padding = ts.uv_padding;
+                        c.padding = Arc::new(display_padding(&self.mesh, ts, &c.gbuf));
+                        c.invalidate_all();
+                    }
+                    let formats = ts.formats();
+                    if c.formats != formats {
+                        c.formats = formats;
+                        c.invalidate_all();
+                    }
+
                     let (want, scales) = (ts.channel_list(), ts.block_scales());
                     if c.composite.channels.keys().copied().collect::<Vec<_>>() != want || c.composite.block_scales != scales {
                         c.composite = Composite { block_scales: scales, ..Composite::with_size(&want, c.size.0, c.size.1) };
@@ -1181,7 +1217,7 @@ impl Session {
                 );
 
                 // The composited tiles and the neighbours their padding reached change
-                let padded = pad_tiles(&mut cache.composite, &cache.dilation, &tiles);
+                let padded = pad_tiles(&mut cache.composite, &cache.padding, &tiles);
                 cache.upload.extend(tiles.iter().copied().chain(padded));
                 cache.revision = cache.revision.wrapping_add(1);
                 changed = true;

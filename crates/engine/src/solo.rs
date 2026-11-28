@@ -81,7 +81,7 @@ impl Session {
             let set = inputs.project.texture_sets.get(ts)?;
             let mut output = Composite { block_scales: inputs.block_scales.clone(), ..Composite::with_size(&set.channel_list(), cache.size.0, cache.size.1) };
             composite_tiles(inputs, &mut output, tiles);
-            pad_tiles(&mut output, &cache.dilation, tiles);
+            pad_tiles(&mut output, &cache.padding, tiles);
             Some(Cow::Owned(output))
         })
     }

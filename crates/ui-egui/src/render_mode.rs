@@ -268,7 +268,14 @@ fn trace_scene(app: &TextureCraftApp) -> TraceScene {
         .texture_sets
         .iter()
         .zip(&session.caches)
-        .map(|(set, cache)| TraceSet { material: set.material, composite: cache.composite.clone(), height_strength: set.atlas_height_strength() })
+        .map(|(set, cache)| TraceSet {
+            material: set.material,
+            composite: cache.composite.clone(),
+            height_strength: set.atlas_height_strength(),
+            height_y_factor: set.atlas_height_y_factor(),
+            height_in_normal: set.height_in_normal(),
+            height_to_normal: set.height_to_normal,
+        })
         .collect();
     let env_image = display.environment_resource().and_then(|n| session.images.get(n));
 
@@ -327,7 +334,13 @@ fn work(app: &TextureCraftApp, size: (u32, u32)) -> Work {
 /// revisions bump with every composited chunk, so while textures load this changes every frame).
 fn scene_key(session: &texturecraft_engine::Session, composites: bool) -> String {
     let revisions: Vec<u64> = if composites { session.caches.iter().map(|cache| cache.revision).collect() } else { Vec::new() };
-    let sets: Vec<_> = session.doc.project.texture_sets.iter().map(|set| (set.material, set.atlas_height_strength())).collect();
+    let sets: Vec<_> = session
+        .doc
+        .project
+        .texture_sets
+        .iter()
+        .map(|set| (set.material, set.atlas_height_strength(), set.atlas_height_y_factor(), set.height_in_normal(), set.height_to_normal))
+        .collect();
 
     let display = &session.doc.project.display;
     let env_image = display.environment_resource().and_then(|name| session.images.get(name)).map(Arc::as_ptr);

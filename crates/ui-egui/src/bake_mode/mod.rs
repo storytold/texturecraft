@@ -52,7 +52,7 @@ pub fn texture_sets(app: &mut TextureCraftApp, ui: &mut Ui) {
             let Some(texture_set) = app.session.doc.project.texture_sets.get(set_index) else { continue };
 
             let name = texture_set.name.clone();
-            let resolution = texture_set.resolution;
+            let (resolution, height) = (texture_set.resolution, texture_set.height());
             let mut is_enabled = texture_set.bake.common.is_enabled;
             let visible = texture_set.visible;
             let tiles: Vec<_> = texture_set
@@ -72,7 +72,7 @@ pub fn texture_sets(app: &mut TextureCraftApp, ui: &mut Ui) {
                     }
 
                     // The name takes the room the resolution leaves, so it only shortens when the row is too narrow
-                    let resolution_text = format!("{resolution}x{resolution}");
+                    let resolution_text = format!("{resolution}x{height}");
                     let name_width = (ui.available_width() - resolution_menu_width(ui, &resolution_text) - ui.spacing().item_spacing.x).max(0.0);
                     let name_size = egui::vec2(name_width, ui.spacing().interact_size.y);
                     let name_button = ui.allocate_ui_with_layout(name_size, egui::Layout::left_to_right(egui::Align::Center), |ui| {

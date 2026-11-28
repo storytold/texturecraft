@@ -112,7 +112,8 @@ fn the_catalog_characters_are_the_ones_the_web_font_keeps() {
     std::fs::write(fixture.0.join("locales/es/common.tsv"), "\tSave\tGuardar\n").unwrap();
     std::fs::create_dir_all(fixture.0.join("locales/ja")).unwrap();
     std::fs::write(fixture.0.join("locales/ja/texturecraft.tsv"), "\tLayers\t\u{30ec}\u{30a4}\u{30e4}\u{30fc}\n").unwrap();
-    // A shared-only locale contributes no characters: its catalog is not embedded.
+
+    // A shared-only locale contributes no characters: its catalog is not embedded
     std::fs::create_dir_all(fixture.0.join("locales/de")).unwrap();
     std::fs::write(fixture.0.join("locales/de/common.tsv"), "\tSave\tSpeichern \u{fc}\n").unwrap();
 
@@ -127,7 +128,7 @@ fn the_catalog_characters_are_the_ones_the_web_font_keeps() {
     sorted.dedup();
     assert_eq!(sorted, characters, "sorted and distinct");
 
-    // Nothing to cut with no checkout: the web build then keeps the faces whole.
+    // Nothing to cut with no checkout: the web build then keeps the faces whole
     assert_eq!(i18n_build::collect(None, false).unwrap().1, Vec::<char>::new());
     assert!(i18n_build::collect(None, true).is_err());
 }

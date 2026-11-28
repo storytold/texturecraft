@@ -369,11 +369,14 @@ fn stage_handoff_package_in(base: &std::path::Path, file_name: &str, package: &[
     if file_name.is_empty() || std::path::Path::new(file_name).file_name() != Some(std::ffi::OsStr::new(file_name)) {
         return Err(EngineError::Other(format!("`{file_name}` is not a plain file name")));
     }
+
     sweep_old_handoffs(base, HANDOFF_MAX_AGE);
-    // Dropped (and removed) on any early return, so a failed write leaves no empty folder behind.
+
+    // Dropped (and removed) on any early return, so a failed write leaves no empty folder behind
     let mut builder = tempfile::Builder::new();
     builder.prefix(HANDOFF_PREFIX);
-    // tempfile makes folders with the default mode (0755 under the usual umask), so ask for 0700 and 0600 explicitly.
+
+    // tempfile makes folders with the default mode (0755 under the usual umask), so ask for 0700 and 0600 explicitly
     #[cfg(unix)]
     builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
     let dir = builder.tempdir_in(base).map_err(io)?;
@@ -398,6 +401,7 @@ fn sweep_old_handoffs(base: &std::path::Path, max_age: std::time::Duration) {
         if !entry.file_name().to_string_lossy().starts_with(HANDOFF_PREFIX) {
             continue;
         }
+
         let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
         let old = meta.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > max_age);
         if meta.is_dir() && old {
@@ -790,7 +794,8 @@ mod tests {
         let base = scratch("planted");
         let victim = base.join("victim.txt");
         std::fs::write(&victim, b"precious").unwrap();
-        // The old code wrote `<temp>/<name>` with `fs::write`; a hard link there reaches the victim on every platform.
+
+        // The old code wrote `<temp>/<name>` with `fs::write`; a hard link there reaches the victim on every platform
         std::fs::hard_link(&victim, base.join("wood.mcraft")).unwrap();
 
         let path = super::stage_handoff_package_in(&base, "wood.mcraft", b"package").unwrap();
@@ -843,7 +848,8 @@ mod tests {
             std::fs::create_dir(dir).unwrap();
         }
         std::fs::write(&file, b"x").unwrap();
-        // Zero age limit: everything with the prefix that is a folder counts as old.
+
+        // Zero age limit: everything with the prefix that is a folder counts as old
         super::sweep_old_handoffs(&base, std::time::Duration::ZERO);
         assert!(!old.exists() && other.exists() && file.exists());
         let young = base.join("texturecraft-open-young");

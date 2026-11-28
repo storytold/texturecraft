@@ -488,6 +488,7 @@ pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                             let bake_brush = tool == Tool::Paint && app.ui.bake_paint_brush.on;
                             (bake_brush, bake_brush)
                         }
+
                         // A greyed tool never shows as selected, even while it stays equipped
                         _ => {
                             let usable = crate::menus::enabled(app, &command);

@@ -1,6 +1,6 @@
 use texturecraft_compose::{DisplayKind, ImageRes};
 use texturecraft_core::DisplaySettings;
-use texturecraft_geom::glam::Vec3;
+use texturecraft_geom::glam::{Quat, Vec3};
 use texturecraft_geom::{OrbitCamera, primitives};
 use texturecraft_render::headless::Headless;
 use texturecraft_render::renderer::TAA_SAMPLES;
@@ -47,16 +47,26 @@ impl Img {
 /// The id `setup` uploads the material ball under
 const MESH_ID: u64 = 1;
 
-/// A headless renderer with the material ball framed in a 480×360 view (None without a GPU).
-fn setup() -> Option<(Headless, Frame)> {
-    let Ok(mut h) = Headless::new() else {
+const TEST_TEXTURE_RESOLUTION: u32 = 256;
+
+fn headless_renderer() -> Option<Headless> {
+    let Ok(headless) = Headless::new() else {
         eprintln!("skipping: no GPU adapter");
         return None;
     };
-    eprintln!("headless adapter: {:?}", h.device.adapter_info());
+
+    eprintln!("headless adapter: {:?}", headless.device.adapter_info());
+    Some(headless)
+}
+
+/// A headless renderer with the material ball framed in a 480×360 view (None without a GPU).
+fn setup() -> Option<(Headless, Frame)> {
+    let mut h = headless_renderer()?;
     let mesh = primitives::material_ball();
     h.renderer.set_mesh(&h.device, &h.queue, &mesh, MESH_ID);
-    h.renderer.set_texture_sets(&h.device, &h.queue, &[((256, 256), 0), ((256, 256), 1)], 2);
+    let dimensions = (TEST_TEXTURE_RESOLUTION, TEST_TEXTURE_RESOLUTION);
+    h.renderer.set_texture_sets(&h.device, &h.queue, &[(dimensions, 0), (dimensions, 1)], 2);
+
     let mut cam = OrbitCamera { yaw: 0.6, pitch: 0.25, ..OrbitCamera::default() };
     let (lo, hi) = mesh.bounds();
     cam.frame(lo, hi);
@@ -259,6 +269,44 @@ fn the_combined_normal_view_shows_the_shading_normal_unlit() {
     let b = render(&mut h, &shaded(&combined, |s| s.exposure_ev = 2.0), "normal_height_mesh_ev2");
     assert_ne!(a.px, base.px, "the view differs from the lit material");
     assert_eq!(a.px, b.px, "a data view ignores exposure");
+}
+
+#[test]
+fn the_height_y_factor_steepens_slopes_down_the_texture_only() {
+    let Some(mut headless) = headless_renderer() else { return };
+
+    // An orthographic plane gives both ramps a uniform UV footprint
+    let resolution = TEST_TEXTURE_RESOLUTION;
+    let mesh = primitives::plane(2.0, 1);
+    headless.renderer.set_mesh(&headless.device, &headless.queue, &mesh, MESH_ID);
+    headless.renderer.set_texture_sets(&headless.device, &headless.queue, &[((resolution, resolution), 0)], 1);
+    let camera = OrbitCamera { free: true, orient: Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2), ortho: true, distance: 2.0, ..OrbitCamera::default() };
+    let normal_view = Frame {
+        view_id: 1,
+        size: [resolution; 2],
+        kind: ViewKind::Scene,
+        camera,
+        shade: Shade { view_mode: 4, ..Shade::default() },
+        visible: vec![true],
+        overlay: Vec::new(),
+    };
+    let doubled = shaded(&normal_view, |shade| shade.height_y_factor = 2.0);
+    let center = resolution / 2;
+    let flat = render(&mut headless, &normal_view, "height_flat").at(center, center);
+
+    upload_height_to_sets(&mut headless, &[0], |x, _| [x as f32 / resolution as f32, 0.0, 0.0, 0.0]);
+    let across = render(&mut headless, &normal_view, "height_across");
+    let across_doubled = render(&mut headless, &doubled, "height_across_y_doubled");
+
+    assert_ne!(across.at(center, center)[0], flat[0], "the horizontal ramp tilts the normal");
+    assert_same(&across, &across_doubled, "a slope across the texture keeps its tilt");
+
+    upload_height_to_sets(&mut headless, &[0], |_, y| [y as f32 / resolution as f32, 0.0, 0.0, 0.0]);
+    let vertical_tilt = |image: Img| image.at(center, center)[2].abs_diff(flat[2]);
+    let down = vertical_tilt(render(&mut headless, &normal_view, "height_down"));
+    let down_doubled = vertical_tilt(render(&mut headless, &doubled, "height_down_y_doubled"));
+
+    assert!(down > 0 && down_doubled > down, "the vertical ramp tilts farther from flat ({down} → {down_doubled})");
 }
 
 #[test]
@@ -739,10 +787,21 @@ fn bench_1080p() {
 
 /// Fill the height texture of both 256² sets: `f(x, y)` → (height, F0 r, g, b).
 fn upload_height(h: &mut Headless, f: impl Fn(u32, u32) -> [f32; 4]) {
-    for ts in 0..2 {
-        for (tx, ty) in (0..16).map(|i| (i % 4, i / 4)) {
-            let bytes: Vec<u8> = (0..64 * 64).flat_map(|i| f(tx * 64 + i % 64, ty * 64 + i / 64)).flat_map(|v| half::f16::from_f32(v).to_le_bytes()).collect();
-            h.renderer.upload_tile(&h.device, &h.queue, ts, DisplayKind::Height, tx, ty, &bytes);
+    upload_height_to_sets(h, &[0, 1], f);
+}
+
+fn upload_height_to_sets(headless: &mut Headless, sets: &[usize], texel: impl Fn(u32, u32) -> [f32; 4]) {
+    use texturecraft_texel::TILE;
+
+    let tiles_per_side = TEST_TEXTURE_RESOLUTION / TILE;
+    for (tile_x, tile_y) in (0..tiles_per_side.pow(2)).map(|index| (index % tiles_per_side, index / tiles_per_side)) {
+        let bytes: Vec<u8> = (0..TILE * TILE)
+            .flat_map(|index| texel(tile_x * TILE + index % TILE, tile_y * TILE + index / TILE))
+            .flat_map(|value| half::f16::from_f32(value).to_le_bytes())
+            .collect();
+
+        for &texture_set in sets {
+            headless.renderer.upload_tile(&headless.device, &headless.queue, texture_set, DisplayKind::Height, tile_x, tile_y, &bytes);
         }
     }
 }

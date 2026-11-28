@@ -25,7 +25,7 @@
 //! the extra lobes off, so the renderer can keep Lobes and Sheen as 1×1 placeholders until a
 //! tile with a non-default value arrives.
 
-use texturecraft_core::{BakedMap, Channel};
+use texturecraft_core::{AoMixing, BakedMap, Channel};
 use texturecraft_texel::{TILE, TILE_AREA, srgb_lut};
 
 use crate::eval::Composite;
@@ -93,7 +93,7 @@ impl DisplayKind {
 
     /// The texel of a set that has none of this texture's channels (the GPU clear value).
     pub fn default_texel(self) -> Vec<u8> {
-        let mut px = tile_bytes(&Composite::new(&[], TILE), &BakedMaps::default(), self, 0, 0);
+        let mut px = tile_bytes(&Composite::new(&[], TILE), &BakedMaps::default(), AoMixing::Multiply, self, 0, 0);
         px.truncate(self.bytes_per_texel());
         px
     }
@@ -110,8 +110,8 @@ fn u8_of(v: u16) -> u8 {
     (v >> 8) as u8
 }
 
-/// Tile bytes (`TILE × TILE`, row-major) for `kind`, using channel defaults for absent source tiles.
-pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: u32, ty: u32) -> Vec<u8> {
+/// Tile bytes (`TILE × TILE`, row-major) for `kind` mixing baked occlusion by `ao_mixing`, with channel defaults for absent source tiles
+pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, ao_mixing: AoMixing, kind: DisplayKind, tx: u32, ty: u32) -> Vec<u8> {
     let bytes_per_texel = kind.bytes_per_texel();
     let mut out = vec![0u8; TILE_AREA * bytes_per_texel];
     let srgb = srgb_lut();
@@ -183,9 +183,12 @@ pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, t
 
             for i in 0..TILE_AREA {
                 let (x, y) = (tx * TILE + (i as u32 % TILE), ty * TILE + (i as u32 / TILE));
-                let baked_ao = baked
-                    .sample_working(BakedMap::AmbientOcclusion, x, y, (resolution, composite.height), &composite.block_scales)
-                    .map_or(1.0, |value| value[0]);
+                let baked_ao = match ao_mixing {
+                    AoMixing::Multiply => baked
+                        .sample_working(BakedMap::AmbientOcclusion, x, y, (resolution, composite.height), &composite.block_scales)
+                        .map_or(1.0, |value| value[0]),
+                    AoMixing::None => 1.0,
+                };
                 let ch_ao = ao.and_then(|a| a.get(i)).map(|v| *v as f32 / 65535.0).unwrap_or(1.0);
 
                 let pixel = &mut out[i * 4..i * 4 + 4];
@@ -263,7 +266,7 @@ mod tests {
             }
             for kind in DisplayKind::ALL.into_iter().filter(|k| !kinds_for(channels).any(|n| n == *k)) {
                 let want = kind.default_texel().repeat(TILE_AREA);
-                assert!(tile_bytes(&comp, &BakedMaps::default(), kind, 0, 0) == want, "{kind:?} for {channels:?}");
+                assert!(tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, kind, 0, 0) == want, "{kind:?} for {channels:?}");
             }
         }
     }
@@ -274,7 +277,7 @@ mod tests {
         comp.channels.get_mut(&Channel::BaseColor).unwrap().set(0, 0, &[to_u16(1.0), to_u16(0.5), 0]);
         comp.channels.get_mut(&Channel::Opacity).unwrap().set(0, 0, &[to_u16(0.5)]);
 
-        let b = tile_bytes(&comp, &BakedMaps::default(), DisplayKind::BaseColor, 0, 0);
+        let b = tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, DisplayKind::BaseColor, 0, 0);
 
         assert_eq!(b[0], 255);
         assert!((b[1] as i32 - 188).abs() <= 1, "{}", b[1]);
@@ -288,7 +291,7 @@ mod tests {
         set.uv_tiles = vec![1001, 1002];
         set.tile_resolutions.insert(1002, 64);
         let comp = Composite { block_scales: set.block_scales(), ..Composite::new(&[], 512) };
-        let alpha = |tx: u32| tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Extra, tx, 0)[3];
+        let alpha = |tx: u32| tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, DisplayKind::Extra, tx, 0)[3];
 
         // Tile 1001 fills its block; 1002 fills a quarter, encoded as 32 × log2(4)
         assert_eq!((alpha(0), alpha(3), alpha(4), alpha(7)), (0, 0, 64, 64));
@@ -297,20 +300,28 @@ mod tests {
     #[test]
     fn missing_channels_fall_back_to_defaults() {
         let comp = Composite::new(&[], 64);
-        let orm = tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Orm, 0, 0);
+        let orm = tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, DisplayKind::Orm, 0, 0);
 
         assert_eq!(&orm[..4], &[255, 128, 0, 128]);
         assert_eq!(normal_texel(&comp, &BakedMaps::default(), 0), [0.0, 0.0, 1.0, 0.5], "flat, sheen roughness 0.5 rides in alpha");
-        assert_eq!(&tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Emissive, 0, 0)[..4], &[0, 0, 0, 0]);
-        assert_eq!(&tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Lobes, 0, 0)[..4], &[0, 25, 0, 0], "lobes off, coat roughness 0.1");
-        assert_eq!(&tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Sheen, 0, 0)[..4], &[255, 255, 255, 0]);
-        assert_eq!(&tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Extra, 0, 0)[..4], &[128, 128, 0, 0], "flat coat normal, no transmission");
+        assert_eq!(&tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, DisplayKind::Emissive, 0, 0)[..4], &[0, 0, 0, 0]);
+        assert_eq!(
+            &tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, DisplayKind::Lobes, 0, 0)[..4],
+            &[0, 25, 0, 0],
+            "lobes off, coat roughness 0.1"
+        );
+        assert_eq!(&tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, DisplayKind::Sheen, 0, 0)[..4], &[255, 255, 255, 0]);
+        assert_eq!(
+            &tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, DisplayKind::Extra, 0, 0)[..4],
+            &[128, 128, 0, 0],
+            "flat coat normal, no transmission"
+        );
 
         for k in DisplayKind::ALL {
-            assert_eq!(k.default_texel(), tile_bytes(&comp, &BakedMaps::default(), k, 3, 5)[..k.bytes_per_texel()]);
+            assert_eq!(k.default_texel(), tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, k, 3, 5)[..k.bytes_per_texel()]);
         }
 
-        let h = tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Height, 0, 0);
+        let h = tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, DisplayKind::Height, 0, 0);
         assert_eq!(h.len(), TILE_AREA * 8);
         assert_eq!(half::f16::from_le_bytes([h[2], h[3]]).to_f32(), half::f16::from_f32(0.04).to_f32(), "default F0");
     }
@@ -339,7 +350,7 @@ mod tests {
 
     /// Decode texel `i` of the Normal display tile (0, 0).
     fn normal_texel(comp: &Composite, baked: &BakedMaps, i: usize) -> [f32; 4] {
-        let bytes = tile_bytes(comp, baked, DisplayKind::Normal, 0, 0);
+        let bytes = tile_bytes(comp, baked, AoMixing::Multiply, DisplayKind::Normal, 0, 0);
         [0, 1, 2, 3].map(|k| half::f16::from_le_bytes([bytes[i * 8 + k * 2], bytes[i * 8 + k * 2 + 1]]).to_f32())
     }
 
@@ -374,11 +385,11 @@ mod tests {
         comp.channels.get_mut(&Channel::Glossiness).unwrap().set(0, 0, &[to_u16(0.8)]);
         comp.channels.get_mut(&Channel::Specular).unwrap().set(0, 0, &[to_u16(1.0), to_u16(0.5), 0]);
 
-        let orm = tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Orm, 0, 0);
+        let orm = tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, DisplayKind::Orm, 0, 0);
 
         assert!((orm[1] as i32 - 51).abs() <= 1, "roughness = 1 - 0.8, got {}", orm[1]);
 
-        let h = tile_bytes(&comp, &BakedMaps::default(), DisplayKind::Height, 0, 0);
+        let h = tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, DisplayKind::Height, 0, 0);
         let at = |k: usize| half::f16::from_le_bytes([h[k * 2], h[k * 2 + 1]]).to_f32();
 
         assert_eq!(at(0), 0.0);
@@ -402,7 +413,7 @@ mod tests {
         set(Channel::Transmission, &[to_u16(0.6)]);
         set(Channel::CoatNormal, &[to_u16(1.0), to_u16(0.5), to_u16(1.0)]);
 
-        let px = |k: DisplayKind| tile_bytes(&comp, &BakedMaps::default(), k, 0, 0)[4..8].to_vec();
+        let px = |k: DisplayKind| tile_bytes(&comp, &BakedMaps::default(), AoMixing::Multiply, k, 0, 0)[4..8].to_vec();
         let near = |a: &[u8], b: &[u8]| a.iter().zip(b).all(|(x, y)| x.abs_diff(*y) <= 1);
 
         assert!(near(&px(DisplayKind::Lobes), &[255, 51, 153, 64]), "{:?}", px(DisplayKind::Lobes));

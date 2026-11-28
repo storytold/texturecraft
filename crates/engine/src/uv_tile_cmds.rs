@@ -50,6 +50,10 @@ fn tile_resolution(session: &mut Session, params: &Value) -> Result<Value> {
         return Err(bad(COMMAND, format!("texture set \"{}\" has no UV tile {tile} (tiles: {:?})", texture_set.name, texture_set.uv_tiles)));
     }
 
+    if texture_set.resolution_height.is_some() && resolution != texture_set.resolution {
+        return Err(bad(COMMAND, format!("UV tiles of a non-square texture set (\"{}\") can't have their own size", texture_set.name)));
+    }
+
     let removes_override = resolution == texture_set.resolution && texture_set.tile_resolutions.contains_key(&tile);
     if texture_set.tile_resolution(tile) == resolution && !removes_override {
         return Ok(json!({ "ts": texture_set_index, "tile": tile, "resolution": resolution, "size": texture_set.size() }));
@@ -299,6 +303,11 @@ mod tests {
         }
     }
 
+    /// Width and height of a PNG file, read from its header
+    fn png_size(bytes: &[u8]) -> (u32, u32) {
+        image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png).into_dimensions().unwrap()
+    }
+
     /// Mean painted alpha over the covered texels of the set's current layout.
     fn painted_fraction(s: &Session) -> f64 {
         let id = s.doc.project.texture_sets[0].stack[0];
@@ -374,13 +383,39 @@ mod tests {
         execute(&mut s, "textureSet.tile.resolution", &json!({"tile": 1002, "resolution": 128})).unwrap();
         let opts = crate::file_cmds::export_options(&s, &json!({"preset": "Document channels + Normal + AO", "format": "png"}), "t").unwrap();
         let files = s.export_files(&[0], &opts).unwrap();
-        // PNG: width and height are the big-endian words after the IHDR tag.
-        let png_size = |b: &[u8]| (u32::from_be_bytes(b[16..20].try_into().unwrap()), u32::from_be_bytes(b[20..24].try_into().unwrap()));
         assert!(files.len() >= 4);
         for f in &files {
             let want = if f.name.contains("1002") { 128 } else { 256 };
             assert_eq!(png_size(&f.bytes), (want, want), "{}", f.name);
         }
+    }
+
+    #[test]
+    fn non_square_sets_keep_their_paint_export_wide_tiles_and_refuse_tile_sizes() {
+        let mut s = udim_session();
+        paint_all(&mut s, 50000);
+        execute(&mut s, "textureSet.resolution", &json!({"resolution": 256, "height": 128})).unwrap();
+        s.update();
+        let (w, h) = s.doc.project.texture_sets[0].size();
+        assert!(w > 2 * h, "two tiles side by side, each wider than tall: {:?}", (w, h));
+        assert_eq!((s.caches[0].gbuf.width, s.caches[0].gbuf.height), (w, h));
+        assert!(painted_fraction(&s) > 0.97);
+        let inspect = execute(&mut s, "textureSet.inspect", &json!({})).unwrap();
+        assert!(inspect["height"].as_u64() < inspect["resolution"].as_u64());
+
+        let opts = crate::file_cmds::export_options(&s, &json!({"preset": "Document channels + Normal + AO", "format": "png"}), "t").unwrap();
+        for f in &s.export_files(&[0], &opts).unwrap() {
+            let (fw, fh) = png_size(&f.bytes);
+            assert!(fw > fh, "{} is {fw}x{fh}", f.name);
+        }
+
+        assert!(execute(&mut s, "textureSet.tile.resolution", &json!({"tile": 1002, "resolution": 128})).is_err());
+        s.undo().unwrap();
+        assert_eq!(s.doc.project.texture_sets[0].size(), (512, 256));
+
+        // A set whose tiles have their own sizes stays square
+        execute(&mut s, "textureSet.tile.resolution", &json!({"tile": 1002, "resolution": 128})).unwrap();
+        assert!(execute(&mut s, "textureSet.resolution", &json!({"resolution": 256, "height": 128})).is_err());
     }
 
     /// Paint channel `c` of the first layer over every covered texel as `f(u)`, `u` the texel's

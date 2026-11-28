@@ -468,8 +468,7 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
         return;
     }
 
-    // A plain Escape or Enter while no widget of TextureCraft's has the keyboard is the window's cancel or submit: back
-    // in egui's input, it runs the Escape and Enter handlers below, the shortcuts and the Path tool's keys
+    // Forward unclaimed Escape and Enter to window shortcuts and tool handlers
     for (key, taken) in [(Key::Escape, crate::framework::take_window_cancel(ctx)), (Key::Enter, crate::framework::take_window_submit(ctx))] {
         if taken {
             let escape = craft_ui::runtime::keys::escape_mods(ctx).filter(|_| key == Key::Escape);
@@ -495,14 +494,19 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
         input.events.extend(aliases);
     });
 
-    // Let the innermost popup consume Escape before cancelling the active tool
-    // (the drop popup of the Output templates tab is open without registering with egui, and reads Escape itself)
+    // Give the innermost popup first use of Escape
+    // The output template popup handles Escape outside egui’s popup registry
     let popup_open = egui::Popup::is_any_open(ctx) || app.ui.export.pending_drop.is_some();
     let point_pick_armed = crate::generator_point_pick::armed(ctx).is_some();
     let mut cancel_point_pick = false;
     let picker_open = crate::color_picker::open_window(ctx).is_some();
 
     let nothing_focused = !crate::framework::widget_has_keyboard(ctx);
+
+    // A dialog closes on Escape itself
+    let modal_open = ctx.memory(|memory| memory.top_modal_layer().is_some());
+    let over_set_list = crate::texture_set_list::pointer_over(ctx);
+    let mut set_list_keys = (false, false);
     let log_copies = crate::log_panel::takes_copy(app, ctx);
     let commands_to_invoke = ctx.input_mut(|input| {
         // egui's label selection copies on these events at the end of the frame
@@ -521,6 +525,13 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
         if app.ui.windows.export && app.ui.export.tab == 1 && app.ui.export.ask.is_none() && input.consume_key(Modifiers::NONE, Key::F2) {
             app.ui.export.rename_key = true;
         }
+
+        // Give the hovered texture set list first use of its rename and menu keys, as Escape, never under a dialog
+        if over_set_list && !modal_open {
+            let menu = input.consume_key(Modifiers::SHIFT, Key::F10) || input.consume_key(Modifiers::NONE, Key::Menu);
+            set_list_keys = (input.consume_key(Modifiers::NONE, Key::F2), menu);
+        }
+
         let commands = app.bindings.dispatch(input);
         for copy in copies {
             if !input.events.contains(&copy) {
@@ -538,7 +549,7 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
         }
 
         let export = &app.ui.export;
-        let escape_is_free = !popup_open && !picker_open;
+        let escape_is_free = !popup_open && !picker_open && !modal_open;
 
         // Local export inputs handle Escape during drawing
         let export_input_active = app.ui.windows.export && (export.field_had_keyboard || export.pending_drop.is_some() || export.renaming.is_some());
@@ -554,8 +565,8 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
         } else if app.ui.windows.import_resources.is_some() {
             #[cfg(not(target_arch = "wasm32"))]
             crate::import_resources::keys_in(app, input, nothing_focused, popup_open);
-        } else if popup_open || export_input_active {
-            // The open list or export input handles the key
+        } else if popup_open || modal_open || export_input_active {
+            // The open list, dialog or export input handles the key
         } else if app.picking_color.is_some() && input.consume_key(Modifiers::NONE, Key::Escape) {
             app.picking_color = None;
         } else if point_pick_armed && input.consume_key(Modifiers::NONE, Key::Escape) {
@@ -582,6 +593,7 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
     if cancel_point_pick {
         crate::generator_point_pick::set(ctx, None);
     }
+    crate::texture_set_list::take_keys(ctx, set_list_keys.0, set_list_keys.1);
 
     for id in &commands_to_invoke {
         run_shortcut(app, ctx, id);

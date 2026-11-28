@@ -268,6 +268,7 @@ fn matching_not_enabled(ui: &mut Ui) {
     let tokens = Tokens::get(ui.ctx());
     let mut text = egui::text::LayoutJob::default();
     let format = |font| egui::TextFormat { font_id: font, color: tokens.text, ..Default::default() };
+
     // One sentence to translate, its setting and value kept apart to set them in SemiBold
     let sentence = tr("Set {setting} to {value} to pair parts by name.");
     let (before, rest) = sentence.split_once("{setting}").unwrap_or(("", sentence));
@@ -295,6 +296,7 @@ fn baking_process(ui: &mut Ui, maps: &[BakeLogMap], issues_only: bool) -> Option
     let mut opened = None;
     for (index, row) in maps.iter().enumerate().filter(|(_, row)| !issues_only || row.state.is_issue()) {
         let (rect, open_clicked) = map_row(ui, row);
+
         // Bring the next map into view too, so the list shows what comes after the map being baked
         if newly_followed && followed == Some(index) {
             ui.scroll_to_rect(rect.with_max_y(rect.bottom() + ROW_HEIGHT), None);

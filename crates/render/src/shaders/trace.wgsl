@@ -8,6 +8,8 @@ const TAU: f32 = 6.28318530717959;
 const BIG: f32 = 3.0e38;
 const WALK_STEPS: u32 = 48u;
 const MAX_SETS: u32 = 256u;
+// MAX_SETS / 4: the height slope factors pack four sets to an entry
+const HEIGHT_Y_FACTOR_ENTRIES: u32 = 64u;
 
 struct Params {
     inv_vp: mat4x4<f32>,
@@ -18,8 +20,10 @@ struct Params {
     sigma: vec4<f32>,   // subsurface extinction per color channel
     eye: vec4<f32>,     // camera position
     lens: vec4<f32>,    // focus depth along the view axis, lens radius (0: pinhole), transmission IOR, dielectric F0 scale
-    // Per texture set (array layer): width, height, bit mask of 1×1 placeholder kinds, height strength.
+    // Per texture set (array layer): width, height, bit mask of 1×1 placeholder kinds (bit 8: Smooth (Sobel) height to normal), height strength
     sets: array<vec4<f32>, MAX_SETS>,
+    // Per texture set, four to an entry: how much more the height slope tilts down the texture than across it
+    height_y_factors: array<vec4<f32>, HEIGHT_Y_FACTOR_ENTRIES>,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -209,6 +213,23 @@ fn occluded(o: vec3<f32>, d: vec3<f32>) -> bool {
 
 // ---- Materials ----
 
+// The change of height per texel to the right and down: Sobel when smooth, else the neighbours across (as HeightToNormalMethod::slope)
+fn height_slope(layer: u32, uv: vec2<f32>, sobel: bool) -> vec2<f32> {
+    let r = textureLoad(t_height, texel(layer, 3u, uv, 1, 0), layer, 0).r;
+    let l = textureLoad(t_height, texel(layer, 3u, uv, -1, 0), layer, 0).r;
+    let d = textureLoad(t_height, texel(layer, 3u, uv, 0, 1), layer, 0).r;
+    let u = textureLoad(t_height, texel(layer, 3u, uv, 0, -1), layer, 0).r;
+    if (!sobel) {
+        return vec2<f32>(r - l, d - u) * 0.5;
+    }
+
+    let ru = textureLoad(t_height, texel(layer, 3u, uv, 1, -1), layer, 0).r;
+    let rd = textureLoad(t_height, texel(layer, 3u, uv, 1, 1), layer, 0).r;
+    let lu = textureLoad(t_height, texel(layer, 3u, uv, -1, -1), layer, 0).r;
+    let ld = textureLoad(t_height, texel(layer, 3u, uv, -1, 1), layer, 0).r;
+    return vec2<f32>(ru + 2.0 * r + rd - lu - 2.0 * l - ld, ld + 2.0 * d + rd - lu - 2.0 * u - ru) / 8.0;
+}
+
 // Texel of `uv` (nearest, wrapped) in kind `k` of layer `layer`, offset by (dx, dy).
 fn texel(layer: u32, k: u32, uv: vec2<f32>, dx: i32, dy: i32) -> vec2<i32> {
     let info = P.sets[layer];
@@ -299,12 +320,11 @@ fn surface(hit: Hit, o: vec3<f32>, d: vec3<f32>) -> Surface {
     let info = P.sets[layer];
 
     // Extra alpha stores 32 × log2(1 / UV tile scale)
-    let k = info.w * info.x / 16.0 * exp2(-extra.a * 255.0 / 32.0);
+    let k = info.w * info.xy * vec2<f32>(1.0, P.height_y_factors[layer / 4u][layer % 4u]) / 16.0 * exp2(-extra.a * 255.0 / 32.0);
     var n_height = vec3<f32>(0.0, 0.0, 1.0);
-    if (k != 0.0) {
-        let hx = textureLoad(t_height, texel(layer, 3u, uv, 1, 0), layer, 0).r - textureLoad(t_height, texel(layer, 3u, uv, -1, 0), layer, 0).r;
-        let hy = textureLoad(t_height, texel(layer, 3u, uv, 0, 1), layer, 0).r - textureLoad(t_height, texel(layer, 3u, uv, 0, -1), layer, 0).r;
-        n_height = normalize_or(vec3<f32>(-hx * 0.5 * k, hy * 0.5 * k, 1.0), vec3<f32>(0.0, 0.0, 1.0));
+    if (info.w != 0.0) {
+        let slope = height_slope(layer, uv, ((u32(info.z) >> 8u) & 1u) == 1u);
+        n_height = normalize_or(vec3<f32>(-slope.x * k.x, slope.y * k.y, 1.0), vec3<f32>(0.0, 0.0, 1.0));
     }
 
     // The signed normal in half floats, as in mesh.wgsl (flat is exactly +z)

@@ -22,11 +22,11 @@ mod item_icon;
 mod menu_icon;
 mod pick;
 
-use add_item::AddItem;
+pub(crate) use add_item::AddItem;
 use bitmap_choice::BitmapChoice;
-use item_icon::ItemIcon;
-use menu_icon::MenuIcon;
-use pick::Pick;
+pub(crate) use item_icon::ItemIcon;
+pub(crate) use menu_icon::MenuIcon;
+pub(crate) use pick::Pick;
 
 /// The row's height and its controls' height
 const BAR_HEIGHT: f32 = 40.0;
@@ -64,7 +64,7 @@ const LAYER_BUTTONS_WIDTH: f32 = 4.0 * BUTTON_WIDTH + 3.0 * BUTTON_GAP;
 const ONE_ROW_WIDTH: f32 = MENUS_ROW_WIDTH + CHANNEL_WIDTH + GROUP_GAP + LAYER_BUTTONS_WIDTH;
 
 /// A hanging menu: its caption, rows, icon and text columns and its smallest width
-const MENU_PADDING: f32 = 4.0;
+pub(crate) const MENU_PADDING: f32 = 4.0;
 const MENU_CAPTION_HEIGHT: f32 = 22.0;
 const MENU_CAPTION_X: f32 = 12.0;
 const MENU_CAPTION_SIZE: f32 = 10.0;
@@ -201,7 +201,15 @@ const TAB_SEAM_COVER: f32 = 2.5;
 const TAB_BORDER_WIDTH: f32 = 1.0;
 
 /// A button with its icon and a caret whose menu hangs from it (caption, then the `items` built while it is open); the item picked
-fn menu_button(ui: &mut Ui, rect: Rect, label: &str, icon: MenuIcon, caption: &str, items: impl FnOnce() -> Vec<AddItem>, tokens: &Tokens) -> Option<Pick> {
+pub(crate) fn menu_button(
+    ui: &mut Ui,
+    rect: Rect,
+    label: &str,
+    icon: MenuIcon,
+    caption: &str,
+    items: impl FnOnce() -> Vec<AddItem>,
+    tokens: &Tokens,
+) -> Option<Pick> {
     let response = tip_above(ui.interact(rect, ui.scope_id().with(("layer_toolbar_menu", label)), Sense::click()), label);
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     let popup = ui.scope_id().with(("layer_toolbar_menu_popup", label));
@@ -215,11 +223,7 @@ fn menu_button(ui: &mut Ui, rect: Rect, label: &str, icon: MenuIcon, caption: &s
     // A click opens the menu this frame
     let items = if open || response.clicked() { items() } else { Vec::new() };
     let width = menu_width(ui, &items);
-    let frame = Frame::NONE
-        .fill(tokens.chrome)
-        .stroke(Stroke::new(1.0, tokens.field_border))
-        .corner_radius(CornerRadius { nw: 0, ..CornerRadius::same(MENU_ROUNDING) })
-        .shadow(Shadow { offset: SHADOW_OFFSET, blur: 0, spread: 0, color: HARD_SHADOW });
+    let frame = menu_frame(tokens).corner_radius(CornerRadius { nw: 0, ..CornerRadius::same(MENU_ROUNDING) });
     let mut picked = None;
     let shown = egui::Popup::menu(&response).id(popup).align(egui::RectAlign::BOTTOM_START).gap(MENU_TAB_OVERLAP).frame(frame).width(width).show(|ui| {
         ui.set_width(width);
@@ -256,6 +260,16 @@ fn menu_button(ui: &mut Ui, rect: Rect, label: &str, icon: MenuIcon, caption: &s
     picked
 }
 
+/// The toolbar menus' frame: chrome fill, field border, hard shadow
+pub(crate) fn menu_frame(tokens: &Tokens) -> Frame {
+    Frame::NONE.fill(tokens.chrome).stroke(Stroke::new(1.0, tokens.field_border)).corner_radius(CornerRadius::same(MENU_ROUNDING)).shadow(Shadow {
+        offset: SHADOW_OFFSET,
+        blur: 0,
+        spread: 0,
+        color: HARD_SHADOW,
+    })
+}
+
 /// A menu button's icon and caret
 fn button_face(painter: &Painter, rect: Rect, icon: MenuIcon, tokens: &Tokens) {
     let icon_at = pos2(rect.left() + MENU_ICON_X, rect.center().y);
@@ -269,7 +283,7 @@ fn button_face(painter: &Painter, rect: Rect, icon: MenuIcon, tokens: &Tokens) {
 }
 
 /// The menu's width: its longest item, with room for the icons and the right edge
-fn menu_width(ui: &Ui, items: &[AddItem]) -> f32 {
+pub(crate) fn menu_width(ui: &Ui, items: &[AddItem]) -> f32 {
     let widest = items
         .iter()
         .map(|item| ui.fonts_mut(|fonts| fonts.layout_no_wrap(tr(item.short).to_owned(), FontId::proportional(TEXT_SIZE), Color32::WHITE).size().x))
@@ -278,7 +292,7 @@ fn menu_width(ui: &Ui, items: &[AddItem]) -> f32 {
 }
 
 /// One menu row: hover face, icon, name; dim and unclickable when it can't go where the selection is
-fn menu_row(ui: &mut Ui, width: f32, item: &AddItem, tokens: &Tokens) -> Response {
+pub(crate) fn menu_row(ui: &mut Ui, width: f32, item: &AddItem, tokens: &Tokens) -> Response {
     let sense = if item.enabled { Sense::click() } else { Sense::hover() };
     let (rect, response) = ui.allocate_exact_size(vec2(width, MENU_ROW), sense);
     let label = tr(item.short);

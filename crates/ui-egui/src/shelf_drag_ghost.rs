@@ -87,9 +87,11 @@ fn dragged(ctx: &Context) -> Option<(Option<TextureId>, String)> {
     if let Some(drag) = egui::DragAndDrop::payload::<ShelfDrag>(ctx) {
         return Some((drag.thumb.as_ref().map(egui::TextureHandle::id), drag.label.clone()));
     }
+
     if !egui::DragAndDrop::has_payload_of_type::<u64>(ctx) {
         return None;
     }
+
     ctx.data(|data| data.get_temp::<String>(Id::unique(LAYER))).map(|label| (None, label))
 }
 

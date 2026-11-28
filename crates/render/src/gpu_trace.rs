@@ -14,6 +14,7 @@ use std::task::{Context, Poll, Waker};
 
 use bytemuck::{Pod, Zeroable};
 use texturecraft_compose::DisplayKind;
+use texturecraft_core::HeightToNormalMethod;
 use texturecraft_geom::glam::{Vec3, Vec4};
 use texturecraft_geom::{Mesh, OrbitCamera};
 use wgpu::util::DeviceExt;
@@ -27,8 +28,14 @@ pub const MAX_SETS: usize = 255;
 /// Depth of the shader's BVH traversal stack (`STACK` in trace.wgsl).
 pub(crate) const STACK: usize = 64;
 const KINDS: usize = DisplayKind::ALL.len();
-/// Bytes of the trace uniform: [`Head`] then 256 texture-set entries (`MAX_SETS` in trace.wgsl).
-const PARAMS_SIZE: u64 = (size_of::<Head>() + 256 * 16) as u64;
+// trace.wgsl reads the smooth bit as `>> 8u`
+const _: () = assert!(KINDS == 8);
+
+/// The placeholder mask word's bit for a set with Smooth (Sobel) height to normal (trace.wgsl reads it)
+const SMOOTH_HEIGHT_BIT: f32 = (1 << KINDS) as f32;
+
+/// Bytes of the trace uniform: [`Head`], 256 texture-set entries (`MAX_SETS` in trace.wgsl), then their height slope factors down the texture, four per entry
+const PARAMS_SIZE: u64 = (size_of::<Head>() + 256 * 16 + 256 * 4) as u64;
 /// Post uniform slots: resolve and denoise init, then the five à-trous steps.
 const STEPS: [u32; 6] = [0, 1, 2, 4, 8, 16];
 const WORKGROUP: u32 = 8;
@@ -96,6 +103,10 @@ struct SceneConst {
     rotation: f32,
     env_camera: bool,
     heights: Vec<f32>,
+    /// Per set: how much more the height slope tilts down the texture than across it
+    height_y_factors: Vec<f32>,
+    /// Per set: Smooth (Sobel) height to normal
+    smooth: Vec<bool>,
     ior: f32,
     dielectric_f0_scale: f32,
     /// Focus depth (0: the orbit target) and lens radius in world units (0: pinhole).
@@ -419,7 +430,9 @@ impl GpuTracer {
             sigma: scene.scatter_sigma,
             rotation: scene.env_rotation,
             env_camera: scene.env_camera,
-            heights: scene.sets.iter().map(|s| s.height_strength).collect(),
+            heights: scene.sets.iter().map(crate::trace::TraceSet::normal_height_strength).collect(),
+            height_y_factors: scene.sets.iter().map(|s| s.height_y_factor).collect(),
+            smooth: scene.sets.iter().map(|s| s.height_to_normal == HeightToNormalMethod::Smooth).collect(),
             ior: scene.ior,
             dielectric_f0_scale: scene.dielectric_f0_scale,
             lens: scene.lens.map_or([0.0; 2], |[focus, aperture]| [focus, aperture.max(0.0) * scene.radius]),
@@ -617,10 +630,17 @@ impl GpuTracer {
         };
         let mut sets = [[0.0f32; 4]; 256];
         for (i, (slot, m)) in sets.iter_mut().zip(&mat.info).enumerate() {
-            *slot = [m[0], m[1], m[2], sc.heights.get(i).copied().unwrap_or(0.0)];
+            // The bit past the placeholder mask bits: Smooth (Sobel) height to normal
+            let smooth = if sc.smooth.get(i).copied().unwrap_or(false) { SMOOTH_HEIGHT_BIT } else { 0.0 };
+            *slot = [m[0], m[1], m[2] + smooth, sc.heights.get(i).copied().unwrap_or(0.0)];
+        }
+        let mut height_y_factors = [1.0f32; 256];
+        for (slot, factor) in height_y_factors.iter_mut().zip(&sc.height_y_factors) {
+            *slot = *factor;
         }
         let mut bytes = bytemuck::bytes_of(&head).to_vec();
         bytes.extend_from_slice(bytemuck::cast_slice(&sets));
+        bytes.extend_from_slice(bytemuck::cast_slice(&height_y_factors));
         queue.write_buffer(&self.params, 0, &bytes);
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tc_trace"), timestamp_writes: None });
         cpass.set_pipeline(&self.trace_pipe);
@@ -825,12 +845,33 @@ mod tests {
         h.renderer.set_texture_sets(&h.device, &h.queue, &[((64, 64), 0)], 1);
         for (tx, ty) in all_tiles(64, 64) {
             for k in DisplayKind::ALL {
-                h.renderer.upload_tile(&h.device, &h.queue, 0, k, tx, ty, &tile_bytes(&composite, &BakedMaps::default(), k, tx, ty));
+                h.renderer.upload_tile(
+                    &h.device,
+                    &h.queue,
+                    0,
+                    k,
+                    tx,
+                    ty,
+                    &tile_bytes(&composite, &BakedMaps::default(), texturecraft_core::AoMixing::Multiply, k, tx, ty),
+                );
             }
         }
         let mesh = Arc::new(primitives::sphere(1.0, 32, 16));
         let bvh = Arc::new(Bvh::new(&mesh));
-        TraceScene::new(mesh, bvh, vec![TraceSet { material: 0, composite, height_strength: 0.0 }], Arc::new(env), 0.0)
+        TraceScene::new(
+            mesh,
+            bvh,
+            vec![TraceSet {
+                material: 0,
+                composite,
+                height_strength: 0.0,
+                height_y_factor: 1.0,
+                height_in_normal: true,
+                height_to_normal: texturecraft_core::HeightToNormalMethod::Smooth,
+            }],
+            Arc::new(env),
+            0.0,
+        )
     }
 
     fn gpu() -> Option<(Headless, GpuTracer)> {
@@ -1001,7 +1042,15 @@ mod tests {
         h.renderer.set_texture_sets(&h.device, &h.queue, &[((64, 64), 0)], 1);
         for (tx, ty) in all_tiles(64, 64) {
             for k in DisplayKind::ALL {
-                h.renderer.upload_tile(&h.device, &h.queue, 0, k, tx, ty, &tile_bytes(&composite, &BakedMaps::default(), k, tx, ty));
+                h.renderer.upload_tile(
+                    &h.device,
+                    &h.queue,
+                    0,
+                    k,
+                    tx,
+                    ty,
+                    &tile_bytes(&composite, &BakedMaps::default(), texturecraft_core::AoMixing::Multiply, k, tx, ty),
+                );
             }
         }
         let sizes: Vec<u32> = h.renderer.display_textures()[0].iter().map(|t| t.width()).collect();
@@ -1010,7 +1059,20 @@ mod tests {
         let mesh = Arc::new(primitives::sphere(1.0, 32, 16));
         let bvh = Arc::new(Bvh::new(&mesh));
         let env = crate::ibl::environment("Studio Contrast", 256);
-        let scene = TraceScene::new(mesh, bvh, vec![TraceSet { material: 0, composite, height_strength: 0.0 }], Arc::new(env), 0.0);
+        let scene = TraceScene::new(
+            mesh,
+            bvh,
+            vec![TraceSet {
+                material: 0,
+                composite,
+                height_strength: 0.0,
+                height_y_factor: 1.0,
+                height_in_normal: true,
+                height_to_normal: texturecraft_core::HeightToNormalMethod::Smooth,
+            }],
+            Arc::new(env),
+            0.0,
+        );
         let d = TraceDisplay { exposure: 1.0, aces: true, env_opacity: 0.5, denoise: false, background: crate::DEFAULT_BACKGROUND };
         let settings = TraceSettings { bounces: 4 };
         let (_, _, gpu) = t.render(&h.device, &h.queue, &h.renderer, &scene, &camera(), &settings, &d, [48, 36], 1024).unwrap();
