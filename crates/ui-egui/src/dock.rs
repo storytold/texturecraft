@@ -2462,11 +2462,17 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         (brush.size, brush.min_size, brush.screen_space) = size_fields(&defaults);
     }
 
-    let flow_fields = |settings: &BrushSettings| (settings.flow, settings.opacity, settings.spacing);
+    let mut min_flow = None;
+    let flow_fields = |settings: &BrushSettings| (settings.flow, settings.min_flow, settings.opacity, settings.spacing);
     if section_with_reset(ui, "sec_flow", tr("Flow and opacity"), true, flow_fields(brush) == flow_fields(&defaults), |ui| {
         let mut flow_percent = brush.flow * 100.0;
         if slider(ui, tr("Flow"), &mut flow_percent, 0.0..=100.0, 0).changed() {
             brush.flow = flow_percent / 100.0;
+        }
+
+        let mut min_flow_percent = brush.min_flow * 100.0;
+        if slider(ui, tr("Minimum flow (%)"), &mut min_flow_percent, 0.0..=100.0, 0).changed() {
+            min_flow = Some(min_flow_percent);
         }
 
         let mut opacity_percent = brush.opacity * 100.0;
@@ -2479,7 +2485,8 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
             brush.spacing = spacing_percent / 100.0;
         }
     }) {
-        (brush.flow, brush.opacity, brush.spacing) = flow_fields(&defaults);
+        (brush.flow, brush.opacity, brush.spacing) = (defaults.flow, defaults.opacity, defaults.spacing);
+        min_flow = Some(defaults.min_flow * 100.0);
     }
 
     let angle_fields = |settings: &BrushSettings| (settings.angle, settings.follow_path);
@@ -2553,6 +2560,9 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
 
     *brush = brush.sanitized();
+    if let Some(value) = min_flow {
+        app.run("tool.brush", json!({"minFlow": value}));
+    }
 }
 
 /// One alpha in the picker: a 52×64 tile with the shape drawn by `paint` and a label.

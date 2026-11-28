@@ -36,7 +36,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Brush settings",
             [],
             None,
-            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, alphaSizeX?: 5..100 and alphaSizeY?: 5..100 (percent of the stamp the alpha fills), alphaRoundness?: 0..100 (Round alpha only: 100 circle, 0 square), alphaContrast?: 1..8, alphaInvert?, backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), cloneAligned? (default true: the first stroke fixes the offset to the source for the following strokes; false: every stroke starts sampling at the source point), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
+            "{size?: 0..100, flow?: 0..100, minFlow?: 0..100 (% of configured Flow at zero pen pressure; Flow 40 and minFlow 25 gives 10; default 100; tool.stroke and tool.strokeUv still use full pressure), opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, alphaSizeX?: 5..100 and alphaSizeY?: 5..100 (percent of the stamp the alpha fills), alphaRoundness?: 0..100 (Round alpha only: 100 circle, 0 square), alphaContrast?: 1..8, alphaInvert?, backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), cloneAligned? (default true: the first stroke fixes the offset to the source for the following strokes; false: every stroke starts sampling at the source point), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
             always,
             brush
         ),
@@ -143,6 +143,9 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
 
     if let Some(value) = percent("flow") {
         settings.flow = value;
+    }
+    if let Some(value) = percent("minFlow") {
+        settings.min_flow = value;
     }
     if let Some(value) = percent("opacity") {
         settings.opacity = value;
@@ -292,7 +295,7 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
 pub(crate) fn brush_json(session: &Session) -> Value {
     let settings = &session.tool.brush;
     json!({
-        "size": settings.size / 0.25 * 100.0, "minSize": settings.min_size * 100.0, "flow": settings.flow * 100.0, "opacity": settings.opacity * 100.0,
+        "size": settings.size / 0.25 * 100.0, "minSize": settings.min_size * 100.0, "flow": settings.flow * 100.0, "minFlow": settings.min_flow * 100.0, "opacity": settings.opacity * 100.0,
         "spacing": settings.spacing * 100.0, "hardness": settings.hardness * 100.0, "angle": settings.angle, "followPath": settings.follow_path,
         "alignment": format!("{:?}", settings.alignment).to_lowercase(), "lazy": settings.lazy,
         "alpha": match (&settings.alpha_image, &settings.alpha_library) {

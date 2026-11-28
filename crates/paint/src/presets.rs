@@ -26,6 +26,7 @@ impl BrushPreset {
 pub fn with_stroke_of(brush: &BrushSettings, from: &BrushSettings) -> BrushSettings {
     BrushSettings {
         flow: from.flow,
+        min_flow: from.min_flow,
         opacity: from.opacity,
         spacing: from.spacing,
         hardness: from.hardness,

@@ -192,6 +192,33 @@ fn image_alpha_shapes_the_stamp() {
     assert_eq!(r["alpha"], json!("Round"));
 }
 
+#[test]
+fn old_json_without_min_flow_deserializes_to_default_one() {
+    let mut saved = serde_json::to_value(texturecraft_paint::BrushSettings::default()).unwrap();
+    saved.as_object_mut().unwrap().remove("min_flow");
+    let brush: texturecraft_paint::BrushSettings = serde_json::from_value(saved).unwrap();
+    assert_eq!(brush.stamp_flow(0.0), brush.stamp_flow(1.0));
+    assert_eq!(brush.min_flow, 1.0);
+}
+
+#[test]
+fn low_pressure_reduces_uv_paint_only_when_min_flow_is_lowered() {
+    let green_at_center = |min_flow: f32, pressure: f32| {
+        let mut s = session();
+        paint_red(&mut s, 20.0);
+        let settings = execute(&mut s, "tool.brush", &json!({"minFlow": min_flow, "minSize": 100})).unwrap();
+        assert_eq!(settings["minFlow"].as_f64(), Some(f64::from(min_flow)));
+        s.begin_stroke_uv(Vec2::splat(0.5), pressure).unwrap();
+        s.end_stroke().unwrap();
+        s.update();
+        s.caches[0].composite.value(Channel::BaseColor, 128, 128)[1]
+    };
+    let full = green_at_center(0.0, 1.0);
+    let light = green_at_center(0.0, 0.5);
+    assert!(light > full, "the lighter stroke leaves more of the original color: {full} -> {light}");
+    assert_eq!(green_at_center(100.0, 0.5), full, "the default minimum flow does not change the dab");
+}
+
 /// Offsets (dx, dy) of red composite texels within `r` texels of (cx, cy), with their lengths.
 fn red_offsets(s: &Session, cx: i32, cy: i32, r: i32) -> Vec<(i32, i32, f32)> {
     let mut out = Vec::new();

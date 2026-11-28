@@ -139,7 +139,7 @@ impl Stroke {
         };
         let radius = self.radius_at(ctx, hit.pos, pressure);
         let Some(last) = self.last else {
-            out.push(self.stamp(ctx, &hit, radius));
+            out.push(self.stamp(ctx, &hit, radius, pressure));
             self.last = Some(hit);
             self.dist = 0.0;
             return;
@@ -174,7 +174,7 @@ impl Stroke {
                 .and_then(|s| pick(ctx, s))
                 .filter(|h| h.pos.distance(p) < radius * 2.0);
             let h = snapped.unwrap_or(SurfaceHit { pos: p, ..hit });
-            out.push(self.stamp(ctx, &h, radius));
+            out.push(self.stamp(ctx, &h, radius, pressure));
             emitted += 1;
             t += step;
         }
@@ -183,7 +183,7 @@ impl Stroke {
     }
 
     /// The next stamp at `hit`: oriented to the surface or the camera, then jittered
-    fn stamp(&mut self, ctx: &PickCtx, hit: &SurfaceHit, radius: f32) -> Stamp {
+    fn stamp(&mut self, ctx: &PickCtx, hit: &SurfaceHit, radius: f32, pressure: f32) -> Stamp {
         let settings = &self.settings;
         let seed = self.count;
         self.count = self.count.wrapping_add(1);
@@ -210,7 +210,7 @@ impl Stroke {
         let bitangent = normal.cross(tangent);
         let jittered_radius = radius * (1.0 + jitter(JITTER_SIZE, settings.jitter_size)).max(MIN_JITTERED_SIZE);
         let offset = (tangent * jitter(JITTER_ACROSS, 1.0) + bitangent * jitter(JITTER_ALONG, 1.0)) * settings.jitter_position * radius;
-        let flow = (settings.flow * (1.0 - jitter(JITTER_FLOW, settings.jitter_flow).abs())).clamp(0.0, 1.0);
+        let flow = (settings.stamp_flow(pressure) * (1.0 - jitter(JITTER_FLOW, settings.jitter_flow).abs())).clamp(0.0, 1.0);
 
         Stamp {
             center: hit.pos + offset,
@@ -317,6 +317,25 @@ mod tests {
         assert_eq!(st.len(), 1);
         assert!((st[0].center.length() - 1.0).abs() < 0.01);
         assert!((st[0].tangent.dot(st[0].normal)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn stroke_stamp_flow_follows_pen_pressure() {
+        let (m, b, c) = ctx_parts();
+        let ctx = PickCtx { mesh: &m, bvh: &b, camera: &c, viewport: Vec2::new(400.0, 400.0) };
+        let settings = BrushSettings { flow: 0.8, min_flow: 0.25, ..BrushSettings::default() };
+        let mut full = Stroke::new(&settings, &m);
+        let mut light = Stroke::new(&settings, &m);
+        let st_full = full.add(&ctx, Vec2::new(200.0, 200.0), 1.0);
+        let st_light = light.add(&ctx, Vec2::new(200.0, 200.0), 0.5);
+        assert_eq!(st_full.len(), 1);
+        assert_eq!(st_light.len(), 1);
+        assert!((st_full[0].flow - 0.8).abs() < 1e-4);
+        assert!((st_light[0].flow - 0.5).abs() < 1e-4);
+
+        let continued: Vec<_> = (1..=20).flat_map(|i| full.add(&ctx, Vec2::new(200.0 + i as f32 * 2.5, 200.0), 0.5)).collect();
+        assert!(!continued.is_empty(), "the stroke emitted stamps after the pressure changed");
+        assert!(continued.iter().all(|stamp| (stamp.flow - 0.5).abs() < 1e-4));
     }
 
     #[test]

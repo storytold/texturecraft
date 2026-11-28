@@ -289,6 +289,10 @@ impl Default for Particles {
     }
 }
 
+fn default_min_flow() -> f32 {
+    1.0
+}
+
 /// Brush parameters (the "Brush" properties section plus tool-bar values).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BrushSettings {
@@ -298,6 +302,9 @@ pub struct BrushSettings {
     pub min_size: f32,
     /// Per-stamp alpha 0..1.
     pub flow: f32,
+    /// Pen pressure may scale per-stamp flow down to this fraction.
+    #[serde(default = "default_min_flow")]
+    pub min_flow: f32,
     /// Caps a whole stroke 0..1.
     pub opacity: f32,
     /// Distance between stamps as a fraction of the diameter.
@@ -344,6 +351,7 @@ impl Default for BrushSettings {
             size: 0.02,
             min_size: 0.05,
             flow: 1.0,
+            min_flow: default_min_flow(),
             opacity: 1.0,
             spacing: 0.1,
             hardness: 0.5,
@@ -377,6 +385,13 @@ impl BrushSettings {
         self.size * 2.0 * if p < 1.0 { self.min_size + (1.0 - self.min_size) * p } else { 1.0 }
     }
 
+    /// Per-stamp flow, scaled towards `min_flow` for a light pen in either view.
+    pub fn stamp_flow(&self, pressure: f32) -> f32 {
+        let p = pressure.clamp(0.0, 1.0);
+        let scale = if p < 1.0 { self.min_flow + (1.0 - self.min_flow) * p } else { 1.0 };
+        (self.flow * scale).clamp(0.0, 1.0)
+    }
+
     /// Clamp every value into its valid range (input from UI, CLI or agents)
     pub fn sanitized(&self) -> BrushSettings {
         let clamp_finite = |value: f32, min: f32, max: f32, default: f32| if value.is_finite() { value.clamp(min, max) } else { default };
@@ -385,6 +400,7 @@ impl BrushSettings {
             size: clamp_finite(self.size, 0.0005, 0.5, 0.02),
             min_size: clamp_finite(self.min_size, 0.0, 1.0, 0.05),
             flow: clamp_finite(self.flow, 0.0, 1.0, 1.0),
+            min_flow: clamp_finite(self.min_flow, 0.0, 1.0, default_min_flow()),
             opacity: clamp_finite(self.opacity, 0.0, 1.0, 1.0),
             spacing: clamp_finite(self.spacing, 0.01, 10.0, 0.1),
             hardness: clamp_finite(self.hardness, 0.0, 0.999, 0.5),
@@ -424,6 +440,15 @@ mod tests {
         assert!((b.uv_stamp_radius(0.5) - 0.15).abs() < 1e-6);
         assert!((b.uv_stamp_radius(0.0) - 0.1).abs() < 1e-6);
         assert!((b.uv_stamp_radius(7.0) - 0.2).abs() < 1e-6, "pressure clamps to 1");
+    }
+
+    #[test]
+    fn uv_stamp_flow_follows_pen_pressure() {
+        let b = BrushSettings { flow: 0.8, min_flow: 0.25, ..BrushSettings::default() };
+        assert!((b.stamp_flow(1.0) - 0.8).abs() < 1e-6);
+        assert!((b.stamp_flow(0.5) - 0.5).abs() < 1e-6);
+        assert!((b.stamp_flow(0.0) - 0.2).abs() < 1e-6);
+        assert!((b.stamp_flow(5.0) - 0.8).abs() < 1e-6, "pressure clamps to 1");
     }
 
     use super::*;
