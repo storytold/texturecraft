@@ -98,6 +98,7 @@ mod tests {
             depth: 1.0,
             seed: 3,
             source: None,
+            hidden: false,
         };
         let particles = Particles { enabled: true, count: 4, lifetime: 20, gravity: 1.0 };
 

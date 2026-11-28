@@ -152,6 +152,7 @@ fn surface_visible(context: &RasterCtx, depth: &EyeDepth, point: Vec3, geometric
 }
 
 /// What the rasterizer reads.
+#[derive(Clone, Copy)]
 pub struct RasterCtx<'a> {
     pub mesh: &'a Mesh,
     pub bvh: &'a Bvh,
@@ -184,17 +185,22 @@ pub fn rasterize(canvas: &mut StrokeCanvas, context: &RasterCtx, stamps: &[Stamp
     let fade_lo = context.angle_fade.1.to_radians().cos();
     let fade_hi = context.angle_fade.0.to_radians().cos();
 
-    // The camera scale is shared by every candidate texel in this batch
-    let pixels_per_unit = context.depth.map_or(1.0, |depth| {
-        let ndc_per_unit = depth.view_proj.row(1).truncate().length();
-        (depth.height as f32 * ndc_per_unit).max(f32::EPSILON)
-    });
+    // A stamp on a surface the view cannot see ([`Stamp::hidden`], e.g. a 3D path point stored
+    // on the far side) paints without the view's depth and backface tests
+    let no_view = RasterCtx { depth: None, backface_culling: false, ..*context };
 
     let mut triangles = Vec::new();
     for stamp in stamps {
         if stamp.radius.is_nan() || stamp.radius <= 0.0 || !stamp.center.is_finite() {
             continue;
         }
+        let context = if stamp.hidden { &no_view } else { context };
+
+        // The camera scale is shared by every candidate texel of this stamp
+        let pixels_per_unit = context.depth.map_or(1.0, |depth| {
+            let ndc_per_unit = depth.view_proj.row(1).truncate().length();
+            (depth.height as f32 * ndc_per_unit).max(f32::EPSILON)
+        });
 
         let extent = Vec3::splat(stamp.radius * stamp.depth.max(1.0) * STAMP_QUERY_PADDING);
         triangles.clear();
@@ -397,6 +403,7 @@ mod tests {
             depth: 1.0,
             seed: 0,
             source: Some(crate::StampSource { origin: Vec3::ZERO, to_source: Mat3::from_diagonal(Vec3::new(1.0, -1.0, 1.0)) }),
+            hidden: false,
         };
         let mut canvas = StrokeCanvas::new(128, 128);
         let mapped = Vec3::new(0.0, -0.03, 0.0);
@@ -550,8 +557,19 @@ mod tests {
             angle_fade: (89.0, 90.0),
             shape: Shape { alpha: crate::BrushAlpha::Round, image: None, library: None, params: Default::default(), level: 0 },
         };
-        let stamp =
-            Stamp { center, normal: Vec3::Y, tangent: Vec3::X, bitangent: Vec3::Z, radius, flow: 1.0, hardness: 0.9, depth: 1.0, seed: 0, source: None };
+        let stamp = Stamp {
+            center,
+            normal: Vec3::Y,
+            tangent: Vec3::X,
+            bitangent: Vec3::Z,
+            radius,
+            flow: 1.0,
+            hardness: 0.9,
+            depth: 1.0,
+            seed: 0,
+            source: None,
+            hidden: false,
+        };
 
         rasterize(&mut canvas, &context, &[stamp]);
 
@@ -699,6 +717,7 @@ mod tests {
                     depth: 1.0,
                     seed: stamp_index,
                     source: None,
+                    hidden: false,
                 }
             })
             .collect();
@@ -760,6 +779,7 @@ mod tests {
             depth: 1.0,
             seed: 0,
             source: None,
+            hidden: false,
         };
 
         rasterize(&mut canvas, &context, &[stamp]);

@@ -1,7 +1,10 @@
 //! Path tool geometry: a smooth curve through control points and the antialiased coverage of
-//! a closed curve (lasso fill). Works in any 2D space (screen pixels or texels).
+//! a closed curve (lasso fill). Works in any 2D space (screen pixels or texels), and the curve
+//! also in 3D (world units, along the surface).
 
-use texturecraft_geom::glam::Vec2;
+use std::ops::{Add, Mul, Sub};
+
+use texturecraft_geom::glam::{Vec2, Vec3};
 
 /// Most samples per curve segment.
 const MAX_SEGMENT_SAMPLES: f32 = 1024.0;
@@ -31,13 +34,42 @@ pub fn spline_segments_with_corners(points: &[Vec2], corners: &[bool], closed: b
     segment_samples(points, corners, closed, step).map(Iterator::collect).collect()
 }
 
+/// [`spline_segments_with_corners`] through points in 3D, sampled about every `step` world units
+pub fn spline_segments_3d_with_corners(points: &[Vec3], corners: &[bool], closed: bool, step: f32) -> Vec<Vec<Vec3>> {
+    segment_samples(points, corners, closed, step).map(Iterator::collect).collect()
+}
+
+/// A curve point in any space: 2D (screen pixels, texels) or 3D (world units)
+trait CurvePoint: Copy + Default + Add<Output = Self> + Sub<Output = Self> + Mul<f32, Output = Self> {
+    fn length(self) -> f32;
+}
+
+impl CurvePoint for Vec2 {
+    fn length(self) -> f32 {
+        self.length()
+    }
+}
+
+impl CurvePoint for Vec3 {
+    fn length(self) -> f32 {
+        self.length()
+    }
+}
+
 /// Stream samples so a flat curve does not allocate and retain every segment alongside its output
-fn segment_samples<'a>(points: &'a [Vec2], corners: &'a [bool], closed: bool, step: f32) -> impl Iterator<Item = impl Iterator<Item = Vec2> + 'a> + 'a {
+fn segment_samples<'a, P: CurvePoint>(
+    points: &'a [P],
+    corners: &'a [bool],
+    closed: bool,
+    step: f32,
+) -> impl Iterator<Item = impl Iterator<Item = P> + 'a> + 'a {
     let n = points.len();
     let wrap = move |i: isize| if closed { i.rem_euclid(n as isize) } else { i.clamp(0, n as isize - 1) };
     let at = move |i: isize| points.get(wrap(i) as usize).copied().unwrap_or_default();
     let corner = move |i: isize| corners.get(wrap(i) as usize).copied().unwrap_or(false);
-    let step = if step.is_finite() && step > 1e-6 { step } else { 1.0 };
+    // Any finite positive step: world-space steps on a small mesh can be tiny (the sample cap
+    // bounds the count)
+    let step = if step.is_finite() && step > 0.0 { step } else { 1.0 };
     let segments = if n < 2 {
         0
     } else if closed {
@@ -55,7 +87,7 @@ fn segment_samples<'a>(points: &'a [Vec2], corners: &'a [bool], closed: bool, st
         (1..=k).map(move |j| {
             let t = j as f32 / k as f32;
             let (t2, t3) = (t * t, t * t * t);
-            0.5 * (2.0 * p1 + (p2 - p0) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3)
+            (p1 * 2.0 + (p2 - p0) * t + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * t2 + (p1 * 3.0 - p0 - p2 * 3.0 + p3) * t3) * 0.5
         })
     })
 }
@@ -99,6 +131,14 @@ impl Lasso {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 3D curve on a small mesh samples at its tiny world-space step instead of one sample
+    #[test]
+    fn a_tiny_world_step_still_samples_the_curve() {
+        let pts = [Vec3::ZERO, Vec3::new(2e-5, 1e-5, 0.0), Vec3::new(4e-5, 0.0, 0.0)];
+        let segments = spline_segments_3d_with_corners(&pts, &[false; 3], false, 1e-7);
+        assert!(segments.iter().all(|s| s.len() > 50), "samples per segment: {:?}", segments.iter().map(Vec::len).collect::<Vec<_>>());
+    }
 
     #[test]
     fn spline_passes_through_the_points() {

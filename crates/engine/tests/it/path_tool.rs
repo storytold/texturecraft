@@ -830,3 +830,64 @@ fn paths_saved_without_corner_flags_load_smooth() {
     assert!(!s.path_live().unwrap(), "a loaded smooth path matches what is stored");
     assert_eq!(s.doc.pixels.layers, pixels.layers);
 }
+
+/// Reproduction for #552: dragging one point of a 3D path must not re-project the other points
+#[test]
+fn dragging_one_point_keeps_the_other_points_where_they_are_stored() {
+    let mut s = session(primitives::sphere(1.0, 48, 24));
+    execute(&mut s, "tool.path", &json!({"points": [[200, 200], [150, 200]]})).unwrap();
+    // A path with a point on the far side of the sphere (the camera looks at +Z)
+    let far = Vec3::new(-0.53, 0.0, -0.848);
+    assert!((far.length() - 1.0).abs() < 0.01, "the far point is on the sphere");
+    s.tool.path.points = vec![Vec3::new(0.0, 0.0, 1.0), Vec3::new(-0.707, 0.0, 0.707), far];
+    s.path_live().unwrap();
+
+    // Drag the first point the way the 3D view does: pick under the pointer, move that point only
+    let before = s.tool.path.points.clone();
+    let pointer = Vec2::new(230.0, 200.0);
+    let target = s.pick(pointer, s.viewport).unwrap().pos;
+    assert!(s.move_path_point(0, target, true), "the drag moved the point");
+    s.path_live().unwrap();
+    s.update();
+
+    assert_eq!(&s.tool.path.points[1..], &before[1..], "the other points stay where they are stored");
+    assert_ne!(s.tool.path.points[0], before[0], "the dragged point changed");
+    assert!((s.tool.path.points[0].length() - 1.0).abs() < 0.02, "the dragged point lies on the surface: {:?}", s.tool.path.points[0]);
+
+    // The far point is drawn and painted where it is stored, not where the view projects it
+    let surface = s.path_surface(&s.tool.path.points, false, s.camera, s.viewport);
+    let painted_far = surface.last().and_then(|segment| segment.last().copied()).flatten();
+    assert!(painted_far.is_some_and(|p| p.distance(far) < 0.05), "the untouched far point is drawn at {painted_far:?}, stored at {far:?}");
+
+    s.camera.yaw = std::f32::consts::PI;
+    let ndc = s.camera.project(far, 1.0).unwrap();
+    let screen = Vec2::new((ndc.x * 0.5 + 0.5) * s.viewport.x, (0.5 - ndc.y * 0.5) * s.viewport.y);
+    assert!(red_at(&s, screen.x, screen.y), "the far point is painted where it is stored");
+}
+
+/// Two 2×2 sheets facing the camera, 0.1 apart: the front one maps to the left half of the
+/// texture, the one hidden behind it to the right half
+fn two_sheets() -> Mesh {
+    let front = [Vec3::new(-1.0, -1.0, 0.05), Vec3::new(1.0, -1.0, 0.05), Vec3::new(1.0, 1.0, 0.05), Vec3::new(-1.0, 1.0, 0.05)];
+    let back = front.map(|p| p - Vec3::Z * 0.1);
+    let uv = |half: f32, p: Vec3| Vec2::new(half + (p.x + 1.0) * 0.25, (p.y + 1.0) * 0.5);
+    let uvs = front.iter().map(|p| uv(0.0, *p)).chain(back.iter().map(|p| uv(0.5, *p))).collect();
+    let positions = front.into_iter().chain(back).collect();
+    let normals = [Vec3::Z; 8].to_vec();
+    let quad = [0u32, 1, 2, 0, 2, 3];
+    let indices = quad.iter().copied().chain(quad.iter().map(|i| i + 4)).collect();
+    Mesh::from_parts(positions, Some(normals), uvs, indices, "two sheets").unwrap()
+}
+
+/// A path the view can see entirely must paint exactly like a pointer stroke: with backface
+/// culling on, the sheet hidden behind the painted one (within the brush radius) stays clean
+#[test]
+fn a_visible_3d_path_does_not_paint_the_surface_hidden_behind_it() {
+    let mut s = session(two_sheets());
+    execute(&mut s, "tool.brush", &json!({"size": 60, "backfaceCulling": true})).unwrap();
+    // Two points on the front sheet, both in plain view of the camera
+    execute(&mut s, "tool.path", &json!({"points": [[170, 200], [230, 200]], "commit": true})).unwrap();
+
+    assert!(red_uv(&s, 0.25, 0.5), "the visible sheet is painted where the path runs");
+    assert!(!red_uv(&s, 0.75, 0.5), "the sheet hidden behind it, within the brush radius, stays clean");
+}
