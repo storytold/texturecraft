@@ -747,6 +747,9 @@ pub struct UiState {
     /// The History panel's last shown container and steps (done, undone, newest name): a change scrolls to the current step
     #[serde(skip)]
     pub history_shown: Option<(egui::Id, usize, usize, Option<String>)>,
+    /// The widest line of each Log tab, measured once per line
+    #[serde(skip)]
+    pub log_widths: crate::log_panel::LogWidthCache,
 }
 
 pub(crate) const MAX_RECENT_PROJECTS: u16 = 100;
@@ -916,6 +919,7 @@ impl Default for UiState {
             log_anchor: None,
             log_id: 0,
             history_shown: None,
+            log_widths: Default::default(),
         }
     }
 }
