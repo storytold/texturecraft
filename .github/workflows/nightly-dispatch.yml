@@ -11,9 +11,9 @@ permissions: {}
 
 jobs:
   dispatch:
-    # SOURCE PREPARATION: literal off until immutable shared tooling and policy qualification.
+    # Exact context guard only; admission belongs to the protected signer branch.
     if: >-
-      false && github.repository == 'storytold/texturecraft' &&
+      github.repository == 'storytold/texturecraft' &&
       github.event_name == 'workflow_run'
     runs-on: ubuntu-latest
     timeout-minutes: 5
