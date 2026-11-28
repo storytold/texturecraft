@@ -103,3 +103,19 @@ fn decreasing_pressure_does_not_stamp_behind_a_turn() {
     assert!(red_at(&session, 0.33, 0.55), "the new segment is painted");
     assert!(!red_at(&session, 0.33, 0.45), "a smaller step must not stamp behind the turn");
 }
+
+#[test]
+fn a_light_pen_paints_at_full_size_with_size_pressure_off() {
+    let painted_across = |size_pressure: bool| {
+        let mut session = red_brush_session(json!({"size": 10.0, "minSize": 0.0, "sizePressure": size_pressure, "hardness": 90}));
+        session.begin_stroke_uv([0.5, 0.5].into(), 0.2).unwrap();
+        session.continue_stroke_uv([0.5, 0.5001].into(), 0.2);
+        session.end_stroke().unwrap();
+        session.update();
+        (0..RESOLUTION).filter(|x| red_at(&session, *x as f32 / RESOLUTION as f32, 0.5)).count()
+    };
+
+    let (pressed, ignored) = (painted_across(true), painted_across(false));
+    assert!(pressed > 0, "a light pen still paints");
+    assert!(ignored > pressed, "with size pressure off a light pen paints wider ({ignored} vs {pressed} texels)");
+}

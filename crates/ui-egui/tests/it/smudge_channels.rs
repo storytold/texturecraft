@@ -8,7 +8,9 @@ use texturecraft_engine::core::Channel;
 use texturecraft_engine::geom::primitives;
 use texturecraft_engine::{Session, Tool, execute};
 use texturecraft_ui_egui::TextureCraftApp;
-use texturecraft_ui_egui::state::PropsTab;
+
+/// Frames egui's scroll animation takes to bring a row into view
+const SCROLL_FRAMES: usize = 30;
 
 fn harness() -> Harness<'static, TextureCraftApp> {
     let session = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 256).unwrap();
@@ -26,11 +28,13 @@ fn run(harness: &mut Harness<'_, TextureCraftApp>, command: &str, params: Value)
     harness.run_steps(4);
 }
 
-/// The channel chips drawn in the open Properties panel
+/// The Smudge panel's chip for `channel` (the Material section's pill below it is a checkbox)
+fn smudge_chip<'a>(harness: &'a Harness<'_, TextureCraftApp>, channel: Channel) -> egui_kittest::Node<'a> {
+    harness.get_by_role_and_label(Role::Button, channel.short())
+}
+
 fn chip_is_on(harness: &Harness<'_, TextureCraftApp>, channel: Channel) -> bool {
-    let chips: Vec<_> = harness.get_all_by_role_and_label(Role::Button, channel.short()).collect();
-    assert_eq!(chips.len(), 1, "one {} chip is drawn", channel.short());
-    chips[0].accesskit_node().toggled() == Some(egui::accesskit::Toggled::True)
+    smudge_chip(harness, channel).accesskit_node().toggled() == Some(egui::accesskit::Toggled::True)
 }
 
 /// Channels whose chip is on, in the order of `Channel::ALL`
@@ -67,13 +71,15 @@ fn smudge_panel_shows_the_channels_the_material_has_on() {
 fn clicking_a_channel_in_the_smudge_panel_turns_it_off_and_on_for_the_material() {
     let mut harness = harness();
 
-    harness.get_by_role_and_label(Role::Button, Channel::Metallic.short()).click();
+    smudge_chip(&harness, Channel::Metallic).click();
     harness.run_steps(4);
+
     assert!(!harness.state().session.tool.enabled.contains(&Channel::Metallic));
     assert!(!chip_is_on(&harness, Channel::Metallic));
 
-    harness.get_by_role_and_label(Role::Button, Channel::Metallic.short()).click();
+    smudge_chip(&harness, Channel::Metallic).click();
     harness.run_steps(4);
+
     assert!(harness.state().session.tool.enabled.contains(&Channel::Metallic));
     assert!(chip_is_on(&harness, Channel::Metallic));
 }
@@ -81,19 +87,23 @@ fn clicking_a_channel_in_the_smudge_panel_turns_it_off_and_on_for_the_material()
 #[test]
 fn material_tab_and_smudge_panel_stay_in_sync() {
     let mut harness = harness();
-    harness.state_mut().ui.props_tab = PropsTab::Material;
-    harness.run_steps(4);
 
-    // Both the Smudge panel and the Material tab draw a chip per channel
-    let chips = harness.get_all_by_role_and_label(Role::Button, Channel::Height.short()).count();
-    assert_eq!(chips, 2, "Smudge panel and Material tab");
-
-    let first = harness.get_all_by_role_and_label(Role::Button, Channel::Height.short()).next().unwrap();
-    first.click();
+    // The Smudge panel draws a chip per channel, the Material section a pill
+    harness.get_by_role_and_label(Role::CheckBox, "Height").scroll_to_me();
+    harness.run_steps(SCROLL_FRAMES);
+    harness.get_by_role_and_label(Role::CheckBox, "Height").click();
     harness.run_steps(4);
 
     assert!(!harness.state().session.tool.enabled.contains(&Channel::Height));
-    for chip in harness.get_all_by_role_and_label(Role::Button, Channel::Height.short()) {
-        assert_ne!(chip.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True), "both chips show height off");
-    }
+    assert!(!chip_is_on(&harness, Channel::Height), "the Smudge panel's chip shows height off");
+    let pill = harness.get_by_role_and_label(Role::CheckBox, "Height");
+    assert_ne!(pill.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True), "so does the Material section's pill");
+
+    smudge_chip(&harness, Channel::Height).scroll_to_me();
+    harness.run_steps(SCROLL_FRAMES);
+    smudge_chip(&harness, Channel::Height).click();
+    harness.run_steps(4);
+
+    let pill = harness.get_by_role_and_label(Role::CheckBox, "Height");
+    assert_eq!(pill.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True), "the chip turns the pill back on")
 }

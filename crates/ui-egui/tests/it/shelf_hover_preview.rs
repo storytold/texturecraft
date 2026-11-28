@@ -39,14 +39,14 @@ fn materials_shelf(step_seconds: f32, pixels_per_point: f32) -> (Harness<'static
     (harness, unique)
 }
 
-/// Largest drawn texture in pixels, excluding fonts and images below `min_width` points
-fn largest_drawn_texture(h: &Harness<'_, TextureCraftApp>, min_width: f32) -> Option<[usize; 2]> {
+/// Largest drawn texture in pixels, excluding fonts and images below `min_side` points on either side (a wide strip is not a big preview)
+fn largest_drawn_texture(h: &Harness<'_, TextureCraftApp>, min_side: f32) -> Option<[usize; 2]> {
     let textures = h.ctx.tex_manager();
     let textures = textures.read();
     h.output()
         .shapes
         .iter()
-        .filter(|clipped| clipped.shape.texture_id() != egui::TextureId::default() && clipped.shape.visual_bounding_rect().width() >= min_width)
+        .filter(|clipped| clipped.shape.texture_id() != egui::TextureId::default() && clipped.shape.visual_bounding_rect().size().min_elem() >= min_side)
         .filter_map(|clipped| textures.meta(clipped.shape.texture_id()).map(|meta| meta.size))
         .max()
 }

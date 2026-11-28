@@ -65,8 +65,8 @@ fn a_saved_smart_mask_is_listed_with_the_smart_masks_and_applies_to_the_selected
     let source = add_layer(&mut saved, "Source", true);
     let dir = std::env::temp_dir().join(format!("tc-ui-smart-mask-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("Stencil.tcmask");
-    std::fs::write(&file, saved.smart_mask_bytes(source, "Stencil").unwrap()).unwrap();
+    let file = dir.join("Zebra Saved.tcmask");
+    std::fs::write(&file, saved.smart_mask_bytes(source, "Zebra Saved").unwrap()).unwrap();
 
     let mut harness = harness(|_| {});
     let target = harness.state().session.selected_layer().unwrap();
@@ -75,11 +75,12 @@ fn a_saved_smart_mask_is_listed_with_the_smart_masks_and_applies_to_the_selected
     harness.state_mut().ui.shelf_path = vec!["user".into()];
     harness.state_mut().ui.shelf_tab = SMART_MATERIALS_TYPE;
     harness.run_steps(3);
-    assert!(harness.query_by_label_contains("Stencil").is_none(), "it is not a smart material");
+
+    assert!(harness.query_by_label_contains("Zebra Saved").is_none(), "it is not a smart material");
 
     harness.state_mut().ui.shelf_tab = SMART_MASKS_TYPE;
     harness.run_steps(3);
-    harness.get_by_label_contains("Stencil").click();
+    harness.get_by_label_contains("Zebra Saved").click();
     harness.run_steps(3);
     std::fs::remove_dir_all(&dir).unwrap();
 

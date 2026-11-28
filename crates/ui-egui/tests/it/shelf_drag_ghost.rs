@@ -64,6 +64,7 @@ fn the_badge_says_whether_the_place_under_the_pointer_takes_the_asset_without_co
 
     harness.event(Event::PointerButton { pos: background, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
     harness.run_steps(2);
+
     assert!(shown(&harness.ctx).is_none(), "the ghost goes when the drag ends");
 }
 
@@ -96,5 +97,6 @@ fn a_layer_dragged_in_the_layer_stack_gets_the_same_ghost_and_badge() {
 
     harness.event(Event::PointerButton { pos: background, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
     harness.run_steps(2);
+
     assert!(shown(&harness.ctx).is_none(), "the ghost goes when the drag ends");
 }

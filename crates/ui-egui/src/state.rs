@@ -85,14 +85,6 @@ pub enum ViewLayout {
     Only2D,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum PropsTab {
-    #[default]
-    Brush,
-    Alpha,
-    Material,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct Windows {
     pub export: bool,
@@ -666,7 +658,6 @@ pub struct UiState {
     /// The share of the Assets panel's width the filter panes take
     #[serde(default = "default_shelf_panes_share", deserialize_with = "deserialize_shelf_panes_share")]
     pub shelf_panes_share: f32,
-    pub props_tab: PropsTab,
     #[serde(default)]
     pub text: TextUi,
     /// Layer being renamed and the edit buffer.
@@ -883,7 +874,6 @@ impl Default for UiState {
             shelf_updates: crate::shelf_updates::ShelfUpdates::default(),
             shelf_panes_split: default_shelf_panes_split(),
             shelf_panes_share: default_shelf_panes_share(),
-            props_tab: PropsTab::Brush,
             text: TextUi::default(),
             rename: None,
             new_project: NewProject::default(),

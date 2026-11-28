@@ -283,7 +283,7 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
     const SIZE_PERCENT_RANGE: std::ops::RangeInclusive<f32> = 0.05..=100.0;
 
     /// Spacing's track, in percent of the brush's diameter
-    const SPACING_PERCENT_RANGE: std::ops::RangeInclusive<f32> = 1.0..=200.0;
+    const SPACING_PERCENT_RANGE: std::ops::RangeInclusive<f32> = 1.0..=1000.0;
 
     /// Lazy mouse Distance's track, in pixels
     const LAZY_DISTANCE_RANGE_PX: std::ops::RangeInclusive<f32> = 1.0..=200.0;

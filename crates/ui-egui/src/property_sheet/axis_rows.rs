@@ -2,7 +2,7 @@
 
 use std::ops::RangeInclusive;
 
-use egui::{Align2, Color32, FontId, Painter, Rect, Response, Role, Sense, Stroke, StrokeKind, WidgetInfo, pos2, vec2};
+use egui::{Align2, Color32, CornerRadius, FontId, Painter, Rect, Response, Role, Sense, Stroke, StrokeKind, WidgetInfo, pos2, vec2};
 
 use super::row::SECTION_CAPTION_CENTER;
 use super::slider::{DIAL_AIR, DIAL_RADIUS, KNOB_RADIUS};
@@ -44,6 +44,9 @@ const AXIS_CHIP_LETTER: Color32 = Color32::from_rgb(20, 20, 24);
 const PICTURE_TOP: f32 = 4.0;
 const PICTURE_SHORTER: f32 = 10.0;
 const PICTURE_TO_COLUMN: f32 = 6.0;
+
+/// Width of the line around the picture
+const PICTURE_OUTLINE_WIDTH: f32 = 1.0;
 
 impl PropertySheet<'_> {
     /// A section caption with its on/off switch at the right edge
@@ -135,32 +138,35 @@ impl PropertySheet<'_> {
         Self::apply_typed(value, typed, dragged)
     }
 
-    /// Draw a picture beside captioned sliders and report the edit on each slider.
+    /// Draw a picture beside captioned sliders and report the edit on each slider
     pub(crate) fn picture_sliders<const N: usize>(&mut self, picture: &dyn Fn(&Painter, Rect), sliders: &mut [StackSlider<'_>; N]) -> [Option<bool>; N] {
         let count = sliders.len().max(1) as f32;
         let height = count * (STACK_CAPTION_LINE + STACK_PART_LINE) + (count - 1.0) * STACK_GAP;
         self.space(BLOCK_MARGIN);
         let block = self.take(height);
-        let x0 = self.column();
-        let side = (height - PICTURE_SHORTER).min(x0 - self.left - PICTURE_TO_COLUMN).max(1.0);
+
+        let column_x = self.column();
+        let side = (height - PICTURE_SHORTER).min(column_x - self.left - PICTURE_TO_COLUMN).max(1.0);
         let square = Rect::from_min_size(pos2(self.left, block.top() + PICTURE_TOP), vec2(side, side));
         picture(self.ui.painter(), square);
-        self.ui.painter().rect_stroke(square, 0, Stroke::new(1.0, self.tokens.field_border), StrokeKind::Inside);
+        self.ui.painter().rect_stroke(square, CornerRadius::ZERO, Stroke::new(PICTURE_OUTLINE_WIDTH, self.tokens.field_border), StrokeKind::Inside);
 
+        let caption_color = self.tokens.text_dim;
         let mut edits = [None; N];
         let mut y = block.top();
         for (edit, slider) in edits.iter_mut().zip(sliders) {
-            let dim = self.tokens.text_dim;
-            let caption = pos2(x0, y + STACK_CAPTION_LINE / 2.0);
-            self.ui.painter().text(caption, Align2::LEFT_CENTER, slider.label, FontId::proportional(SMALL_TEXT_SIZE), dim);
+            let caption = pos2(column_x, y + STACK_CAPTION_LINE / 2.0);
+            self.ui.painter().text(caption, Align2::LEFT_CENTER, slider.label, FontId::proportional(SMALL_TEXT_SIZE), caption_color);
+
             let center_y = y + STACK_CAPTION_LINE + STACK_PART_LINE / 2.0;
             let id = self.next_id();
             let dial_x = self.right - self.used.value_width.max(super::VALUE_MIN_WIDTH) - DIAL_AIR - DIAL_RADIUS;
             let end = if slider.dial { dial_x - DIAL_RADIUS - DIAL_AIR } else { self.track_end() };
-            let track = Track { start: x0 + KNOB_RADIUS, end, center_y, zero: None, ramp: false };
+            let track = Track { start: column_x + KNOB_RADIUS, end, center_y, zero: (*slider.range.start() < 0.0).then_some(0.0), ramp: false };
             if slider.dial {
                 self.paint_dial(pos2(dial_x, center_y), *slider.value);
             }
+
             let dragged = self.track(id, slider.label, &track, slider.value, &slider.range);
             let typed = self.value_field(id, slider.label, center_y, *slider.value, &slider.typed, slider.decimals, slider.suffix);
             *edit = Self::apply_typed(slider.value, typed, dragged);

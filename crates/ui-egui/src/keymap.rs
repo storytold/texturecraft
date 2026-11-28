@@ -698,9 +698,9 @@ pub fn fixed_gestures() -> Vec<(String, String)> {
         (tr("Ctrl + RMB drag").into(), tr("Brush size (left/right) and hardness (up/down)").into()),
         (tr("Ctrl + LMB drag").into(), tr("Brush flow (left/right) and angle (up/down)").into()),
         (tr("Ctrl + Shift + RMB drag").into(), tr("Brush size and hardness in fine steps").into()),
-        (keyed("{key} + LMB drag"), tr("Projection: rotate the stencil").into()),
-        (keyed("{key} + RMB drag"), tr("Projection: scale the stencil").into()),
-        (keyed("{key} + MMB drag"), tr("Projection: move the stencil").into()),
+        (keyed("{key} + LMB drag"), tr("Rotate the stencil").into()),
+        (keyed("{key} + RMB drag"), tr("Scale the stencil").into()),
+        (keyed("{key} + MMB drag"), tr("Move the stencil").into()),
         (trf("{key} + LMB", &[("key", &clone)]), tr("Clone: pick the point to copy from").into()),
         (tr("Click (Path tool)").into(), tr("Path: add a point; on the curve it inserts one").into()),
         (tr("LMB drag on a point (Path tool)").into(), tr("Path: move the point").into()),
@@ -733,7 +733,7 @@ mod tests {
         let rows = fixed_gestures();
         let has = |gesture: &str, what: &str| rows.iter().any(|(g, w)| g == gesture && w.contains(what));
         let (s, v) = (crate::viewport::STENCIL_KEY.name(), crate::viewport::CLONE_SOURCE_KEY.name());
-        assert!(has(&format!("{s} + LMB drag"), "rotate") && has(&format!("{s} + RMB drag"), "scale") && has(&format!("{s} + MMB drag"), "move"));
+        assert!(has(&format!("{s} + LMB drag"), "Rotate") && has(&format!("{s} + RMB drag"), "Scale") && has(&format!("{s} + MMB drag"), "Move"));
         assert!(has(&format!("{v} + LMB"), "Clone"));
         for (gesture, what) in [
             ("Shift + LMB", "straight line"),

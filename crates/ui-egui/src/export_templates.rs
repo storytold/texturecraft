@@ -889,15 +889,13 @@ pub fn save_library(app: &TextureCraftApp, storage: &mut dyn eframe::Storage) {
 fn outputs(app: &mut TextureCraftApp, ui: &mut Ui, column: Rect, top: f32) {
     let look = ExportLook::get(ui.ctx());
     let tokens = Tokens::get(ui.ctx());
-    let (mut preset, editable) = match (&app.ui.export.draft, selected(app)) {
-        (Some(d), _) => (d.clone(), true),
-        (None, Some(b)) => (b, false),
-        (None, None) => {
-            MapPreviewCache::clear(ui.ctx());
-            drawn::label_at(ui, column.left(), top + CURRENT_PRESET_Y, tr("Select an output template"), look.text_dim, false);
-            return;
-        }
+    let editable = app.ui.export.draft.is_some();
+    let Some(mut preset) = app.ui.export.draft.clone().or_else(|| selected(app)) else {
+        MapPreviewCache::clear(ui.ctx());
+        drawn::label_at(ui, column.left(), top + CURRENT_PRESET_Y, tr("Select an output template"), look.text_dim, false);
+        return;
     };
+
     let params = plan_params(app, &preset);
     let preview = match &params {
         Ok(params) => MapPreviewCache::plan(app, ui.ctx(), params),
@@ -1043,9 +1041,10 @@ fn outputs(app: &mut TextureCraftApp, ui: &mut Ui, column: Rect, top: f32) {
     if acted {
         pending = None;
     }
-    let e = &mut app.ui.export;
-    e.draft_split = split;
-    e.pending_drop = pending;
+
+    app.ui.export.draft_split = split;
+    app.ui.export.pending_drop = pending;
+
     if acted || changed {
         commit(app, preset, origin);
     }
@@ -1782,7 +1781,8 @@ fn source_channel_popup(ui: &Ui, pending: &mut Option<PendingDrop>, maps: &mut [
 
 /// The maps the selected template's outputs read, with their colours, for the panes' markers
 fn marked_sources(app: &TextureCraftApp) -> Vec<(SourceRef, Color32)> {
-    let Some(preset) = app.ui.export.draft.clone().or_else(|| selected(app)) else { return Vec::new() };
+    let draft = app.ui.export.draft.as_ref().map(std::borrow::Cow::Borrowed);
+    let Some(preset) = draft.or_else(|| selected(app).map(std::borrow::Cow::Owned)) else { return Vec::new() };
 
     let sources = preset.maps.iter().flat_map(|map| map.channels.iter().map(|(_, source)| source));
     sources.filter_map(|source| source_color(source).map(|color| (source.clone(), color))).collect()

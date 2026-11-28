@@ -125,11 +125,13 @@ impl Stroke {
         all
     }
 
+    /// The stamp radius at `pos` under `pressure`, scaled by its distance from the camera for a screen-space brush
     fn radius_at(&self, ctx: &PickCtx, pos: Vec3, pressure: f32) -> f32 {
-        let p = pressure.clamp(0.0, 1.0);
-        let scale = self.settings.min_size + (1.0 - self.settings.min_size) * p;
-        let r = self.radius * if pressure < 1.0 { scale } else { 1.0 };
-        if self.settings.screen_space { r * (pos.distance(ctx.camera.eye()) / ctx.camera.distance.max(1e-4)) } else { r }
+        // Keeps the screen-space scale finite with the camera on its target
+        const MIN_CAMERA_DISTANCE: f32 = 1e-4;
+
+        let radius = self.radius * self.settings.pressure_size(pressure);
+        if self.settings.screen_space { radius * (pos.distance(ctx.camera.eye()) / ctx.camera.distance.max(MIN_CAMERA_DISTANCE)) } else { radius }
     }
 
     fn feed(&mut self, ctx: &PickCtx, screen: Vec2, pressure: f32, depth: u32, out: &mut Vec<Stamp>) {

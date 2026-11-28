@@ -378,16 +378,17 @@ fn every_format_encodes_and_decodes() {
             for f in &files {
                 assert!(f.name.ends_with(format.extension()));
                 if format == FileFormat::Exr && f.name.starts_with("la") {
-                    continue; // Y/A EXR is checked with the EXR crate in `exr_exports_luminance_and_alpha_at_both_depths`.
+                    // The EXR-specific test reads luminance and alpha through the native decoder
+                    continue;
                 }
 
                 assert_eq!(decode(f).dimensions(), (RES, RES), "{}", f.name);
             }
 
             // Roughness 0.25 everywhere survives every format (JPEG within its loss)
-            let px = decode(find(&files, "OcclusionRoughnessMetallic.")).to_rgba32f().get_pixel(1, 1)[1];
+            let roughness_sample = decode(find(&files, "OcclusionRoughnessMetallic.")).to_rgba32f().get_pixel(1, 1)[1];
 
-            assert!((px - 0.25).abs() < 0.01, "{format:?}/{depth}: {px}");
+            assert!((roughness_sample - 0.25).abs() < 0.01, "{format:?}/{depth}: {roughness_sample}");
             let base = find(&files, "_BaseColor.");
             match format {
                 FileFormat::Jpeg | FileFormat::Hdr => assert!(base.warnings.iter().any(|w| w.contains("alpha")), "{format:?}"),
@@ -1337,6 +1338,7 @@ fn feedback_psd_dithering_tracks_the_document_depth() {
     options.maps.insert(1, MapOverride { dither: Some(false), ..MapOverride::default() });
 
     let plan = list_outputs(&fx.project, 0, "sphere", &options).unwrap();
+
     assert!(plan[0].dither && plan[0].layers[0].dither && !plan[0].layers[1].dither);
 
     options.preset.maps[1].bit_depth = 16;
@@ -1887,9 +1889,10 @@ fn a_map_preview_holds_the_values_its_file_stores() {
 #[test]
 fn feedback_jpeg_previews_omit_the_alpha_channel() {
     let fx = Fx::new(&default_channels());
-    let mut la = roughness();
-    la.push((Dest::A, SourceRef::Constant(0.5)));
-    for (channels, expected) in [(la, vec![Dest::L]), (rgba_half_alpha(), vec![Dest::R, Dest::G, Dest::B])] {
+    let mut gray_alpha = roughness();
+    gray_alpha.push((Dest::A, SourceRef::Constant(0.5)));
+
+    for (channels, expected) in [(gray_alpha, vec![Dest::L]), (rgba_half_alpha(), vec![Dest::R, Dest::G, Dest::B])] {
         let mut options = one_map(FileFormat::Png, 8, channels);
         let png_preview = MapPreview::sample(&fx.input(), &options, 0, 16).unwrap().unwrap();
         options.maps.insert(0, MapOverride { format: Some(FileFormat::Jpeg), ..MapOverride::default() });
@@ -2206,11 +2209,13 @@ fn feedback_psd_layer_names_keep_literal_and_explicit_tile_numbers() {
 
     options.preset.maps[0].file = "Group/Map.$udim".into();
     let plan = list_outputs(&fx.project, 0, "sphere", &options).unwrap();
+
     assert_eq!(plan[0].layers[0].name, "Group/Map.1001");
 
     options.preset.maps[0].file = "Map".into();
     options.format_override = Some(FileFormat::Png);
     let plan = list_outputs(&fx.project, 0, "sphere", &options).unwrap();
+
     assert_eq!(plan[0].name, "Map.1001.png");
 }
 
@@ -2235,6 +2240,7 @@ fn feedback_psd_tiled_and_untiled_sets_keep_both_documents() {
     assert_eq!(plans[3].1.name, "sphere_Body.1001_1.psd");
     assert_eq!(plans[4].1.name, "sphere_Trim.psd");
     let separate = list_outputs(&fx.project, 1, "sphere", &options).unwrap();
+
     assert_eq!(plans[0].1.name, separate[0].name, "individual desktop jobs agree with selection planning");
 }
 
@@ -2269,6 +2275,7 @@ fn psd_document_names_survive_sanitization_and_case_collisions() {
         assert!(separate.iter().any(|(set, name)| *set == index && name == unchanged));
     }
     let tiled = list_outputs(&fx.project, 3, "sphere", &options).unwrap();
+
     assert!(tiled[0].udim_name.is_some());
     assert_eq!(tiled[0].udim_name, tiled[1].udim_name, "tiles of one set keep the same pattern");
 
@@ -2312,10 +2319,12 @@ fn feedback_psd_batch_rejects_large_retained_output_before_rendering() {
     fx.project.texture_sets[0].uv_tiles = (1001..1008).collect();
 
     let smaller = plan_set_outputs(&fx.project, &[0], "sphere", &options, PsdBudget::WEB).unwrap();
+
     assert_eq!(smaller.len(), 7, "seven 128 MiB payloads fit with record overhead");
     fx.project.texture_sets[0].uv_tiles.extend(1008..1034);
 
     let oversized = plan_set_outputs(&fx.project, &[0], "sphere", &options, PsdBudget::WEB);
+
     assert!(matches!(&oversized, Err(error) if error.to_string().contains("total PSD")), "the 33 individually valid tiles must be rejected as a batch");
 
     let set = &fx.project.texture_sets[0];

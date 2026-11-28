@@ -158,18 +158,11 @@ pub fn image_preview(img: &ImageRes, size: usize) -> ColorImage {
 
 /// Preview the brush along an S curve in a `size_px` square
 pub fn stroke_preview(brush: &BrushSettings, size_px: usize, image: Option<&ImageRes>) -> ColorImage {
-    // Leave room around the S curve and cap work for a single preview
+    // Leave room around the S curve
     const STROKE_RADIUS_FRACTION: f32 = 0.11;
-    const CURVE_SAMPLE_STEP: f32 = 0.002;
-    const MIN_STAMP_SPACING_PX: f32 = 0.5;
-    const MAX_STAMPS: u32 = 2000;
     const CURVE_HORIZONTAL_INSET: f32 = 0.15;
     const CURVE_HORIZONTAL_SPAN: f32 = 0.7;
     const CURVE_WAVE_AMPLITUDE: f32 = 0.22;
-
-    let library = brush.alpha_library.as_deref().and_then(alphas::find).map(alphas::LibraryAlpha::image);
-    let radius = size_px as f32 * STROKE_RADIUS_FRACTION;
-    let shape = Shape { alpha: brush.alpha, image, library, params: brush.alpha_params, level: 0 }.at_radius(radius);
 
     // The horizontal inset and vertical wave keep the S curve inside the swatch
     let curve = |t: f32| {
@@ -178,48 +171,90 @@ pub fn stroke_preview(brush: &BrushSettings, size_px: usize, image: Option<&Imag
             size_px as f32 * (0.5 - CURVE_WAVE_AMPLITUDE * (t * std::f32::consts::TAU).sin()),
         )
     };
-    let mut cover = vec![0f32; size_px * size_px];
+    let cover = stamp_coverage(brush, image, [size_px, size_px], |_| size_px as f32 * STROKE_RADIUS_FRACTION, curve);
+    ColorImage::new([size_px, size_px], cover.into_iter().map(|coverage| Color32::from_gray((coverage * brush.opacity * 255.0 + 0.5) as u8)).collect())
+}
+
+/// The brush's stroke along `curve` (0..1 to pixels) in a `size` strip, stamps `radius` (0..1 to pixels) wide, columns in `tint`'s colour; missed pixels stay transparent
+pub fn stroke_strip(
+    brush: &BrushSettings,
+    image: Option<&ImageRes>,
+    size: [usize; 2],
+    radius: impl Fn(f32) -> f32,
+    curve: impl Fn(f32) -> (f32, f32),
+    tint: impl Fn(usize) -> [u8; 3],
+) -> ColorImage {
+    let cover = stamp_coverage(brush, image, size, radius, curve);
+    let pixels = cover
+        .into_iter()
+        .enumerate()
+        .map(|(index, coverage)| {
+            let [r, g, b] = tint(index % size[0]);
+            Color32::from_rgba_unmultiplied(r, g, b, (coverage * brush.opacity * 255.0 + 0.5) as u8)
+        })
+        .collect();
+    ColorImage::new(size, pixels)
+}
+
+/// Paint coverage 0..1 of the brush's stamps (`radius` 0..1 to pixels, its alpha, hardness, spacing, flow, angle and jitters) along `curve` in a `width` × `height` image
+fn stamp_coverage(
+    brush: &BrushSettings,
+    image: Option<&ImageRes>,
+    [width, height]: [usize; 2],
+    radius: impl Fn(f32) -> f32,
+    curve: impl Fn(f32) -> (f32, f32),
+) -> Vec<f32> {
+    // Cap work for a single preview
+    const CURVE_SAMPLE_STEP: f32 = 0.002;
+    const MIN_STAMP_SPACING_PX: f32 = 0.5;
+    const MAX_STAMPS: u32 = 2000;
+
+    let library = brush.alpha_library.as_deref().and_then(alphas::find).map(alphas::LibraryAlpha::image);
+    let shape = Shape { alpha: brush.alpha, image, library, params: brush.alpha_params, level: 0 }.at_radius(radius(1.0));
+    let mut cover = vec![0f32; width * height];
 
     // Odd multipliers decorrelate reproducible jitter across stamps and channels
     let jitter_sample = |stamp_index: u32, channel: u32| {
         (stamp_index.wrapping_mul(0x9E37_79B9) ^ channel.wrapping_mul(0x85EB_CA6B)).wrapping_mul(0xC2B2_AE35) as f32 / u32::MAX as f32
     };
-    let step = (brush.spacing * 2.0 * radius).max(MIN_STAMP_SPACING_PX);
-    let (mut t, mut travelled, mut i) = (0.0f32, step, 0u32);
+
+    // Spacing follows the stamp's own radius, as on the model
+    let step = |t: f32| (brush.spacing * 2.0 * radius(t)).max(MIN_STAMP_SPACING_PX);
+    let (mut t, mut travelled, mut stamp_index) = (0.0f32, step(0.0), 0u32);
     let mut last = curve(0.0);
 
-    while t <= 1.0 && i < MAX_STAMPS {
-        let p = curve(t);
-        travelled += (p.0 - last.0).hypot(p.1 - last.1);
-        last = p;
+    while t <= 1.0 && stamp_index < MAX_STAMPS {
+        let point = curve(t);
+        travelled += (point.0 - last.0).hypot(point.1 - last.1);
+        last = point;
         t += CURVE_SAMPLE_STEP;
-        if travelled < step {
+        if travelled < step(t) {
             continue;
         }
 
         travelled = 0.0;
-        i += 1;
-        let stamp_radius = radius * (1.0 - brush.jitter_size * jitter_sample(i, 1));
-        let tangent = if brush.follow_path { (curve(t).1 - p.1).atan2(curve(t).0 - p.0) } else { 0.0 };
-        let angle = brush.angle.to_radians() + tangent + brush.jitter_angle * std::f32::consts::TAU * jitter_sample(i, 2);
-        let (cx, cy) = (
-            p.0 + brush.jitter_position * radius * (jitter_sample(i, 3) * 2.0 - 1.0),
-            p.1 + brush.jitter_position * radius * (jitter_sample(i, 4) * 2.0 - 1.0),
+        stamp_index += 1;
+        let stamp_radius = radius(t) * (1.0 - brush.jitter_size * jitter_sample(stamp_index, 1));
+        let tangent = if brush.follow_path { (curve(t).1 - point.1).atan2(curve(t).0 - point.0) } else { 0.0 };
+        let angle = brush.angle.to_radians() + tangent + brush.jitter_angle * std::f32::consts::TAU * jitter_sample(stamp_index, 2);
+        let (center_x, center_y) = (
+            point.0 + brush.jitter_position * radius(t) * (jitter_sample(stamp_index, 3) * 2.0 - 1.0),
+            point.1 + brush.jitter_position * radius(t) * (jitter_sample(stamp_index, 4) * 2.0 - 1.0),
         );
-        let flow = brush.flow * (1.0 - brush.jitter_flow * jitter_sample(i, 5));
+        let flow = brush.flow * (1.0 - brush.jitter_flow * jitter_sample(stamp_index, 5));
         let (sin, cos) = angle.sin_cos();
-        let (x0, x1) = ((cx - stamp_radius).floor().max(0.0) as usize, ((cx + stamp_radius).ceil() as usize).min(size_px));
-        let (y0, y1) = ((cy - stamp_radius).floor().max(0.0) as usize, ((cy + stamp_radius).ceil() as usize).min(size_px));
+        let (x0, x1) = ((center_x - stamp_radius).floor().max(0.0) as usize, ((center_x + stamp_radius).ceil() as usize).min(width));
+        let (y0, y1) = ((center_y - stamp_radius).floor().max(0.0) as usize, ((center_y + stamp_radius).ceil() as usize).min(height));
         for y in y0..y1 {
             for x in x0..x1 {
-                let (dx, dy) = ((x as f32 + 0.5 - cx) / stamp_radius, (cy - y as f32 - 0.5) / stamp_radius);
-                let alpha = shape.sample(dx * cos + dy * sin, -dx * sin + dy * cos, brush.hardness, i) * flow;
-                let coverage = &mut cover[y * size_px + x];
+                let (dx, dy) = ((x as f32 + 0.5 - center_x) / stamp_radius, (center_y - y as f32 - 0.5) / stamp_radius);
+                let alpha = shape.sample(dx * cos + dy * sin, -dx * sin + dy * cos, brush.hardness, stamp_index) * flow;
+                let coverage = &mut cover[y * width + x];
                 *coverage = 1.0 - (1.0 - *coverage) * (1.0 - alpha.clamp(0.0, 1.0));
             }
         }
     }
-    ColorImage::new([size_px, size_px], cover.into_iter().map(|v| Color32::from_gray((v * brush.opacity * 255.0 + 0.5) as u8)).collect())
+    cover
 }
 
 /// Environment `name`'s panorama across a `size²` swatch, transparent above and below

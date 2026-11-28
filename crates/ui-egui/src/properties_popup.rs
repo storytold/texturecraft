@@ -85,9 +85,10 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
             // The docked panel's jump tabs on the top edge stay put while the sections scroll under them
             let scope = SectionScope::Popup;
-            if let Some(tabs) = crate::dock::properties_fill_tabs(app) {
+            if let Some(tabs) = crate::dock::properties_tabs(app) {
                 crate::property_sheet::section_tabs(ui, scope, ui.style().visuals.menu_corner_radius.nw, &tabs);
             }
+            crate::dock::pinned_brush_preview(app, ui);
             crate::property_sheet::in_scope(ui, scope, |ui| {
                 // A popup that fits its rows keeps its size; one that scrolls goes on until its last section's top
                 let area = egui::ScrollArea::vertical().id_salt("properties_popup_scroll");

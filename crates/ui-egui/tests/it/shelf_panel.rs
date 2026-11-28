@@ -237,6 +237,7 @@ fn a_long_saved_search_list_can_select_the_last_query() {
         })
         .collect();
     harness.run_steps(3);
+
     assert!(harness.query_by_label("search 500").is_none(), "offscreen searches do not build rows");
 
     harness.get_by_label("search 0").hover();

@@ -217,15 +217,17 @@ impl Session {
             .collect()
     }
 
-    /// Common setup of 3D and 2D strokes. `first_uv` is where the stroke starts on the mesh
-    /// (the Clone tool's destination anchor).
+    /// Common setup of 3D and 2D strokes, `first_uv` being where the stroke starts on the mesh (the Clone tool's destination anchor)
     fn start_stroke(&mut self, viewport: Vec2, uv_mode: bool, first_uv: Option<Vec2>) -> Result<()> {
+        // Texture size a stroke paints at before the texture set has a cache
+        const FALLBACK_TEXTURE_SIZE: (u32, u32) = (1024, 1024);
+
         self.refuse_while_baking()?;
         let tool = self.tool.tool;
         let erase = tool == Tool::Eraser;
         let quick_mask = self.quick_mask.editing;
         let ts = self.ts();
-        let size = self.caches.get(ts).map(|c| c.size).unwrap_or((1024, 1024));
+        let size = self.caches.get(ts).map_or(FALLBACK_TEXTURE_SIZE, |cache| cache.size);
         let pickup = if quick_mask { None } else { self.pickup_mode(first_uv)? };
         let composite_pickup = tool == Tool::Smudge || (tool == Tool::Clone && self.tool.clone_from == CloneFrom::Composite);
         if pickup.is_some() && composite_pickup && !self.paints_mask() && self.solo.is_none() {
@@ -240,26 +242,30 @@ impl Session {
             }
             _ => None,
         };
+
         let before = self.doc.clone();
         let target = if quick_mask {
             None
         } else {
             match self.paint_target() {
-                Ok(t) => Some(t),
-                Err(e) => {
+                Ok(target) => Some(target),
+                Err(error) => {
                     self.doc = before;
-                    return Err(e);
+                    return Err(error);
                 }
             }
         };
-        let values = target.map(|t| self.stroke_values(t)).unwrap_or_default();
+
+        let values = target.map(|target| self.stroke_values(target)).unwrap_or_default();
 
         // Clone and smudge on a mask read the mask as it was before the stroke
         let mask_owner = match target {
             Some(PaintTarget::Mask(effect)) if pickup.is_some() => self.doc.project.effect(effect).map(|(owner, _)| owner),
             _ => None,
         };
-        let stencil = if tool == Tool::Projection && !quick_mask { self.capture_stencil(viewport) } else { None };
+
+        // The 2D view doesn't show the stencil, so there it shapes only the Projection tool
+        let stencil = if !quick_mask && tool.uses_stencil() && (tool == Tool::Projection || !uv_mode) { self.capture_stencil(viewport) } else { None };
         let problem = if !erase && values.is_empty() && matches!(target, Some(PaintTarget::Layer(_))) {
             Some("no channel enabled to paint: enable channels in the tool's material")
         } else if tool == Tool::Projection && !quick_mask && stencil.is_none() && !uv_mode {
@@ -267,9 +273,10 @@ impl Session {
         } else {
             None
         };
-        if let Some(msg) = problem {
+
+        if let Some(message) = problem {
             self.doc = before;
-            return Err(EngineError::Other(msg.into()));
+            return Err(EngineError::Other(message.into()));
         }
 
         let depth = (!uv_mode).then(|| self.eye_depth(viewport));
@@ -278,6 +285,7 @@ impl Session {
         if !quick_mask {
             canvas.limit = self.stroke_limit(ts, size);
         }
+
         if let Some((mode, offset)) = pickup
             && let Some(cache) = self.caches.get(ts)
         {
@@ -285,7 +293,7 @@ impl Session {
                 PickupMode::Clone { .. } => {
                     PickupMode::Clone { offset: [(offset[0] * size.0 as f32).round() as i64, (offset[1] * size.1 as f32).round() as i64] }
                 }
-                m => m,
+                other_mode => other_mode,
             };
             let mut pickup = match (&layer_source, mask_owner) {
                 // On a mask the stroke reads the mask's own values
@@ -317,20 +325,23 @@ impl Session {
             canvas.pickup = Some(pickup);
             if tool == Tool::Clone
                 && self.tool.clone_aligned
-                && let Some(src) = self.tool.clone_source.as_mut()
+                && let Some(clone_source) = self.tool.clone_source.as_mut()
             {
-                src.offset.get_or_insert(offset);
+                clone_source.offset.get_or_insert(offset);
             }
         }
+
         if canvas.pickup.is_none() && tool == Tool::Paint && matches!(target, Some(PaintTarget::Layer(_))) {
             canvas.pickup = self.brush_pattern(&values);
         }
+
         let label = if quick_mask {
             QUICK_MASK_STROKE_LABEL.to_string()
         } else {
             let on_mask = matches!(target, Some(PaintTarget::Mask(_)));
             history_label(stroke_template(tool, on_mask), &self.stroke_layer_name())
         };
+
         self.stroke = Some(ActiveStroke {
             ts,
             target,
@@ -345,6 +356,7 @@ impl Session {
             erase,
             stencil,
             before,
+            start_revision: self.revision,
             label,
             staging: Staging::default(),
         });
@@ -394,13 +406,14 @@ impl Session {
         }
     }
 
-    /// The stencil placed for the current camera and viewport.
+    /// The stencil placed for the current camera and viewport
     fn capture_stencil(&self, viewport: Vec2) -> Option<texturecraft_compose::Stencil> {
-        let st = self.tool.stencil.as_ref()?;
-        let image = self.images.get(&st.image)?.clone();
+        let stencil_state = self.tool.stencil.as_ref()?;
+        let image = self.images.get(&stencil_state.image)?.clone();
         let aspect = viewport.x.max(1.0) / viewport.y.max(1.0);
-        let (center, half, rotation) = st.placement(image.width as f32 / image.height.max(1) as f32, aspect);
-        Some(texturecraft_compose::Stencil { image, view_proj: self.camera.view_proj(aspect), center, half, rotation, tile: st.tile })
+        let (center, half, rotation) = stencil_state.placement(image.width as f32 / image.height.max(1) as f32, aspect);
+        let colors = self.tool.tool == Tool::Projection;
+        Some(texturecraft_compose::Stencil { image, view_proj: self.camera.view_proj(aspect), center, half, rotation, tile: stencil_state.tile, colors })
     }
 
     /// Painting is paused while a bake preview shows the baked maps instead of the material.
@@ -566,6 +579,12 @@ impl Session {
         }
 
         let gbuf = self.caches.get(stroke.ts).map(|c| c.gbuf.clone());
+        if stroke.stencil.is_some() && !with_commit_source(&stroke, gbuf.as_deref(), &self.mesh, &stroke.canvas.dirty, stencil_allows_stroke) {
+            self.mark_painted(stroke.ts, stroke.target, stroke.canvas.dirty.iter().copied());
+            self.discard_unused_stroke_mask(&stroke);
+            return Ok(());
+        }
+
         let mesh = self.mesh.clone();
         let mut staging = std::mem::take(&mut stroke.staging);
         match stroke.target {
@@ -596,6 +615,32 @@ impl Session {
         // Recompute committed tiles at low priority because the live preview already shows them
         self.mark_settle(stroke.ts, stroke.target, stroke.canvas.dirty.iter().copied());
         Ok(())
+    }
+
+    fn discard_unused_stroke_mask(&mut self, stroke: &ActiveStroke) {
+        // An intervening edit may already have recorded the mask effect
+        if self.revision != stroke.start_revision {
+            return;
+        }
+
+        self.doc.project.next_id = stroke.before.project.next_id;
+        if let Some(PaintTarget::Mask(effect)) = stroke.target
+            && let Some((owner, _)) = self.doc.project.effect(effect)
+            && let Some(previous_layer) = stroke.before.project.layers.get(&owner)
+            && !previous_layer.mask.iter().flat_map(|mask| &mask.effects).any(|previous| previous.id == effect)
+            && let Some(layer) = self.doc.project.layers.get_mut(&owner)
+        {
+            layer.mask = previous_layer.mask.clone();
+
+            // Removing a new mask background can change texels outside the dabs
+            if previous_layer.mask.is_none() {
+                for texture_set in self.doc.project.sets_drawing(owner) {
+                    if let Some(cache) = self.caches.get_mut(texture_set) {
+                        cache.invalidate_all();
+                    }
+                }
+            }
+        }
     }
 
     /// Abandon the active stroke (Esc).
@@ -738,22 +783,44 @@ impl Session {
     }
 }
 
-/// Run `f` with stroke `st` as a commit source over `tiles` (the Projection tool's stencil
-/// colors and alpha come from the surface under each texel).
+/// Check that some rasterized paint survives the stencil before writing tiles or history.
+fn stencil_allows_stroke(source: CommitSource) -> bool {
+    use texturecraft_texel::{TILE, from_u16};
+
+    let Some(sample_stencil) = source.per_texel else { return true };
+    let opacity = source.opacity.clamp(0.0, 1.0);
+    source.tiles.iter().any(|&(tile_x, tile_y)| {
+        source.alpha.tile(tile_x, tile_y).is_some_and(|alpha| {
+            alpha.iter().enumerate().any(|(index, &coverage)| {
+                let weight = from_u16(coverage) * opacity;
+                if weight <= 0.0 {
+                    return false;
+                }
+
+                let x = tile_x * TILE + index as u32 % TILE;
+                let y = tile_y * TILE + index as u32 / TILE;
+                sample_stencil(x, y).is_some_and(|(_, factor)| weight * factor > 0.0)
+            })
+        })
+    })
+}
+
+/// Run `f` with `stroke` as a commit source over `tiles` (the stencil's alpha and, on the Projection tool, its colors come from the surface under each texel)
 fn with_commit_source<R>(
-    st: &ActiveStroke,
-    gbuf: Option<&texturecraft_geom::UvGBuffer>,
+    stroke: &ActiveStroke,
+    gbuffer: Option<&texturecraft_geom::UvGBuffer>,
     mesh: &texturecraft_geom::Mesh,
     tiles: &BTreeSet<(u32, u32)>,
     f: impl FnOnce(CommitSource) -> R,
 ) -> R {
-    let stencil_fn = |x: u32, y: u32| -> Option<([f32; 3], f32)> {
-        let g = gbuf?;
-        let p = g.surface(mesh, (y * g.width + x) as usize)?.pos;
-        st.stencil.as_ref()?.sample_world(p)
+    let stencil_fn = |x: u32, y: u32| -> Option<(Option<[f32; 3]>, f32)> {
+        let gbuffer = gbuffer?;
+        let position = gbuffer.surface(mesh, (y * gbuffer.width + x) as usize)?.pos;
+        stroke.stencil.as_ref()?.paint_world(position)
     };
-    let per_texel: Option<texturecraft_paint::TexelFn> = if st.stencil.is_some() { Some(&stencil_fn) } else { None };
-    let carried = st.canvas.pickup.as_ref().map(|p| &p.values);
-    let carried_mask = st.canvas.pickup.as_ref().and_then(|p| p.mask_values());
-    f(CommitSource { alpha: &st.canvas.alpha, tiles, opacity: st.stroke.settings.opacity, erase: st.erase, per_texel, carried, carried_mask })
+    let per_texel: Option<texturecraft_paint::TexelFn> = if stroke.stencil.is_some() { Some(&stencil_fn) } else { None };
+
+    let carried = stroke.canvas.pickup.as_ref().map(|pickup| &pickup.values);
+    let carried_mask = stroke.canvas.pickup.as_ref().and_then(|pickup| pickup.mask_values());
+    f(CommitSource { alpha: &stroke.canvas.alpha, tiles, opacity: stroke.stroke.settings.opacity, erase: stroke.erase, per_texel, carried, carried_mask })
 }

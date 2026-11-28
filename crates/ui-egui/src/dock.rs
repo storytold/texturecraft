@@ -8,21 +8,21 @@ use texturecraft_engine::compose::ThumbTarget;
 use texturecraft_engine::core::{
     BakedMap, BlendMode, Channel, ChannelBlend, Effect, EffectKind, Layer, LayerId, LayerKind, LinkParam, Project, Projection, Sampling, Source,
 };
-use texturecraft_engine::paint::alpha_params::MAX_ALPHA_CONTRAST;
-use texturecraft_engine::paint::{BrushAlpha, BrushSettings, alphas};
+use texturecraft_engine::texel::linear_to_srgb;
 use texturecraft_engine::{CloneFrom, StackTarget, Tool};
 
 use crate::TextureCraftApp;
+use crate::brush_stroke_preview::BrushStrokePreview;
 use crate::i18n::{n_, tr, trf};
 use crate::layer_panel::{effect_preview_size, effect_row_height, layer_preview_size, layer_row_height};
+use crate::paint_section::PaintSection;
 use crate::past_end::PastEnd;
 use crate::property_sheet::{PropertySheet, SectionScope};
 use crate::shelf::{Asset, ShelfDrag};
 use crate::source_choice::SourceChoice;
-use crate::state::PropsTab;
+use crate::tabbed_page::TabbedPage;
 use crate::theme::{Tokens, caption};
-use crate::toolbar::{MAX_BRUSH_SIZE, MIN_BRUSH_SIZE};
-use crate::widgets::{chip, color_swatch, combo, dnd_release, elided, icon_button, press_edit, section, section_with_reset, slider, slider_edit};
+use crate::widgets::{chip, color_swatch, combo, dnd_release, elided, icon_button, press_edit, section, slider, slider_edit};
 
 const TAG_COLORS: [Color32; 8] = [
     Color32::from_rgb(0xc0, 0x40, 0x40),
@@ -1895,9 +1895,10 @@ pub(crate) fn properties(app: &mut TextureCraftApp, ui: &mut Ui) {
     // A floating scroll bar would cover the right-aligned slider values and section reset icons
     ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
     let scope = SectionScope::Docked;
-    if let Some(tabs) = properties_fill_tabs(app) {
+    if let Some(tabs) = properties_tabs(app) {
         crate::property_sheet::section_tabs(ui, scope, 0, &tabs);
     }
+    pinned_brush_preview(app, ui);
 
     let selection = properties_selection(app);
     crate::property_sheet::in_scope(ui, scope, |ui| {
@@ -1936,20 +1937,42 @@ pub(crate) fn properties_scrolled(app: &mut TextureCraftApp, ui: &mut Ui, area: 
     output.state.clamped_offset().y
 }
 
-/// The tabs over the panel when it shows a fill layer's or a mask fill effect's sections, which they jump between
-pub(crate) fn properties_fill_tabs(app: &TextureCraftApp) -> Option<[(&'static str, &'static str); 3]> {
-    if app.session.tool.tool == Tool::PolygonFill && app.session.tool_usable(Tool::PolygonFill) {
+/// The tabs over the panel when it shows a fill layer's, a mask fill effect's or a paint tool's sections, which they jump between
+pub(crate) fn properties_tabs(app: &TextureCraftApp) -> Option<Vec<(&'static str, &'static str)>> {
+    Some(match tabbed_page(app)? {
+        TabbedPage::Fill { mask } => crate::fill_panel::fill_tabs(mask).to_vec(),
+        TabbedPage::Tool => tool_sections(app).into_iter().map(|section| (section.icon(), section.title())).collect(),
+    })
+}
+
+/// The page under the panel's jump tabs, if it shows one
+fn tabbed_page(app: &TextureCraftApp) -> Option<TabbedPage> {
+    if !app.session.project_open || app.session.tool.tool == Tool::PolygonFill && app.session.tool_usable(Tool::PolygonFill) {
         return None;
     }
 
     let project = &app.session.doc.project;
-    match app.session.target {
-        StackTarget::Content => {
-            let layer = app.session.selected_layer().and_then(|id| project.layers.get(&id))?;
-            matches!(&layer.kind, LayerKind::Fill(fill) if fill.projection.placed().is_none()).then(|| crate::fill_panel::fill_tabs(false))
+    let layer = app.session.selected_layer().and_then(|id| project.layers.get(&id));
+    let tool_shown = match (layer, app.session.target) {
+        (Some(layer), StackTarget::Content) if matches!(layer.kind, LayerKind::Fill(_)) => {
+            return matches!(&layer.kind, LayerKind::Fill(fill) if fill.projection.placed().is_none()).then_some(TabbedPage::Fill { mask: false });
         }
-        StackTarget::Effect(effect) => mask_fill_of(project, effect).map(|_| crate::fill_panel::fill_tabs(true)),
-        _ => None,
+        (Some(_), StackTarget::Effect(effect)) => match project.effect(effect).map(|(_, effect)| &effect.kind) {
+            Some(EffectKind::Paint | EffectKind::Path(_)) => true,
+            _ => return mask_fill_of(project, effect).map(|_| TabbedPage::Fill { mask: true }),
+        },
+        (Some(layer), StackTarget::Content) => !layer.is_group() && layer.instance_source().is_none(),
+        _ => true,
+    };
+
+    // Everything else shows the tool's sections where the tool can paint
+    (tool_shown && app.session.tool_usable(app.session.tool.tool)).then_some(TabbedPage::Tool)
+}
+
+/// The brush preview under the tool's jump tabs: it stays in view while the sections scroll under it
+pub(crate) fn pinned_brush_preview(app: &TextureCraftApp, ui: &mut Ui) {
+    if tabbed_page(app) == Some(TabbedPage::Tool) {
+        legacy_body(ui, |ui| brush_preview(app, ui));
     }
 }
 
@@ -1991,10 +2014,6 @@ pub(crate) fn properties_contents(app: &mut TextureCraftApp, ui: &mut Ui) {
         (Some(layer), StackTarget::Effect(effect)) => {
             let snapshot = layer.clone();
             effect_properties(app, ui, &snapshot, effect);
-            let painted = app.session.doc.project.effect(effect).is_some_and(|(_, effect)| matches!(effect.kind, EffectKind::Paint | EffectKind::Path(_)));
-            if painted && grayscale_tab_open(app) {
-                crate::mask_paint_panel::grayscale_sheet(app, ui);
-            }
         }
         (Some(layer), StackTarget::Content) if matches!(layer.kind, LayerKind::Fill(_)) => {
             let snapshot = layer.clone();
@@ -2007,33 +2026,25 @@ pub(crate) fn properties_contents(app: &mut TextureCraftApp, ui: &mut Ui) {
         }
         (Some(layer), StackTarget::Mask) => {
             let layer_id = layer.id;
-            legacy_body(ui, |ui| {
-                // Saved height masks can still be turned off here
-                let height_shown = app.session.doc.project.content_layer(layer_id).is_some_and(|content| content.height_mask.enabled);
-                if height_shown {
+
+            // Saved height masks can still be turned off here
+            if app.session.doc.project.content_layer(layer_id).is_some_and(|content| content.height_mask.enabled) {
+                legacy_body(ui, |ui| {
                     height_mask_section(app, ui, layer_id);
-                }
-                if tool_usable {
-                    if height_shown {
+                    if tool_usable {
                         ui.separator();
                     }
-                    tool_properties(app, ui);
-                }
-            });
-            if tool_usable && grayscale_tab_open(app) {
-                crate::mask_paint_panel::grayscale_sheet(app, ui);
+                });
+            }
+            if tool_usable {
+                tool_properties(app, ui);
             }
         }
         (None, _) if !tool_usable => legacy_body(ui, |ui| {
             ui.label(RichText::new(tr("Select a layer to paint on")).color(tokens.text_dim));
         }),
-        _ => legacy_body(ui, |ui| tool_properties(app, ui)),
+        _ => tool_properties(app, ui),
     }
-}
-
-/// Whether the tool panel's third tab is open while a mask is painted: its Grayscale tab, drawn under the tool's rows
-fn grayscale_tab_open(app: &TextureCraftApp) -> bool {
-    app.ui.props_tab == PropsTab::Material && !targets_content(app)
 }
 
 /// Mask with height: the layer's height shapes its mask transitions.
@@ -2066,97 +2077,69 @@ fn height_mask_section(app: &mut TextureCraftApp, ui: &mut Ui, layer: LayerId) {
 const BRUSH_PREVIEW_HEIGHT: f32 = 88.0;
 const BRUSH_PREVIEW_CORNER_RADIUS: f32 = 2.0;
 
-/// The preview stroke: its segments, its margin from the preview's left (each side of its half), its wave's phase span in radians and its swing
-const PREVIEW_STROKE_STEPS: usize = 40;
-const PREVIEW_STROKE_MARGIN: f32 = 14.0;
-const PREVIEW_STROKE_WAVE: f32 = 9.0;
-const PREVIEW_STROKE_SWING: f32 = 18.0;
-
-/// The preview stroke's width: [`PREVIEW_STROKE_WIDTH_SCALE`] points for each [`PREVIEW_SIZE_UNIT`] of brush size, kept inside [`PREVIEW_STROKE_WIDTH`]
-const PREVIEW_SIZE_UNIT: f32 = 0.25;
-const PREVIEW_STROKE_WIDTH_SCALE: f32 = 60.0;
-const PREVIEW_STROKE_WIDTH: std::ops::RangeInclusive<f32> = 2.0..=30.0;
-
-/// Faintest the preview stroke draws, so a low flow or opacity still shows
-const PREVIEW_STROKE_MIN_ALPHA: u8 = 30;
-
-/// Radius of the preview's material sphere, and the colour it shows when the tool has no base colour
+/// Radius of the preview's material sphere, and the material it shows for channels the tool doesn't paint
 const PREVIEW_SPHERE_RADIUS: f32 = 36.0;
 const PREVIEW_FALLBACK_BASE_COLOR: [f32; 3] = [0.8; 3];
 
-/// Gap between the brush preview and the tab buttons
+/// Samples an image-backed mask's gray is read at across the preview stroke
+const STROKE_GRAY_SAMPLES: u32 = 64;
+
+/// Gap under the brush preview
 const BRUSH_PREVIEW_GAP: f32 = 4.0;
 
-fn tool_properties(app: &mut TextureCraftApp, ui: &mut Ui) {
+/// The brush's stroke in its target's tint, with a material sphere for content targets
+fn brush_preview(app: &TextureCraftApp, ui: &mut Ui) {
     let tokens = Tokens::get(ui.ctx());
     let content = targets_content(app);
-
-    // Brush preview: a stroke and a sphere with the tool's material
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), BRUSH_PREVIEW_HEIGHT), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), BRUSH_PREVIEW_HEIGHT), Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, tr("Brush preview")));
     let painter = ui.painter();
     painter.rect_filled(rect, BRUSH_PREVIEW_CORNER_RADIUS, tokens.viewport);
     let half_width = rect.width() * 0.5;
-    let brush = &app.session.tool.brush;
-    let mut points = Vec::new();
-    for step in 0..=PREVIEW_STROKE_STEPS {
-        let fraction = step as f32 / PREVIEW_STROKE_STEPS as f32;
-        let x = rect.left() + PREVIEW_STROKE_MARGIN + fraction * (half_width - 2.0 * PREVIEW_STROKE_MARGIN);
-        points.push(pos2(x, rect.center().y + (fraction * PREVIEW_STROKE_WAVE).sin() * PREVIEW_STROKE_SWING));
+    let stroke_rect = Rect::from_min_size(rect.min, vec2(half_width, rect.height()));
+    let tool = &app.session.tool;
+    let brush = &tool.brush;
+    let image = brush.alpha_image.as_ref().and_then(|name| app.session.images.get(name));
+
+    let channel_value = |channel| if tool.enabled.contains(&channel) { tool.values.get(&channel).copied() } else { None };
+    let base_color = content.then(|| channel_value(Channel::BaseColor).unwrap_or(PREVIEW_FALLBACK_BASE_COLOR));
+
+    if app.session.quick_mask.editing {
+        // The quick mask stores coverage independently of the tool's material and mask gray
+        BrushStrokePreview::paint(ui.ctx(), painter, stroke_rect, brush, image, |_| [u8::MAX; 3]);
+    } else if let Some(base_color) = base_color {
+        let srgb = base_color.map(|linear| (linear_to_srgb(linear) * 255.0 + 0.5) as u8);
+        BrushStrokePreview::paint(ui.ctx(), painter, stroke_rect, brush, image, |_| srgb);
+    } else {
+        // A mask paints gray: an image-backed one is read across the stroke
+        let gray = app.session.mask_gray();
+        let mask_tint = |across: f32| {
+            let gray = (gray.at((across * STROKE_GRAY_SAMPLES as f32) as u32, 0, (STROKE_GRAY_SAMPLES, 1)) * 255.0).round() as u8;
+            [gray; 3]
+        };
+        BrushStrokePreview::paint(ui.ctx(), painter, stroke_rect, brush, image, mask_tint);
     }
 
-    let stroke_width = (brush.size / PREVIEW_SIZE_UNIT * PREVIEW_STROKE_WIDTH_SCALE).clamp(*PREVIEW_STROKE_WIDTH.start(), *PREVIEW_STROKE_WIDTH.end());
-    let alpha = (brush.flow * brush.opacity * 255.0) as u8;
-
-    let preview_stroke = |gray: f32| {
-        let gray = (gray.clamp(0.0, 1.0) * 255.0).round() as u8;
-        Stroke::new(stroke_width, Color32::from_rgba_unmultiplied(gray, gray, gray, alpha.max(PREVIEW_STROKE_MIN_ALPHA)))
-    };
-
-    // Sample image-backed masks along the preview stroke
-    let gray = if content { texturecraft_engine::compose::MaskGray::Value(1.0) } else { app.session.mask_gray() };
-    match gray {
-        texturecraft_engine::compose::MaskGray::Value(value) => {
-            painter.add(egui::Shape::line(points, preview_stroke(value)));
-        }
-        texturecraft_engine::compose::MaskGray::Image { .. } => {
-            let size = PREVIEW_STROKE_STEPS as u32;
-            for (index, segment) in points.windows(2).enumerate() {
-                let value = gray.at(index as u32, size / 2, (size, size));
-                painter.line_segment([segment[0], segment[1]], preview_stroke(value));
-            }
-        }
-    }
-
-    if content {
-        let base_color = app.session.tool.values.get(&Channel::BaseColor).copied().unwrap_or(PREVIEW_FALLBACK_BASE_COLOR);
-
+    if let Some(base_color) = base_color {
         // The sphere sits in the middle of the preview's right half
-        crate::thumbs::paint_sphere(painter, pos2(rect.left() + half_width * 1.5, rect.center().y), PREVIEW_SPHERE_RADIUS, base_color);
+        let metallic = channel_value(Channel::Metallic).map_or(crate::thumbs::SPHERE_DEFAULT_METALLIC, |metallic| metallic[0]);
+        let roughness = channel_value(Channel::Roughness).map_or(crate::thumbs::SPHERE_DEFAULT_ROUGHNESS, |roughness| roughness[0]);
+        let center = pos2(rect.left() + half_width * 1.5, rect.center().y);
+        crate::thumbs::paint_material_sphere(painter, center, PREVIEW_SPHERE_RADIUS, base_color, metallic, roughness);
     }
+
     ui.add_space(BRUSH_PREVIEW_GAP);
+}
 
-    ui.horizontal(|ui| {
-        let button_size = ui.spacing().interact_size.y;
-
-        // Painting a mask, the material tab becomes the Grayscale tab
-        let material = if content { (ic::SPHERE, tr("Material")) } else { (ic::SQUARE_HALF, tr("Grayscale")) };
-        for (tab, icon, tip) in
-            [(PropsTab::Brush, ic::PAINT_BRUSH, tr("Brush")), (PropsTab::Alpha, ic::CIRCLE_HALF, tr("Alpha")), (PropsTab::Material, material.0, material.1)]
-        {
-            if icon_button(ui, icon, tip, app.ui.props_tab == tab, button_size).clicked() {
-                app.ui.props_tab = tab;
-            }
-        }
-    });
-    ui.separator();
-
+/// What only this tool has, above the sections every brush tool shares
+fn tool_header(app: &mut TextureCraftApp, ui: &mut Ui) {
+    let tokens = Tokens::get(ui.ctx());
     if app.session.quick_mask.editing {
         ui.label(RichText::new(tr("Editing the quick mask: strokes paint where painting is allowed. Press U to finish.")).color(tokens.text_dim));
         ui.separator();
     }
 
     let tool_section: Option<fn(&mut TextureCraftApp, &mut Ui)> = match app.session.tool.tool {
-        Tool::Projection => Some(stencil_section),
         Tool::Clone => Some(clone_section),
         Tool::Smudge => Some(smudge_section),
         Tool::Path => Some(path_section),
@@ -2167,75 +2150,32 @@ fn tool_properties(app: &mut TextureCraftApp, ui: &mut Ui) {
         section(app, ui);
         ui.separator();
     }
-
-    match app.ui.props_tab {
-        PropsTab::Brush => brush_section(app, ui),
-        PropsTab::Alpha => alpha_section(app, ui),
-        PropsTab::Material if content => material_section(app, ui),
-        // A mask's Grayscale tab is a property sheet, drawn by the caller past this panel's margins
-        PropsTab::Material => {}
-    }
 }
 
-/// How far the Position sliders move the stencil's center from the middle of the view (NDC; -1..1 is the view)
-const STENCIL_POSITION_RANGE: f32 = 2.0;
-
-fn stencil_section(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let tk = Tokens::get(ui.ctx());
-    ui.label(caption(tr("Stencil")));
-    let names: Vec<String> = app.session.doc.resources.keys().cloned().collect();
-    let current = app.session.tool.stencil.as_ref().map(|s| s.image.clone()).unwrap_or_else(|| tr("None").into());
-    let row = ui.horizontal(|ui| {
-        egui::ComboBox::from_id_salt("stencil_img").width(170.0).selected_text(current.clone()).show_ui(ui, |ui| {
-            if ui.selectable_label(app.session.tool.stencil.is_none(), tr("None")).clicked() {
-                app.run("tool.stencil", json!({"clear": true}));
+/// The tool's sections, one page under the panel's jump tabs
+fn tool_properties(app: &mut TextureCraftApp, ui: &mut Ui) {
+    legacy_body(ui, |ui| tool_header(app, ui));
+    PropertySheet::show(ui, "tool_sheet", |sheet| {
+        for section in tool_sections(app) {
+            // The Stencil caption carries its own reset
+            let menu = if section == PaintSection::Stencil { None } else { sheet.section(section.title(), section == PaintSection::Brush) };
+            match section {
+                PaintSection::Brush => crate::brush_sheet::brush_section(app, sheet, menu),
+                PaintSection::Alpha => crate::alpha_sheet::alpha_section(app, sheet),
+                PaintSection::Stencil => crate::stencil_sheet::stencil_section(app, sheet),
+                PaintSection::Material => crate::material_sheet::material_section(app, sheet),
+                PaintSection::Grayscale => crate::mask_paint_panel::grayscale_section(app, sheet),
             }
-            for n in &names {
-                if ui.selectable_label(*n == current, n).clicked() {
-                    app.run("tool.stencil", json!({"image": n}));
-                }
-            }
-        });
-        import_button(app, ui);
-    });
-
-    // An image from the Assets panel dropped on the row becomes the stencil
-    let row_response = row.response.interact(Sense::hover()).on_hover_text(tr("Drop an image from the Assets panel here to use it as the stencil"));
-    if let Some(name) = image_drop(ui, &row_response) {
-        app.run("tool.stencil", json!({"image": name}));
-    }
-    if names.is_empty() {
-        ui.label(RichText::new(tr("Import an image (File > Import resources) to project it onto the mesh.")).color(tk.text_dim));
-        return;
-    }
-
-    if let Some(st) = app.session.tool.stencil.as_mut() {
-        slider(ui, tr("Scale"), &mut st.scale, 0.05..=4.0, 2);
-        slider(ui, tr("Rotation"), &mut st.rotation, 0.0..=360.0, 0);
-        slider(ui, tr("Position X"), &mut st.center[0], -STENCIL_POSITION_RANGE..=STENCIL_POSITION_RANGE, 2);
-        slider(ui, tr("Position Y"), &mut st.center[1], -STENCIL_POSITION_RANGE..=STENCIL_POSITION_RANGE, 2);
-        if ui.button(tr("Reset stencil")).on_hover_text(tr("Put the stencil back in the middle of the view at its starting size and rotation")).clicked() {
-            st.reset_placement();
         }
-        slider(ui, tr("Overlay opacity"), &mut st.opacity, 0.0..=1.0, 2);
-        ui.checkbox(&mut st.tile, tr("Tile"));
-        ui.label(
-            RichText::new(tr("S + left-drag rotates (with Shift in 15° steps), S + right-drag scales, S + middle-drag moves; or use Position X / Y."))
-                .size(10.5)
-                .color(tk.text_dim),
-        );
-    }
+    });
 }
 
-fn import_button(app: &mut TextureCraftApp, ui: &mut Ui) {
-    if ui.small_button(tr("Import...")).clicked() {
-        let ctx = ui.ctx().clone();
-        crate::menus::invoke(app, &ctx, "resource.import");
-    }
+/// The sections of [`tool_properties`]: Stencil for the brush tools it shapes, except while they paint the quick mask
+fn tool_sections(app: &TextureCraftApp) -> Vec<PaintSection> {
+    PaintSection::page(crate::viewport::stencil_applies(app), targets_content(app))
 }
 
 fn clone_section(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let tk = Tokens::get(ui.ctx());
     ui.label(caption(tr("Clone")));
     ui.horizontal(|ui| {
         ui.label(tr("Copy from"));
@@ -2248,6 +2188,7 @@ fn clone_section(app: &mut TextureCraftApp, ui: &mut Ui) {
             }
         }
     });
+
     let mut aligned = app.session.tool.clone_aligned;
     if ui
         .checkbox(&mut aligned, tr("Aligned"))
@@ -2256,39 +2197,47 @@ fn clone_section(app: &mut TextureCraftApp, ui: &mut Ui) {
     {
         app.run("tool.brush", json!({"cloneAligned": aligned}));
     }
-    let Some(src) = app.session.tool.clone_source else {
-        ui.label(RichText::new(tr("Hold V and click the mesh to set the source, then paint elsewhere to copy it.")).color(tk.text_dim));
+
+    let Some(source) = app.session.tool.clone_source else {
+        ui.label(tr("Source: none")).on_hover_text(tr("Hold V and click the mesh to set the source, then paint elsewhere to copy it."));
         return;
     };
 
-    ui.horizontal(|ui| {
-        ui.label(trf("Source  U {u}  V {v}", &[("u", &format!("{:.3}", src.uv[0])), ("v", &format!("{:.3}", src.uv[1]))]));
-        if ui.small_button(tr("Clear")).clicked() {
-            app.run("tool.cloneSource", json!({"clear": true}));
-        }
-    });
     let hint = if !app.session.tool.clone_aligned {
         tr("Not aligned: every stroke starts at the source. V + click sets a new source.")
-    } else if src.offset.is_some() {
+    } else if source.offset.is_some() {
         tr("Aligned: the offset set by the first stroke is kept. V + click sets a new source.")
     } else {
         tr("The first stroke sets the offset from the source.")
     };
-    ui.label(RichText::new(hint).size(10.5).color(tk.text_dim));
+    ui.horizontal(|ui| {
+        ui.label(trf("Source  U {u}  V {v}", &[("u", &format!("{:.3}", source.uv[0])), ("v", &format!("{:.3}", source.uv[1]))])).on_hover_text(hint);
+        if ui.small_button(tr("Clear")).clicked() {
+            app.run("tool.cloneSource", json!({"clear": true}));
+        }
+    });
 }
 
+/// Space between the smudge strength and the channels it drags
+const SMUDGE_CHANNELS_GAP: f32 = 4.0;
+
+/// Full value of the smudge strength slider, the 0..100 scale `tool.brush` takes
+const SMUDGE_STRENGTH_PERCENT: f32 = 100.0;
+
 fn smudge_section(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let tk = Tokens::get(ui.ctx());
     ui.label(caption(tr("Smudge")));
-    let mut v = app.session.tool.smudge_strength * 100.0;
-    if slider(ui, tr("Strength"), &mut v, 0.0..=100.0, 0).changed() {
-        app.session.tool.smudge_strength = (v / 100.0).clamp(0.0, 1.0);
+
+    let mut strength_percent = app.session.tool.smudge_strength * SMUDGE_STRENGTH_PERCENT;
+    let strength = slider(ui, tr("Strength"), &mut strength_percent, 0.0..=SMUDGE_STRENGTH_PERCENT, 0);
+    if strength.on_hover_text(tr("Drags the layer stack's values along the stroke into the selected layer.")).changed() {
+        app.run("tool.brush", json!({"smudgeStrength": strength_percent}));
     }
-    ui.label(RichText::new(tr("Drags the layer stack's values along the stroke into the selected layer.")).size(10.5).color(tk.text_dim));
-    ui.add_space(4.0);
-    ui.label(tr("Channels dragged"));
+
+    ui.add_space(SMUDGE_CHANNELS_GAP);
+    ui.label(tr("Channels dragged")).on_hover_text(tr(
+        "These are the brush's material channels, the same ones Paint writes and the Material tab shows. A channel the selected layer does not have is skipped.",
+    ));
     material_channel_chips(app, ui);
-    ui.label(RichText::new(tr("These are the brush's material channels, the same ones Paint writes and the Material tab shows. A channel the selected layer does not have is skipped.")).size(10.5).color(tk.text_dim));
 }
 
 fn path_section(app: &mut TextureCraftApp, ui: &mut Ui) {
@@ -2301,34 +2250,6 @@ fn path_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         &[("n", &n)],
     );
     ui.label(RichText::new(hint).size(10.5).color(tk.text_dim));
-}
-
-/// Popover for built-in and saved brush presets
-fn brush_presets_popover(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let response = ui.button(format!("{}  {}", ic::PAINT_BRUSH_BROAD, tr("Brush presets")));
-    let popup_id = ui.make_persistent_id("brush_presets_popup");
-    if response.clicked() {
-        egui::Popup::toggle_id(ui.ctx(), popup_id);
-    }
-
-    egui::Popup::from_response(&response).id(popup_id).open_memory(None).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-        ui.set_min_width(230.0);
-        egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
-            let mut category = "";
-            for preset in texturecraft_engine::paint::presets::PRESETS.iter() {
-                if preset.category != category {
-                    category = preset.category;
-                    ui.label(caption(category));
-                }
-                if ui.selectable_label(false, preset.label).on_hover_text(tr("Use this brush (keeps its size)")).clicked() {
-                    app.run("brush.preset.apply", json!({"preset": preset.id}));
-                }
-            }
-
-            ui.separator();
-            crate::shelf::user_brushes(app, ui, "");
-        });
-    });
 }
 
 /// Width of the label column in polygon fill's properties
@@ -2429,289 +2350,8 @@ fn polygon_fill_paints_mask(app: &TextureCraftApp) -> Result<bool, String> {
     }
 }
 
-/// Font size of the dim hint line under the Brush caption
-const HINT_TEXT_SIZE: f32 = 10.5;
-
-fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
-    ui.horizontal(|ui| {
-        ui.label(caption(tr("Brush")));
-        brush_presets_popover(app, ui);
-    });
-
-    let brush = &mut app.session.tool.brush;
-    let defaults = BrushSettings::default();
-    let hint = tr("Ctrl+right-drag in a view sets the size and hardness, Ctrl+left-drag the flow and angle.");
-    ui.label(RichText::new(hint).size(HINT_TEXT_SIZE).color(Tokens::get(ui.ctx()).text_dim));
-    ui.label(RichText::new(tr("Ctrl+Shift+right-drag: size and hardness in fine steps.")).size(HINT_TEXT_SIZE).color(Tokens::get(ui.ctx()).text_dim));
-
-    // Each section's reset puts back only the fields it shows
-    let size_fields = |settings: &BrushSettings| (settings.size, settings.min_size, settings.screen_space);
-    if section_with_reset(ui, "sec_size", tr("Size"), true, size_fields(brush) == size_fields(&defaults), |ui| {
-        let mut size_percent = brush.size / MAX_BRUSH_SIZE * 100.0;
-        if slider(ui, tr("Size"), &mut size_percent, 0.05..=100.0, 1).changed() {
-            brush.size = (size_percent / 100.0 * MAX_BRUSH_SIZE).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
-        }
-
-        let mut min_size_percent = brush.min_size * 100.0;
-        if slider(ui, tr("Minimum size (%)"), &mut min_size_percent, 0.0..=100.0, 0).changed() {
-            brush.min_size = min_size_percent / 100.0;
-        }
-
-        ui.checkbox(&mut brush.screen_space, tr("Size in screen space"));
-    }) {
-        (brush.size, brush.min_size, brush.screen_space) = size_fields(&defaults);
-    }
-
-    let flow_fields = |settings: &BrushSettings| (settings.flow, settings.opacity, settings.spacing);
-    if section_with_reset(ui, "sec_flow", tr("Flow and opacity"), true, flow_fields(brush) == flow_fields(&defaults), |ui| {
-        let mut flow_percent = brush.flow * 100.0;
-        if slider(ui, tr("Flow"), &mut flow_percent, 0.0..=100.0, 0).changed() {
-            brush.flow = flow_percent / 100.0;
-        }
-
-        let mut opacity_percent = brush.opacity * 100.0;
-        if slider(ui, tr("Stroke opacity"), &mut opacity_percent, 0.0..=100.0, 0).changed() {
-            brush.opacity = opacity_percent / 100.0;
-        }
-
-        let mut spacing_percent = brush.spacing * 100.0;
-        if slider(ui, tr("Spacing"), &mut spacing_percent, 1.0..=1000.0, 0).changed() {
-            brush.spacing = spacing_percent / 100.0;
-        }
-    }) {
-        (brush.flow, brush.opacity, brush.spacing) = flow_fields(&defaults);
-    }
-
-    let angle_fields = |settings: &BrushSettings| (settings.angle, settings.follow_path);
-    if section_with_reset(ui, "sec_angle", tr("Angle"), false, angle_fields(brush) == angle_fields(&defaults), |ui| {
-        slider(ui, tr("Angle"), &mut brush.angle, -180.0..=180.0, 0);
-        ui.checkbox(&mut brush.follow_path, tr("Follow path"));
-    }) {
-        (brush.angle, brush.follow_path) = angle_fields(&defaults);
-    }
-
-    let jitter_fields = |settings: &BrushSettings| (settings.jitter_size, settings.jitter_angle, settings.jitter_flow, settings.jitter_position);
-    if section_with_reset(ui, "sec_jitter", tr("Jitters"), false, jitter_fields(brush) == jitter_fields(&defaults), |ui| {
-        let jitters = [(tr("Size jitter"), &mut brush.jitter_size), (tr("Angle jitter"), &mut brush.jitter_angle), (tr("Flow jitter"), &mut brush.jitter_flow)];
-        for (label, jitter) in jitters {
-            let mut jitter_percent = *jitter * 100.0;
-            if slider(ui, label, &mut jitter_percent, 0.0..=100.0, 0).changed() {
-                *jitter = jitter_percent / 100.0;
-            }
-        }
-
-        let mut position_jitter_percent = brush.jitter_position * 100.0;
-        if slider(ui, tr("Position jitter"), &mut position_jitter_percent, 0.0..=400.0, 0).changed() {
-            brush.jitter_position = position_jitter_percent / 100.0;
-        }
-    }) {
-        (brush.jitter_size, brush.jitter_angle, brush.jitter_flow, brush.jitter_position) = jitter_fields(&defaults);
-    }
-
-    let alignment_fields = |settings: &BrushSettings| (settings.alignment, settings.backface_culling, settings.angle_fade, settings.depth);
-    if section_with_reset(ui, "sec_align", tr("Alignment and culling"), false, alignment_fields(brush) == alignment_fields(&defaults), |ui| {
-        use texturecraft_engine::paint::Alignment;
-        let alignments = [(Alignment::Tangent, tr("Tangent | Wrap")), (Alignment::Camera, tr("Camera"))];
-        let shown = alignments.iter().find(|(alignment, _)| *alignment == brush.alignment).map_or("", |(_, label)| label);
-        combo(ui, tr("Alignment"), shown, |ui| {
-            for (alignment, label) in alignments {
-                ui.selectable_value(&mut brush.alignment, alignment, label);
-            }
-        });
-
-        ui.checkbox(&mut brush.backface_culling, tr("Backface culling"));
-        slider(ui, tr("Angle fade from"), &mut brush.angle_fade.0, 0.0..=90.0, 0);
-        slider(ui, tr("Angle fade to"), &mut brush.angle_fade.1, 0.0..=90.0, 0);
-        slider(ui, tr("Stamp depth"), &mut brush.depth, 0.05..=4.0, 2);
-    }) {
-        (brush.alignment, brush.backface_culling, brush.angle_fade, brush.depth) = alignment_fields(&defaults);
-    }
-
-    if section_with_reset(ui, "sec_particles", tr("Particles"), false, brush.particles == defaults.particles, |ui| {
-        let particles = &mut brush.particles;
-        ui.checkbox(&mut particles.enabled, tr("Particle brush (slides down the surface)"));
-
-        let mut count = particles.count as f32;
-        if slider(ui, tr("Count per stamp"), &mut count, 1.0..=16.0, 0).changed() {
-            particles.count = count as u32;
-        }
-
-        let mut lifetime_steps = particles.lifetime as f32;
-        if slider(ui, tr("Lifetime (steps)"), &mut lifetime_steps, 1.0..=128.0, 0).changed() {
-            particles.lifetime = lifetime_steps as u32;
-        }
-
-        slider(ui, tr("Gravity"), &mut particles.gravity, 0.0..=2.0, 2);
-    }) {
-        brush.particles = defaults.particles;
-    }
-
-    if section_with_reset(ui, "sec_lazy", tr("Lazy mouse"), false, brush.lazy == defaults.lazy, |ui| {
-        slider(ui, tr("Lazy mouse distance"), &mut brush.lazy, 0.0..=200.0, 0);
-    }) {
-        brush.lazy = defaults.lazy;
-    }
-
-    *brush = brush.sanitized();
-}
-
-/// One alpha in the picker: a 52×64 tile with the shape drawn by `paint` and a label.
-fn alpha_tile(ui: &mut Ui, on: bool, label: &str, paint: impl FnOnce(&egui::Painter, Rect)) -> egui::Response {
-    let tk = Tokens::get(ui.ctx());
-    let (rect, resp) = ui.allocate_exact_size(vec2(52.0, 64.0), Sense::click());
-    let p = ui.painter();
-    p.rect_filled(rect, 3.0, tk.viewport);
-    if on {
-        p.rect_stroke(rect, 3.0, Stroke::new(1.0, tk.accent), egui::StrokeKind::Inside);
-    }
-    paint(p, Rect::from_center_size(rect.center() - vec2(0.0, 7.0), vec2(40.0, 40.0)));
-    let name = elided(p, label, 9.5, tk.viewport_text, rect.width() - 4.0);
-    p.galley(rect.center_bottom() - vec2(name.size().x * 0.5, 6.0 + name.size().y * 0.5), name, tk.viewport_text);
-    resp.on_hover_text(label)
-}
-
-fn alpha_section(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let tk = Tokens::get(ui.ctx());
-    ui.horizontal(|ui| {
-        ui.label(caption(tr("Alpha")));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| import_button(app, ui));
-    });
-    let brush = &app.session.tool.brush;
-    let (current, image, hardness) = (brush.alpha, brush.alpha_image.clone(), brush.hardness);
-    let library = if image.is_none() { brush.alpha_library.as_deref().and_then(alphas::find) } else { None };
-    let mut pick = None;
-    let zone = ui.horizontal_wrapped(|ui| {
-        for a in BrushAlpha::ALL {
-            let on = image.is_none() && library.is_none() && current == a;
-            if alpha_tile(ui, on, tr(a.label()), |p, r| crate::thumbs::paint_alpha(p, r, a, hardness)).clicked() {
-                pick = Some(json!(a.label()));
-            }
-        }
-
-        // The library alpha in use (picked from the shelf's Alphas tab)
-        if let Some(a) = library {
-            let tex = app.thumbs.alpha(ui.ctx(), a);
-            alpha_tile(ui, true, &a.label, |p, r| {
-                if let Some(t) = tex {
-                    p.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                }
-            });
-        }
-
-        // Imported images, sampled as grayscale
-        for name in app.session.doc.resources.keys() {
-            let Some(img) = app.session.images.get(name) else { continue };
-            let tex = app.thumbs.image(ui.ctx(), name, img);
-            let on = image.as_deref() == Some(name.as_str());
-            if alpha_tile(ui, on, name, |p, r| {
-                p.image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-            })
-            .clicked()
-            {
-                pick = Some(json!({ "image": name }));
-            }
-        }
-    });
-    if let Some(alpha) = pick {
-        app.run("tool.brush", json!({ "alpha": alpha }));
-    }
-    ui.label(RichText::new(tr("More in Assets > Alphas: click one, or drag it here")).size(10.0).color(tk.text_dim));
-    crate::shelf::drop_target(app, ui, &zone.response, crate::shelf::DropZone::Brush);
-    alpha_parameters(&mut app.session.tool.brush, ui);
-    section(ui, "sec_text", tr("Text"), true, |ui| text_section(app, ui));
-}
-
-/// Hardness and the parameters every alpha shares, under a header whose reset puts them back
-fn alpha_parameters(brush: &mut BrushSettings, ui: &mut Ui) {
-    let defaults = BrushSettings::default();
-    let at_defaults = brush.hardness == defaults.hardness && brush.alpha_params == defaults.alpha_params;
-    let round = brush.alpha == BrushAlpha::Round && brush.alpha_image.is_none() && brush.alpha_library.is_none();
-    let percent_slider = |ui: &mut Ui, label: &str, value: &mut f32, min: f32, max: f32| {
-        let mut percent = *value * 100.0;
-        if slider(ui, label, &mut percent, min..=max, 0).changed() {
-            *value = percent / 100.0;
-        }
-    };
-
-    let reset = section_with_reset(ui, "sec_alpha_params", tr("Parameters"), true, at_defaults, |ui| {
-        percent_slider(ui, tr("Hardness"), &mut brush.hardness, 0.0, 99.9);
-        percent_slider(ui, tr("Size X"), &mut brush.alpha_params.size_x, 5.0, 100.0);
-        percent_slider(ui, tr("Size Y"), &mut brush.alpha_params.size_y, 5.0, 100.0);
-
-        // Only the procedural Round shape has a roundness
-        ui.add_enabled_ui(round, |ui| percent_slider(ui, tr("Roundness"), &mut brush.alpha_params.roundness, 0.0, 100.0));
-        slider(ui, tr("Contrast"), &mut brush.alpha_params.contrast, 1.0..=MAX_ALPHA_CONTRAST, 2);
-        ui.checkbox(&mut brush.alpha_params.invert, tr("Invert"));
-    });
-    if reset {
-        (brush.hardness, brush.alpha_params) = (defaults.hardness, defaults.alpha_params);
-    }
-    *brush = brush.sanitized();
-}
-
-/// Text drawn in a font, as the brush alpha or a decal (`resource.text`).
-fn text_section(app: &mut TextureCraftApp, ui: &mut Ui) {
-    if app.ui.text.fonts.is_empty()
-        && let Some(f) = app.run("text.fonts", Value::Null)
-    {
-        let installed = f["installed"].as_array().into_iter().flatten().map(|v| {
-            let styles = v["styles"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
-            (v["family"].as_str().unwrap_or_default().to_string(), styles)
-        });
-        let built_in = f["builtIn"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|n| (n.to_string(), Vec::new()));
-        app.ui.text.fonts = installed.chain(built_in).collect();
-    }
-    // A decal shows the text in the tool's base color; an alpha must stay white.
-    let color = app.session.tool.values.get(&Channel::BaseColor).copied().unwrap_or([1.0; 3]);
-    let t = &mut app.ui.text;
-    ui.add(egui::TextEdit::multiline(&mut t.text).desired_rows(2).desired_width(f32::INFINITY).hint_text(tr("Text")));
-    let shown = if t.font.is_empty() { tr("Default").to_string() } else { t.font.clone() };
-    combo(ui, tr("Font"), shown, |ui| {
-        if ui.selectable_label(t.font.is_empty(), tr("Default")).clicked() {
-            (t.font, t.style) = (String::new(), String::new());
-        }
-        for (family, _) in &t.fonts {
-            if ui.selectable_label(t.font == *family, family).clicked() {
-                (t.font, t.style) = (family.clone(), String::new());
-            }
-        }
-    });
-    let styles = t.fonts.iter().find(|(f, _)| *f == t.font).map(|(_, s)| s.clone()).unwrap_or_default();
-    if styles.len() > 1 {
-        let shown = if t.style.is_empty() { tr("Default").to_string() } else { t.style.clone() };
-        combo(ui, tr("Style"), shown, |ui| {
-            for s in styles {
-                ui.selectable_value(&mut t.style, s.clone(), s);
-            }
-        });
-    }
-    let mut params = json!({"text": t.text, "font": (!t.font.is_empty()).then_some(&t.font), "style": (!t.style.is_empty()).then_some(&t.style)});
-    let ready = !t.text.trim().is_empty();
-    ui.horizontal_wrapped(|ui| {
-        let alpha = ui.add_enabled(ready, egui::Button::new(tr("Use as brush alpha"))).clicked();
-        let decal = ui.add_enabled(ready, egui::Button::new(tr("Place as decal"))).clicked();
-        if decal {
-            params["color"] = json!(color);
-        }
-        if (alpha || decal)
-            && let Some(name) = app.run("resource.text", params).and_then(|r| r["name"].as_str().map(str::to_string))
-        {
-            match alpha {
-                true => app.run("tool.brush", json!({"alpha": {"image": name}})),
-                false => app.run("layer.add.decal", json!({"image": name})),
-            };
-        }
-    });
-}
-
 /// Tooltip of the material channel chips.
 pub(crate) const SOLO_HINT: &str = "Click: turn this channel on or off. Alt+click: this channel only";
-
-/// The tool's material under a "Material" heading
-fn material_section(app: &mut TextureCraftApp, ui: &mut Ui) {
-    ui.label(caption(tr("Material")));
-    material_controls(app, ui);
-}
 
 /// Space between the tool's channel chips and the first channel value
 const CHIPS_GAP: f32 = 4.0;
@@ -2719,8 +2359,7 @@ const CHIPS_GAP: f32 = 4.0;
 /// Room right of the tool's colour swatch, like a linked material's
 const TOOL_SWATCH_RIGHT_MARGIN: f32 = LINK_SWATCH_RIGHT_MARGIN;
 
-/// One chip per channel of the texture set, on while the tool's material has it enabled; returns the channels.
-/// The Material tab and the Smudge panel both draw these, so they share one set of flags.
+/// One chip per channel of the texture set, on while the tool's material has it enabled (the flags the Material section's pills show); returns the channels
 fn material_channel_chips(app: &mut TextureCraftApp, ui: &mut Ui) -> Vec<Channel> {
     let channels = app.session.doc.project.texture_set(app.session.ts()).map(|set| set.channel_list()).unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
@@ -2735,7 +2374,7 @@ fn material_channel_chips(app: &mut TextureCraftApp, ui: &mut Ui) -> Vec<Channel
     channels
 }
 
-/// The tool's material: channel chips, then each enabled channel's value
+/// Polygon fill's material: channel chips, then each enabled channel's value
 fn material_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
     use texturecraft_engine::core::ChannelKind;
 
@@ -2775,10 +2414,6 @@ fn material_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
                 }
             }
         }
-    }
-
-    if app.session.tool.tool == Tool::Eraser {
-        ui.label(RichText::new(tr("The eraser removes paint from the enabled channels.")).color(tokens.text_dim));
     }
 }
 
@@ -3229,42 +2864,46 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effe
             });
         }
         EffectKind::Anchor => crate::anchor_properties::anchor_properties(app, ui, effect_id, &effect.name),
-        EffectKind::Paint => legacy_body(ui, |ui| {
-            let hint = if layer.content_effects.iter().any(|content| content.id == effect_id) {
-                tr("Paint on the mesh to edit the layer content.")
-            } else {
-                tr("Paint on the mesh to edit this mask.")
-            };
-            ui.label(RichText::new(hint).color(tokens.text_dim));
+        EffectKind::Paint => {
+            legacy_body(ui, |ui| {
+                let hint = if layer.content_effects.iter().any(|content| content.id == effect_id) {
+                    tr("Paint on the mesh to edit the layer content.")
+                } else {
+                    tr("Paint on the mesh to edit this mask.")
+                };
+                ui.label(RichText::new(hint).color(tokens.text_dim));
+            });
             if app.session.tool_usable(app.session.tool.tool) {
                 tool_properties(app, ui);
             }
-        }),
-        EffectKind::Path(paths) => legacy_body(ui, |ui| {
-            ui.label(
+        }
+        EffectKind::Path(paths) => {
+            legacy_body(ui, |ui| {
+                ui.label(
                 RichText::new(tr("Paths stay editable: pick one to move its points or change its brush and material, and the sublayer repaints at once. Add paths with the Path tool."))
                     .color(tokens.text_dim),
             );
-            let editing = app.session.tool.path.editing;
-            for index in 0..paths.len() {
-                ui.horizontal(|ui| {
-                    let selected = editing == Some((effect_id, index));
-                    if ui.selectable_label(selected, format!("{} {}", tr("Path"), index + 1)).on_hover_text(tr("Edit")).clicked() {
-                        if selected {
-                            app.run("tool.path", json!({"clear": true}));
-                        } else {
-                            app.run("path.edit", json!({"effect": id, "index": index}));
+                let editing = app.session.tool.path.editing;
+                for index in 0..paths.len() {
+                    ui.horizontal(|ui| {
+                        let selected = editing == Some((effect_id, index));
+                        if ui.selectable_label(selected, format!("{} {}", tr("Path"), index + 1)).on_hover_text(tr("Edit")).clicked() {
+                            if selected {
+                                app.run("tool.path", json!({"clear": true}));
+                            } else {
+                                app.run("path.edit", json!({"effect": id, "index": index}));
+                            }
                         }
-                    }
-                    if icon_button(ui, ic::TRASH, tr("Remove"), false, ICON_BUTTON_SIZE).clicked() {
-                        app.run("path.remove", json!({"effect": id, "index": index}));
-                    }
-                });
-            }
+                        if icon_button(ui, ic::TRASH, tr("Remove"), false, ICON_BUTTON_SIZE).clicked() {
+                            app.run("path.remove", json!({"effect": id, "index": index}));
+                        }
+                    });
+                }
+            });
             if app.session.tool_usable(app.session.tool.tool) {
                 tool_properties(app, ui);
             }
-        }),
+        }
         EffectKind::Filter(filter) => crate::filter_properties::filter_properties(app, ui, effect_id, filter),
         EffectKind::ColorSelection(selection) => crate::color_selection_editor::color_selection_properties(app, ui, effect_id, selection),
         EffectKind::Compare { op, value, tolerance, left, right, channel, hardness } => {

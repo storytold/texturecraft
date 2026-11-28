@@ -7,7 +7,6 @@ use serde_json::json;
 use texturecraft_engine::core::LayerId;
 use texturecraft_engine::execute;
 use texturecraft_ui_egui::TextureCraftApp;
-use texturecraft_ui_egui::state::PropsTab;
 
 use crate::{BAKE_RESOLUTION, DRAG_STEP_FRAMES, FRAME_SECONDS, PROPERTIES_WINDOW, SETTLE_FRAMES, SLIDER_END_INSET, STARTUP_FRAMES, TEXTURE_RESOLUTION};
 
@@ -32,8 +31,9 @@ fn folder_mask_harness() -> (Harness<'static, TextureCraftApp>, String) {
         .with_context_setup(texturecraft_ui_egui::framework::install_headless)
         .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
-    harness.state_mut().ui.props_tab = PropsTab::Material;
     harness.run_steps(STARTUP_FRAMES);
+    harness.get_by_role_and_label(Role::Tab, "Grayscale").click();
+    harness.run_steps(SETTLE_FRAMES);
     (harness, image)
 }
 

@@ -9,7 +9,7 @@ use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::properties_popup::{self, PropertiesPopup};
 use texturecraft_ui_egui::state::{Mode, ViewLayout};
 
-use crate::{BAKE_RESOLUTION, DRAG_STEP_FRAMES, SETTLE_FRAMES, STARTUP_FRAMES, TEXTURE_RESOLUTION};
+use crate::{BAKE_RESOLUTION, DRAG_STEP_FRAMES, SETTLE_FRAMES, SLIDER_END_INSET, STARTUP_FRAMES, TEXTURE_RESOLUTION};
 
 /// A common laptop window
 const WINDOW_SIZE: egui::Vec2 = egui::vec2(1600.0, 960.0);
@@ -34,6 +34,9 @@ const SCROLL_FRAMES: usize = 25;
 
 /// How far left of the popup a click lands on the model
 const MODEL_LEFT_OF_POPUP: f32 = 60.0;
+
+/// How far in from the popup's right edge a slider drag ends, still over the slider's band
+const DROP_LEFT_OF_POPUP_EDGE: f32 = 30.0;
 
 fn harness() -> Harness<'static, TextureCraftApp> {
     harness_sized(WINDOW_SIZE)
@@ -156,21 +159,23 @@ fn dragging_its_size_slider_changes_the_brush() {
     click(&mut harness, PointerButton::Secondary, center);
     let popup = harness.ctx.memory(|memory| memory.area_rect(properties_popup::area_id())).unwrap();
 
-    // The Size section's header sits above its slider of the same name
-    let slider_label = harness
-        .query_all_by_label("Size")
+    // The Size band holds a slider of the same name, its track right of the label
+    let slider = harness
+        .query_all_by_role(egui::Role::Slider)
+        .filter(|node| node.accesskit_node().label().as_deref() == Some("Size"))
         .map(|node| node.rect())
-        .filter(|rect| popup.contains_rect(*rect))
-        .max_by(|first, second| first.top().total_cmp(&second.top()))
+        .find(|rect| popup.contains_rect(*rect))
         .unwrap();
-    let track_y = slider_label.bottom() + 10.0;
+    let track_y = slider.center().y;
     let size = harness.state().session.tool.brush.size;
-    harness.drag_at(egui::pos2(slider_label.left() + 20.0, track_y));
-    harness.run_steps(2);
-    harness.hover_at(egui::pos2(popup.right() - 30.0, track_y));
-    harness.run_steps(2);
-    harness.drop_at(egui::pos2(popup.right() - 30.0, track_y));
-    harness.run_steps(3);
+    let drop = egui::pos2(popup.right() - DROP_LEFT_OF_POPUP_EDGE, track_y);
+    harness.drag_at(egui::pos2(slider.left() + SLIDER_END_INSET, track_y));
+    harness.run_steps(DRAG_STEP_FRAMES);
+    harness.hover_at(drop);
+    harness.run_steps(DRAG_STEP_FRAMES);
+    harness.drop_at(drop);
+    harness.run_steps(SETTLE_FRAMES);
+
     assert!(harness.state().session.tool.brush.size > size, "{size} -> {}", harness.state().session.tool.brush.size);
     assert!(is_open(&harness), "editing it keeps it open");
 }
@@ -194,7 +199,28 @@ fn it_shows_what_the_properties_panel_shows() {
     let popup = harness.ctx.memory(|memory| memory.area_rect(properties_popup::area_id())).unwrap();
     let in_popup = |label: &str| harness.query_all_by_label(label).any(|node| popup.contains_rect(node.rect()));
     assert!(in_popup("UV projection"), "a selected fill shows its fill settings");
-    assert!(!in_popup("Minimum size (%)"), "not the brush's");
+    assert!(!in_popup("Minimum Size (%)"), "not the brush's");
+}
+
+#[test]
+fn its_brush_pictures_and_the_docked_panels_keep_their_own_textures() {
+    let mut harness = harness();
+    let center = view_center(&harness);
+    click(&mut harness, PointerButton::Secondary, center);
+
+    assert!(is_open(&harness));
+
+    let previews = |harness: &Harness<'_, TextureCraftApp>| {
+        let mut ids: Vec<_> =
+            harness.ctx.tex_manager().read().allocated().filter(|(_, texture)| texture.name == "brush_stroke_preview").map(|(id, _)| *id).collect();
+        ids.sort_unstable_by_key(|id| format!("{id:?}"));
+        ids
+    };
+    let before = previews(&harness);
+    harness.run_steps(SETTLE_FRAMES);
+
+    assert_eq!(before.len(), 2, "one stroke preview for the docked panel and one for the popup");
+    assert_eq!(previews(&harness), before, "neither is drawn again while the brush stays the same");
 }
 
 /// Whether the jump tab `name` inside `area` is the lit one

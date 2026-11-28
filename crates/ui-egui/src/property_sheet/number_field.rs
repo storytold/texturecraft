@@ -8,7 +8,7 @@ use crate::theme::semibold;
 const FIELD_GAP: f32 = 4.0;
 
 /// Room kept at the row's end for the link button, on every row of a group that has one
-const LINK_SLOT: f32 = 26.0;
+pub(super) const LINK_SLOT: f32 = 26.0;
 
 /// Size of the link button
 pub(super) const LINK_SIZE: f32 = 18.0;

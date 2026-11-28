@@ -43,10 +43,20 @@ pub(crate) fn remove(previews: &mut Vec<ShelfCustomPreview>, entry: &ShelfEntry)
 
 /// The largest centred square of `image`, scaled to [`CUSTOM_PREVIEW_PX`] (smaller images keep their size)
 pub(crate) fn square(image: &image::DynamicImage) -> image::RgbaImage {
+    use image::{DynamicImage, GenericImageView, imageops};
+
     let side = image.width().min(image.height());
-    let cropped = image.crop_imm((image.width() - side) / 2, (image.height() - side) / 2, side, side);
+    let left = (image.width() - side) / 2;
+    let top = (image.height() - side) / 2;
     let size = side.min(CUSTOM_PREVIEW_PX);
-    cropped.resize_exact(size, size, image::imageops::FilterType::Triangle).to_rgba8()
+    let filter = imageops::FilterType::Triangle;
+
+    // Sample common thumbnail formats directly from the decoded pixels
+    match image {
+        DynamicImage::ImageRgba8(pixels) => imageops::resize(&*pixels.view(left, top, side, side), size, size, filter),
+        DynamicImage::ImageRgb8(pixels) => DynamicImage::ImageRgb8(imageops::resize(&*pixels.view(left, top, side, side), size, size, filter)).into_rgba8(),
+        other => other.crop_imm(left, top, side, side).resize_exact(size, size, filter).into_rgba8(),
+    }
 }
 
 #[cfg(test)]

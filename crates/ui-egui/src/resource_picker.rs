@@ -395,7 +395,7 @@ fn tile_ui<K>(ui: &mut Ui, thumbs: &mut Thumbs, rect: Rect, (place, item): (usiz
         TilePicture::Image(name, image) => Some(thumbs.image(ui.ctx(), name, image)),
         TilePicture::Procedural(kind) => thumbs.procedural(ui.ctx(), *kind),
         TilePicture::Generator(kind) => thumbs.generator(ui.ctx(), *kind),
-        TilePicture::Swatch(_) | TilePicture::Glyph(_) | TilePicture::Import => None,
+        TilePicture::Shape(..) | TilePicture::Swatch(_) | TilePicture::Glyph(_) | TilePicture::Import => None,
     };
 
     match (&item.picture, texture) {
@@ -418,6 +418,10 @@ fn tile_ui<K>(ui: &mut Ui, thumbs: &mut Thumbs, rect: Rect, (place, item): (usiz
                 FontId::proportional(LOADING_GLYPH_SIZE),
                 tokens.text_dim.gamma_multiply(LOADING_GLYPH_OPACITY),
             );
+        }
+        (TilePicture::Shape(alpha, hardness), None) => {
+            painter.rect_filled(picture, rounding, Color32::BLACK);
+            crate::thumbs::paint_alpha(painter, picture, *alpha, *hardness);
         }
         (TilePicture::Swatch(color), None) => {
             painter.rect_filled(picture, rounding, *color);

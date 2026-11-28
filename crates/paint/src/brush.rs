@@ -296,6 +296,9 @@ pub struct BrushSettings {
     pub size: f32,
     /// Pen pressure may shrink the size down to this fraction.
     pub min_size: f32,
+    /// Pen pressure shrinks the size towards `min_size`; on for projects saved before it could be turned off
+    #[serde(default = "pressure_on")]
+    pub size_pressure: bool,
     /// Per-stamp alpha 0..1.
     pub flow: f32,
     /// Caps a whole stroke 0..1.
@@ -343,6 +346,7 @@ impl Default for BrushSettings {
         BrushSettings {
             size: 0.02,
             min_size: 0.05,
+            size_pressure: true,
             flow: 1.0,
             opacity: 1.0,
             spacing: 0.1,
@@ -370,11 +374,15 @@ impl Default for BrushSettings {
 }
 
 impl BrushSettings {
-    /// Radius of a 2D (UV) stamp as a fraction of the UV square, for pen `pressure` 0..1: twice the
-    /// brush size, shrunk towards `min_size` by a light pen. Painting and the 2D cursor share it.
+    /// Radius of a 2D (UV) stamp as a fraction of the UV square at pen `pressure` 0..1: twice the brush size, shrunk towards `min_size` by a light pen (shared by painting and the 2D cursor)
     pub fn uv_stamp_radius(&self, pressure: f32) -> f32 {
-        let p = pressure.clamp(0.0, 1.0);
-        self.size * 2.0 * if p < 1.0 { self.min_size + (1.0 - self.min_size) * p } else { 1.0 }
+        self.size * 2.0 * self.pressure_size(pressure)
+    }
+
+    /// The fraction of the size a stamp gets at pen `pressure` 0..1: full when size pressure is off
+    pub fn pressure_size(&self, pressure: f32) -> f32 {
+        let pressure = pressure.clamp(0.0, 1.0);
+        if self.size_pressure && pressure < 1.0 { self.min_size + (1.0 - self.min_size) * pressure } else { 1.0 }
     }
 
     /// Clamp every value into its valid range (input from UI, CLI or agents)
@@ -415,8 +423,31 @@ impl BrushSettings {
     }
 }
 
+fn pressure_on() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn size_pressure_off_keeps_a_light_pen_at_full_size() {
+        let pressed = BrushSettings { size: 0.1, min_size: 0.2, ..BrushSettings::default() };
+        let mouse = BrushSettings { size_pressure: false, ..pressed.clone() };
+
+        assert!(pressed.uv_stamp_radius(0.3) < mouse.uv_stamp_radius(0.3));
+        assert_eq!(mouse.uv_stamp_radius(0.3), mouse.uv_stamp_radius(1.0));
+    }
+
+    #[test]
+    fn settings_saved_before_the_size_pressure_switch_keep_pen_pressure() {
+        let mut saved = serde_json::to_value(BrushSettings { size_pressure: false, ..BrushSettings::default() }).unwrap();
+        saved.as_object_mut().unwrap().remove("size_pressure");
+
+        let loaded: BrushSettings = serde_json::from_value(saved).unwrap();
+
+        assert!(loaded.size_pressure);
+    }
+
     #[test]
     fn uv_stamp_radius_follows_pen_pressure() {
         let b = BrushSettings { size: 0.1, min_size: 0.5, ..BrushSettings::default() };

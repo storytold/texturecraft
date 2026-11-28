@@ -79,6 +79,7 @@ fn read_inside(dir: &std::path::Path, rel: &str) -> Option<Vec<u8>> {
     if !file.starts_with(&root) {
         return None;
     }
+
     crate::read_capped(&file, MAX_MESH_FILE_BYTES).ok()
 }
 
@@ -178,20 +179,22 @@ mod tests {
             assert_eq!(read_inside(&dir, "tex/missing.png"), None);
             assert!(link_dir(&dir.join("out"), &outside), "this system would not make a link");
             assert_eq!(read_inside(&dir, "out/key.txt"), None, "through a link to another folder");
-            // A link that stays inside the folder is an ordinary shortcut and still works.
+
             assert!(link_dir(&dir.join("shortcut"), &dir.join("tex")), "this system would not make a link");
             assert_eq!(read_inside(&dir, "shortcut/a.png").as_deref(), Some(&b"inside"[..]), "through a link to a folder inside");
-            // A link to a single outside file (Unix symbolic links; Windows file links need privileges).
+
+            // Windows file links can require privileges
             #[cfg(unix)]
             {
                 std::os::unix::fs::symlink(outside.join("key.txt"), dir.join("tex/key.png")).unwrap();
                 assert_eq!(read_inside(&dir, "tex/key.png"), None, "through a link to an outside file");
             }
-            // The mesh's own folder reached through a link is fine: both sides are resolved.
+
+            // Resolve the mesh folder and the linked target before comparing them
             assert!(link_dir(&base.join("alias"), &dir), "this system would not make a link");
             assert_eq!(read_inside(&base.join("alias"), "tex/a.png").as_deref(), Some(&b"inside"[..]), "folder given through a link");
 
-            // The same through read_mesh_file: the outside bytes must not end up in the glTF.
+            // Check the bytes embedded in the exported mesh
             std::fs::write(
                 dir.join("m.gltf"),
                 br#"{"asset": {"version": "2.0"}, "buffers": [{"uri": "out/key.txt", "byteLength": 7}, {"uri": "tex/a.png", "byteLength": 6}]}"#,

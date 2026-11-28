@@ -801,6 +801,7 @@ fn assets_pass_two_snapshots() {
             .with_pixels_per_point(1.0)
             // The system draws the pointer, not the app
             .with_render_cursor(false)
+            .with_context_setup(texturecraft_ui_egui::framework::install_headless)
             .wgpu()
             .build_eframe(|context| TextureCraftApp::new(context, session));
         let app = harness.state_mut();
@@ -822,6 +823,7 @@ fn assets_pass_two_snapshots() {
             if MATERIALS.iter().filter(|material| material.smart).all(|material| thumbnails.material(&context, material.id).is_some()) {
                 break;
             }
+
             assert!(started.elapsed() < std::time::Duration::from_secs(120), "smart material thumbnails did not arrive");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -864,6 +866,7 @@ fn assets_pass_two_snapshots() {
         // 05: the drag ghost over the layer stack (takes a material) and over Properties (doesn't)
         let viewport_right = harness.state().viewport_rect.max.x;
         let layer = harness.get_all_by_role(Role::ListItem).find(|row| row.rect().min.x > viewport_right).expect("a layer row").rect().center();
+
         // Properties fills the right column under the layer stack, in the window's lower part
         let properties = egui::pos2(layer.x, harness.ctx.content_rect().height() * PROPERTIES_HEIGHT_SHARE);
         let tile = harness.get_all_by_label("Gold Dirty").next().unwrap().rect().center();
@@ -2404,7 +2407,8 @@ fn folder_mask_snapshots() {
         .with_context_setup(texturecraft_ui_egui::framework::install_headless)
         .build_eframe(|cc| TextureCraftApp::new(cc, session));
     harness.state_mut().ui.prefs.language = "en".into();
-    harness.state_mut().ui.props_tab = texturecraft_ui_egui::state::PropsTab::Material;
+    harness.run_steps(6);
+    harness.get_by_role_and_label(egui::Role::Tab, "Grayscale").click();
     harness.run_steps(6);
     save(&mut harness, &output_dir, "foldermask-white");
     if std::env::var_os("TC_UI_THEMES").is_some() {
@@ -3444,6 +3448,188 @@ fn sheet_scroll_end_snapshots() {
     }
     harness.run_steps(30);
     save(&mut harness, &output_dir, "sheet-end-scrolled-medium");
+}
+
+/// The paint tool's Properties: the Brush tab with every section open and scrolled down, its presets, pen button and Alignment list mid-use, the Alpha tab with its picker open, the Material tab with a pill hovered, a stencil on the Projection tool, a mask's Grayscale tab, the right-click popup, and the Clone and Eraser tools' tabs; `TC_UI_THEMES` set adds the dark and light themes
+#[test]
+#[ignore]
+fn paint_tool_properties_snapshots() {
+    use egui::{Event, Modifiers, PointerButton};
+    use serde_json::json;
+    use texturecraft_engine::core::Channel;
+    use texturecraft_engine::execute;
+    use texturecraft_engine::paint::{BrushAlpha, BrushSettings};
+
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
+    let stripes = image::RgbaImage::from_fn(64, 64, |x, _| {
+        let value = if (x / 8) % 2 == 0 { 230 } else { 40 };
+        image::Rgba([value, value, value, 255])
+    });
+    let mut bytes = Vec::new();
+    stripes.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+    let image = session.import_resource_bytes("stripes.png", bytes).unwrap();
+    execute(&mut session, "tool.select", &json!({"tool": "paint"})).unwrap();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1400.0))
+        .with_pixels_per_point(2.0)
+        .wgpu()
+        .with_context_setup(texturecraft_ui_egui::framework::install_headless)
+        .build_eframe(|cc| TextureCraftApp::new(cc, session));
+    harness.state_mut().ui.prefs.language = "en".into();
+    harness.set_render_cursor(false);
+    harness.run_steps(6);
+    save(&mut harness, &output_dir, "paint-brush");
+
+    // The top preview follows the brush and the paint: one picture per brush
+    let default_brush = harness.state().session.tool.brush.clone();
+    let default_values = harness.state().session.tool.values.clone();
+    let brushes = [
+        ("dotted-red", BrushSettings { size: 0.06, hardness: 1.0, spacing: 1.6, ..default_brush.clone() }, [0.8, 0.05, 0.04], 0.0, 0.5),
+        ("soft-blue-metal", BrushSettings { size: 0.12, hardness: 0.0, flow: 0.35, ..default_brush.clone() }, [0.1, 0.3, 0.9], 1.0, 0.2),
+        (
+            "star-jitter-green",
+            BrushSettings {
+                size: 0.08,
+                alpha: BrushAlpha::Star,
+                spacing: 0.9,
+                follow_path: true,
+                jitter_size: 0.5,
+                jitter_angle: 0.3,
+                jitter_position: 0.6,
+                ..default_brush.clone()
+            },
+            [0.1, 0.6, 0.15],
+            0.0,
+            0.8,
+        ),
+    ];
+    for (name, brush, base_color, metallic, roughness) in brushes {
+        let tool = &mut harness.state_mut().session.tool;
+        tool.brush = brush;
+        tool.values.insert(Channel::BaseColor, base_color);
+        tool.values.insert(Channel::Metallic, [metallic; 3]);
+        tool.values.insert(Channel::Roughness, [roughness; 3]);
+        save(&mut harness, &output_dir, &format!("paint-preview-{name}"));
+    }
+    let tool = &mut harness.state_mut().session.tool;
+    tool.brush = default_brush;
+    tool.values = default_values;
+
+    // The top bar has labels of the same names: Properties is the rightmost
+    let in_properties = |harness: &Harness<'_, TextureCraftApp>, label: &str| {
+        harness.get_all_by_label(label).map(|node| node.rect().center()).max_by(|a, b| a.x.total_cmp(&b.x)).unwrap()
+    };
+
+    harness.get_all_by_label("Particles").max_by(|a, b| a.rect().left().total_cmp(&b.rect().left())).unwrap().scroll_to_me();
+    harness.run_steps(3);
+    let at = in_properties(&harness, "Particles");
+    harness.hover_at(at);
+    for pressed in [true, false] {
+        harness.event(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
+        harness.run_steps(2);
+    }
+
+    let themes = std::env::var_os("TC_UI_THEMES").is_some();
+    let shoot = |harness: &mut Harness<'_, TextureCraftApp>, name: &str| {
+        save(harness, &output_dir, name);
+        if themes {
+            for (brightness, theme) in [(Brightness::Dark, "dark"), (Brightness::Light, "light")] {
+                harness.state_mut().ui.prefs.brightness = brightness;
+                save(harness, &output_dir, &format!("{name}-{theme}"));
+            }
+            harness.state_mut().ui.prefs.brightness = Brightness::MediumDark;
+        }
+    };
+    let hover = |harness: &mut Harness<'_, TextureCraftApp>, role: egui::Role, label: &str| {
+        let at = harness.get_by_role_and_label(role, label).rect().center();
+        harness.hover_at(at);
+        harness.run_steps(40);
+    };
+    let open = |harness: &mut Harness<'_, TextureCraftApp>, role: egui::Role, label: &str| {
+        harness.get_by_role_and_label(role, label).scroll_to_me();
+        harness.run_steps(6);
+        harness.get_by_role_and_label(role, label).click();
+        harness.run_steps(6);
+    };
+    let close = |harness: &mut Harness<'_, TextureCraftApp>| {
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(4);
+    };
+    harness.get_by_label_contains("Brush presets").scroll_to_me();
+    harness.run_steps(3);
+    shoot(&mut harness, "paint-brush-open");
+    open(&mut harness, egui::Role::Button, "Brush presets");
+    shoot(&mut harness, "paint-presets-open");
+    close(&mut harness);
+    hover(&mut harness, egui::Role::CheckBox, "Size pen pressure");
+    shoot(&mut harness, "paint-size-pen-hover");
+    harness.get_by_role_and_label(egui::Role::CheckBox, "Size pen pressure").click();
+    harness.run_steps(6);
+    shoot(&mut harness, "paint-size-pen-off");
+    harness.get_by_role_and_label(egui::Role::CheckBox, "Size pen pressure").click();
+    harness.run_steps(4);
+    open(&mut harness, egui::Role::ComboBox, "Tangent | Wrap");
+    shoot(&mut harness, "paint-alignment-open");
+    close(&mut harness);
+    harness.get_all_by_label("Particles").max_by(|a, b| a.rect().left().total_cmp(&b.rect().left())).unwrap().scroll_to_me();
+    harness.run_steps(6);
+    shoot(&mut harness, "paint-brush-scrolled");
+
+    let tab = |harness: &mut Harness<'_, TextureCraftApp>, tab: &str, name: &str| {
+        harness.run_steps(2);
+        harness.get_by_role_and_label(egui::Role::Tab, tab).click();
+        harness.run_steps(6);
+        shoot(harness, name);
+    };
+    tab(&mut harness, "Brush", "paint-brush-top");
+    tab(&mut harness, "Alpha", "paint-alpha");
+    open(&mut harness, egui::Role::ComboBox, "Round");
+    let star =
+        harness.query_all_by_role_and_label(egui::Role::ListBoxOption, "Star").map(|node| node.rect()).min_by(|a, b| a.top().total_cmp(&b.top())).unwrap();
+    harness.hover_at(star.center());
+    harness.run_steps(6);
+    shoot(&mut harness, "paint-alpha-picker");
+    close(&mut harness);
+    tab(&mut harness, "Material", "paint-material");
+    hover(&mut harness, egui::Role::CheckBox, "Height");
+    shoot(&mut harness, "paint-material-pill-hover");
+
+    execute(&mut harness.state_mut().session, "tool.select", &json!({"tool": "eraser"})).unwrap();
+    tab(&mut harness, "Material", "eraser-material");
+    execute(&mut harness.state_mut().session, "tool.select", &json!({"tool": "clone"})).unwrap();
+    tab(&mut harness, "Brush", "clone-brush");
+    execute(&mut harness.state_mut().session, "tool.select", &json!({"tool": "projection"})).unwrap();
+    execute(&mut harness.state_mut().session, "tool.stencil", &json!({"image": image})).unwrap();
+    tab(&mut harness, "Stencil", "projection-stencil");
+    execute(&mut harness.state_mut().session, "tool.stencil", &json!({"rotation": 15.0, "center": [0.1, -0.05]})).unwrap();
+    harness.run_steps(3);
+    harness.get_by_role_and_label(egui::Role::ComboBox, "No Tiling").click();
+    harness.run_steps(4);
+    shoot(&mut harness, "projection-stencil-tiling-open");
+    harness.get_by_label("H and V Tiling").click();
+    harness.run_steps(4);
+    save(&mut harness, &output_dir, "projection-stencil-tiled");
+    execute(&mut harness.state_mut().session, "tool.stencil", &json!({"clear": true})).unwrap();
+
+    execute(&mut harness.state_mut().session, "tool.select", &json!({"tool": "paint"})).unwrap();
+    let layer = harness.state().session.selected_layer().map(|id| id.0);
+    execute(&mut harness.state_mut().session, "mask.add.black", &json!({"layer": layer})).unwrap();
+    execute(&mut harness.state_mut().session, "layer.select", &json!({"layer": layer, "target": "mask"})).unwrap();
+    tab(&mut harness, "Grayscale", "mask-grayscale");
+    execute(&mut harness.state_mut().session, "layer.select", &json!({"layer": layer, "target": "content"})).unwrap();
+
+    harness.get_by_role_and_label(egui::Role::Tab, "Brush").click();
+    harness.run_steps(4);
+    let at = harness.state().viewport_rect.center() - egui::vec2(150.0, 250.0);
+    harness.hover_at(at);
+    for pressed in [true, false] {
+        harness.event(Event::PointerButton { pos: at, button: PointerButton::Secondary, pressed, modifiers: Modifiers::NONE });
+        harness.run_steps(2);
+    }
+    harness.run_steps(6);
+    shoot(&mut harness, "paint-popup");
 }
 
 /// The Export textures window on each tab at its mocks' size; TC_SNAPSHOT_THEME=medium (default), dark or light

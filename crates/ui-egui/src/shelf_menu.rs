@@ -222,6 +222,7 @@ fn custom_preview_rows(app: &mut TextureCraftApp, ui: &mut Ui, width: f32, entry
         && row(ui, width, tr("Remove custom preview"), true, tokens).clicked()
     {
         crate::shelf_custom_preview::remove(&mut app.ui.shelf_custom_previews, entry);
+        app.thumbs.retain_custom_previews(&app.ui.shelf_custom_previews);
         ui.close();
     }
 }
@@ -243,6 +244,7 @@ fn pick_custom_preview(app: &mut TextureCraftApp, entry: &ShelfEntry) {
 
         app.thumbs.forget_custom_preview(&file);
         crate::shelf_custom_preview::set(&mut app.ui.shelf_custom_previews, kind, id, file);
+        app.thumbs.retain_custom_previews(&app.ui.shelf_custom_previews);
     });
 }
 

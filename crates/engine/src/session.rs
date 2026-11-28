@@ -110,6 +110,12 @@ pub enum Tool {
 impl Tool {
     pub const ALL: [Tool; 9] =
         [Tool::Paint, Tool::Eraser, Tool::Projection, Tool::PolygonFill, Tool::Smudge, Tool::Clone, Tool::ColorPicker, Tool::Path, Tool::GeometryMask];
+
+    /// The brush tools whose strokes the stencil shapes
+    pub fn uses_stencil(self) -> bool {
+        matches!(self, Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Smudge | Tool::Clone)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Tool::Paint => "Paint",
@@ -181,7 +187,7 @@ impl ViewMode {
     }
 }
 
-/// A screen-pinned image for the Projection tool (a stencil).
+/// A screen-pinned image the brush tools paint through (a stencil)
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StencilState {
     /// Image resource name.
@@ -252,7 +258,7 @@ pub struct ToolState {
     /// Polygon fill boxes in the 3D view select only the polygons the camera sees
     #[serde(default = "default_fill_visible_only")]
     pub fill_visible_only: bool,
-    /// Stencil used by the Projection tool.
+    /// Stencil the brush tools paint through (the Projection tool paints its colors)
     #[serde(default)]
     pub stencil: Option<StencilState>,
     /// Placement the next stencil starts with: the last stencil's, kept when the stencil is
@@ -364,10 +370,12 @@ pub(crate) struct ActiveStroke {
     /// What a mask stroke paints, resolved once so staging, preview and commit read one image
     pub mask_gray: texturecraft_compose::MaskGray,
     pub erase: bool,
-    /// Projection tool: the stencil captured with the stroke's camera.
+    /// The stencil captured with the stroke's camera.
     pub stencil: Option<texturecraft_compose::Stencil>,
     /// History snapshot taken when the stroke began.
     pub before: Document,
+    /// Document revision before any edits made during the stroke.
+    pub start_revision: u64,
     pub label: String,
     /// The commit's destination tiles, copied as the stroke reaches them.
     pub staging: texturecraft_paint::Staging,
@@ -1040,13 +1048,17 @@ impl Session {
         self.invalidate_changed(other);
 
         // An undone add or duplicate takes the selected effect away
-        if let StackTarget::Effect(e) = self.target
-            && self.doc.project.effect(e).is_none()
+        if let StackTarget::Effect(effect_id) = self.target
+            && self.doc.project.effect(effect_id).is_none()
         {
-            let p = &other.project;
-            let content = p.effect(e).and_then(|(owner, _)| p.layers.get(&owner)).is_some_and(|l| l.content_effects.iter().any(|x| x.id == e));
+            let previous_project = &other.project;
+            let content = previous_project
+                .effect(effect_id)
+                .and_then(|(owner, _)| previous_project.layers.get(&owner))
+                .is_some_and(|layer| layer.content_effects.iter().any(|effect| effect.id == effect_id));
             self.target = if content { StackTarget::Content } else { StackTarget::Mask };
         }
+
         let has_mask = self.selected_layer().and_then(|lid| self.doc.project.layer(self.doc.project.mask_owner(lid)).ok()).is_some_and(|l| l.mask.is_some());
         if self.target == StackTarget::Mask && !has_mask {
             self.target = StackTarget::Content;

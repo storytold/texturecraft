@@ -143,16 +143,16 @@ fn a_map_override_sets_its_own_file_type_and_marks_the_set() {
     let rows = plan(&mut h).len();
     h.get_all_by_label_contains("Enable override for ").nth(4).unwrap().click();
     h.run_steps(4);
-    let m = maps(&h);
-    let (_, first) = m.iter().next().unwrap();
+    let map_overrides = maps(&h);
+    let (_, first) = map_overrides.iter().next().unwrap();
 
-    assert!(first.file_type.is_some(), "{m:?}");
+    assert!(first.file_type.is_some(), "{map_overrides:?}");
     assert!(h.query_by_label("*").is_some(), "the set is marked");
 
     click(&mut h, "Output maps menu");
     click(&mut h, "Override every item");
 
-    assert_eq!(maps(&h).values().filter(|m| m.file_type.is_some()).count(), rows);
+    assert_eq!(maps(&h).values().filter(|map_overrides| map_overrides.file_type.is_some()).count(), rows);
     click(&mut h, "Output maps menu");
     click(&mut h, "Clear all overrides");
 
@@ -165,12 +165,12 @@ fn export_writes_a_map_with_its_own_file_type() {
     let first = plan(&mut h)[0]["map"].as_u64().unwrap() as usize;
     let dir = TempDir::new("export-map-overrides");
     let template = h.state().ui.export.preset.clone();
-    let mut o = SetExport { maps_template: template, ..SetExport::default() };
-    o.maps.insert(first, MapExport { enabled: true, file_type: Some(FileType { format: "targa".into(), bit_depth: 8, dithering: false }), size: None });
-    let e = &mut h.state_mut().ui.export;
-    e.dir = dir.display().to_string();
-    e.sets.insert(0, o);
-    e.skip = (1..32).collect();
+    let mut overrides = SetExport { maps_template: template, ..SetExport::default() };
+    overrides.maps.insert(first, MapExport { enabled: true, file_type: Some(FileType { format: "targa".into(), bit_depth: 8, dithering: false }), size: None });
+    let export = &mut h.state_mut().ui.export;
+    export.dir = dir.display().to_string();
+    export.sets.insert(0, overrides);
+    export.skip = (1..32).collect();
     h.run_steps(3);
     click(&mut h, "Export");
 
@@ -193,9 +193,9 @@ fn a_map_the_template_no_longer_has_is_ignored() {
     let mut h = harness();
     let before = selected(&h);
     let template = h.state().ui.export.preset.clone();
-    let mut o = SetExport { maps_template: template, ..SetExport::default() };
-    o.maps.insert(999, MapExport { enabled: false, file_type: None, size: None });
-    h.state_mut().ui.export.sets.insert(0, o);
+    let mut overrides = SetExport { maps_template: template, ..SetExport::default() };
+    overrides.maps.insert(999, MapExport { enabled: false, file_type: None, size: None });
+    h.state_mut().ui.export.sets.insert(0, overrides);
     h.run_steps(3);
 
     assert_eq!(selected(&h), before, "the export still plans every file");
@@ -285,11 +285,13 @@ fn rows_with_a_one_depth_file_type_each_have_their_own_bit_depth_list() {
     let mut h = harness();
     let rows: Vec<usize> = plan(&mut h).iter().take(2).map(|file| file["map"].as_u64().unwrap() as usize).collect();
     let template = h.state().ui.export.preset.clone();
-    let mut o = SetExport { maps_template: template, ..SetExport::default() };
+    let mut overrides = SetExport { maps_template: template, ..SetExport::default() };
     for map in &rows {
-        o.maps.insert(*map, MapExport { enabled: true, file_type: Some(FileType { format: "hdr".into(), bit_depth: 32, dithering: false }), size: None });
+        overrides
+            .maps
+            .insert(*map, MapExport { enabled: true, file_type: Some(FileType { format: "hdr".into(), bit_depth: 32, dithering: false }), size: None });
     }
-    h.state_mut().ui.export.sets.insert(0, o);
+    h.state_mut().ui.export.sets.insert(0, overrides);
     h.run_steps(4);
 
     let greyed: Vec<_> =

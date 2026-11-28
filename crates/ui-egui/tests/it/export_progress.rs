@@ -50,6 +50,7 @@ fn export_shows_progress_logs_the_steps_and_keeps_the_window_open() {
     click(&mut h, "Export");
     assert_eq!(h.state().ui.export.tab, 2, "Export switches to LIST OF EXPORTS");
     h.run_steps(1);
+
     assert!(h.query_by_label("Cancel Export").is_some());
     assert_eq!(h.get_by_role(egui::Role::ProgressIndicator).accesskit_node().live(), egui::accesskit::Live::Polite);
     assert!(h.query_by_label("Cancel").is_none(), "the progress bar replaces the buttons");
@@ -63,6 +64,7 @@ fn export_shows_progress_logs_the_steps_and_keeps_the_window_open() {
         h.run_steps(1);
     }
     h.run_steps(2);
+
     assert!(h.state().ui.windows.export, "the window stays open");
     assert!(h.query_by_label("Cancel").is_some() && h.query_by_label("Cancel Export").is_none());
     let lines = console(&h);
@@ -176,6 +178,7 @@ fn long_filenames_leave_the_export_details_reachable_by_scrolling() {
     assert!(!bits_fit(&h), "the bit-depth column starts beyond the viewport");
     h.get_by_role_and_label(egui::Role::DisclosureTriangle, &name).focus();
     h.run_steps(3);
+
     assert!(h.get_by_role_and_label(egui::Role::DisclosureTriangle, &name).is_focused());
 
     for _ in 0..12 {
@@ -378,4 +381,31 @@ fn a_texture_set_that_leaves_the_export_leaves_its_count() {
     assert!(job.pending.iter().all(|(ts, _)| *ts != 1));
     assert_eq!(job.total - job.pending.len(), exports(&h), "the bar counts the writes done");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_folded_set_stays_folded_while_a_selection_is_exported() {
+    let (mut harness, _) = harness("folded-selection");
+    let directory = super::temp_dir::TempDir::new("folded-export-selection");
+    harness.state_mut().ui.export.dir = directory.display().to_string();
+    harness.state_mut().ui.export.skip = vec![0];
+    harness.state_mut().ui.export.tab = 2;
+    harness.run_steps(3);
+    let set = harness.state().session.doc.project.texture_sets[1].name.clone();
+    let preset = harness.state().ui.export.preset.clone();
+    let plan = texturecraft_engine::execute(&mut harness.state_mut().session, "export.plan", &json!({"preset": preset, "ts": 1})).unwrap();
+    let file = plan[0]["file"].as_str().unwrap();
+    assert!(harness.query_by_label(file).is_some());
+
+    harness.get_by_role_and_label(egui::Role::DisclosureTriangle, &set).click();
+    harness.run_steps(2);
+
+    assert!(harness.query_by_label(file).is_none());
+
+    click(&mut harness, "Export");
+    harness.run_steps(1);
+
+    assert!(harness.query_by_label("Cancel Export").is_some(), "the selection is being written");
+    assert!(harness.query_by_label(file).is_none(), "starting the export keeps the selected set folded");
+    assert_eq!(harness.get_by_role_and_label(egui::Role::DisclosureTriangle, &set).accesskit_node().data().is_expanded(), Some(false));
 }

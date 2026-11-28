@@ -22,6 +22,9 @@ const GESTURE: Vec2 = vec2(-60.0, 40.0);
 /// Where in the view the gestures start, as a share of its width from its left edge
 const GESTURE_SHARE: f32 = 0.3;
 
+/// Frames for a scroll to a list to finish its animation
+const SCROLL_FRAMES: usize = 30;
+
 /// Escapes between lists, so one that stays open can't leave its popup over the next
 const ESCAPES_TO_CLEAR: usize = 2;
 
@@ -239,6 +242,17 @@ fn every_list_opens_leaves_the_view_its_camera_and_closes_on_escape_a_click_and_
             // Looked up again each time: a closed list or a stroke may move the rows below
             let Some((button, shown)) = lists(&harness).get(index).cloned() else {
                 problems.push(format!("{screen}: list {index} of {count} is gone"));
+                continue;
+            };
+
+            // A list low in a long panel sits below its visible part until scrolled to
+            let same_before = lists(&harness).iter().take(index).filter(|(_, other)| *other == shown).count();
+            if let Some(node) = harness.query_all_by_role(Role::ComboBox).find(|node| node.rect() == button) {
+                node.scroll_to_me();
+            }
+            harness.run_steps(SCROLL_FRAMES);
+            let Some((button, _)) = lists(&harness).into_iter().filter(|(_, other)| *other == shown).nth(same_before) else {
+                problems.push(format!("{screen}: {shown} is gone after scrolling to it"));
                 continue;
             };
 

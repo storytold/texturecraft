@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod alpha_choice;
+mod alpha_sheet;
 mod anchor_properties;
 mod angle_dial;
 mod ask;
@@ -20,6 +22,9 @@ pub mod bake_presets;
 mod bake_report;
 mod bake_scene;
 pub mod baking_log;
+mod brush_pictures;
+mod brush_sheet;
+mod brush_stroke_preview;
 mod color_management;
 mod color_picker;
 mod color_selection_editor;
@@ -79,6 +84,7 @@ mod levels_display;
 mod levels_editor;
 mod levels_handle;
 mod levels_properties;
+mod library_theme;
 mod line_snap;
 mod list_action;
 pub mod log_panel;
@@ -90,6 +96,7 @@ mod mask_preview_image;
 mod mask_source_choice;
 mod material_orb;
 mod material_preview_image;
+mod material_sheet;
 pub mod menus;
 mod mesh_export_options;
 #[cfg(not(target_arch = "wasm32"))]
@@ -109,6 +116,7 @@ pub mod orb_previews;
 mod orb_shape;
 /// The channel's OS identity (app id, window and app names) — see its module docs.
 pub mod os_window;
+mod paint_section;
 mod pane_split;
 pub mod parity;
 mod past_end;
@@ -185,8 +193,11 @@ mod soft_box;
 mod source_choice;
 mod source_slot;
 pub mod state;
+mod stencil_choice;
+mod stencil_sheet;
 mod surface_paint_point;
 pub mod symmetry;
+mod tabbed_page;
 pub mod theme;
 pub mod thumbs;
 mod tile_edits;

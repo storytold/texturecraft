@@ -472,6 +472,7 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(run(&mut s, "export.preset.get", json!({"name": name.to_ascii_lowercase()})).unwrap(), custom);
         let plan = run(&mut s, "export.plan", json!({"preset": name, "ts": 0})).unwrap();
+
         assert_eq!(plan.as_array().unwrap().len(), 1);
         assert!(plan[0]["file"].as_str().unwrap().ends_with("_R.png"));
 
@@ -481,9 +482,11 @@ mod tests {
         let builtin = format!("builtin:{name}");
         assert!(names.iter().any(|entry| entry["name"] == builtin && entry["builtin"] == true));
         let builtin_plan = run(&mut s, "export.plan", json!({"preset": builtin, "ts": 0})).unwrap();
+
         assert!(builtin_plan.as_array().unwrap().len() > 1);
         run(&mut s, "export.preset.save", json!({"preset": custom})).unwrap();
         run(&mut s, "export.preset.remove", json!({"name": name})).unwrap();
+
         assert_eq!(run(&mut s, "export.preset.get", json!({"name": name})).unwrap()["maps"].as_array().unwrap().len(), 4);
     }
 

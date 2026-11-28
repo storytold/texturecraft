@@ -46,7 +46,7 @@ pub fn collect_into(dir: Option<&Path>, required: bool, deflated_in: Option<&Pat
         Some(_) => String::from("static CRAFT_I18N_DEFLATED: &[(&str, &[u8], &[u8])] = &[\n"),
         None => String::from("pub static CRAFT_I18N: &craft_i18n::Embedded = &[\n"),
     };
-    let close = |mut source: String| {
+    let finish_source = |mut source: String| {
         source.push_str("];\n");
         source.push_str(if deflated_in.is_some() {
             INFLATE_FN
@@ -55,11 +55,13 @@ pub fn collect_into(dir: Option<&Path>, required: bool, deflated_in: Option<&Pat
         });
         source
     };
+
     let Some(dir) = dir else {
         if required {
             return Err("CRAFT_I18N_REQUIRED=1 requires CRAFT_I18N_DIR".into());
         }
-        return Ok((close(source), Vec::new()));
+
+        return Ok((finish_source(source), Vec::new()));
     };
 
     if !dir.is_absolute() {
@@ -69,6 +71,7 @@ pub fn collect_into(dir: Option<&Path>, required: bool, deflated_in: Option<&Pat
     let locales = dir.join("locales");
     let entries = std::fs::read_dir(&locales).map_err(|e| format!("{}: {e}", locales.display()))?;
     println!("cargo::rerun-if-changed={}", locales.display());
+
     let mut paths = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -80,7 +83,8 @@ pub fn collect_into(dir: Option<&Path>, required: bool, deflated_in: Option<&Pat
     paths.sort();
     let mut count = 0;
     let mut catalogs = Vec::new();
-    let mut characters = Vec::new();
+    let mut characters = std::collections::HashSet::new();
+
     for path in paths {
         // Watch directories so adding or removing an app catalog rebuilds the embedding
         println!("cargo::rerun-if-changed={}", path.display());
@@ -104,9 +108,11 @@ pub fn collect_into(dir: Option<&Path>, required: bool, deflated_in: Option<&Pat
                 }
                 None => format!("include_str!({name:?})"),
             };
+
             // The shared runtime needs static inputs for this short-lived build process
             Ok((include, Box::leak(text.into_boxed_str())))
         };
+
         let empty = if deflated_in.is_some() { "&[]" } else { "\"\"" };
         let (shared, shared_text) = if common.is_file() { embed(&common)? } else { (empty.into(), "") };
         let (app, app_text) = embed(&app)?;
@@ -116,6 +122,7 @@ pub fn collect_into(dir: Option<&Path>, required: bool, deflated_in: Option<&Pat
         let _ = writeln!(source, "    ({locale:?}, {shared}, {app}),");
         count += 1;
     }
+
     if required && count == 0 {
         return Err("no TextureCraft translation catalogs found".into());
     }
@@ -127,9 +134,9 @@ pub fn collect_into(dir: Option<&Path>, required: bool, deflated_in: Option<&Pat
         return Err(format!("invalid translation catalogs in {}: {}", locales.display(), problems.join("; ")));
     }
 
+    let mut characters: Vec<_> = characters.into_iter().collect();
     characters.sort_unstable();
-    characters.dedup();
-    Ok((close(source), characters))
+    Ok((finish_source(source), characters))
 }
 
 /// Write the embedding for both desktop and wasm, reporting optional failures as warnings.

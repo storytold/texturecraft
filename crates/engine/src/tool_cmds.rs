@@ -12,6 +12,12 @@ use crate::fill_mode::FillMode;
 use crate::session::{CloneFrom, CloneSource, StackTarget, Tool};
 use crate::{Result, Session, cmd};
 
+/// Brush size the UI's full size slider stands for
+const MAX_BRUSH_SIZE: f32 = 0.25;
+
+/// Full value of the UI's 0–100 brush scales
+const PERCENT: f32 = 100.0;
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("tool.paint", "Paint", ["Tools"], Some("1"), "{}", always, |s, _| set_tool(s, Tool::Paint)),
@@ -36,7 +42,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Brush settings",
             [],
             None,
-            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, alphaSizeX?: 5..100 and alphaSizeY?: 5..100 (percent of the stamp the alpha fills), alphaRoundness?: 0..100 (Round alpha only: 100 circle, 0 square), alphaContrast?: 1..8, alphaInvert?, backfaceCulling?, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), cloneAligned? (default true: the first stroke fixes the offset to the source for the following strokes; false: every stroke starts sampling at the source point), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
+            "{size?: 0..100, flow?: 0..100, opacity?: 0..100, spacing?: 1..1000, hardness?: 0..100, angle?, followPath?, alignment?: tangent|camera, lazy?, jitterSize?, jitterAngle?, jitterFlow?, jitterPosition?, alpha?: procedural name | {image: resource name} | {library: id (alpha.list)}, alphaSizeX?: 5..100 and alphaSizeY?: 5..100 (percent of the stamp the alpha fills), alphaRoundness?: 0..100 (Round alpha only: 100 circle, 0 square), alphaContrast?: 1..8, alphaInvert?, backfaceCulling?, angleFade?: [from, to] degrees 0..90 (culled faces fade out between them), screenSpace? (the size follows the view), stampDepth?: 0.05..4, symmetryOn? (the toolbar toggle; off keeps the settings), symmetryX?, symmetryY?, symmetryZ?, symmetryRadial?: 0..32 copies around symmetryAxis?: x|y|z (default y), symmetryOffset?: [x, y, z] (world units from the mesh center, where the mirror planes and radial axis cross), symmetryAngleSpan?: 0..360 degrees the radial copies spread over, minSize?, sizePressure? (default true: pen pressure shrinks the size towards minSize), smudgeStrength?: 0..100, cloneSource?: composite|layer (what the Clone tool copies), cloneAligned? (default true: the first stroke fixes the offset to the source for the following strokes; false: every stroke starts sampling at the source point), particles?: {enabled?, count?: 1..16, lifetime?: 1..128 steps, gravity?: 0..2}}",
             always,
             brush
         ),
@@ -64,7 +70,7 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!(
             "tool.stencil",
-            "Projection stencil",
+            "Stencil",
             [],
             None,
             "{image?: resource name, center?: [x,y] NDC, scale?: 0.01..10, rotation?: degrees, tile?, opacity?, clear?: bool}",
@@ -132,13 +138,16 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
 /// Brush values use the UI's 0–100 scales, so agents and the sliders speak the same numbers
 fn brush(session: &mut Session, params: &Value) -> Result<Value> {
     let mut settings = session.tool.brush.clone();
-    let percent = |key: &str| f32p(params, key).map(|value| value / 100.0);
+    let percent = |key: &str| f32p(params, key).map(|value| value / PERCENT);
 
     if let Some(value) = percent("size") {
-        settings.size = value * 0.25;
+        settings.size = value * MAX_BRUSH_SIZE;
     }
     if let Some(value) = percent("minSize") {
         settings.min_size = value;
+    }
+    if let Some(value) = boolp(params, "sizePressure") {
+        settings.size_pressure = value;
     }
 
     if let Some(value) = percent("flow") {
@@ -174,11 +183,11 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
 
     for (key, slot) in [("jitterSize", &mut settings.jitter_size), ("jitterAngle", &mut settings.jitter_angle), ("jitterFlow", &mut settings.jitter_flow)] {
         if let Some(value) = f32p(params, key) {
-            *slot = value / 100.0;
+            *slot = value / PERCENT;
         }
     }
     if let Some(value) = f32p(params, "jitterPosition") {
-        settings.jitter_position = value / 100.0;
+        settings.jitter_position = value / PERCENT;
     }
 
     let alpha = params.get("alpha");
@@ -214,6 +223,13 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
 
     if let Some(value) = boolp(params, "backfaceCulling") {
         settings.backface_culling = value;
+    }
+    if params.get("angleFade").is_some() {
+        let [from, to] = pair(params, "angleFade").ok_or_else(|| bad("tool.brush", "`angleFade` must be [from, to] in degrees"))?;
+        settings.angle_fade = (from, to);
+    }
+    if let Some(value) = f32p(params, "stampDepth") {
+        settings.depth = value;
     }
 
     if let Some(value) = boolp(params, "symmetryOn") {
@@ -282,30 +298,32 @@ fn brush(session: &mut Session, params: &Value) -> Result<Value> {
         }
     }
     if let Some(value) = f32p(params, "smudgeStrength") {
-        session.tool.smudge_strength = (value / 100.0).clamp(0.0, 1.0);
+        session.tool.smudge_strength = (value / PERCENT).clamp(0.0, 1.0);
     }
 
     session.revision = session.revision.wrapping_add(1);
     Ok(brush_json(session))
 }
 
+/// The brush settings `tool.brush` reports, on the UI's 0–100 scales
 pub(crate) fn brush_json(session: &Session) -> Value {
     let settings = &session.tool.brush;
     json!({
-        "size": settings.size / 0.25 * 100.0, "minSize": settings.min_size * 100.0, "flow": settings.flow * 100.0, "opacity": settings.opacity * 100.0,
-        "spacing": settings.spacing * 100.0, "hardness": settings.hardness * 100.0, "angle": settings.angle, "followPath": settings.follow_path,
+        "size": settings.size / MAX_BRUSH_SIZE * PERCENT, "minSize": settings.min_size * PERCENT, "sizePressure": settings.size_pressure, "flow": settings.flow * PERCENT, "opacity": settings.opacity * PERCENT,
+        "spacing": settings.spacing * PERCENT, "hardness": settings.hardness * PERCENT, "angle": settings.angle, "followPath": settings.follow_path,
         "alignment": format!("{:?}", settings.alignment).to_lowercase(), "lazy": settings.lazy,
         "alpha": match (&settings.alpha_image, &settings.alpha_library) {
             (Some(name), _) => json!({ "image": name }),
             (None, Some(id)) => json!({ "library": id }),
             (None, None) => json!(settings.alpha.label()),
         },
-        "alphaSizeX": settings.alpha_params.size_x * 100.0, "alphaSizeY": settings.alpha_params.size_y * 100.0,
-        "alphaRoundness": settings.alpha_params.roundness * 100.0, "alphaContrast": settings.alpha_params.contrast, "alphaInvert": settings.alpha_params.invert,
-        "backfaceCulling": settings.backface_culling, "symmetry": [settings.symmetry.x, settings.symmetry.y, settings.symmetry.z],
+        "alphaSizeX": settings.alpha_params.size_x * PERCENT, "alphaSizeY": settings.alpha_params.size_y * PERCENT,
+        "alphaRoundness": settings.alpha_params.roundness * PERCENT, "alphaContrast": settings.alpha_params.contrast, "alphaInvert": settings.alpha_params.invert,
+        "backfaceCulling": settings.backface_culling, "angleFade": [settings.angle_fade.0, settings.angle_fade.1], "screenSpace": settings.screen_space,
+        "stampDepth": settings.depth, "symmetry": [settings.symmetry.x, settings.symmetry.y, settings.symmetry.z],
         "radialSymmetry": { "copies": settings.symmetry.radial, "axis": (["x", "y", "z"].get(settings.symmetry.axis as usize)) },
         "symmetryOffset": settings.symmetry.offset, "symmetryOn": settings.symmetry.enabled, "symmetryAngleSpan": settings.symmetry.angle_span,
-        "material": session.tool.material, "smudgeStrength": session.tool.smudge_strength * 100.0, "particles": settings.particles,
+        "material": session.tool.material, "smudgeStrength": session.tool.smudge_strength * PERCENT, "particles": settings.particles,
         "cloneSource": if session.tool.clone_from == CloneFrom::Layer { "layer" } else { "composite" },
         "cloneAligned": session.tool.clone_aligned,
     })

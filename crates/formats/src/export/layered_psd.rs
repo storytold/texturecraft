@@ -71,7 +71,7 @@ fn working_set<'a>(
         padding_peak = padding_bytes.saturating_add(atlas_texels.saturating_mul((4 * size_of::<usize>()) as u64));
     }
 
-    // The quantized layers kept so far and the merged image are part of the file; the encoder can hold staged pixels, planes and the output at once
+    // Budget for the retained layers and merged image alongside encoder planes, staging and output
     let rendering = scratch_bytes.max(merge_bytes).saturating_add(file_bytes);
     let encoding = 3 * file_bytes;
     let working_bytes = padding_bytes.saturating_add(rendering.max(encoding)).max(padding_peak);

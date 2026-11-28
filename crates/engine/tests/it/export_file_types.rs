@@ -39,6 +39,7 @@ fn in_memory_psd_export_only_renders_the_first_plan_for_each_name() {
     let small = options(SMALL_SIDE);
     let large = options(4096);
     let first = session.export_files(&[0], &small).unwrap();
+
     assert!(first.len() > 1, "the mesh supplies multiple PSD tiles");
 
     let jobs = std::iter::once((0, &small)).chain(std::iter::repeat_n((0, &large), 4));

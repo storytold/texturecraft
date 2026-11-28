@@ -51,6 +51,7 @@ fn a_built_in_tile_menu_says_what_the_asset_is_and_where_it_lives() {
 
     harness.get_by_label("Close").click();
     harness.run_steps(3);
+
     assert!(harness.query_by_label("Usages material").is_none(), "Close closes the menu");
 }
 
@@ -88,8 +89,11 @@ fn type_name(harness: &mut Harness<'_, TextureCraftApp>, text: &str) {
 
 #[test]
 fn a_saved_brush_menu_renames_replaces_and_deletes_it() {
-    // A name that sorts before every built-in brush, so its tile is in view
+    let dir = super::temp_dir::TempDir::new("shelf-rename-brush");
     let mut harness = shelf(BRUSHES_TYPE);
+    harness.state_mut().session.brush_presets.dir = Some(dir.to_path_buf());
+
+    // Keep the saved brush in view at the beginning of the sorted grid
     texturecraft_engine::execute(&mut harness.state_mut().session, "brush.preset.store", &json!({"name": "Aa ink"})).unwrap();
     harness.run_steps(3);
 
@@ -97,23 +101,27 @@ fn a_saved_brush_menu_renames_replaces_and_deletes_it() {
     type_name(&mut harness, "Never applied");
     harness.key_press(Key::Escape);
     harness.run_steps(3);
+
     assert_eq!(preset_names(&harness), ["Aa ink"], "Escape keeps the name");
 
     right_click(&mut harness, "Aa ink");
     type_name(&mut harness, "Aa pen");
     harness.key_press(Key::Enter);
     harness.run_steps(3);
+
     assert_eq!(preset_names(&harness), ["Aa pen"], "Enter renames the brush");
 
     texturecraft_engine::execute(&mut harness.state_mut().session, "tool.brush", &json!({"size": 77})).unwrap();
     right_click(&mut harness, "Aa pen");
     harness.get_by_label("Replace with the current brush").click();
     harness.run_steps(3);
+
     assert_eq!(harness.state().session.brush_presets.list[0].brush, harness.state().session.tool.brush, "the preset holds the current brush");
 
     right_click(&mut harness, "Aa pen");
     harness.get_by_label("Delete").click();
     harness.run_steps(3);
+
     assert!(preset_names(&harness).is_empty(), "Delete removes the brush");
 }
 
@@ -188,14 +196,17 @@ fn shift_f10_opens_the_menu_of_the_focused_tile_on_its_first_row_and_escape_retu
 
     harness.get_all_by_label(&name).next().unwrap().focus();
     harness.run_steps(2);
+
     assert!(harness.get_all_by_label(&name).next().unwrap().is_focused(), "the tile takes the focus");
     harness.key_press_modifiers(Modifiers::SHIFT, Key::F10);
     harness.run_steps(3);
+
     assert!(harness.query_by_label("Usages texture").is_some(), "Shift+F10 opens the menu");
     assert!(harness.get_by_label("Delete").is_focused(), "the first row that can be picked takes the focus (Reload can't: no file)");
 
     harness.key_press(Key::Escape);
     harness.run_steps(3);
+
     assert!(harness.query_by_label("Usages texture").is_none(), "Escape closes it");
     assert!(harness.get_all_by_label(&name).next().unwrap().accesskit_node().is_focused(), "the focus is back on the tile");
 }
@@ -265,4 +276,77 @@ fn set_custom_preview_shows_a_picked_picture_until_removed() {
     assert!(picked(&harness).is_empty(), "the tile shows its own thumbnail again");
     right_click(&mut harness, material.label);
     assert!(harness.query_by_label("Remove custom preview").is_none(), "only a tile with a custom preview offers to remove it");
+}
+
+#[test]
+fn custom_preview_textures_live_until_their_last_tile_releases_them() {
+    let mut materials: Vec<_> = MATERIALS.iter().filter(|material| !material.smart).collect();
+    materials.sort_by_key(|material| material.label.to_lowercase());
+    let (first, second) = (materials[0].label, materials[1].label);
+    let mut harness = shelf(MATERIALS_TYPE);
+    let directory = super::temp_dir::TempDir::new("shared-shelf-preview");
+    let shared = directory.join("shared.png");
+    let replacement = directory.join("replacement.png");
+    let last = directory.join("last.png");
+    for path in [&shared, &replacement, &last] {
+        image::RgbaImage::from_pixel(164, 164, image::Rgba([40, 160, 90, 255])).save(path).unwrap();
+    }
+    let mut answers = vec![shared.clone(), shared, replacement, last].into_iter();
+    harness.state_mut().file_dialogs.set_override(Some(Box::new(move |_| Answer::Paths(vec![answers.next().unwrap()]))));
+
+    let allocated = |harness: &Harness<'_, TextureCraftApp>| {
+        harness
+            .ctx
+            .tex_manager()
+            .read()
+            .allocated()
+            .filter(|(_, texture)| texture.name.starts_with("custom_preview_"))
+            .fold((0, 0), |(count, bytes), (_, texture)| (count + 1, bytes + texture.size[0] * texture.size[1] * texture.bytes_per_pixel))
+    };
+
+    pick_from_menu(&mut harness, first, "Set custom preview...");
+    pick_from_menu(&mut harness, second, "Set custom preview...");
+    let shared = allocated(&harness);
+    pick_from_menu(&mut harness, first, "Set custom preview...");
+    let separate = allocated(&harness);
+    pick_from_menu(&mut harness, second, "Remove custom preview");
+    let remaining = allocated(&harness);
+    pick_from_menu(&mut harness, first, "Set custom preview...");
+    let replaced_last = allocated(&harness);
+    pick_from_menu(&mut harness, first, "Remove custom preview");
+    let cleared = allocated(&harness);
+
+    println!(
+        "Custom preview (textures, bytes): shared {shared:?}, replaced {separate:?}, removed {remaining:?}, replaced last {replaced_last:?}, cleared {cleared:?}"
+    );
+    assert_eq!(shared.0, 1);
+    assert!(shared.1 > 0);
+    assert_eq!(separate, (2, 2 * shared.1));
+    assert_eq!(remaining, shared);
+    assert_eq!(replaced_last, shared);
+    assert_eq!(cleared, (0, 0));
+}
+
+#[test]
+fn the_shelf_uploads_only_the_project_thumbnails_in_view() {
+    const RESOURCE_COUNT: usize = 100;
+    let mut harness = shelf(TEXTURES_TYPE);
+    harness.state_mut().ui.shelf_filter = "visible-tile".into();
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(64, 64, image::Rgba([80, 140, 40, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    for index in 0..RESOURCE_COUNT {
+        harness.state_mut().session.import_resource_bytes(&format!("visible-tile-{index:03}.png"), png.clone()).unwrap();
+    }
+
+    harness.run_steps(3);
+
+    let allocated = harness
+        .ctx
+        .tex_manager()
+        .read()
+        .allocated()
+        .filter(|(_, texture)| texture.name.starts_with("res_visible-tile-"))
+        .fold((0, 0), |(count, bytes), (_, texture)| (count + 1, bytes + texture.size[0] * texture.size[1] * texture.bytes_per_pixel));
+    println!("Shelf of {RESOURCE_COUNT} textures: {} uploads retained, {} bytes", allocated.0, allocated.1);
+    assert!(allocated.0 > 0 && allocated.0 < RESOURCE_COUNT);
 }

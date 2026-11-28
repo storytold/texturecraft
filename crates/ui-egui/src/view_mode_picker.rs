@@ -76,7 +76,7 @@ pub(crate) fn show(app: &mut TextureCraftApp, child: &mut Ui, id_salt: &str, wid
     // The picker stays greyed without project maps
     let combo = child
         .add_enabled_ui(project_open, |child| {
-            egui::ComboBox::from_id_salt(id_salt).width(width).height(LIST_HEIGHT).selected_text(label).show_ui(child, |ui| {
+            egui::ComboBox::from_id_salt(id_salt).width(width).height(LIST_HEIGHT).selected_text(label.as_str()).show_ui(child, |ui| {
                 // Bake mode keeps its own list: the material, then the mesh maps, without titles
                 if !baking {
                     section(ui, "Lighting");
@@ -135,6 +135,11 @@ pub(crate) fn show(app: &mut TextureCraftApp, child: &mut Ui, id_salt: &str, wid
         })
         .inner;
 
+    // The box shows only the mode's name: it is named for what it picks
+    combo.response.widget_info(|| egui::WidgetInfo {
+        current_text_value: Some(label.clone()),
+        ..egui::WidgetInfo::labeled(egui::Role::ComboBox, project_open, tr("View mode"))
+    });
     image_picker(app, &combo.response, popup_id);
 }
 

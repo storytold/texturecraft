@@ -213,10 +213,10 @@ fn the_preview_ignores_a_texture_sets_output_map_settings() {
     two.maps.truncate(2);
     h.state_mut().run("export.preset.save", json!({ "preset": two })).unwrap();
     let own = "Unreal Engine (Packed)".to_string();
-    let mut o = texturecraft_ui_egui::state::SetExport { preset: Some(own.clone()), maps_template: own, ..Default::default() };
-    o.maps.insert(2, texturecraft_ui_egui::state::MapExport { enabled: false, file_type: None, size: None });
+    let mut overrides = texturecraft_ui_egui::state::SetExport { preset: Some(own.clone()), maps_template: own, ..Default::default() };
+    overrides.maps.insert(2, texturecraft_ui_egui::state::MapExport { enabled: false, file_type: None, size: None });
     let ts = h.state().session.ts();
-    h.state_mut().ui.export.sets.insert(ts, o);
+    h.state_mut().ui.export.sets.insert(ts, overrides);
     h.state_mut().ui.export.preset = "Two".into();
     h.run_steps(4);
 
@@ -235,13 +235,13 @@ fn the_preview_ignores_a_texture_sets_output_map_settings() {
 fn texture_set_overrides_follow_a_renamed_template_and_drop_a_removed_one() {
     let library = TemplateLibrary::new("follow");
     let mut h = harness(&library);
-    let mut o = texturecraft_ui_egui::state::SetExport { preset: Some("Mine".into()), maps_template: "Mine".into(), ..Default::default() };
-    o.maps.insert(1, texturecraft_ui_egui::state::MapExport { enabled: false, file_type: None, size: None });
+    let mut overrides = texturecraft_ui_egui::state::SetExport { preset: Some("Mine".into()), maps_template: "Mine".into(), ..Default::default() };
+    overrides.maps.insert(1, texturecraft_ui_egui::state::MapExport { enabled: false, file_type: None, size: None });
 
     // The override is there when the window opens
     h.state_mut().ui.windows.export = false;
     h.run_steps(2);
-    h.state_mut().ui.export.sets.insert(0, o);
+    h.state_mut().ui.export.sets.insert(0, overrides);
     let ui = &mut h.state_mut().ui;
     ui.windows.export = true;
     ui.export.tab = 1;
@@ -256,10 +256,10 @@ fn texture_set_overrides_follow_a_renamed_template_and_drop_a_removed_one() {
     h.run_steps(4);
 
     assert_eq!(h.state().ui.export.preset, "Yours");
-    let o = h.state().ui.export.sets[&0].clone();
+    let overrides = h.state().ui.export.sets[&0].clone();
 
-    assert_eq!((o.preset.as_deref(), o.maps_template.as_str()), (Some("Yours"), "Yours"), "the set keeps its template and map ticks");
-    assert_eq!(o.maps.len(), 1);
+    assert_eq!((overrides.preset.as_deref(), overrides.maps_template.as_str()), (Some("Yours"), "Yours"), "the set keeps its template and map ticks");
+    assert_eq!(overrides.maps.len(), 1);
 
     right_click(&mut h, "Yours");
     click(&mut h, "Remove");
@@ -271,7 +271,7 @@ fn texture_set_overrides_follow_a_renamed_template_and_drop_a_removed_one() {
     // Cancel goes back to the settings the window opened with, minus the removed template
     click(&mut h, "Cancel");
 
-    assert!(h.state().ui.export.sets.values().all(|o| o.preset.as_deref() != Some("Yours") && o.preset.as_deref() != Some("Mine")));
+    assert!(h.state().ui.export.sets.values().all(|overrides| overrides.preset.as_deref() != Some("Yours") && overrides.preset.as_deref() != Some("Mine")));
 }
 
 #[test]
@@ -786,5 +786,6 @@ fn feedback_template_preview_counts_overrides_only_for_its_own_maps() {
     assert!(h.query_by_label(&format!("{} output maps will be exported", initial - 1)).is_some());
     h.state_mut().ui.export.sets.get_mut(&ts).unwrap().preset = Some("Separate maps".into());
     h.run_steps(4);
+
     assert!(h.query_by_label(&format!("{initial} output maps will be exported")).is_some());
 }

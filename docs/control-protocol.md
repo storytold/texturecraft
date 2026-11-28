@@ -170,7 +170,13 @@ sampling at the source point. Changing `cloneAligned` forgets the offset of earl
 procedural Round alpha: 100 is a circle, 0 a square), `alphaContrast` (1..8, 1 leaves the values
 alone) and `alphaInvert` (swaps paint and no paint inside the stamp square). They apply to
 procedural, library and imported alphas alike and are returned by `tool.brush` with the other
-values. The alpha's rotation is the brush `angle`.
+values. The alpha's rotation is the brush `angle`. The Projection settings of the Brush section go
+through `tool.brush` too and come back with it: `angleFade` (`[from, to]` in degrees, 0..90: with
+`backfaceCulling` on, faces turned further than `from` from the view fade out until `to`),
+`screenSpace` (Size Space Viewport: the size follows the view instead of the object) and
+`stampDepth` (0.05..4). `sizePressure` (default `true`) lets pen pressure shrink the size towards
+`minSize`. Setting `sizePressure` to `false` removes pen-pressure scaling. In 3D, `jitterSize`
+still varies stamp size independently.
 
 Bake mode applies an edit in Common Settings or Mesh Map Settings to the texture sets sharing that
 group's settings: Common Settings, and each map's settings, are shared by any set of texture sets

@@ -67,6 +67,9 @@ const MIN_BOUNDS_EXTENT: f32 = 1e-6;
 /// Stack values being composited, per channel.
 type Acc = [[f32; 3]; NCH];
 
+/// What the live stroke's stencil lets through at a texel ([`Stencil::paint_world`])
+type StencilPaint = Option<(Option<[f32; 3]>, f32)>;
+
 /// How tall a baked height of 1 stands, as a fraction of a UV tile, when Baked Lighting Stylized tilts normals by its slope
 const HEIGHT_RELIEF: f32 = 1.0 / 32.0;
 
@@ -82,39 +85,66 @@ pub enum PaintTarget {
     Mask(LayerId),
 }
 
-/// A screen-pinned image painted through the camera (projection tool / stencil).
+/// Smallest clip w a stencil paints at and smallest half extent it divides by
+const STENCIL_EPSILON: f32 = 1e-6;
+
+/// Rec. 709 red, green and blue weights of a gray's luminance
+const REC709_LUMINANCE_WEIGHTS: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
+/// A screen-pinned image every brush tool paints through
 #[derive(Clone, Debug)]
 pub struct Stencil {
     pub image: std::sync::Arc<crate::store::ImageRes>,
-    /// Camera view-projection captured when the stroke started.
+    /// Camera view-projection captured when the stroke started
     pub view_proj: texturecraft_geom::glam::Mat4,
-    /// Image placement in normalized device coordinates: center, half extents, rotation.
+    /// Image placement in normalized device coordinates: center, half extents, rotation
     pub center: [f32; 2],
     pub half: [f32; 2],
     pub rotation: f32,
-    /// Repeat the image beyond its bounds (otherwise nothing is painted outside it).
+    /// Repeat the image beyond its bounds (otherwise nothing is painted outside it)
     pub tile: bool,
+    /// The Projection tool paints the image's colors; every other tool paints through its gray
+    pub colors: bool,
 }
 
 impl Stencil {
-    /// Linear color and alpha of the stencil at world point `p` (None outside the image).
-    pub fn sample_world(&self, p: Vec3) -> Option<([f32; 3], f32)> {
-        let c = self.view_proj * p.extend(1.0);
-        if c.w <= 1e-6 {
+    /// Linear color and alpha of the stencil at world point `point` (None outside the image)
+    pub fn sample_world(&self, point: Vec3) -> Option<([f32; 3], f32)> {
+        let sample = self.sample_raw(point)?;
+        let rgb = [sample[0], sample[1], sample[2]];
+        let rgb = if self.image.srgb { rgb.map(texturecraft_texel::srgb_to_linear) } else { rgb };
+        Some((rgb, sample[3].clamp(0.0, 1.0)))
+    }
+
+    /// How much paint passes at world point `point` when the stencil masks a stroke: its gray times its alpha, read as stored like a brush alpha image (0 outside the image)
+    pub fn mask_world(&self, point: Vec3) -> f32 {
+        let Some([red, green, blue, alpha]) = self.sample_raw(point) else { return 0.0 };
+        let [red_weight, green_weight, blue_weight] = REC709_LUMINANCE_WEIGHTS;
+        ((red_weight * red + green_weight * green + blue_weight * blue) * alpha).clamp(0.0, 1.0)
+    }
+
+    /// The paint a stroke receives at world point `point`: the stencil's color (Projection only) and the factor scaling the stroke there, None where nothing is painted
+    pub fn paint_world(&self, point: Vec3) -> Option<(Option<[f32; 3]>, f32)> {
+        if self.colors { self.sample_world(point).map(|(color, alpha)| (Some(color), alpha)) } else { Some((None, self.mask_world(point))) }
+    }
+
+    /// The stored image value under world point `point` (None outside the image)
+    fn sample_raw(&self, point: Vec3) -> Option<[f32; 4]> {
+        let clip = self.view_proj * point.extend(1.0);
+        if clip.w <= STENCIL_EPSILON {
             return None;
         }
 
-        let (dx, dy) = (c.x / c.w - self.center[0], c.y / c.w - self.center[1]);
-        let (sn, cs) = (-self.rotation).sin_cos();
-        let lx = (dx * cs - dy * sn) / self.half[0].max(1e-6);
-        let ly = (dx * sn + dy * cs) / self.half[1].max(1e-6);
-        if !self.tile && (lx.abs() > 1.0 || ly.abs() > 1.0) {
+        let offset_x = clip.x / clip.w - self.center[0];
+        let offset_y = clip.y / clip.w - self.center[1];
+        let (sine, cosine) = (-self.rotation).sin_cos();
+        let local_x = (offset_x * cosine - offset_y * sine) / self.half[0].max(STENCIL_EPSILON);
+        let local_y = (offset_x * sine + offset_y * cosine) / self.half[1].max(STENCIL_EPSILON);
+        if !self.tile && (local_x.abs() > 1.0 || local_y.abs() > 1.0) {
             return None;
         }
 
-        let s = self.image.sample(lx * 0.5 + 0.5, 0.5 - ly * 0.5);
-        let rgb = if self.image.srgb { [s[0], s[1], s[2]].map(texturecraft_texel::srgb_to_linear) } else { [s[0], s[1], s[2]] };
-        Some((rgb, s[3].clamp(0.0, 1.0)))
+        Some(self.image.sample(local_x * 0.5 + 0.5, 0.5 - local_y * 0.5))
     }
 }
 
@@ -3015,6 +3045,8 @@ struct Texel<'a, 'b> {
     tape: Tape<'b>,
     /// The copy of a symmetric fill being sampled: the surface point and normal it sees, and its image's flip
     copy: Option<(usize, FillCopy)>,
+    /// The live stroke's stencil sampled here once for every channel (None until a channel reads it)
+    stencil_paint: Option<StencilPaint>,
 }
 
 /// What a layer contributes (its mask, its content value and coverage per channel): evaluated
@@ -3050,7 +3082,22 @@ type ChannelContents = [Option<([f32; 3], f32)>; NCH];
 
 impl<'a, 'b> Texel<'a, 'b> {
     fn new(inp: &'b Inputs<'a>, x: u32, y: u32, o: usize, stroke: f32) -> Self {
-        Texel { inp, x, y, o, res: inp.gbuf.width, coords: None, stroke, stop: None, anchors: Vec::new(), below: None, lit: None, tape: Tape::Off, copy: None }
+        Texel {
+            inp,
+            x,
+            y,
+            o,
+            res: inp.gbuf.width,
+            coords: None,
+            stroke,
+            stop: None,
+            anchors: Vec::new(),
+            below: None,
+            lit: None,
+            tape: Tape::Off,
+            copy: None,
+            stencil_paint: None,
+        }
     }
 
     /// Run `f` with `tape` as this texel's tape.
@@ -3191,6 +3238,24 @@ impl<'a, 'b> Texel<'a, 'b> {
     /// World position of this texel as the fill copy being sampled sees it (None when uncovered)
     fn world(&self) -> Option<Vec3> {
         self.surface((self.y * self.inp.gbuf.width + self.x) as usize).map(|s| s.pos)
+    }
+
+    /// What the live stroke's `stencil` lets through here, sampled once for all of the texel's channels
+    fn stencil_paint(&mut self, stencil: &Stencil) -> StencilPaint {
+        let sample = |texel: &Self| texel.world().and_then(|world| stencil.paint_world(world));
+
+        // A symmetric fill's copy sees another surface point, so only the texel's own sample is kept
+        if self.copy.is_some() {
+            return sample(self);
+        }
+
+        if let Some(paint) = self.stencil_paint {
+            return paint;
+        }
+
+        let paint = sample(self);
+        self.stencil_paint = Some(paint);
+        paint
     }
 
     /// The surface at G-buffer index `i`, as the fill copy being sampled sees it
@@ -3897,7 +3962,7 @@ impl<'a, 'b> Texel<'a, 'b> {
         self.mask_effects(plan, value, skip, plan.effects.len())
     }
 
-    /// Mask effects `from..to` of `plan` over `value`, recording the anchors among them.
+    /// Mask effects `from..to` of `plan` over `value`, recording the anchors among them
     fn mask_effects(&mut self, plan: &MaskPlan, mut value: f32, from: usize, to: usize) -> f32 {
         // Avoid amplifying rounding error when unpremultiplying faint paint
         const MIN_PAINT_COVERAGE: f32 = 1e-5;
@@ -3915,10 +3980,19 @@ impl<'a, 'b> Texel<'a, 'b> {
                         Some(data) => (from_u16(data.get(self.o * 2).copied().unwrap_or(0)), from_u16(data.get(self.o * 2 + 1).copied().unwrap_or(0))),
                         None => (0.0, 0.0),
                     };
+
                     if effect.preview
                         && let Some(preview) = self.inp.preview
                     {
-                        let stroke = (self.stroke * preview.opacity).clamp(0.0, 1.0);
+                        let mut stroke = (self.stroke * preview.opacity).clamp(0.0, 1.0);
+
+                        // The stencil shapes the stroke as the commit does
+                        if let Some(stencil) = preview.stencil.as_ref()
+                            && stroke > 0.0
+                        {
+                            stroke *= self.stencil_paint(stencil).map_or(0.0, |(_, factor)| factor);
+                        }
+
                         if preview.erase {
                             painted *= 1.0 - stroke;
                             coverage *= 1.0 - stroke;
@@ -3932,6 +4006,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                             coverage = stroke + coverage * (1.0 - stroke);
                         }
                     }
+
                     if coverage > 0.0 {
                         let layer_value = painted / coverage.max(MIN_PAINT_COVERAGE);
                         value += (blend1(effect.blend, value, layer_value) - value) * coverage * opacity;
@@ -4271,62 +4346,66 @@ impl<'a, 'b> Texel<'a, 'b> {
         (coverage > 0.0).then_some((value, coverage.min(1.0)))
     }
 
-    /// Straight value and coverage of painted data of one channel (premultiplied values plus
-    /// coverage per texel), with the live stroke when `preview`.
-    fn painted(&mut self, data: Option<&[u16]>, c: &ChanPlan, preview: bool) -> ([f32; 3], f32) {
-        let pv = if preview { self.inp.preview } else { None };
-        let mut sa = pv.map(|p| (self.stroke * p.opacity).clamp(0.0, 1.0)).unwrap_or(0.0);
+    /// Straight value and coverage of one channel's painted data (premultiplied values plus coverage per texel), with the live stroke when `preview`
+    fn painted(&mut self, data: Option<&[u16]>, chan_plan: &ChanPlan, preview: bool) -> ([f32; 3], f32) {
+        // Coverage floor the premultiplied value is divided by
+        const MIN_COVERAGE: f32 = 1e-5;
 
-        // Projection: the stencil's alpha shapes the stroke and its color is the base color
-        let stencil = match pv.and_then(|p| p.stencil.as_ref()) {
-            Some(st) if sa > 0.0 => {
-                let s = self.world().and_then(|w| st.sample_world(w));
-                sa *= s.map(|(_, a)| a).unwrap_or(0.0);
-                s.map(|(c, _)| c)
+        let stroke_preview = if preview { self.inp.preview } else { None };
+        let mut stroke_alpha = stroke_preview.map(|stroke| (self.stroke * stroke.opacity).clamp(0.0, 1.0)).unwrap_or(0.0);
+
+        // The stencil shapes the stroke; on the Projection tool its color is the base color
+        let stencil_color = match stroke_preview.and_then(|stroke| stroke.stencil.as_ref()) {
+            Some(stencil) if stroke_alpha > 0.0 => {
+                let stencil_paint = self.stencil_paint(stencil);
+                stroke_alpha *= stencil_paint.map(|(_, factor)| factor).unwrap_or(0.0);
+                stencil_paint.and_then(|(color, _)| color)
             }
             _ => None,
         };
-        let mut val = [0.0f32; 3];
-        let mut cov = 0.0f32;
-        if let Some(d) = data {
-            let base = self.o * (c.comps + 1);
-            for (k, slot) in val.iter_mut().take(c.comps).enumerate() {
-                *slot = decode(c.kind, d.get(base + k).copied().unwrap_or(0));
+
+        let mut value = [0.0f32; 3];
+        let mut coverage = 0.0f32;
+        if let Some(texels) = data {
+            let base = self.o * (chan_plan.comps + 1);
+            for (component, slot) in value.iter_mut().take(chan_plan.comps).enumerate() {
+                *slot = decode(chan_plan.kind, texels.get(base + component).copied().unwrap_or(0));
             }
-            cov = from_u16(d.get(base + c.comps).copied().unwrap_or(0));
+            coverage = from_u16(texels.get(base + chan_plan.comps).copied().unwrap_or(0));
         }
-        if let Some(p) = pv
-            && sa > 0.0
+
+        if let Some(stroke) = stroke_preview
+            && stroke_alpha > 0.0
         {
-            if p.erase {
-                val = val.map(|v| v * (1.0 - sa));
-                cov *= 1.0 - sa;
-            } else if let Some(ch) = Channel::ALL.get(c.ch)
-                && let Some(pval) = p.values.get(ch)
+            if stroke.erase {
+                value = value.map(|component| component * (1.0 - stroke_alpha));
+                coverage *= 1.0 - stroke_alpha;
+            } else if let Some(channel) = Channel::ALL.get(chan_plan.ch)
+                && let Some(stroke_value) = stroke.values.get(channel)
             {
-                let pval = match stencil {
-                    Some(col) if *ch == Channel::BaseColor => col,
-                    _ => match p.carried.get(ch) {
-                        Some(img) => {
-                            let raw = img.get(self.x, self.y).map(|v| decode(c.kind, v));
+                let stroke_value = match stencil_color {
+                    Some(color) if *channel == Channel::BaseColor => color,
+                    _ => match stroke.carried.get(channel) {
+                        Some(carried) => {
+                            let raw = carried.get(self.x, self.y).map(|stored| decode(chan_plan.kind, stored));
                             [raw[0], raw[1], raw[2]]
                         }
-                        None => *pval,
+                        None => *stroke_value,
                     },
                 };
-                for k in 0..c.comps {
-                    val[k] = pval[k] * sa + val[k] * (1.0 - sa);
+                for component in 0..chan_plan.comps {
+                    value[component] = stroke_value[component] * stroke_alpha + value[component] * (1.0 - stroke_alpha);
                 }
-                cov = sa + cov * (1.0 - sa);
+                coverage = stroke_alpha + coverage * (1.0 - stroke_alpha);
             }
         }
-        if cov <= 0.0 {
+        if coverage <= 0.0 {
             return ([0.0; 3], 0.0);
         }
 
-        let inv = 1.0 / cov.max(1e-5);
-        let v = if c.comps == 3 { val.map(|x| x * inv) } else { [val[0] * inv; 3] };
-        (v, cov.min(1.0))
+        let inverse_coverage = 1.0 / coverage.max(MIN_COVERAGE);
+        let straight = if chan_plan.comps == 3 { value.map(|component| component * inverse_coverage) } else { [value[0] * inverse_coverage; 3] };
+        (straight, coverage.min(1.0))
     }
 
     /// Apply one content effect to a channel's straight value and coverage

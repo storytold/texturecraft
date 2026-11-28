@@ -33,6 +33,7 @@ fn the_folder_button_opens_a_second_assets_panel_that_searches_on_its_own() {
 
     harness.get_by_label("New Assets panel").click();
     harness.run_steps(3);
+
     assert!(harness.state().ui.dock.is_visible(Panel::AssetsSecond), "the folder button shows a second Assets panel");
 
     search_shown_panel(&mut harness, "brick");

@@ -944,12 +944,14 @@ pub fn is_set_warning(warning: &str) -> bool {
 fn unique_name(used: &mut BTreeSet<String>, stem: &str, ext: &str, warnings: &mut Vec<String>) -> (String, String) {
     let mut name = format!("{stem}.{ext}");
     let mut renamed = String::new();
-    let mut k = 2;
+    let mut suffix_number = 2;
+
     while used.contains(&name.to_ascii_lowercase()) {
-        renamed = format!("_{k}");
+        renamed = format!("_{suffix_number}");
         name = format!("{stem}{renamed}.{ext}");
-        k += 1;
+        suffix_number += 1;
     }
+
     if !renamed.is_empty() {
         warnings.push(format!("\"{stem}.{ext}\" is produced by more than one map; this one was renamed to \"{name}\""));
     }

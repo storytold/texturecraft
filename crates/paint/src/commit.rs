@@ -71,26 +71,34 @@ fn over(img: &mut TileImage, b: &Blend, src: &CommitSource, mut staged: Option<S
     }
 }
 
-/// Blend the stroke's alpha tile `stroke_alpha` into tile `(tx, ty)` of an image (`dst`, `components` per texel)
-fn blend_tile(dst: &mut [u16], components: usize, stroke_alpha: &[u16], (tx, ty): (u32, u32), blend: &Blend, source: &CommitSource, carried: Option<&[u16]>) {
+/// Blend the stroke's alpha tile `stroke_alpha` into tile `(tile_x, tile_y)` of an image (`dst`, `components` per texel)
+fn blend_tile(
+    dst: &mut [u16],
+    components: usize,
+    stroke_alpha: &[u16],
+    (tile_x, tile_y): (u32, u32),
+    blend: &Blend,
+    source: &CommitSource,
+    carried: Option<&[u16]>,
+) {
     // The last component is the coverage, the ones before it the value
     let value_count = components.saturating_sub(1);
     let opacity = source.opacity.clamp(0.0, 1.0);
     let gray_source = if source.erase || carried.is_some() { None } else { blend.gray };
 
-    for i in 0..TILE_AREA {
-        let mut weight = from_u16(stroke_alpha.get(i).copied().unwrap_or(0)) * opacity;
+    for texel_index in 0..TILE_AREA {
+        let mut weight = from_u16(stroke_alpha.get(texel_index).copied().unwrap_or(0)) * opacity;
         if weight <= 0.0 {
             continue;
         }
 
         let mut stencil = None;
-        let (x, y) = (tx * TILE + i as u32 % TILE, ty * TILE + i as u32 / TILE);
+        let (x, y) = (tile_x * TILE + texel_index as u32 % TILE, tile_y * TILE + texel_index as u32 / TILE);
         if let Some(per_texel) = source.per_texel {
             match per_texel(x, y) {
                 Some((color, alpha_factor)) => {
                     weight *= alpha_factor;
-                    stencil = Some(color);
+                    stencil = color;
                 }
                 None => continue,
             }
@@ -99,13 +107,16 @@ fn blend_tile(dst: &mut [u16], components: usize, stroke_alpha: &[u16], (tx, ty)
             }
         }
 
-        let Some((coverage_slot, values)) = dst.get_mut(i * components..(i + 1) * components).and_then(<[u16]>::split_last_mut) else { continue };
+        let Some((coverage_slot, values)) = dst.get_mut(texel_index * components..(texel_index + 1) * components).and_then(<[u16]>::split_last_mut) else {
+            continue;
+        };
+
         let gray = gray_source.map(|gray| gray.at(x, y, (source.alpha.width(), source.alpha.height())));
         let coverage = from_u16(*coverage_slot);
         for (component, slot) in values.iter_mut().enumerate() {
             let previous = dec(blend.kind, *slot);
             let target = match (carried, stencil) {
-                (Some(carried_tile), _) => dec(blend.kind, carried_tile.get(i * value_count + component).copied().unwrap_or(0)),
+                (Some(carried_tile), _) => dec(blend.kind, carried_tile.get(texel_index * value_count + component).copied().unwrap_or(0)),
                 (None, _) if let Some(gray) = gray => gray,
                 (None, Some(color)) if blend.stencil_color => color.get(component).copied().unwrap_or(0.0),
                 _ => blend.value.get(component).copied().unwrap_or(0.0),
@@ -318,8 +329,8 @@ fn mask_blend<'a>(gray: &'a MaskGray, value: &'a [f32; 1]) -> Blend<'a> {
     Blend { kind: ChannelKind::Scalar, value, stencil_color: false, carried: None, gray }
 }
 
-/// Per-texel override of a stroke: `(x, y)` → (base color, alpha factor), None = no paint.
-pub type TexelFn<'a> = &'a (dyn Fn(u32, u32) -> Option<([f32; 3], f32)> + Sync);
+/// Per-texel override of a stroke: `(x, y)` → (base color, alpha factor), None = no paint; a None color keeps the stroke's own value
+pub type TexelFn<'a> = &'a (dyn Fn(u32, u32) -> Option<(Option<[f32; 3]>, f32)> + Sync);
 
 /// The stroke being committed: its alpha, touched tiles, opacity cap and mode.
 #[derive(Clone, Copy)]
@@ -328,7 +339,7 @@ pub struct CommitSource<'a> {
     pub tiles: &'a BTreeSet<(u32, u32)>,
     pub opacity: f32,
     pub erase: bool,
-    /// Projection tool: base color and alpha per texel from a stencil.
+    /// The stencil: alpha per texel and, on the Projection tool, base color
     pub per_texel: Option<TexelFn<'a>>,
     /// Clone and smudge: straight values per channel carried by the stroke (replace `values`).
     pub carried: Option<&'a BTreeMap<Channel, TileImage>>,

@@ -58,6 +58,15 @@ fn last_run_id() -> Id {
 
 /// Runs the automatic updates once their minutes have passed since the last run, and wakes the app for the next one
 pub(crate) fn tick(app: &mut TextureCraftApp, ctx: &Context) {
+    let failures_id = Id::unique("shelf_updates_reported_failures");
+    ctx.data_mut(|data| {
+        let owner = data.get_temp_mut_or(failures_id, app.session.project_id);
+        if *owner != app.session.project_id {
+            *owner = app.session.project_id;
+            data.remove::<Vec<String>>(failures_id);
+        }
+    });
+
     let updates = app.ui.shelf_updates;
     if !updates.assets && !updates.resources {
         ctx.data_mut(|data| data.remove::<f64>(last_run_id()));
@@ -83,7 +92,7 @@ pub(crate) fn tick(app: &mut TextureCraftApp, ctx: &Context) {
         refresh_assets(app);
     }
     if updates.resources {
-        update_resources(app, ctx);
+        update_resources(app, ctx, failures_id);
     }
     ctx.request_repaint_after(std::time::Duration::from_secs_f64(every));
 }
@@ -101,19 +110,17 @@ pub(crate) fn refresh_assets(app: &mut TextureCraftApp) {
 }
 
 /// Reads the project's changed image files again; a file that is gone or can't be read says why once, until it reads again
-fn update_resources(app: &mut TextureCraftApp, ctx: &Context) {
+fn update_resources(app: &mut TextureCraftApp, ctx: &Context, failures_id: Id) {
     let Some(status) = app.run("resource.status", json!({})) else { return };
-    let rows = status["resources"].as_array().cloned().unwrap_or_default();
-    let mut failures: Vec<(String, String)> =
-        rows.iter().filter(|row| row["status"] == "missing").map(|row| (text(&row["name"]), text(&row["error"]))).collect();
+    let rows = status["resources"].as_array().into_iter().flatten();
+    let mut failures: Vec<(String, String)> = rows.filter(|row| row["status"] == "missing").map(|row| (text(&row["name"]), text(&row["error"]))).collect();
     if status["outdated"].as_u64().is_some_and(|outdated| outdated > 0)
         && let Some(result) = app.run("resource.update", json!({}))
     {
         failures.extend(result["failed"].as_array().into_iter().flatten().map(|failure| (text(&failure["name"]), text(&failure["error"]))));
     }
 
-    let reported_id = reported_failures_id(app.session.project_id);
-    let mut reported: Vec<String> = ctx.data(|data| data.get_temp(reported_id)).unwrap_or_default();
+    let mut reported: Vec<String> = ctx.data_mut(|data| data.remove_temp(failures_id)).unwrap_or_default();
     reported.retain(|name| failures.iter().any(|(failed, _)| failed == name));
     for (name, error) in failures {
         if !reported.contains(&name) {
@@ -121,7 +128,9 @@ fn update_resources(app: &mut TextureCraftApp, ctx: &Context) {
             reported.push(name);
         }
     }
-    ctx.data_mut(|data| data.insert_temp(reported_id, reported));
+    if !reported.is_empty() {
+        ctx.data_mut(|data| data.insert_temp(failures_id, reported));
+    }
 }
 
 /// Reads the files of `names` (every changed image when None) again through the Resources Updater, which says what happened
@@ -139,11 +148,6 @@ pub(crate) fn update_from_files(app: &mut TextureCraftApp, names: Option<Vec<Str
 /// A string field of a command's result, empty when it has none
 fn text(value: &serde_json::Value) -> String {
     value.as_str().unwrap_or_default().to_owned()
-}
-
-/// The files of project `project_id` whose failure to read was already shown (ctx temp data)
-fn reported_failures_id(project_id: u64) -> Id {
-    Id::unique(("shelf_updates_reported_failures", project_id))
 }
 
 /// The refresh button with its popup of update settings, opening upward from the toolbar `panel` with its left edge on the panel's

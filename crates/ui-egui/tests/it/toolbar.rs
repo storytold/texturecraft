@@ -6,6 +6,8 @@ use texturecraft_engine::{Session, Tool};
 use texturecraft_ui_egui::state::{Mode, ViewLayout};
 use texturecraft_ui_egui::{TextureCraftApp, theme, toolbar};
 
+use crate::DRAG_STEP_FRAMES;
+
 fn toolbar_harness(width: f32, tool: Tool) -> Harness<'static, TextureCraftApp> {
     let session = Session::new_project("Toolbar", texturecraft_engine::geom::primitives::cube(1.0), "builtin:cube", None, 128).unwrap();
     let context = eframe::CreationContext::_new_kittest(egui::Context::default());
@@ -24,12 +26,17 @@ fn toolbar_harness(width: f32, tool: Tool) -> Harness<'static, TextureCraftApp> 
 }
 
 fn size_label(harness: &Harness<'_, TextureCraftApp>) -> (egui::Pos2, egui::Rect) {
+    bar_label(harness, "Size")
+}
+
+/// Where the top bar paints the slider label `label`, and that text's clip
+fn bar_label(harness: &Harness<'_, TextureCraftApp>, label: &str) -> (egui::Pos2, egui::Rect) {
     harness
         .output()
         .shapes
         .iter()
         .find_map(|shape| match &shape.shape {
-            egui::Shape::Text(text) if text.galley.text() == "Size" => Some((text.pos, shape.clip_rect)),
+            egui::Shape::Text(text) if text.galley.text() == label => Some((text.pos, shape.clip_rect)),
             _ => None,
         })
         .unwrap()
@@ -86,6 +93,34 @@ fn arrows_and_wheel_scroll_without_changing_the_brush() {
     harness.run_steps(30);
     assert!(size_label(&harness).0.x < start - 50.0);
     assert_eq!(harness.state().session.tool.brush, brush);
+}
+
+#[test]
+fn the_spacing_slider_reaches_as_far_as_the_properties_one() {
+    // Wide enough that the bar shows Spacing without scrolling
+    const BAR_WIDTH: f32 = 1600.0;
+    // From the label's top left onto its text, which drags the value
+    const LABEL_GRAB_OFFSET: egui::Vec2 = egui::vec2(4.0, 8.0);
+    // Far enough right to pass the slider's end
+    const DRAG_PAST_END: f32 = 400.0;
+    // The top bar's old Spacing limit: 200 % of the diameter
+    const OLD_SPACING_LIMIT: f32 = 2.0;
+
+    let mut harness = toolbar_harness(BAR_WIDTH, Tool::Paint);
+    let (label, _) = bar_label(&harness, "Spacing");
+    let from = label + LABEL_GRAB_OFFSET;
+    let past_the_end = from + egui::vec2(DRAG_PAST_END, 0.0);
+
+    harness.hover_at(from);
+    harness.event(egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    harness.run_steps(DRAG_STEP_FRAMES);
+    harness.hover_at(past_the_end);
+    harness.run_steps(DRAG_STEP_FRAMES);
+    harness.event(egui::Event::PointerButton { pos: past_the_end, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    harness.run_steps(DRAG_STEP_FRAMES);
+
+    // Properties' Spacing goes to 1000 % of the diameter
+    assert!(harness.state().session.tool.brush.spacing > OLD_SPACING_LIMIT, "past the 200 % the top bar used to stop at");
 }
 
 #[test]

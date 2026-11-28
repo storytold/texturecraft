@@ -1,4 +1,4 @@
-//! A press outside a popup closes it when it turns into a drag (a paint stroke on the model), as a click does: the tool's colour, the layer menus and the symmetry settings, in the default layout and in a rearranged one restored after a restart
+//! A press outside a popup closes it when it turns into a drag (a paint stroke on the model), as a click does: the brush presets, the layer menus and the symmetry settings, in the default layout and in a rearranged one restored after a restart
 
 use eframe::App as _;
 use egui::accesskit::Role;
@@ -17,9 +17,6 @@ const DRAG_MOVES: usize = 6;
 
 /// A short stroke on the model
 const STROKE: Vec2 = vec2(-60.0, 40.0);
-
-/// From the tool's Base color label to inside its swatch
-const LABEL_TO_SWATCH: f32 = 60.0;
 
 /// The app started on `storage` (its saved arrangement, if any) with the paint tool's Properties showing
 fn app(storage: &MemoryStorage) -> Harness<'static, TextureCraftApp> {
@@ -91,23 +88,17 @@ fn stroke_on_model(harness: &mut Harness<'_, TextureCraftApp>, modifiers: Modifi
     drag(harness, view.center(), STROKE, modifiers);
 }
 
-/// Opens the paint tool's Base color swatch from its Properties' Material tab
-fn open_tool_color(harness: &mut Harness<'_, TextureCraftApp>) {
-    let header = harness.get_by_role_and_label(egui::Role::Tab, "Properties - Paint").rect();
-    let in_properties = |rect: egui::Rect| header.x_range().contains(rect.center().x) && rect.top() > header.top();
-    let material = harness.get_all_by_label("Material").find(|node| in_properties(node.rect())).unwrap();
-    material.click();
-    harness.run_steps(SETTLE_FRAMES);
-
-    let label = harness.get_all_by_value("Base color").find(|node| in_properties(node.rect())).unwrap().rect();
-    click(harness, label.right_center() + vec2(LABEL_TO_SWATCH, 0.0));
-    assert!(egui::Popup::is_any_open(&harness.ctx), "the swatch opens its colour popup");
+/// Opens the brush presets from the ≡ on the paint tool's Brush caption
+fn open_brush_presets(harness: &mut Harness<'_, TextureCraftApp>) {
+    let menu = harness.get_by_role_and_label(Role::Button, "Brush presets").rect();
+    click(harness, menu.center());
+    assert!(egui::Popup::is_any_open(&harness.ctx), "the ≡ opens the brush presets");
 }
 
 #[test]
-fn a_stroke_on_the_model_closes_the_tool_colour_popup_in_the_default_and_a_restored_rearranged_layout() {
+fn a_stroke_on_the_model_closes_the_brush_presets_in_the_default_and_a_restored_rearranged_layout() {
     let check_stroke = |mut harness: Harness<'_, TextureCraftApp>, layout: &str| {
-        open_tool_color(&mut harness);
+        open_brush_presets(&mut harness);
         let history = harness.state().session.history_labels().len();
 
         stroke_on_model(&mut harness, Modifiers::NONE);
@@ -121,9 +112,9 @@ fn a_stroke_on_the_model_closes_the_tool_colour_popup_in_the_default_and_a_resto
 }
 
 #[test]
-fn an_alt_orbit_keeps_the_tool_colour_popup_open() {
+fn an_alt_orbit_keeps_the_brush_presets_open() {
     let mut harness = app(&MemoryStorage::default());
-    open_tool_color(&mut harness);
+    open_brush_presets(&mut harness);
 
     stroke_on_model(&mut harness, Modifiers::ALT);
 
@@ -147,7 +138,7 @@ fn a_stroke_on_the_model_closes_the_add_effect_menu() {
 fn outside_drag_dismissal_handles_motion_batched_with_release() {
     for (modifiers, stays_open) in [(Modifiers::ALT, true), (Modifiers::NONE, false)] {
         let mut harness = app(&MemoryStorage::default());
-        open_tool_color(&mut harness);
+        open_brush_presets(&mut harness);
         let origin = harness.state().viewport_rect.center();
         harness.event(Event::ModifiersChanged(modifiers));
         harness.hover_at(origin);

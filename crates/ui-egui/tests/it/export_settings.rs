@@ -198,8 +198,9 @@ fn the_output_directory_resets_and_the_dilation_follows_the_padding() {
 
     assert!(h.query_by_label("Dilation (pixels)").is_some());
 
-    // A click on the slider sets the width and leaves the menu open
-    h.get_by_role(egui::Role::Slider).click();
+    // A click on the slider sets the width and leaves the menu open; Properties has sliders too, so take the one under the menu's label
+    let label = h.get_by_label("Dilation (pixels)").rect().left_bottom();
+    h.query_all_by_role(egui::Role::Slider).min_by(|a, b| a.rect().left_top().distance(label).total_cmp(&b.rect().left_top().distance(label))).unwrap().click();
     h.run_steps(4);
 
     assert_ne!(h.state().ui.export.dilation, 16);

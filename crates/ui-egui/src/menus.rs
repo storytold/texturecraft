@@ -468,8 +468,7 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
         return;
     }
 
-    // A plain Escape or Enter while no widget of TextureCraft's has the keyboard is the window's cancel or submit: back
-    // in egui's input, it runs the Escape and Enter handlers below, the shortcuts and the Path tool's keys
+    // Route unhandled window actions back through the shortcuts and Path tool
     for (key, taken) in [(Key::Escape, crate::framework::take_window_cancel(ctx)), (Key::Enter, crate::framework::take_window_submit(ctx))] {
         if taken {
             let escape = craft_ui::runtime::keys::escape_mods(ctx).filter(|_| key == Key::Escape);
@@ -496,7 +495,7 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
     });
 
     // Let the innermost popup consume Escape before cancelling the active tool
-    // (the drop popup of the Output templates tab is open without registering with egui, and reads Escape itself)
+    // The Output templates drop popup handles Escape outside egui's popup registry
     let popup_open = egui::Popup::is_any_open(ctx) || app.ui.export.pending_drop.is_some();
     let point_pick_armed = crate::generator_point_pick::armed(ctx).is_some();
     let mut cancel_point_pick = false;

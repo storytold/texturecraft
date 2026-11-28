@@ -70,8 +70,8 @@ fn craft_fonts(dir: &std::path::Path, rel: &str, desktop: &[(&str, &str)], web: 
     let wanted = if wasm { web } else { desktop };
     let mut out = String::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
-        let f: Vec<&str> = line.split(" | ").map(str::trim).collect();
-        let [family, style, file, scripts, ..] = f.as_slice() else {
+        let fields: Vec<&str> = line.split(" | ").map(str::trim).collect();
+        let [family, style, file, scripts, ..] = fields.as_slice() else {
             return Err(format!("malformed manifest line: {line}"));
         };
 
@@ -82,9 +82,9 @@ fn craft_fonts(dir: &std::path::Path, rel: &str, desktop: &[(&str, &str)], web: 
         let mut path = dir.join(file).canonicalize().map_err(|e| format!("{file}: {e}"))?;
         println!("cargo::rerun-if-changed={}", path.display());
         let tags: Vec<&str> = scripts.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-        // The Latin faces lose their Private Use Area everywhere; a web build also cuts its CJK
-        // faces to the characters the shipped catalogs use. The desktop keeps its CJK faces whole:
-        // the same face draws text the app never ships, a user's Japanese file name.
+
+        // Leave the Private Use Area to the icon font
+        // Desktop CJK fonts also cover user file names outside the catalogs
         let cut = rel == LATIN_MANIFEST || (wasm && !catalogs.is_empty() && tags.iter().any(|tag| CJK_SCRIPTS.contains(tag)));
         if cut {
             let bytes = std::fs::read(&path).map_err(|e| format!("{file}: {e}"))?;

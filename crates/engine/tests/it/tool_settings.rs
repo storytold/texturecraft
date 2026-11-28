@@ -148,3 +148,26 @@ fn restored_stencil_and_smudge_settings_use_the_tool_limits() {
     let look = session.tool.stencil_look;
     assert_eq!((look.center, look.scale, look.opacity, look.rotation), ([-4.0, 4.0], 0.01, 0.0, 345.0));
 }
+
+#[test]
+fn tool_brush_sets_and_reports_the_projection_bands_settings() {
+    let mut session = another_project();
+    let defaults = session.tool.brush.clone();
+    let reported = execute(&mut session, "tool.brush", &json!({"angleFade": [20, 40], "stampDepth": 2.5, "screenSpace": !defaults.screen_space})).unwrap();
+
+    let brush = &session.tool.brush;
+    assert_ne!(brush.angle_fade, defaults.angle_fade, "Angle fade from / to changes through the command");
+    assert_ne!(brush.depth, defaults.depth, "Stamp depth changes through the command");
+    assert_eq!(reported["angleFade"], json!([brush.angle_fade.0, brush.angle_fade.1]));
+    assert_eq!(reported["stampDepth"], json!(brush.depth));
+    assert_eq!(reported["screenSpace"], json!(brush.screen_space));
+}
+
+#[test]
+fn a_malformed_angle_fade_leaves_the_brush_unchanged() {
+    let mut session = another_project();
+    let before = session.tool.brush.clone();
+
+    assert!(execute(&mut session, "tool.brush", &json!({"size": 50, "angleFade": "steep"})).is_err());
+    assert_eq!(session.tool.brush, before);
+}

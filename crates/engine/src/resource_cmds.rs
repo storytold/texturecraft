@@ -341,6 +341,7 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
     if to == name {
         return Ok(json!({ "name": name }));
     }
+
     if s.doc.resources.contains_key(&to) || crate::fill_alpha::library_alpha_of(&to).is_some() {
         return Err(bad(command, format!("a resource named `{to}` exists already")));
     }
@@ -348,6 +349,7 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit("Rename resource", |s| {
         let bytes = s.doc.resources.remove(&name).ok_or_else(|| bad(command, format!("no resource `{name}`")))?;
         s.doc.resources.insert(to.clone(), bytes);
+
         // The Resources Updater keeps following the file the image came from
         if let Some(source) = s.doc.project.resource_sources.remove(&name) {
             s.doc.project.resource_sources.insert(to.clone(), source);
@@ -428,17 +430,23 @@ fn images_in_use(s: &Session) -> Vec<String> {
 }
 
 /// Drop resources unused by layers, mesh maps, paint tools or the environment (one undo step)
-fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
-    let used = images_in_use(s);
-    let unused: Vec<String> = s.doc.resources.keys().filter(|k| !used.contains(k)).cloned().collect();
+fn remove_unused(session: &mut Session, _: &Value) -> Result<Value> {
+    let mut used = images_in_use(session);
+    used.sort_unstable();
+    let unused: Vec<_> = session.doc.resources.keys().filter(|name| used.binary_search(name).is_err()).cloned().collect();
+
     if !unused.is_empty() {
-        s.edit("Remove unused resources", |s| {
-            s.doc.resources.retain(|k, _| !unused.contains(k));
-            s.doc.project.resource_sources.retain(|k, _| !unused.contains(k));
+        session.edit("Remove unused resources", |session| {
+            for name in &unused {
+                session.doc.resources.remove(name);
+                session.doc.project.resource_sources.remove(name);
+            }
+
             Ok(())
         })?;
-        s.sync_images();
+        session.sync_images();
     }
+
     Ok(json!({ "removed": unused }))
 }
 
@@ -538,6 +546,7 @@ mod tests {
 
         let renamed = crate::execute(&mut session, "resource.rename", &json!({"name": name, "to": "stone"})).unwrap()["name"].as_str().unwrap().to_string();
         std::fs::write(&path, texturecraft_formats::gray16_png(1, 1, [0.75].into_iter()).unwrap()).unwrap();
+
         // An equal-size file counts as changed once its time moved, as a later save's does
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();

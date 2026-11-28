@@ -1,11 +1,11 @@
-//! Each brush section header has a reset icon that puts only that section's settings back to their defaults
+//! Each band of the Brush section has a reset that puts back only that band's settings, grouped as the reference groups them
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_engine::paint::{Alignment, BrushAlpha, BrushSettings, Particles, Symmetry};
 use texturecraft_ui_egui::TextureCraftApp;
 
-/// The default window; Properties shows only the top of the brush there, so lower headers are scrolled to
+/// The default window; Properties shows only the top of the brush there, so lower bands are scrolled to
 const WINDOW_SIZE: egui::Vec2 = egui::vec2(1600.0, 960.0);
 
 /// Frames for the first layout and fonts to settle
@@ -17,25 +17,22 @@ const SETTLE_FRAMES: usize = 3;
 /// Puts one section's fields of the first brush back to the second's values
 type SectionReset = fn(&mut BrushSettings, &BrushSettings);
 
-/// Each brush section's title, a label shown only while it is open, whether it starts open, and its reset
-const SECTIONS: [(&str, &str, bool, SectionReset); 7] = [
-    ("Size", "Minimum size (%)", true, |brush, defaults| {
-        (brush.size, brush.min_size, brush.screen_space) = (defaults.size, defaults.min_size, defaults.screen_space)
+/// Each band's title, a label shown only while it is open, whether it starts open, and its reset
+const SECTIONS: [(&str, &str, bool, SectionReset); 6] = [
+    ("Size", "Minimum Size (%)", true, |brush, defaults| {
+        (brush.size, brush.size_pressure, brush.min_size, brush.spacing) = (defaults.size, defaults.size_pressure, defaults.min_size, defaults.spacing)
     }),
-    ("Flow and opacity", "Stroke opacity", true, |brush, defaults| {
-        (brush.flow, brush.opacity, brush.spacing) = (defaults.flow, defaults.opacity, defaults.spacing)
-    }),
-    ("Angle", "Follow path", false, |brush, defaults| (brush.angle, brush.follow_path) = (defaults.angle, defaults.follow_path)),
-    ("Jitters", "Size jitter", false, |brush, defaults| {
+    ("Opacity", "Stroke opacity", true, |brush, defaults| (brush.flow, brush.opacity) = (defaults.flow, defaults.opacity)),
+    ("Orientation", "Follow Path", true, |brush, defaults| (brush.angle, brush.follow_path) = (defaults.angle, defaults.follow_path)),
+    ("Jitter", "Size Jitter", true, |brush, defaults| {
         (brush.jitter_size, brush.jitter_angle, brush.jitter_flow, brush.jitter_position) =
             (defaults.jitter_size, defaults.jitter_angle, defaults.jitter_flow, defaults.jitter_position)
     }),
-    ("Alignment and culling", "Backface culling", false, |brush, defaults| {
-        (brush.alignment, brush.backface_culling, brush.angle_fade, brush.depth) =
-            (defaults.alignment, defaults.backface_culling, defaults.angle_fade, defaults.depth)
+    ("Projection", "Backface culling", true, |brush, defaults| {
+        (brush.alignment, brush.backface_culling, brush.angle_fade, brush.screen_space, brush.depth) =
+            (defaults.alignment, defaults.backface_culling, defaults.angle_fade, defaults.screen_space, defaults.depth)
     }),
     ("Particles", "Gravity", false, |brush, defaults| brush.particles = defaults.particles),
-    ("Lazy mouse", "Lazy mouse distance", false, |brush, defaults| brush.lazy = defaults.lazy),
 ];
 
 /// A valid brush with every section field changed and a custom alpha that resets must preserve
@@ -43,6 +40,7 @@ fn changed_brush() -> BrushSettings {
     BrushSettings {
         size: 0.1,
         min_size: 0.5,
+        size_pressure: false,
         screen_space: true,
         flow: 0.5,
         opacity: 0.6,
@@ -82,22 +80,38 @@ fn app_with_brush(brush: BrushSettings) -> Harness<'static, TextureCraftApp> {
     harness
 }
 
-/// The reset icon on the header row titled `title`
-fn reset_icon<'tree>(harness: &'tree Harness<'_, TextureCraftApp>, title: &str) -> egui_kittest::Node<'tree> {
-    let label = format!("{title}: Reset to defaults");
+/// The band titled `title` in Properties: the rightmost, as the top bar has a Size too
+fn band<'tree>(harness: &'tree Harness<'_, TextureCraftApp>, title: &str) -> egui_kittest::Node<'tree> {
     harness
         .query_all_by_role(egui::Role::Button)
-        .find(|node| node.accesskit_node().label().as_deref() == Some(label.as_str()))
-        .unwrap_or_else(|| panic!("no reset icon on the {title} header"))
+        .filter(|node| node.accesskit_node().label().as_deref() == Some(title))
+        .max_by(|a, b| a.rect().left().total_cmp(&b.rect().left()))
+        .unwrap_or_else(|| panic!("no {title} band"))
 }
 
-/// Scrolls the header titled `title` into view and clicks its reset icon
+/// The reset on the band titled `title`
+fn reset_icon<'tree>(harness: &'tree Harness<'_, TextureCraftApp>, title: &str) -> egui_kittest::Node<'tree> {
+    let band = band(harness, title).rect();
+    harness
+        .query_all_by_role(egui::Role::Button)
+        .find(|node| node.accesskit_node().label().as_deref() == Some("Restore defaults") && node.rect().y_range().intersects(band.y_range()))
+        .unwrap_or_else(|| panic!("no reset on the {title} band"))
+}
+
+/// Scrolls the band titled `title` into view and clicks its reset
 fn click_reset(harness: &mut Harness<'_, TextureCraftApp>, title: &str) {
-    reset_icon(harness, title).scroll_to_me();
+    band(harness, title).scroll_to_me();
     harness.run_steps(SETTLE_FRAMES);
 
     reset_icon(harness, title).click();
     harness.run_steps(SETTLE_FRAMES);
+}
+
+#[test]
+fn the_lazy_mouse_is_set_only_in_the_top_bar() {
+    let harness = app_with_brush(BrushSettings::default());
+
+    assert_eq!(harness.query_all_by_label("Lazy mouse").count(), 1, "the top bar's button, no band in Properties");
 }
 
 #[test]
@@ -118,13 +132,12 @@ fn each_reset_puts_back_only_its_own_section() {
     }
 }
 
-/// Scrolls the header titled `title` into view and clicks the header itself, folding or unfolding it
+/// Scrolls the band titled `title` into view and clicks it, folding or unfolding it
 fn click_header(harness: &mut Harness<'_, TextureCraftApp>, title: &str) {
-    reset_icon(harness, title).scroll_to_me();
+    band(harness, title).scroll_to_me();
     harness.run_steps(SETTLE_FRAMES);
 
-    let icon = reset_icon(harness, title).rect();
-    harness.query_all_by_label(title).find(|label| label.rect().y_range().intersects(icon.y_range())).unwrap_or_else(|| panic!("no {title} header")).click();
+    band(harness, title).click();
     harness.run_steps(SETTLE_FRAMES);
 }
 
@@ -157,7 +170,7 @@ fn at_the_defaults_the_reset_icons_are_inert() {
 
         click_reset(&mut harness, title);
 
-        assert_eq!(harness.query_by_label(body_label).is_some(), starts_open, "the click doesn't reach the {title} header");
+        assert_eq!(harness.query_by_label(body_label).is_some(), !starts_open, "an inert reset folds the {title} band like the rest of it");
         assert_eq!(harness.state().session.tool.brush, BrushSettings::default(), "the {title} reset is inert");
     }
 }
@@ -168,6 +181,7 @@ fn enter_and_space_on_the_focused_reset_icon_reset_only_its_section() {
         let mut harness = app_with_brush(changed_brush());
         reset_icon(&harness, "Size").focus();
         harness.run_steps(SETTLE_FRAMES);
+
         assert!(reset_icon(&harness, "Size").is_focused());
 
         harness.key_press(key);
@@ -175,7 +189,8 @@ fn enter_and_space_on_the_focused_reset_icon_reset_only_its_section() {
 
         let defaults = BrushSettings::default();
         let mut expected = changed_brush();
-        (expected.size, expected.min_size, expected.screen_space) = (defaults.size, defaults.min_size, defaults.screen_space);
+        (expected.size, expected.size_pressure, expected.min_size, expected.spacing) =
+            (defaults.size, defaults.size_pressure, defaults.min_size, defaults.spacing);
         assert_eq!(harness.state().session.tool.brush, expected, "resetting Size with {key:?}");
     }
 }

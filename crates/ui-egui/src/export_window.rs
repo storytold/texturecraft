@@ -448,22 +448,22 @@ fn start_export(app: &mut TextureCraftApp) {
         texturecraft_engine::formats::export::validate_export_paths(paths).err().map(|error| trf("Export stopped: {error}", &[("error", &error)]))
     });
 
-    let e = &mut app.ui.export;
-    e.tab = 2;
-    e.console = vec![ConsoleLine::Step(tr("Preparing texture export").into())];
+    let export = &mut app.ui.export;
+    export.tab = 2;
+    export.console = vec![ConsoleLine::Step(tr("Preparing texture export").into())];
     if let Some(error) = error {
-        e.console.push(ConsoleLine::Step(error.clone()));
+        export.console.push(ConsoleLine::Step(error.clone()));
         app.toast(error, true);
         return;
     }
 
-    e.job = Some(crate::state::ExportJob {
+    export.job = Some(crate::state::ExportJob {
         total: pending.len(),
         pending,
         preview,
         directory: dir,
-        usd_asset: e.usd_asset,
-        shader_parameters: e.shader_parameters,
+        usd_asset: export.usd_asset,
+        shader_parameters: export.shader_parameters,
         ..Default::default()
     });
 }
@@ -1340,9 +1340,9 @@ fn success(tk: &Tokens) -> egui::Color32 {
 }
 
 /// The LIST OF EXPORTS tab in `body`: the file tree with each file's path as tooltip, the fold strip and the console
-fn list_tab(app: &mut TextureCraftApp, ui: &mut Ui, body: egui::Rect) {
+fn list_tab(app: &mut TextureCraftApp, ui: &mut Ui, body: egui::Rect, idle_plans: Option<&[ExportSetPlan]>) {
     let look = ExportLook::get(ui.ctx());
-    let tk = Tokens::get(ui.ctx());
+    let tokens = Tokens::get(ui.ctx());
     let hidden = app.ui.export.console_hidden;
 
     // The console keeps at least its least width, the tree at least its own
@@ -1353,7 +1353,7 @@ fn list_tab(app: &mut TextureCraftApp, ui: &mut Ui, body: egui::Rect) {
     let tree = egui::Rect::from_min_max(egui::pos2(body.left(), body.top() + 1.0), egui::pos2(strip.left() - STRIP_GAP, body.bottom()));
     ui.painter().rect_filled(tree, 0.0, look.chrome);
     ui.scope_builder(egui::UiBuilder::new().max_rect(tree), |ui| {
-        egui::ScrollArea::both().id_salt("exp_list").auto_shrink([false; 2]).show(ui, |ui| export_tree(app, ui, &tk));
+        egui::ScrollArea::both().id_salt("exp_list").auto_shrink([false; 2]).show(ui, |ui| export_tree(app, ui, &tokens, idle_plans));
     });
 
     // The strip at the console's left edge: a click hides or shows the console, a drag resizes it
@@ -1391,8 +1391,8 @@ fn list_tab(app: &mut TextureCraftApp, ui: &mut Ui, body: egui::Rect) {
             for (index, line) in app.ui.export.console.iter().enumerate() {
                 let response = match line {
                     ConsoleLine::Step(text) => ui.label(text),
-                    ConsoleLine::Done(text) => ui.label(RichText::new(text).color(success(&tk))),
-                    ConsoleLine::Set(name) => ui.label(set_line(ui, name, &tk)),
+                    ConsoleLine::Done(text) => ui.label(RichText::new(text).color(success(&tokens))),
+                    ConsoleLine::Set(name) => ui.label(set_line(ui, name, &tokens)),
                 };
 
                 if index + 1 == app.ui.export.console.len() {
@@ -1417,19 +1417,30 @@ fn set_line(ui: &Ui, name: &str, tk: &Tokens) -> egui::text::LayoutJob {
 }
 
 /// One foldable node per ticked texture set, a row per file; the columns start after the longest file name
-fn export_tree(app: &mut TextureCraftApp, ui: &mut Ui, tk: &Tokens) {
-    let (sets, directory): (Vec<(usize, ExportSetPlan)>, String) = match &app.ui.export.job {
-        Some(job) if !job.preview.is_empty() => (job.preview.iter().cloned().enumerate().collect(), job.directory.clone()),
+fn export_tree(app: &mut TextureCraftApp, ui: &mut Ui, tokens: &Tokens, idle_plans: Option<&[ExportSetPlan]>) {
+    let planned: Vec<ExportSetPlan>;
+    let (sets, directory) = match (&app.ui.export.job, idle_plans) {
+        (Some(job), _) if !job.preview.is_empty() => (job.preview.as_slice(), job.directory.as_str()),
+        (_, Some(plans)) => (plans, app.ui.export.dir.as_str()),
         _ => {
-            let planned = export_selection(app).into_iter().filter_map(|ts| {
-                let params = set_params(app, ts);
-                plan_set(app, ts, &params).map(|set| (ts, set))
-            });
-            (planned.collect(), app.ui.export.dir.clone())
+            planned = selected_plans(app);
+            (planned.as_slice(), app.ui.export.dir.as_str())
         }
     };
-    let rows: Vec<Vec<TreeFile>> = sets.iter().map(|(_, set)| tree_files(set, &directory)).collect();
-    let longest = |text: fn(&TreeFile) -> &str| rows.iter().flatten().map(|file| drawn::text_width(ui, text(file), false)).fold(0.0, f32::max);
+
+    let rows: Vec<Vec<TreeFile>> = sets.iter().map(|set| tree_files(set, directory)).collect();
+    let longest = |column: fn(&TreeFile) -> &str| {
+        let mut widest = 0.0_f32;
+        let mut previous = None;
+        for value in rows.iter().flatten().map(column) {
+            if previous != Some(value) {
+                widest = widest.max(drawn::text_width(ui, value, false));
+                previous = Some(value);
+            }
+        }
+
+        widest
+    };
     let columns = {
         let size = TREE_FILE_INDENT + longest(|f| &f.name) + TREE_COLUMN_GAP;
         let format = size + longest(|f| &f.size) + TREE_COLUMN_GAP;
@@ -1437,27 +1448,38 @@ fn export_tree(app: &mut TextureCraftApp, ui: &mut Ui, tk: &Tokens) {
     };
 
     // Each set takes its header row, its files when open and a blank row
-    let open: Vec<bool> = sets.iter().map(|(index, _)| ui.data(|d| d.get_temp::<bool>(tree_id(ui, *index))).unwrap_or(true)).collect();
+    let disclosure: Vec<_> = sets
+        .iter()
+        .enumerate()
+        .map(|(row, set)| {
+            let id = match set.index {
+                Some(index) => ui.scope_id().with(("exp_tree", index)),
+                None => ui.scope_id().with(("removed_export_set", row)),
+            };
+            let open = ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(true);
+            (id, open)
+        })
+        .collect();
     let row_count: usize = sets
         .iter()
         .zip(&rows)
-        .zip(&open)
-        .map(|(((_, set), files), open)| 1 + 1 + if *open { files.len().max(usize::from(set.files.is_err())) } else { 0 })
+        .zip(&disclosure)
+        .map(|((set, files), (_, open))| 2 + if *open { files.len().max(usize::from(set.files.is_err())) } else { 0 })
         .sum();
     let width = ui.available_width().max(columns[2] + longest(|file| &file.bits) + TREE_BITS_GAP);
     let height = TREE_TOP_PADDING + row_count as f32 * TREE_ROW_HEIGHT;
     let (area, _) = ui.allocate_exact_size(vec2(width, height), egui::Sense::hover());
 
     let mut y = area.top() + TREE_TOP_PADDING;
-    for (((index, set), files), open) in sets.iter().zip(&rows).zip(open) {
+    for ((set, files), (id, open)) in sets.iter().zip(&rows).zip(disclosure) {
         let header = egui::Rect::from_min_max(egui::pos2(area.left(), y), egui::pos2(area.right(), y + TREE_ROW_HEIGHT));
-        if tree_header(ui, header, &set.name, open, tree_id(ui, *index)) {
-            ui.data_mut(|d| d.insert_temp(tree_id(ui, *index), !open));
+        if tree_header(ui, header, &set.name, open, id) {
+            ui.data_mut(|data| data.insert_temp(id, !open));
         }
         y += TREE_ROW_HEIGHT;
         if open {
             if let Err(error) = &set.files {
-                drawn::label_at(ui, area.left() + TREE_FILE_INDENT, y + TREE_ROW_HEIGHT / 2.0, error, tk.danger, false);
+                drawn::label_at(ui, area.left() + TREE_FILE_INDENT, y + TREE_ROW_HEIGHT / 2.0, error, tokens.danger, false);
                 y += TREE_ROW_HEIGHT;
             }
             for file in files {
@@ -1469,17 +1491,22 @@ fn export_tree(app: &mut TextureCraftApp, ui: &mut Ui, tk: &Tokens) {
     }
 }
 
+fn selected_plans(app: &mut TextureCraftApp) -> Vec<ExportSetPlan> {
+    export_selection(app)
+        .into_iter()
+        .filter_map(|index| {
+            let params = set_params(app, index);
+            plan_set(app, index, &params)
+        })
+        .collect()
+}
+
 fn plan_set(app: &mut TextureCraftApp, index: usize, params: &serde_json::Value) -> Option<ExportSetPlan> {
     let set = app.session.doc.project.texture_sets.get(index)?;
     let name = set.name.clone();
     let files = texturecraft_engine::execute(&mut app.session, "export.plan", params).map_err(|error| error.to_string());
 
     Some(ExportSetPlan { index: Some(index), name, files })
-}
-
-/// Where a texture set's node keeps whether it is open
-fn tree_id(ui: &Ui, index: usize) -> egui::Id {
-    ui.scope_id().with(("exp_tree", index))
 }
 
 /// The texts of each file `set` plans: name, size, file type, bit depth and its whole path
@@ -1511,6 +1538,7 @@ fn tree_header(ui: &mut Ui, rect: egui::Rect, name: &str, open: bool, id: egui::
 
     // Expose the hand-drawn header as a disclosure control
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::DisclosureTriangle, true, name));
+    ui.ctx().accesskit_node_builder(response.id, |node| node.set_expanded(open));
 
     let y = rect.center().y;
     let chevron = if open {
@@ -1734,7 +1762,7 @@ pub(crate) fn keys_in(app: &mut TextureCraftApp, input: &mut egui::InputState) {
 }
 
 /// The bottom bar: Export, Save settings, Cancel and the texture count, Reset all on SETTINGS; while exporting, progress
-fn footer(app: &mut TextureCraftApp, ui: &mut Ui, window: egui::Rect, y: f32, do_export: &mut bool, canceled: &mut bool) {
+fn footer(app: &mut TextureCraftApp, ui: &mut Ui, window: egui::Rect, y: f32, do_export: &mut bool, canceled: &mut bool) -> Option<Vec<ExportSetPlan>> {
     let slot = |k: f32| {
         let right = window.right() - RIGHT_MARGIN - k * (FOOTER_BUTTON_WIDTH + FOOTER_BUTTON_GAP);
         drawn::control_rect(right - FOOTER_BUTTON_WIDTH, right, y)
@@ -1749,7 +1777,7 @@ fn footer(app: &mut TextureCraftApp, ui: &mut Ui, window: egui::Rect, y: f32, do
         let look = ExportLook::get(ui.ctx());
         let response = ui.put(bar, egui::ProgressBar::new(progress).fill(look.outline).text(format!("{:.0}%", progress * 100.0)));
         ui.ctx().accesskit_node_builder(response.id, |node| node.set_live(egui::accesskit::Live::Polite));
-        return;
+        return None;
     }
 
     // OUTPUT TEMPLATES shows no count; a template edit that does not validate holds Save and Export
@@ -1770,9 +1798,20 @@ fn footer(app: &mut TextureCraftApp, ui: &mut Ui, window: egui::Rect, y: f32, do
     if cancel.on_hover_text(tr("Close the window and go back to the settings it opened with")).clicked() {
         *canceled = true;
     }
+    let list_plans = (app.ui.export.tab == 2).then(|| selected_plans(app));
     if !templates_tab {
+        let texture_count = match &list_plans {
+            Some(plans) => plans
+                .iter()
+                .try_fold(0, |count, set| {
+                    let files = set.files.as_ref().ok()?;
+                    Some(count + files.as_array().map_or(0, Vec::len))
+                })
+                .unwrap_or(0),
+            None => selected_texture_count(app),
+        };
         let look = ExportLook::get(ui.ctx());
-        let count = trf("{n} textures selected for export", &[("n", &selected_texture_count(app))]);
+        let count = trf("{n} textures selected for export", &[("n", &texture_count)]);
         let left = slot(2.0).left() - COUNT_GAP - drawn::text_width(ui, &count, false);
         drawn::label_at(ui, left, y, &count, look.text_dim, false);
     }
@@ -1782,10 +1821,12 @@ fn footer(app: &mut TextureCraftApp, ui: &mut Ui, window: egui::Rect, y: f32, do
         && drawn::button(ui, reset_rect, tr("Reset all"), false, true).on_hover_text(tr("Restore the export defaults and select every texture")).clicked()
     {
         // Keep ownership so Cancel can restore the opening settings
-        let e = &mut app.ui.export;
-        let (opened_with, owner, owner_id) = (e.opened_with.take(), std::mem::take(&mut e.owner), e.owner_id);
+        let export = &mut app.ui.export;
+        let (opened_with, owner, owner_id) = (export.opened_with.take(), std::mem::take(&mut export.owner), export.owner_id);
         app.ui.export = ExportUi { opened_with, owner, owner_id, ..ExportUi::default() };
     }
+
+    list_plans
 }
 
 /// The SETTINGS tab in `body`: the texture set list, a divider, then the selected page
@@ -1826,13 +1867,13 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
         crate::export_templates::clear_map_previews(ctx);
 
         // The window opens on SETTINGS again; an export stops with it
-        let e = &mut app.ui.export;
-        e.job = None;
-        e.ask = None;
-        e.pending_drop = None;
-        e.opened_with = None;
-        e.tab = 0;
-        e.page = None;
+        let export = &mut app.ui.export;
+        export.job = None;
+        export.ask = None;
+        export.pending_drop = None;
+        export.opened_with = None;
+        export.tab = 0;
+        export.page = None;
         return;
     }
 
@@ -1921,7 +1962,7 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
         let footer_y = window.bottom() - FOOTER_MIDDLE_FROM_BOTTOM;
         drawn::divider(ui, egui::Rect::from_min_max(body.left_bottom(), body.right_bottom() + vec2(0.0, 1.0)));
-        footer(app, ui, window, footer_y, &mut do_export, &mut canceled);
+        let list_plans = footer(app, ui, window, footer_y, &mut do_export, &mut canceled);
 
         // The tabs lay out from the body; a child clips what an overflow would draw past it
         let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
@@ -1929,7 +1970,7 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
         let ui = &mut body_ui;
         match app.ui.export.tab {
             1 => crate::export_templates::tab(app, ui, body, presets),
-            2 => list_tab(app, ui, body),
+            2 => list_tab(app, ui, body, list_plans.as_deref()),
             _ => settings_tab(app, ui, body, presets),
         }
     });
