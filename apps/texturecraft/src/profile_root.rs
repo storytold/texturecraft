@@ -191,18 +191,7 @@ fn private_subdirectory(root: &Path, name: impl AsRef<Path>, label: &str) -> Res
 }
 
 /// Known folder-only entries directly inside a Nightly profile.
-const PROFILE_FOLDERS: [&str; 10] = [
-    "autosave",
-    "logs",
-    "cache",
-    "library",
-    "layouts",
-    "templates",
-    "brushes",
-    "export",
-    "export-presets",
-    "Samples",
-];
+const PROFILE_FOLDERS: [&str; 10] = ["autosave", "logs", "cache", "library", "layouts", "templates", "brushes", "export", "export-presets", "Samples"];
 
 /// Every existing entry directly in the profile (autosave, logs, library and so on) must resolve
 /// inside it.
