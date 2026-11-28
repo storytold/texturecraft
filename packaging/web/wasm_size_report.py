@@ -24,24 +24,16 @@ def crate_of(name):
         if m: return m.group(2)[:int(m.group(1))]
     return "<other: " + name.split("::")[0][:40] + ">" if "::" in name else "<unmangled>"
 
-def allowed_wasm(arg):
-    """Resolve arg and accept it only as a .wasm file under the repo or CARGO_TARGET_DIR."""
-    repo = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-    roots = [repo]
-    target = os.environ.get("CARGO_TARGET_DIR")
-    if target:
-        roots.append(os.path.realpath(target))
-    path = os.path.realpath(arg)
-    if not path.endswith(".wasm") or not os.path.isfile(path):
-        return None
-    for root in roots:
-        if os.path.commonpath([root, path]) == root:
-            return path
-    return None
-
 def main(arg, top=25):
-    path = allowed_wasm(arg)
-    if path is None:
+    repo = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    target_env = os.environ.get("CARGO_TARGET_DIR")
+    target = os.path.realpath(target_env) if target_env else None
+    path = os.path.realpath(arg)
+    root = target if target and path.startswith(target + os.sep) else repo
+    if not path.startswith(root + os.sep):
+        print(f"wasm_size_report: skipped {arg!r}: not a .wasm file under the repository or CARGO_TARGET_DIR", file=sys.stderr)
+        return
+    if not path.endswith(".wasm") or not os.path.isfile(path):
         print(f"wasm_size_report: skipped {arg!r}: not a .wasm file under the repository or CARGO_TARGET_DIR", file=sys.stderr)
         return
     with open(path, "rb") as f:
