@@ -244,6 +244,28 @@ fn paint_along_path_without_points_starts_an_open_path() {
 }
 
 #[test]
+fn a_history_jump_over_a_filled_preview_undoes_only_what_was_asked() {
+    let mut s = session();
+    execute(&mut s, "tool.variant.pathFilled", &Value::Null).unwrap();
+    for [u, v] in [TRIANGLE_UV[0], TRIANGLE_UV[1]] {
+        s.append_path_point(Vec3::new(u, v, 0.0), true).unwrap();
+        s.path_live().unwrap();
+    }
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    let layer_count = s.doc.project.layers.len();
+    let [u, v] = TRIANGLE_UV[2];
+    s.append_path_point(Vec3::new(u, v, 0.0), true).unwrap();
+    s.path_live().unwrap();
+
+    for _ in 0..s.history_undo_steps(1) {
+        execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    }
+
+    assert_eq!(s.doc.project.layers.len(), layer_count - 1, "one document step back, not two");
+}
+
+#[test]
 fn finishing_a_stored_edit_keeps_that_paths_variant() {
     let mut s = session();
     let report = execute(&mut s, "tool.path", &json!({"uvPoints": SQUARE_UV, "closed": true, "fill": true, "commit": true})).unwrap();

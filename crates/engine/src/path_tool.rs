@@ -122,6 +122,11 @@ impl PathState {
         self.selected
     }
 
+    /// Whether a new path paints a preview: it has points, and a filled outline has enough to enclose an area
+    fn has_preview(&self) -> bool {
+        !self.points.is_empty() && !(self.closed && self.fill && self.points.len() < MIN_AREA_POINTS)
+    }
+
     /// The same curve (points, open or closed, filled, view) as `other`
     fn same_curve(&self, other: &PathState) -> bool {
         (&self.points, self.corner_flags(), self.closed, self.fill, self.uv) == (&other.points, other.corner_flags(), other.closed, other.fill, other.uv)
@@ -630,7 +635,7 @@ impl Session {
         }
 
         let path = &self.tool.path;
-        if path.closed && path.fill && path.points.len() < MIN_AREA_POINTS {
+        if !path.has_preview() {
             // Nothing fills yet, so the preview goes, and the tool must not keep pointing at it
             let removed = self.remove_draft_preview();
             if removed {
@@ -818,8 +823,12 @@ impl Session {
             return 0;
         }
 
-        let (point_steps, clears_path) = self.path_steps_before_document(true);
-        let cancel_draft = self.path_draft.is_some() && !clears_path;
+        let (point_steps, clears_path, restored) = self.path_steps_before_document(true);
+
+        // Undoing a new path's points can add or remove its preview, which decides whether there is one left to cancel
+        let stored = self.tool.path.editing.is_some() && self.path_draft.is_none();
+        let previews = restored.filter(|_| !stored).map_or(self.path_draft.is_some(), PathState::has_preview);
+        let cancel_draft = previews && !clears_path;
         document_steps.saturating_add(point_steps).saturating_add(usize::from(cancel_draft))
     }
 
@@ -833,10 +842,10 @@ impl Session {
         document_steps.saturating_add(self.path_steps_before_document(false).0)
     }
 
-    /// Count pending point steps and whether their last step clears the path
-    fn path_steps_before_document(&self, back: bool) -> (usize, bool) {
+    /// Count pending point steps, whether their last step clears the path, and the curve that step restores
+    fn path_steps_before_document(&self, back: bool) -> (usize, bool, Option<&PathState>) {
         if self.tool.tool != Tool::Path {
-            return (0, false);
+            return (0, false, None);
         }
 
         let states = if back { &self.path_steps.0 } else { &self.path_steps.1 };
@@ -851,13 +860,13 @@ impl Session {
 
             // Restoring an empty curve cancels the draft and clears point history in the same step
             if state.points.is_empty() {
-                return (steps, true);
+                return (steps, true, Some(state));
             }
 
             current = state;
         }
 
-        (steps, false)
+        (steps, false, (steps > 0).then_some(current))
     }
 
     /// Undo (`back`) or redo a point change and repaint before returning; failure preserves the curve and history
