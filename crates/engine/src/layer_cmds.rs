@@ -1181,6 +1181,6 @@ fn color_tag(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
-    let ts = u64p(p, "ts").map(|t| t as usize).unwrap_or(s.ts());
+    let ts = crate::set_cmds::ts_param(s, p, "layer.list")?;
     Ok(crate::inspect::stack(s, ts))
 }

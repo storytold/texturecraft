@@ -67,11 +67,10 @@ pub fn parts(s: &Session, ts: usize) -> Vec<String> {
 }
 
 pub(crate) fn ts_param(s: &Session, p: &Value, cmd: &str) -> Result<usize> {
-    match u64p(p, "ts") {
-        Some(t) if (t as usize) < s.set_count() => Ok(t as usize),
-        Some(t) => Err(bad(cmd, format!("no texture set {t}"))),
-        None => Ok(s.ts()),
-    }
+    // Only a missing (or null) `ts` means the active set; a negative or non-numeric one names no set.
+    let Some(value) = p.get("ts").filter(|value| !value.is_null()) else { return Ok(s.ts()) };
+    let t = u64p(p, "ts").ok_or_else(|| bad(cmd, format!("no texture set {value}")))?;
+    ((t as usize) < s.set_count()).then_some(t as usize).ok_or_else(|| bad(cmd, format!("no texture set {t}")))
 }
 
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
