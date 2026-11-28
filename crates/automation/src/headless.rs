@@ -401,7 +401,7 @@ impl Headless {
 
         let gpu = match self.gpu.get_or_insert_with(Gpu::new) {
             Ok(g) => g,
-            Err(e) => return Err(AutomationError::Other(format!("cannot render: {e}"))),
+            Err(e) => return Err(AutomationError::Other(format!("cannot render: {e} (pass --samples <n> to use the CPU path tracer)"))),
         };
 
         // Last-resort guard: wgpu panics on device errors; drop the device and report instead
@@ -535,5 +535,14 @@ mod tests {
         preloaded_client.command_run("brush.preset.delete", json!({"name": "Ink"})).unwrap();
         assert!(brush_dir.join("Ink.tcbrush").exists());
         let _ = std::fs::remove_dir_all(&brush_dir);
+    }
+
+    #[test]
+    fn failed_gpu_render_error_mentions_samples_fallback() {
+        let mut client = Headless::new(Headless::default_session().unwrap(), Filesystem::Denied);
+        client.gpu = Some(Err("no GPU device".into()));
+        let error = client.render_png(&RenderOptions::default()).err().unwrap();
+        let message = error.to_string();
+        assert!(message.contains("--samples"), "{message}");
     }
 }
