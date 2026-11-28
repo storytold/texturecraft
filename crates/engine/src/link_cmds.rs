@@ -630,4 +630,31 @@ mod tests {
         std::fs::create_dir_all(root.path().join("MaterialCraft")).unwrap();
         assert_eq!(super::find_installed_tool(&app, "materialcraft-cli"), None);
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_folder_named_like_the_tool_is_not_the_tool() {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("TextureCraft");
+        std::fs::create_dir_all(app.join("materialcraft-cli")).unwrap();
+        std::fs::create_dir_all(root.path().join("MaterialCraft").join("materialcraft-cli")).unwrap();
+        assert_eq!(super::find_installed_tool(&app, "materialcraft-cli"), None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_app_folder_with_no_parent_does_not_panic() {
+        // The root (or an empty path) has no parent: only the beside-the-program step can apply.
+        assert_eq!(super::find_installed_tool(std::path::Path::new(""), "no-such-materialcraft-tool"), None);
+        let root = std::env::temp_dir().ancestors().last().map(std::path::Path::to_path_buf).unwrap_or_default();
+        assert_eq!(super::find_installed_tool(&root, "no-such-materialcraft-tool"), None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_missing_app_folder_is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let gone = root.path().join("nowhere").join("TextureCraft");
+        assert_eq!(super::find_installed_tool(&gone, "materialcraft-cli"), None);
+    }
 }
