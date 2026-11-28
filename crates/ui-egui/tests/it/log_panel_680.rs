@@ -145,6 +145,16 @@ fn assets_has_a_greyed_filter_button_with_the_hint() {
     assert!(h.query_by_label(texturecraft_ui_egui::unavailable::NOT_AVAILABLE).is_some());
 }
 
+/// The two tabs share the panel's width equally, side by side
+#[test]
+fn the_log_tabs_split_the_panel_width() {
+    let h = app();
+    let (general, assets) = (h.get_by_label("GENERAL").rect(), h.get_by_label("ASSETS").rect());
+
+    assert!((general.width() - assets.width()).abs() < 1.0, "{general:?} {assets:?}");
+    assert!((general.right() - assets.left()).abs() < 1.0, "{general:?} {assets:?}");
+}
+
 #[test]
 fn renderer_settings_stays_open_when_opened_in_rendering_mode() {
     let mut h = app();

@@ -584,7 +584,7 @@ struct Panels<'a> {
 const PANEL_BODY_MARGIN: Margin = Margin::symmetric(8, 4);
 
 /// Room around a panel of full-width list rows: none at the sides
-const LIST_PANEL_MARGIN: Margin = Margin::symmetric(0, 4);
+pub(crate) const LIST_PANEL_MARGIN: Margin = Margin::symmetric(0, 4);
 
 /// Narrowest Properties panel and so its dock column: the 300 point design width plus the solid scroll bar; narrower, the 3D projection settings' X, Y, Z fields (the widest row) overlap
 pub const PROPERTIES_MIN_WIDTH: f32 = 310.0;
@@ -616,10 +616,10 @@ pub(crate) fn panel_body(app: &mut TextureCraftApp, ui: &mut Ui, panel: Panel) {
         return;
     }
 
-    // Properties draws full-width bands and tabs and History full-width rows, so they draw their own side margins
+    // Properties draws full-width bands and tabs and History and Log full-width rows, so they draw their own side margins
     let margin = match panel {
         Panel::Properties => Margin::ZERO,
-        Panel::History => LIST_PANEL_MARGIN,
+        Panel::History | Panel::Log => LIST_PANEL_MARGIN,
         _ => PANEL_BODY_MARGIN,
     };
     egui::Frame::new().inner_margin(margin).show(ui, |ui| match panel {

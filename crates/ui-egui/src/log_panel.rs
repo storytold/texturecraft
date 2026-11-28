@@ -1,6 +1,6 @@
 //! The Log panel: the session's messages under a General and an Assets tab, one per channel
 
-use egui::{Color32, RichText, Ui};
+use egui::{Align2, Color32, Rect, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
 use texturecraft_engine::log::{LogEntry, LogLevel};
 
 use crate::TextureCraftApp;
@@ -62,6 +62,46 @@ pub(crate) fn panel_rows<R>(
         })
     })
     .inner
+}
+
+/// The tab strip's and the list's inset from the panel's edges
+const PANEL_INSET: f32 = 6.0;
+const TAB_HEIGHT: f32 = 24.0;
+const TAB_NAME_SIZE: f32 = 11.0;
+
+/// The General and Assets tabs, splitting the panel's width; the open one joins the list under it
+fn channel_tabs(app: &mut TextureCraftApp, ui: &mut Ui, tokens: &Tokens) {
+    // The panel's own margin is above the tabs; the strip adds the rest of the inset
+    ui.add_space(PANEL_INSET - f32::from(crate::docking::LIST_PANEL_MARGIN.top));
+    let (strip, _) = ui.allocate_exact_size(vec2(ui.available_width(), TAB_HEIGHT), Sense::hover());
+    let strip = strip.shrink2(vec2(PANEL_INSET, 0.0));
+    let tab_width = strip.width() / LogChannel::ALL.len() as f32;
+    let outline = Stroke::new(1.0, tokens.field_border);
+    for (slot, channel) in LogChannel::ALL.into_iter().enumerate() {
+        let rect = Rect::from_min_size(strip.min + vec2(slot as f32 * tab_width, 0.0), vec2(tab_width, TAB_HEIGHT));
+        let response = ui.interact(rect, ui.make_persistent_id(("log-tab", channel.name())), Sense::click());
+        let open = app.ui.log_channel == channel;
+        let name = tr(channel.name());
+        response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, open, name));
+
+        let painter = ui.painter();
+        painter.rect(rect, 0.0, if open { tokens.field } else { tokens.row }, outline, StrokeKind::Inside);
+        if open {
+            let joint = Rect::from_min_max(rect.left_bottom() + vec2(1.0, -1.0), rect.right_bottom() + vec2(-1.0, 0.0));
+            painter.rect_filled(joint, 0.0, tokens.field);
+        }
+        let color = if open || response.hovered() { tokens.text } else { tokens.text_dim };
+        painter.text(rect.center(), Align2::CENTER_CENTER, name, crate::theme::semibold(TAB_NAME_SIZE), color);
+        if response.has_focus() {
+            crate::property_sheet::paint_focus_outline(painter, rect, tokens.text_strong);
+        }
+
+        if response.clicked() {
+            app.ui.log_channel = channel;
+            app.ui.log_selection.clear();
+            app.ui.log_anchor = None;
+        }
+    }
 }
 
 /// The entries a tab lists, as indices into the session log
@@ -183,16 +223,8 @@ pub(crate) fn takes_copy(app: &TextureCraftApp, ctx: &egui::Context) -> bool {
 
 /// The Log panel body (a dock tab or rail popup)
 pub(crate) fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
-    ui.horizontal(|ui| {
-        for channel in LogChannel::ALL {
-            if ui.selectable_label(app.ui.log_channel == channel, tr(channel.name())).clicked() {
-                app.ui.log_channel = channel;
-                app.ui.log_selection.clear();
-                app.ui.log_anchor = None;
-            }
-        }
-    });
-    ui.separator();
+    let tk = Tokens::get(ui.ctx());
+    channel_tabs(app, ui, &tk);
 
     // A new session has a new log: indices chosen in the old one point at other lines
     if app.ui.log_id != app.session.log_id {
@@ -201,11 +233,16 @@ pub(crate) fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
         app.ui.log_anchor = None;
     }
 
+    let inset = PANEL_INSET as i8;
+    egui::Frame::new().inner_margin(egui::Margin::symmetric(inset, 0)).show(ui, |ui| entries(app, ui, &tk));
+}
+
+/// The shown tab's lines, under the Assets tab's filter button
+fn entries(app: &mut TextureCraftApp, ui: &mut Ui, tk: &Tokens) {
     if shown_assets_filter(app) {
         crate::unavailable::greyed(ui, |ui| ui.add(egui::Button::new(egui_phosphor::regular::WARNING).selected(false)));
     }
 
-    let tk = Tokens::get(ui.ctx());
     let shown = app.ui.log_channel;
     let rows = listed(app, shown);
 
@@ -225,7 +262,7 @@ pub(crate) fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
     egui::ScrollArea::vertical().id_salt(("log", shown.name())).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
         for index in rows.iter().copied() {
             let Some(entry) = app.session.log.get(index) else { continue };
-            let text = RichText::new(entry.line()).color(level_color(&tk, entry.level));
+            let text = RichText::new(entry.line()).color(level_color(tk, entry.level));
             let band = ui.painter().add(egui::Shape::Noop);
             let response = ui.add(egui::Label::new(text).selectable(false).sense(egui::Sense::click()));
             if app.ui.log_selection.contains(&index) {
