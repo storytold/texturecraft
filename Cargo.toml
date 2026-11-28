@@ -138,12 +138,26 @@ codegen-units = 16
 
 [profile.wasm-release]
 inherits = "release"
-opt-level = "s"
+# "z" over "s": the browser build must stay under the 24 MiB gate in packaging/web/package.sh.
+# Measured on main 7c8dd1ae: 30,812,862 bytes with "s", 26,654,524 bytes with the levels below.
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
 
 [profile.wasm-release.package."*"]
+opt-level = "z"
+
+# Kept at "s": these rely on inlining, and at "z" they come out larger, not smaller.
+[profile.wasm-release.package.fearless_simd]
+opt-level = "s"
+[profile.wasm-release.package.vello_cpu]
+opt-level = "s"
+[profile.wasm-release.package.vello_common]
+opt-level = "s"
+[profile.wasm-release.package.craft-image-codecs]
+opt-level = "s"
+[profile.wasm-release.package.texturecraft-core]
 opt-level = "s"
 
 [profile.wasm-release.package.texturecraft-texel]
