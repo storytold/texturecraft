@@ -1,6 +1,4 @@
-//! The tool shelf's variant menus: a tool with variants shows its current variant's icon and a corner arrow, and the arrow
-//! (or a held press, a right click or the keyboard) opens a menu of the variants beside the shelf; picking one runs that
-//! variant's command
+//! The tool shelf's variant menus: the button with its corner arrow, the gestures that open it and the menu of variants
 
 use egui::{Align2, Color32, CornerRadius, FontId, Id, Key, Modifiers, Rect, Response, Sense, Ui, vec2};
 use serde_json::json;
@@ -42,7 +40,7 @@ const HOLD_SECONDS: f64 = 0.4;
 /// The keys a focused row takes from egui's focus moves: the menu moves between its rows, and Tab and Escape leave it
 const ROW_KEYS: egui::EventFilter = egui::EventFilter { tab: true, horizontal_arrows: false, vertical_arrows: true, escape: true };
 
-/// Temp-data keys under the menu's id: focus the current row on the next frame (opened from the keyboard), and a row had the focus
+/// Temp-data keys under the menu's id: focus the current row on the next frame, and the last pass a row had the focus
 const FOCUS_CURRENT_ROW: &str = "focus_current_row";
 const FOCUS_IN_MENU: &str = "focus_in_menu";
 
@@ -107,8 +105,11 @@ pub(crate) fn menu(app: &mut TextureCraftApp, button: &Response, tool: Tool) -> 
         node.set_has_popup(egui::accesskit::HasPopup::Menu);
         node.set_expanded(open);
     });
-    if !open && ctx.data_mut(|data| data.remove_temp::<bool>(popup_id.with(FOCUS_IN_MENU))).unwrap_or_default() {
-        button.request_focus();
+    if !open && let Some(focus_pass) = ctx.data_mut(|data| data.remove_temp::<u64>(popup_id.with(FOCUS_IN_MENU))) {
+        // Only a menu that just closed under the keyboard: not one left long ago, and not one a click went elsewhere from
+        if focus_pass + 1 >= ctx.cumulative_pass_nr() && !ctx.input(|input| input.pointer.any_click()) {
+            button.request_focus();
+        }
     }
     arrow_click || release_of_hold
 }
@@ -129,18 +130,18 @@ fn pointer_gestures(button: &Response) -> (bool, bool, bool) {
 
     // The app draws only on input, so a still pointer asks for the frame the hold ends in
     let mut held_open = false;
-    if let Some(since) = ctx.data(|data| data.get_temp::<f64>(held_since_id)) {
-        let left = since + HOLD_SECONDS - now;
+    if let Some(held_since_seconds) = ctx.data(|data| data.get_temp::<f64>(held_since_id)) {
+        let remaining_seconds = held_since_seconds + HOLD_SECONDS - now;
         if !down || !position.is_some_and(|position| button.rect.contains(position)) {
             ctx.data_mut(|data| data.remove::<f64>(held_since_id));
-        } else if left <= 0.0 {
+        } else if remaining_seconds <= 0.0 {
             held_open = true;
             ctx.data_mut(|data| {
                 data.remove::<f64>(held_since_id);
                 data.insert_temp(held_open_id, true);
             });
         } else {
-            ctx.request_repaint_after_secs(left as f32);
+            ctx.request_repaint_after_secs(remaining_seconds as f32);
         }
     }
 
@@ -219,7 +220,8 @@ fn rows(app: &mut TextureCraftApp, ui: &mut Ui, tool: Tool, popup_id: Id) {
     let Some(focused) = rows.iter().position(Response::has_focus) else { return };
 
     // egui's own arrow moves could leave the menu for any widget near it, and its Tab would skip past the button
-    ui.data_mut(|data| data.insert_temp(popup_id.with(FOCUS_IN_MENU), true));
+    let pass = ui.ctx().cumulative_pass_nr();
+    ui.data_mut(|data| data.insert_temp(popup_id.with(FOCUS_IN_MENU), pass));
     ui.memory_mut(|memory| memory.set_focus_lock_filter(rows[focused].id, ROW_KEYS));
     let (down, up, tab) = ui.input(|input| (input.key_pressed(Key::ArrowDown), input.key_pressed(Key::ArrowUp), input.key_pressed(Key::Tab)));
     if tab {

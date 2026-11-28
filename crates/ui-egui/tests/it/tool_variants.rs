@@ -1,5 +1,4 @@
-//! The tool shelf's variant menus: a corner arrow opens a tool's variants, picking one sets the tool and its setting, and the
-//! button shows the current variant whichever control changed it
+//! The tool shelf's variant menus: opening them, picking a variant, and the button following the settings
 
 use egui::accesskit::{Role, Toggled};
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, vec2};
@@ -73,9 +72,12 @@ fn press_at(harness: &mut Harness<'_, TextureCraftApp>, position: Pos2, seconds:
     step_at(harness, seconds);
 }
 
+/// How far inside the button's lower-right corner a click lands on the arrow
+const ARROW_INSET_POINTS: f32 = 3.0;
+
 /// A click on the arrow in the button's lower-right corner
 fn click_arrow(harness: &mut Harness<'_, TextureCraftApp>, button: Rect) {
-    click_at(harness, button.right_bottom() - vec2(3.0, 3.0));
+    click_at(harness, button.right_bottom() - vec2(ARROW_INSET_POINTS, ARROW_INSET_POINTS));
 }
 
 /// The open menu's rows, by name, with whether each is the current variant
@@ -185,7 +187,7 @@ fn shelf_tooltips_name_the_tool_without_its_key() {
 fn menu_follows_the_old_controls() {
     let mut harness = app_harness(Tool::Paint);
 
-    // What the top bar's particle toggle, the clone's Aligned setting and the path's Closed and Fill buttons do
+    // What Properties' particle checkbox, Clone's Aligned tick and the path's Closed and Fill buttons do
     harness.state_mut().session.tool.brush.particles.enabled = true;
     harness.state_mut().run("tool.brush", json!({"cloneAligned": false}));
     let session = &mut harness.state_mut().session;
@@ -220,6 +222,7 @@ fn in_top_bar(harness: &Harness<'_, TextureCraftApp>, anchor: &str, name: &str) 
 fn top_bar_leaves_the_variants_to_the_shelf() {
     const PARTICLES: &str = "Particle brush: particles slide down the surface";
     let mut harness = app_harness(Tool::Paint);
+
     // Wide enough that the top bar's strip holds every control without scrolling
     harness.set_size(vec2(2600.0, 960.0));
     for (tool, toggle) in
@@ -233,9 +236,9 @@ fn top_bar_leaves_the_variants_to_the_shelf() {
     for closed in [false, true] {
         harness.state_mut().session.set_path_closed(closed);
         harness.run_steps(2);
-        assert!(in_top_bar(&harness, "Closed path", "Closed path"));
+        assert!(in_top_bar(&harness, "Lazy mouse", "Closed path"));
         for fill in ["Fill the path (close it first)", "Fill the closed path (lasso)"] {
-            assert!(!in_top_bar(&harness, "Closed path", fill), "Filled path stands for the Fill button");
+            assert!(!in_top_bar(&harness, "Lazy mouse", fill), "Filled path stands for the Fill button");
         }
     }
 }
@@ -333,6 +336,30 @@ fn keyboard_opens_picks_and_returns_focus() {
     assert!(menu_rows(&harness).is_empty(), "Tab leaves the menu");
     assert!(harness.get(shelf("Paint")).is_focused(), "and lands on the button, so the next Tab goes on from there");
     assert_eq!(harness.state().session.tool.tool, Tool::Paint);
+}
+
+#[test]
+fn a_menu_left_behind_takes_no_focus() {
+    let mut harness = app_harness(Tool::Paint);
+    harness.get(shelf("Paint")).focus();
+    harness.run_steps(2);
+    key(&mut harness, Key::ArrowDown, Modifiers::ALT);
+
+    let elsewhere = harness.ctx.content_rect().center();
+    click_at(&mut harness, elsewhere);
+
+    assert!(menu_rows(&harness).is_empty());
+    assert!(!harness.get(shelf("Paint")).is_focused(), "a click elsewhere is not pulled back to the button");
+
+    harness.get(shelf("Paint")).focus();
+    harness.run_steps(2);
+    key(&mut harness, Key::ArrowDown, Modifiers::ALT);
+    for mode in [Mode::Baking, Mode::Painting] {
+        harness.state_mut().ui.mode = mode;
+        harness.run_steps(3);
+    }
+
+    assert!(!harness.get(shelf("Paint")).is_focused(), "coming back to painting grabs no focus");
 }
 
 #[test]
