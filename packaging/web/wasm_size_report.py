@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Print where a wasm module's bytes go: sections, data, and code by crate."""
-import re, sys
+import os, re, sys
 from collections import defaultdict
 
 def leb(b, i):
@@ -24,8 +24,28 @@ def crate_of(name):
         if m: return m.group(2)[:int(m.group(1))]
     return "<other: " + name.split("::")[0][:40] + ">" if "::" in name else "<unmangled>"
 
-def main(path, top=25):
-    b = open(path, "rb").read()
+def allowed_wasm(arg):
+    """Resolve arg and accept it only as a .wasm file under the repo or CARGO_TARGET_DIR."""
+    repo = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    roots = [repo]
+    target = os.environ.get("CARGO_TARGET_DIR")
+    if target:
+        roots.append(os.path.realpath(target))
+    path = os.path.realpath(arg)
+    if not path.endswith(".wasm") or not os.path.isfile(path):
+        return None
+    for root in roots:
+        if os.path.commonpath([root, path]) == root:
+            return path
+    return None
+
+def main(arg, top=25):
+    path = allowed_wasm(arg)
+    if path is None:
+        print(f"wasm_size_report: skipped {arg!r}: not a .wasm file under the repository or CARGO_TARGET_DIR", file=sys.stderr)
+        return
+    with open(path, "rb") as f:
+        b = f.read()
     assert b[:4] == b"\0asm"
     i = 8; secs = []; names = {}; code_sizes = []; nimports = 0; data_total = 0
     while i < len(b):
