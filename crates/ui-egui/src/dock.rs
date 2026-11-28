@@ -668,7 +668,11 @@ fn layer_row(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, depth: usize
         if !mask_enabled {
             painter.line_segment([mask_rect.left_top(), mask_rect.right_bottom()], Stroke::new(HIDDEN_STRIKE_WIDTH, tokens.danger));
         }
-        thumbnail_context_menu(ui, &mask_response, mask_label, &layer.name, mask_target, |ui| mask_management_menu(app, ui, layer, true));
+        thumbnail_context_menu(ui, &mask_response, mask_label, &layer.name, mask_target, |ui| {
+            mask_management_menu(app, ui, layer, true);
+            ui.separator();
+            crate::layer_toolbar::effect_menu_items(app, ui, layer, false, true);
+        });
         effect_stack_thumbnail(app, &painter, &tokens, &mask_response, mask_stack);
         ui.ctx().accesskit_node_builder(mask_response.id, |node| node.set_description(if mask_enabled { tr("Mask on") } else { tr("Mask off") }));
 
@@ -1473,7 +1477,7 @@ fn layer_context_menu(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, con
     });
     if !content_thumbnail || has_content_stack {
         ui.separator();
-        crate::layer_toolbar::effect_menu_items(app, ui, layer, content_thumbnail);
+        crate::layer_toolbar::effect_menu_items(app, ui, layer, content_thumbnail, false);
     }
 }
 

@@ -477,26 +477,29 @@ fn thumbnail_menus_apply_actions_to_the_clicked_layer_and_stack() {
 }
 
 #[test]
-fn focused_mask_thumbnail_opens_and_dismisses_its_menu_from_the_keyboard() {
-    let (mut harness, _) = harness();
+fn the_mask_thumbnail_menu_adds_effects_to_the_mask() {
+    let (mut h, layer) = harness();
+    let at = thumb(&h, "Masked fill", false);
+    click(&mut h, at);
+    assert_eq!(h.state().session.target, StackTarget::Content);
 
-    harness.get_by_label(MASK_THUMBNAIL_NAME).focus();
-    harness.run_steps(3);
-    assert!(harness.get_by_label(MASK_THUMBNAIL_NAME).is_focused());
+    let at = thumb(&h, "Masked fill", true);
+    right_click(&mut h, at);
+    assert_eq!(h.state().session.target, StackTarget::Content, "opening the menu does not select a different target");
+    assert!(
+        h.query_by_label(&format!("{}  Add anchor point", egui_phosphor::regular::ANCHOR)).is_none(),
+        "the mask menu leaves out anchor points, which record layer content"
+    );
+    h.get_by_label(&format!("{}  Add fill", egui_phosphor::regular::PAINT_BUCKET)).click();
+    h.run_steps(3);
 
-    harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F10);
-    harness.run_steps(3);
-    assert!(harness.query_by_label("Toggle mask").is_some());
-
-    harness.key_press(egui::Key::ArrowDown);
-    harness.run_steps(3);
-    assert!(harness.get_by_label("Toggle mask").is_focused());
-
-    harness.key_press(egui::Key::Escape);
-    harness.run_steps(3);
-
-    assert!(harness.query_by_label("Toggle mask").is_none());
-    assert!(harness.get_by_label(MASK_THUMBNAIL_NAME).is_focused());
+    let layer = &h.state().session.doc.project.layers[&layer];
+    let mask = layer.mask.as_ref().expect("the layer keeps its mask");
+    assert_eq!(mask.effects.len(), 2, "the mask menu adds a fill beside the existing mask effect");
+    assert_eq!(layer.content_effects.len(), 1, "the content effects are untouched");
+    let added = mask.effects.last().expect("the mask menu adds an effect");
+    assert!(matches!(added.kind, texturecraft_engine::core::EffectKind::Fill { .. }));
+    assert_eq!(h.state().session.target, StackTarget::Effect(added.id), "the new mask effect is selected");
 }
 
 /// Click the eye of the top-level row `name` with `modifiers` held (the eye sits in the first 20 points after the 7-point edge).
