@@ -209,6 +209,37 @@ fn menu_follows_the_old_controls() {
     assert_eq!(menu_rows(&harness), [("Paint".to_owned(), false), ("Physical paint".to_owned(), true)], "the menu ticks the physical variant");
 }
 
+/// The top bar shows a control labelled `name`: one level with the topmost `anchor`, as Properties may repeat both lower down
+fn in_top_bar(harness: &Harness<'_, TextureCraftApp>, anchor: &str, name: &str) -> bool {
+    let top = harness.query_all(by().label(anchor)).map(|node| node.rect().center().y).fold(f32::INFINITY, f32::min);
+    assert!(top.is_finite(), "the top bar shows {anchor}");
+    harness.query_all(by().label(name)).any(|node| (node.rect().center().y - top).abs() < 1.0)
+}
+
+#[test]
+fn top_bar_leaves_the_variants_to_the_shelf() {
+    const PARTICLES: &str = "Particle brush: particles slide down the surface";
+    let mut harness = app_harness(Tool::Paint);
+    // Wide enough that the top bar's strip holds every control without scrolling
+    harness.set_size(vec2(2600.0, 960.0));
+    for (tool, toggle) in
+        [(Tool::Paint, false), (Tool::Eraser, false), (Tool::Projection, false), (Tool::Smudge, true), (Tool::Clone, true), (Tool::Path, true)]
+    {
+        harness.state_mut().session.tool.tool = tool;
+        harness.run_steps(2);
+        assert_eq!(in_top_bar(&harness, "Lazy mouse", PARTICLES), toggle, "{tool:?}: the particle toggle shows only where no variant covers it");
+    }
+
+    for closed in [false, true] {
+        harness.state_mut().session.set_path_closed(closed);
+        harness.run_steps(2);
+        assert!(in_top_bar(&harness, "Closed path", "Closed path"));
+        for fill in ["Fill the path (close it first)", "Fill the closed path (lasso)"] {
+            assert!(!in_top_bar(&harness, "Closed path", fill), "Filled path stands for the Fill button");
+        }
+    }
+}
+
 #[test]
 fn baking_shelf_has_no_variant_arrows() {
     let mut harness = app_harness(Tool::Paint);

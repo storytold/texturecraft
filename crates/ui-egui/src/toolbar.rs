@@ -336,7 +336,10 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
             }
 
             ui.separator();
-            if icon_button(ui, ic::CLOUD_RAIN, tr("Particle brush: particles slide down the surface"), brush.particles.enabled, button_size).clicked() {
+            // Paint, Eraser and Projection switch particles through their shelf variants (Physical paint, ...)
+            if !matches!(tool, Tool::Paint | Tool::Eraser | Tool::Projection)
+                && icon_button(ui, ic::CLOUD_RAIN, tr("Particle brush: particles slide down the surface"), brush.particles.enabled, button_size).clicked()
+            {
                 brush.particles.enabled = !brush.particles.enabled;
             }
             if crate::symmetry::applies_to(tool) {
@@ -358,7 +361,7 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
 
             if tool == Tool::Path {
                 ui.separator();
-                path_controls(app, ui);
+                path_controls(app, ui, false);
             }
         }
         Tool::PolygonFill => {
@@ -409,8 +412,8 @@ pub fn fill_mode_buttons(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     }
 }
 
-/// Path tool options and actions (top bar and properties)
-pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
+/// Path tool options and actions (top bar and properties); the top bar leaves Fill to the shelf's Filled path variant
+pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, fill_button: bool) {
     let button_size = ui.spacing().interact_size.y;
     let path = &app.session.tool.path;
     let (closed, fill) = (path.closed, path.fill);
@@ -422,7 +425,7 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     }
 
     let fill_tip = if closed { tr("Fill the closed path (lasso)") } else { tr("Fill the path (close it first)") };
-    if icon_button(ui, ic::PAINT_BUCKET, fill_tip, fill, button_size).clicked() {
+    if fill_button && icon_button(ui, ic::PAINT_BUCKET, fill_tip, fill, button_size).clicked() {
         app.session.set_path_fill(!fill);
     }
 

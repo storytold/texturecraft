@@ -3628,6 +3628,16 @@ fn tool_variant_snapshots() {
         harness.hover_at(AWAY_FROM_TILES);
         shot(&mut harness, "all-variants");
 
+        // The top bar, wide enough to show all its controls: the variants stand for the particle toggle and the path Fill button
+        harness.set_size(egui::vec2(2600.0, 960.0));
+        for tool in [texturecraft_engine::Tool::Paint, texturecraft_engine::Tool::Clone, texturecraft_engine::Tool::Path] {
+            harness.state_mut().session.tool.tool = tool;
+            harness.run_steps(4);
+            shot(&mut harness, &format!("topbar-{}", tool.id()));
+        }
+        harness.set_size(egui::vec2(1600.0, 960.0));
+        harness.run_steps(4);
+
         // Painting tools can't act on a fill layer's content: their buttons grey out with the badges
         let session = &mut harness.state_mut().session;
         let fill = texturecraft_engine::execute(session, "layer.add.fill", &serde_json::json!({})).unwrap()["layer"].as_u64().unwrap();
