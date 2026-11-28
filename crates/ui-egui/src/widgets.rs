@@ -344,20 +344,23 @@ impl<'a> IconButton<'a> {
         self
     }
 
-    /// Paints the button and returns its response. `paint_icon` gets the button's rect and the icon tint. A
-    /// non-finite, non-positive or oversized (over 4096 points) size gives an inert zero-size response.
+    /// Paints the button, `paint_icon` getting its rect and icon tint; an unusable size gives an inert zero-size response
     fn show(self, ui: &mut Ui, paint_icon: impl FnOnce(&Ui, Rect, Color32)) -> Response {
         self.show_with_visuals(ui, |ui, rect, visuals| paint_icon(ui, rect, visuals.icon))
     }
 
     /// `show`, giving `paint_icon` the whole look of the button's state
     fn show_with_visuals(self, ui: &mut Ui, paint_icon: impl FnOnce(&Ui, Rect, ButtonVisuals)) -> Response {
-        let valid = self.size.is_finite() && self.size.x > 0.0 && self.size.y > 0.0 && self.size.x <= 4096.0 && self.size.y <= 4096.0;
+        const MAX_SIDE_POINTS: f32 = 4096.0;
+        const FOCUS_RING_INSET_POINTS: f32 = 2.0;
+
+        let valid = self.size.is_finite() && self.size.x > 0.0 && self.size.y > 0.0 && self.size.x <= MAX_SIDE_POINTS && self.size.y <= MAX_SIDE_POINTS;
         let (rect, response) = ui.allocate_exact_size(if valid { self.size } else { Vec2::ZERO }, if valid { Sense::click() } else { Sense::hover() });
         response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, valid && ui.is_enabled(), self.selected, self.label));
         if !valid {
             return response;
         }
+
         let visuals = self.style.visuals(self.selected, response.hovered(), response.is_pointer_button_down_on());
         let stroke = bounded_stroke(visuals.stroke, rect);
         if visuals.fill != Color32::TRANSPARENT {
@@ -367,8 +370,11 @@ impl<'a> IconButton<'a> {
             ui.painter().rect_stroke(rect, self.style.corner_radius, stroke, StrokeKind::Inside);
         }
         paint_icon(ui, rect, visuals);
-        if response.has_focus() && rect.width() > 4.0 && rect.height() > 4.0 {
-            let focus_rect = rect.shrink(2.0);
+
+        // The ring needs room inside its inset on both sides
+        let smallest_ring_side = FOCUS_RING_INSET_POINTS * 2.0;
+        if response.has_focus() && rect.width() > smallest_ring_side && rect.height() > smallest_ring_side {
+            let focus_rect = rect.shrink(FOCUS_RING_INSET_POINTS);
             let stroke = bounded_stroke(self.style.focus_stroke, focus_rect);
             if !stroke.is_empty() {
                 ui.painter().rect_stroke(focus_rect, self.style.corner_radius, stroke, StrokeKind::Inside);

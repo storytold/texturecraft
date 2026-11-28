@@ -25,11 +25,7 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
-    /// Whether a keyboard shortcut can run this command: it acts with no parameters at all, or
-    /// every parameter in its first `params` form is optional (`name?`) and none of them is one
-    /// of several alternatives. Left out: commands that need a path, name or similar, commands
-    /// that only return data or do nothing without parameters, and the ones that replace the
-    /// open project (the menu asks to save first).
+    /// Whether a keyboard shortcut can run this command: it acts with no parameters and keeps the open project
     pub fn bindable(&self) -> bool {
         const NOT_FROM_A_KEY: &[&str] = &[
             "project.inspect",

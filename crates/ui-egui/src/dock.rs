@@ -2292,15 +2292,18 @@ fn smudge_section(app: &mut TextureCraftApp, ui: &mut Ui) {
 }
 
 fn path_section(app: &mut TextureCraftApp, ui: &mut Ui) {
+    const HINT_TEXT_SIZE: f32 = 10.5;
+
     let tk = Tokens::get(ui.ctx());
     ui.label(caption(tr("Path")));
     ui.horizontal(|ui| crate::toolbar::path_controls(app, ui, true));
-    let n = app.session.tool.path.points.len();
+
+    let point_count = app.session.tool.path.points.len();
     let hint = trf(
         "{n} control points. Click the mesh (or the 2D view) to add points and drag them to adjust; click the first point to close the path. Enter paints it with the brush (a closed, filled path fills its inside), Esc cancels.",
-        &[("n", &n)],
+        &[("n", &point_count)],
     );
-    ui.label(RichText::new(hint).size(10.5).color(tk.text_dim));
+    ui.label(RichText::new(hint).size(HINT_TEXT_SIZE).color(tk.text_dim));
 }
 
 /// Popover for built-in and saved brush presets

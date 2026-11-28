@@ -3555,7 +3555,8 @@ fn click_at(harness: &mut Harness<'_, TextureCraftApp>, position: egui::Pos2) {
 
 /// The corner arrow of a shelf button: a point inside its lower-right hit square
 fn arrow_of(button: egui::Rect) -> egui::Pos2 {
-    button.right_bottom() - egui::vec2(3.0, 3.0)
+    const ARROW_INSET_POINTS: f32 = 3.0;
+    button.right_bottom() - egui::vec2(ARROW_INSET_POINTS, ARROW_INSET_POINTS)
 }
 
 /// The shelf's variant arrows, menus, picked and greyed badges, the Baking shelf and the smallest window; `TC_UI_THEMES` adds dark and light

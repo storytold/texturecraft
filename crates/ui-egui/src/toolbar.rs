@@ -336,6 +336,7 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
             }
 
             ui.separator();
+
             // Paint, Eraser and Projection switch particles through their shelf variants (Physical paint, ...)
             if !matches!(tool, Tool::Paint | Tool::Eraser | Tool::Projection)
                 && icon_button(ui, ic::CLOUD_RAIN, tr("Particle brush: particles slide down the surface"), brush.particles.enabled, button_size).clicked()
@@ -420,6 +421,7 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, fill_button: 
     let selected = path.selected.is_some_and(|i| i < path.points.len());
     let has_points = !path.points.is_empty();
     let corner = path.selected.is_some_and(|i| path.is_corner(i));
+
     if icon_button(ui, ic::POLYGON, tr("Closed path"), closed, button_size).clicked() {
         app.session.set_path_closed(!closed);
     }
@@ -489,6 +491,7 @@ pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
 
                     // Painting shows a tool with variants as its current one, and its variant menu; Baking's brushes have none
                     let variant = if app.ui.mode == Mode::Painting { ToolVariant::current(&app.session.tool, tool) } else { None };
+
                     // Screen readers hear the tool's key after its name; the tooltip shows only the name
                     let name = tip(&app.ui.keymap, tr(tool.label()), &command);
                     let tooltip = tr(variant.map_or(tool.label(), ToolVariant::label));

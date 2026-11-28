@@ -1,6 +1,4 @@
-//! Tool variants: named ways of using a tool, each mapped onto settings the tool already has
-//! (the shared brush's particle switch, the Clone tool's aligned source, the Path tool's
-//! closed and filled outline)
+//! Named ways of using a tool, each mapped onto settings the tool already has
 
 use crate::session::{Tool, ToolState};
 
