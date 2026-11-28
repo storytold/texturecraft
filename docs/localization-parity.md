@@ -36,6 +36,7 @@ generator, filter and brush alpha names (**KEYS** strings, counted by the
 | Korean | `ko` | KEYS (100%) | yes | Hangul glyphs: system fonts on desktop (craft-fonts has no Korean face yet) | no | full | 2 h (review) |
 | Vietnamese | `vi` | 0 | no | Latin with diacritics | no | none | 3 h |
 | Italian | `it` | KEYS (100%) | yes | Latin | no | full | 1 h (review) |
+| Turkish | `tr` | KEYS (100%) | yes | Latin | no | full with the craft-i18n `tr/texturecraft.tsv` catalog | 1 h (review) |
 
 Not translated on purpose: asset library names (materials, smart masks, alphas, environments),
 user content (layer, texture set, project names), file format and technical names (sRGB8, L16F,

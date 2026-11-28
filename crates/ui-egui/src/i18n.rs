@@ -37,7 +37,7 @@ pub struct Language {
     pub english: &'static str,
 }
 
-const COUNT: usize = 11;
+const COUNT: usize = 12;
 
 pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "en", name: "English", english: "English" },
@@ -47,6 +47,7 @@ pub static LANGUAGES: [Language; COUNT] = [
     Language { code: "pt-BR", name: "Português (Brasil)", english: "Portuguese (Brazil)" },
     Language { code: "it", name: "Italiano", english: "Italian" },
     Language { code: "ru", name: "Русский", english: "Russian" },
+    Language { code: "tr", name: "Türkçe", english: "Turkish" },
     Language { code: "ja", name: "日本語", english: "Japanese" },
     Language { code: "zh-Hans", name: "简体中文", english: "Chinese (Simplified)" },
     Language { code: "ko", name: "한국어", english: "Korean" },
@@ -460,6 +461,8 @@ mod tests",
             ("ar-EG", "ar"),
             ("ru-SK", "ru"),
             ("ru_RU.UTF-8", "ru"),
+            ("tr-TR", "tr"),
+            ("tr_TR.UTF-8", "tr"),
             ("nl-NL", "en"),
             ("", "en"),
         ] {
