@@ -191,10 +191,11 @@ fn a_hidden_texture_set_does_not_block_a_pick_behind_it() {
     };
 
     // Down the middle until a pixel where the hidden ball covers the base: the pick reads the base
+    let ball_pixels: Vec<f32> = (200..400).map(|y| y as f32).filter(|y| ball_in_front(&session, *y)).collect();
     execute(&mut session, "textureSet.visible", &json!({"ts": ball, "visible": false})).unwrap();
     let mut covered = None;
-    for y in (200..400).map(|y| y as f32) {
-        if ball_in_front(&session, y) && pick_at(&mut session, y).is_ok() {
+    for y in ball_pixels {
+        if !ball_in_front(&session, y) && pick_at(&mut session, y).is_ok() {
             covered = Some(y);
             break;
         }

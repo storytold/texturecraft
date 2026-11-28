@@ -356,6 +356,8 @@ pub(crate) struct ActiveStroke {
     pub canvas: StrokeCanvas,
     /// Camera visibility for 3D strokes (None for strokes in the 2D view).
     pub depth: Option<Arc<EyeDepth>>,
+    /// The ray tree the stroke picks and tests occlusion against: the mesh without the texture sets hidden when it began
+    pub bvh: Arc<Bvh>,
     /// 2D view strokes: where the stroke is between samples.
     pub uv: Option<crate::uv_stroke_state::UvStrokeState>,
     pub camera: OrbitCamera,
@@ -374,7 +376,10 @@ pub(crate) struct ActiveStroke {
 }
 
 /// A stroke visibility buffer and what it was rendered for: camera, size, mesh id.
-pub(crate) type DepthCache = (OrbitCamera, (u32, u32), u64, Arc<EyeDepth>);
+pub(crate) type DepthCache = (OrbitCamera, (u32, u32), u64, Vec<bool>, Arc<EyeDepth>);
+
+/// The ray tree of the mesh without its hidden texture sets, with the visibility flags and mesh it was built for
+pub(crate) type ShownBvhCache = (Vec<bool>, u64, Arc<Bvh>);
 
 /// History labels that name a layer, a path number or a smart mask: the UI translates the
 /// template and fills the value in (the control channel and `edit.history` keep the English label).
@@ -501,9 +506,11 @@ pub struct Session {
     pub log: crate::log::SessionLog,
     /// Changes when the session and its log are replaced, including mesh reimport.
     pub log_id: u64,
-    /// The last stroke's camera visibility buffer: reused while the camera, view size and mesh
-    /// are unchanged, so back-to-back dabs start instantly.
+    /// The last stroke's camera visibility buffer: reused while the camera, view size, mesh and
+    /// shown texture sets are unchanged, so back-to-back dabs start instantly.
     pub(crate) depth_cache: Option<DepthCache>,
+    /// The ray tree of the shown texture sets, kept while some set is hidden (see [`Session::shown_bvh`])
+    pub(crate) shown_bvh_cache: Option<ShownBvhCache>,
     /// Projection fill depth maps shared by this session's tile batches.
     projector_depth_cache: texturecraft_compose::ProjectorDepthCache,
     /// The polygon fill box being dragged
@@ -583,6 +590,7 @@ impl Session {
             log: crate::log::SessionLog::new(),
             log_id: next_mesh_id(),
             depth_cache: None,
+            shown_bvh_cache: None,
             projector_depth_cache: Default::default(),
             polygon_fill_drag: None,
             export_presets: Default::default(),
@@ -892,6 +900,7 @@ impl Session {
         self.mesh = tiled_mesh(&self.source, &self.doc.project);
         self.mesh_id = next_mesh_id();
         self.depth_cache = None;
+        self.shown_bvh_cache = None;
         self.projector_depth_cache = Default::default();
         for ts in changed {
             if let (Some(c), Some(set)) = (self.caches.get_mut(ts), self.doc.project.texture_sets.get(ts)) {

@@ -512,3 +512,30 @@ fn solo_keeps_the_document_source_for_clone_and_the_material_picker() {
     s.update();
     assert!(red(color_at(&s, 240.0, 200.0)));
 }
+
+/// Red texels of the "Base" texture set of a material ball after brushing the whole view, with the ball's own set shown or hidden
+fn base_texels_painted(ball_shown: bool) -> usize {
+    let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 256).unwrap();
+    s.viewport = Vec2::new(400.0, 400.0);
+    s.update();
+    let base = s.doc.project.texture_sets.iter().position(|set| set.name == "Base").unwrap();
+    execute(&mut s, "textureSet.select", &json!({"ts": base})).unwrap();
+    execute(&mut s, "textureSet.visible", &json!({"ts": 0, "visible": ball_shown})).unwrap();
+    paint_red(&mut s, 30.0);
+    for y in (20..400).step_by(40) {
+        let points: Vec<[f32; 2]> = (20..400).step_by(20).map(|x| [x as f32, y as f32]).collect();
+        execute(&mut s, "tool.stroke", &json!({"points": points})).unwrap();
+    }
+    s.update();
+
+    let composite = &s.caches[base].composite;
+    let (width, height) = s.caches[base].size;
+    (0..height).flat_map(|y| (0..width).map(move |x| (x, y))).filter(|(x, y)| red(composite.value(Channel::BaseColor, *x, *y))).count()
+}
+
+#[test]
+fn the_brush_passes_through_a_hidden_texture_set() {
+    let behind_the_ball = base_texels_painted(true);
+    let ball_hidden = base_texels_painted(false);
+    assert!(ball_hidden > behind_the_ball, "hiding the ball lets the brush reach the base behind it: {ball_hidden} vs {behind_the_ball}");
+}

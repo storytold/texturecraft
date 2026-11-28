@@ -194,7 +194,7 @@ impl Session {
     }
 
     /// The mesh as the 3D view shows it: hidden texture sets' triangles collapse to a point, so nothing behind them counts as hidden
-    fn shown_mesh(&self) -> Cow<'_, Mesh> {
+    pub(crate) fn shown_mesh(&self) -> Cow<'_, Mesh> {
         let sets = &self.doc.project.texture_sets;
         if sets.iter().all(|set| set.visible) {
             return Cow::Borrowed(&self.mesh);
