@@ -202,11 +202,6 @@ impl TileGenerator {
     pub fn images(&self) -> impl Iterator<Item = &str> {
         self.inputs.iter().chain(&self.background_image).map(String::as_str)
     }
-
-    /// [`TileGenerator::images`], to rename them
-    pub fn images_mut(&mut self) -> impl Iterator<Item = &mut String> {
-        self.inputs.iter_mut().chain(&mut self.background_image)
-    }
 }
 
 impl Default for TileGenerator {

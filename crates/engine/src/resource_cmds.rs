@@ -24,16 +24,6 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!("resource.list", "List resources", [], None, "{}", always, |s, _| Ok(list(s))),
         cmd!("resource.remove", "Remove resource", [], None, "{name}", always, remove),
-        cmd!("resource.export", "Export resource", [], None, "{name, path} — the resource's file as it was imported", always, export),
-        cmd!(
-            "resource.rename",
-            "Rename resource",
-            [],
-            None,
-            "{name, to} — everything that uses the image follows it; `to` keeps the old extension when it has none",
-            always,
-            rename
-        ),
         cmd!("file.removeUnused", "Remove unused resources...", ["File"], None, "{}", always, remove_unused),
         cmd!(
             "layer.add.image",
@@ -302,134 +292,23 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
-/// Writes resource `name`'s bytes, as imported, to `path`
-#[cfg(not(target_arch = "wasm32"))]
-fn export(s: &mut Session, p: &Value) -> Result<Value> {
-    let command = "resource.export";
-    let name = strp(p, "name").ok_or_else(|| bad(command, "`name` is required"))?;
-    let path = strp(p, "path").ok_or_else(|| bad(command, "`path` is required"))?;
-    let bytes = s.doc.resources.get(name).ok_or_else(|| bad(command, format!("no resource `{name}`")))?;
-
-    std::fs::write(path, bytes.as_slice()).map_err(|error| bad(command, format!("cannot write {path}: {error}")))?;
-
-    Ok(json!({ "path": path }))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn export(_: &mut Session, _: &Value) -> Result<Value> {
-    Err(bad("resource.export", "file paths are not available in the browser"))
-}
-
-/// Renames image resource `name` to `to` and every reference to it, in one undo step
-fn rename(s: &mut Session, p: &Value) -> Result<Value> {
-    let command = "resource.rename";
-    let name = strp(p, "name").ok_or_else(|| bad(command, "`name` is required"))?.to_string();
-    let to = strp(p, "to").ok_or_else(|| bad(command, "`to` is required"))?.trim();
-    if !s.doc.resources.contains_key(&name) {
-        return Err(bad(command, format!("no resource `{name}`")));
-    }
-
-    let mut to = sanitize_resource_name(to);
-    if std::path::Path::new(&to).extension().is_none()
-        && let Some(extension) = std::path::Path::new(&name).extension().and_then(|extension| extension.to_str())
-    {
-        // The stem gives way, so a long name keeps its extension
-        let stem_room = MAX_RESOURCE_NAME_LEN.saturating_sub(extension.len() + 1);
-        to.truncate(stem_room);
-        to = format!("{to}.{extension}");
-    }
-    if to == name {
-        return Ok(json!({ "name": name }));
-    }
-    if s.doc.resources.contains_key(&to) || crate::fill_alpha::library_alpha_of(&to).is_some() {
-        return Err(bad(command, format!("a resource named `{to}` exists already")));
-    }
-
-    s.edit("Rename resource", |s| {
-        let bytes = s.doc.resources.remove(&name).ok_or_else(|| bad(command, format!("no resource `{name}`")))?;
-        s.doc.resources.insert(to.clone(), bytes);
-        // The Resources Updater keeps following the file the image came from
-        if let Some(source) = s.doc.project.resource_sources.remove(&name) {
-            s.doc.project.resource_sources.insert(to.clone(), source);
-        }
-        rename_references(&mut s.doc.project, &name, &to);
-
-        // Refuse rather than leave a reference this rename does not know about pointing at nothing
-        if project_images(&s.doc.project).contains(&name) {
-            return Err(bad(command, format!("`{name}` is used somewhere it can't be renamed")));
-        }
-
-        Ok(())
-    })?;
-
-    for tool_image in s.tool_images_mut().filter(|tool_image| **tool_image == name) {
-        tool_image.clone_from(&to);
-    }
-
-    // The decoded pixels are the same: they move instead of decoding again
-    if let Some(image) = s.images.remove(&name) {
-        s.images.insert(to.clone(), image);
-    }
-    if s.library_alphas.remove(&name) {
-        s.library_alphas.insert(to.clone());
-    }
-    s.path_cache = None;
-    s.sync_images();
-    Ok(json!({ "name": to }))
-}
-
-/// Points every layer, effect, stored path and the environment that read image resource `from` at `to`
-fn rename_references(project: &mut texturecraft_core::Project, from: &str, to: &str) {
-    for layer in project.layers.values_mut() {
-        let fill_images: Vec<&mut String> = match &mut layer.kind {
-            LayerKind::Fill(fill) => fill.images_mut().collect(),
-            _ => Vec::new(),
-        };
-        let effects = layer.mask.iter_mut().flat_map(|mask| mask.effects.iter_mut()).chain(&mut layer.content_effects);
-        let mut images = fill_images;
-        for effect in effects {
-            crate::path_tool::rename_path_images(&mut effect.kind, from, to);
-            images.extend(effect.images_mut());
-        }
-
-        for image in images.into_iter().filter(|image| *image == from) {
-            *image = to.to_string();
-        }
-    }
-
-    if project.display.environment_resource() == Some(from) {
-        project.display.environment = format!("{}{to}", texturecraft_core::project::ENV_RESOURCE_PREFIX);
-    }
-}
-
-/// Every image resource a layer, mask effect, stored path or the environment of `project` uses
-fn project_images(project: &texturecraft_core::Project) -> Vec<String> {
+/// Drop resources unused by layers, mesh maps, paint tools or the environment (one undo step)
+fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
     let mut used = Vec::new();
-    for set in &project.texture_sets {
+    for set in &s.doc.project.texture_sets {
         for root in &set.stack {
-            crate::material_lib::images_used(project, *root, &mut used, 0);
+            crate::material_lib::images_used(&s.doc.project, *root, &mut used, 0);
         }
     }
-    used.extend(project.display.environment_resource().map(str::to_string));
-    used
-}
-
-/// [`project_images`] and the images the brush alpha, the projection stencil and the mask brush use
-fn images_in_use(s: &Session) -> Vec<String> {
-    let mut used = project_images(&s.doc.project);
     used.extend(s.tool.stencil.as_ref().map(|st| st.image.clone()));
     used.extend(s.tool.brush.alpha_image.clone());
     used.extend(s.tool.mask_image.clone());
+    used.extend(s.doc.project.display.environment_resource().map(str::to_string));
     used.extend(s.doc.project.resource_sources.iter().filter_map(|(name, source)| {
         let slot = source.mesh_map?;
         s.doc.baked.get(&slot.texture_set).is_some_and(|baked| baked.maps.contains_key(&slot.map)).then(|| name.clone())
     }));
-    used
-}
 
-/// Drop resources unused by layers, mesh maps, paint tools or the environment (one undo step)
-fn remove_unused(s: &mut Session, _: &Value) -> Result<Value> {
-    let used = images_in_use(s);
     let unused: Vec<String> = s.doc.resources.keys().filter(|k| !used.contains(k)).cloned().collect();
     if !unused.is_empty() {
         s.edit("Remove unused resources", |s| {
@@ -488,120 +367,6 @@ fn add_image_fill(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn export_writes_the_imported_bytes() {
-        let mut session = crate::sample_session(128, 32).unwrap();
-        let bytes = texturecraft_formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
-        let name = session.import_resource_bytes("icon.png", bytes.clone()).unwrap();
-        let path = std::env::temp_dir().join(format!("texturecraft-export-resource-{}.png", std::process::id()));
-
-        crate::commands::execute(&mut session, "resource.export", &json!({"name": name, "path": path.to_str().unwrap()})).unwrap();
-
-        assert_eq!(std::fs::read(&path).unwrap(), bytes, "the file is the resource as imported");
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn a_renamed_image_stays_in_use_everywhere_it_was() {
-        let mut session = crate::sample_session(128, 32).unwrap();
-        let png = texturecraft_formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
-        let name = session.import_resource_bytes("photo.png", png).unwrap();
-        crate::execute(&mut session, "layer.add.image", &json!({"name": name})).unwrap();
-        session.tool.brush.alpha_image = Some(name.clone());
-
-        let renamed = crate::execute(&mut session, "resource.rename", &json!({"name": name, "to": "stone"})).unwrap()["name"].as_str().unwrap().to_string();
-
-        assert_ne!(renamed, name);
-        assert!(renamed.ends_with(".png"), "the extension stays: {renamed}");
-        let used = images_in_use(&session);
-        assert!(used.contains(&renamed) && !used.contains(&name), "every use follows the rename: {used:?}");
-        assert!(session.images.contains_key(&renamed) && !session.images.contains_key(&name));
-
-        session.undo().unwrap();
-
-        assert!(project_images(&session.doc.project).contains(&name), "undo brings the old name back");
-        assert!(session.images.contains_key(&name));
-        assert_eq!(session.tool.brush.alpha_image.as_ref(), Some(&name), "the brush alpha follows the undo");
-
-        session.redo().unwrap();
-
-        assert_eq!(session.tool.brush.alpha_image.as_ref(), Some(&renamed), "the brush alpha follows the redo");
-    }
-
-    #[test]
-    fn a_renamed_image_keeps_following_its_file() {
-        let path = std::env::temp_dir().join(format!("texturecraft-rename-source-{}.png", std::process::id()));
-        std::fs::write(&path, texturecraft_formats::gray16_png(1, 1, [0.25].into_iter()).unwrap()).unwrap();
-        let mut session = crate::sample_session(128, 32).unwrap();
-        let name = crate::execute(&mut session, "resource.import", &json!({"path": path.to_str().unwrap()})).unwrap()["name"].as_str().unwrap().to_string();
-
-        let renamed = crate::execute(&mut session, "resource.rename", &json!({"name": name, "to": "stone"})).unwrap()["name"].as_str().unwrap().to_string();
-        std::fs::write(&path, texturecraft_formats::gray16_png(1, 1, [0.75].into_iter()).unwrap()).unwrap();
-        // An equal-size file counts as changed once its time moved, as a later save's does
-        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
-        std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
-        let updated = crate::execute(&mut session, "resource.update", &json!({"names": [renamed]})).unwrap();
-
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(updated["updated"], json!([renamed]), "the renamed image reads its changed file again: {updated}");
-    }
-
-    #[test]
-    fn renaming_a_linked_materials_package_moves_a_material_effects_link_with_it() {
-        use std::collections::BTreeMap;
-        use texturecraft_core::{Effect, EffectKind, MaterialLink};
-
-        let mut session = crate::sample_session(128, 32).unwrap();
-        let png = texturecraft_formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
-        let package = session.import_resource_bytes("package.png", png).unwrap();
-        crate::execute(&mut session, "layer.add.image", &json!({"name": package})).unwrap();
-        let layer_id = session.selected_layer().unwrap();
-        let link = MaterialLink {
-            name: "linked".into(),
-            package: package.clone(),
-            graph: String::new(),
-            params: Vec::new(),
-            presets: Vec::new(),
-            inputs: Vec::new(),
-            size: 1,
-            resolution: None,
-            mapping: BTreeMap::new(),
-            outputs: BTreeMap::from([("basecolor".to_string(), package.clone())]),
-        };
-        let effect_id = session.doc.project.alloc_id();
-        let material = Effect::new(effect_id, EffectKind::Material(Fill { link: Some(Box::new(link)), ..Fill::default() }));
-        session.doc.project.layers.get_mut(&layer_id).unwrap().content_effects.push(material);
-
-        let renamed = crate::execute(&mut session, "resource.rename", &json!({"name": package, "to": "stone"})).unwrap()["name"].as_str().unwrap().to_string();
-
-        let effect = &session.doc.project.layers[&layer_id].content_effects[0];
-        let EffectKind::Material(fill) = &effect.kind else { panic!("the effect stays a material") };
-        let link = fill.link.as_ref().unwrap();
-        assert_ne!(renamed, package);
-        assert_eq!(link.package, renamed, "the link's package follows the rename");
-        assert_eq!(link.outputs.values().collect::<Vec<_>>(), [&renamed], "the link's cooked outputs follow the rename");
-    }
-
-    #[test]
-    fn renaming_an_image_a_generator_reads_as_its_grunge_moves_the_grunge_with_it() {
-        use texturecraft_core::{Effect, EffectKind, Generator, GeneratorKind};
-
-        let mut session = crate::sample_session(128, 32).unwrap();
-        let png = texturecraft_formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
-        let grunge = session.import_resource_bytes("grunge.png", png).unwrap();
-        crate::execute(&mut session, "layer.add.image", &json!({"name": grunge})).unwrap();
-        let layer_id = session.selected_layer().unwrap();
-        let generator = Generator { grunge: Some(Source::image(grunge.clone())), ..Generator::new(GeneratorKind::EdgeWear) };
-        let effect_id = session.doc.project.alloc_id();
-        session.doc.project.layers.get_mut(&layer_id).unwrap().content_effects.push(Effect::new(effect_id, EffectKind::Generator(generator)));
-
-        let renamed = crate::execute(&mut session, "resource.rename", &json!({"name": grunge, "to": "worn"})).unwrap()["name"].as_str().unwrap().to_string();
-
-        let EffectKind::Generator(generator) = &session.doc.project.layers[&layer_id].content_effects[0].kind else { panic!("the effect stays a generator") };
-        assert_ne!(renamed, grunge);
-        assert_eq!(generator.grunge, Some(Source::image(renamed)), "the generator's grunge follows the rename");
-    }
 
     #[test]
     fn file_reads_obey_the_remaining_byte_budget() {

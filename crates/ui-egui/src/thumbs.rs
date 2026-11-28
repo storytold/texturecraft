@@ -70,8 +70,6 @@ pub struct Thumbs {
     big_shown: VecDeque<String>,
     /// The frame that last took in the worker's results
     received_in_pass: u64,
-    /// Pictures the user picked as asset previews, by file; None for a file that doesn't load
-    custom_previews: HashMap<PathBuf, Option<TextureHandle>>,
     /// Per active generator picture size: the current effect, pending key and last finished picture
     set_pictures: HashMap<(u64, usize), (Option<String>, Option<TextureHandle>)>,
 }
@@ -316,26 +314,6 @@ impl Thumbs {
         self.rendered.retain(|key, _| current(key));
         self.big_shown.retain(current);
         self.saved_brush_previews.clear();
-        self.custom_previews.clear();
-    }
-
-    /// Load the picture at `file` again next time: the user picked it anew, maybe after changing it
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn forget_custom_preview(&mut self, file: &Path) {
-        self.custom_previews.remove(file);
-    }
-
-    /// The picture at `file` as an asset's custom preview (its centred square), loaded once; None if it doesn't load
-    pub(crate) fn custom_preview(&mut self, ctx: &egui::Context, file: &Path) -> Option<TextureHandle> {
-        self.custom_previews
-            .entry(file.to_path_buf())
-            .or_insert_with(|| {
-                let image = crate::shelf_custom_preview::square(&image::open(file).ok()?);
-                let size = [image.width() as usize, image.height() as usize];
-                let pixels = ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-                Some(ctx.load_texture(format!("custom_preview_{}", file.display()), pixels, TextureOptions::LINEAR))
-            })
-            .clone()
     }
 
     /// Smart mask thumbnail; None until the worker returns it

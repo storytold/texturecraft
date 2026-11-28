@@ -119,11 +119,6 @@ impl MicroDetails {
         self.height_source.iter().chain(self.normal_source.as_ref())
     }
 
-    /// [`MicroDetails::sources`], to rename the images they read
-    pub fn sources_mut(&mut self) -> impl Iterator<Item = &mut Source> {
-        self.height_source.iter_mut().chain(self.normal_source.as_mut())
-    }
-
     /// Every value brought into its range, non-finite ones to the defaults of `kind`
     pub fn clamped(self, kind: GeneratorKind) -> MicroDetails {
         let Some(defaults) = MicroDetails::defaults(kind) else { return self };

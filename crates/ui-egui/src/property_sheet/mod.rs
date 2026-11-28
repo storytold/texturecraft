@@ -82,7 +82,7 @@ pub(crate) use size_columns_response::SizeColumnsResponse;
 pub(crate) use slot_response::SlotResponse;
 pub(crate) use stack_slider::StackSlider;
 pub(crate) use stacked_rows::{CHECK_SIZE, paint_check};
-pub(crate) use switch_control::{TOGGLE_ROOM, paint_focus_outline};
+pub(crate) use switch_control::paint_focus_outline;
 
 pub(crate) fn paint_keyboard_focus(ui: &egui::Ui, response: &egui::Response, tokens: &crate::theme::Tokens) {
     if response.has_focus() {
@@ -124,7 +124,7 @@ const VALUE_MIN_WIDTH: f32 = 26.0;
 const TRACK_TO_VALUE: f32 = 14.0;
 
 /// Size of regular labels and SemiBold values
-pub(crate) const TEXT_SIZE: f32 = 12.0;
+const TEXT_SIZE: f32 = 12.0;
 
 /// Size of captions, pill names and the switch's words
 const SMALL_TEXT_SIZE: f32 = 11.0;

@@ -5,6 +5,4 @@ pub(crate) enum SectionScope {
     Docked,
     /// The right-click Properties popup over a view
     Popup,
-    /// The Assets panel's refresh popup, which has no strip
-    Shelf,
 }

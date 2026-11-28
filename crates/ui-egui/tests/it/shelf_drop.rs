@@ -48,7 +48,7 @@ fn drop_material(harness: &mut Harness<'_, TextureCraftApp>, position: Pos2) {
 
 /// Drop shelf `asset` at `position`, as a drag from the shelf ends there
 fn drop_asset(harness: &mut Harness<'_, TextureCraftApp>, asset: Asset, position: Pos2) {
-    egui::DragAndDrop::set_payload(&harness.ctx, ShelfDrag { asset, label: "Dragged".into(), thumb: None });
+    egui::DragAndDrop::set_payload(&harness.ctx, ShelfDrag { asset, label: "Dragged".into() });
     harness.hover_at(position);
     harness.run_steps(2);
 

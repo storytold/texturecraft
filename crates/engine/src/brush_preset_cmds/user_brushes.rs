@@ -45,12 +45,6 @@ impl UserBrushes {
         self.dir.as_ref().map(|directory| directory.join(format!("{}.{BRUSH_EXT}", sanitize_file_stem(name.trim()))))
     }
 
-    /// The file user preset `name` is mirrored to (None: no such preset, or the presets live in memory only)
-    pub fn file_for(&self, name: &str) -> Option<std::path::PathBuf> {
-        let preset = self.list.get(self.find(name)?)?;
-        preset.file.clone().or_else(|| self.file_of(&preset.name))
-    }
-
     /// The file a preset named `name` that was never written would have.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn file_of(&self, name: &str) -> Option<std::path::PathBuf> {

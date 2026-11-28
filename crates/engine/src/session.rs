@@ -1029,8 +1029,6 @@ impl Session {
     }
 
     fn after_history(&mut self, other: &Document) {
-        self.follow_renamed_resources(other);
-
         // Pending operations may still hold layer IDs from the discarded snapshot
         self.doc.project.next_id = self.doc.project.next_id.max(other.project.next_id);
         self.mark_modified();
@@ -1050,38 +1048,6 @@ impl Session {
         let has_mask = self.selected_layer().and_then(|lid| self.doc.project.layer(self.doc.project.mask_owner(lid)).ok()).is_some_and(|l| l.mask.is_some());
         if self.target == StackTarget::Mask && !has_mask {
             self.target = StackTarget::Content;
-        }
-    }
-
-    /// The image names the tools and the 2D view read, which a resource rename follows
-    pub(crate) fn tool_images_mut(&mut self) -> impl Iterator<Item = &mut String> {
-        [
-            self.tool.stencil.as_mut().map(|stencil| &mut stencil.image),
-            self.tool.brush.alpha_image.as_mut(),
-            self.tool.mask_image.as_mut(),
-            self.view_image.as_mut(),
-        ]
-        .into_iter()
-        .flatten()
-    }
-
-    /// Points tool images at a resource's name on this side of an undone or redone rename
-    fn follow_renamed_resources(&mut self, other: &Document) {
-        let names: Vec<String> = self.tool_images_mut().map(|name| name.clone()).collect();
-        let renames: Vec<(String, String)> = names
-            .into_iter()
-            .filter(|name| !self.doc.resources.contains_key(name))
-            .filter_map(|name| {
-                let bytes = other.resources.get(&name)?;
-                let to = self.doc.resources.iter().find(|(_, here)| Arc::ptr_eq(here, bytes)).map(|(here, _)| here.clone())?;
-                Some((name, to))
-            })
-            .collect();
-
-        for (name, to) in renames {
-            for tool_image in self.tool_images_mut().filter(|tool_image| **tool_image == name) {
-                tool_image.clone_from(&to);
-            }
         }
     }
 

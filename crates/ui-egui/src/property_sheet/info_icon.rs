@@ -1,7 +1,7 @@
 use egui::{Align2, CornerRadius, FontId, Frame, Margin, Rect, RectAlign, RichText, Role, Sense, Shadow, Stroke, WidgetInfo, pos2, vec2};
 use egui_phosphor::regular as ic;
 
-use super::{PropertySheet, ROW_HEIGHT, SIDE_PADDING_POINTS, SMALL_TEXT_SIZE};
+use super::{PropertySheet, ROW_HEIGHT, SMALL_TEXT_SIZE};
 use crate::theme::HARD_SHADOW;
 
 /// The i's slot at the panel edge; a row with an i at its left starts this much further right
@@ -15,9 +15,6 @@ const INFO_ICON_SIZE: f32 = 13.0;
 
 /// Room the tooltip leaves at the panel's right edge, so it covers no number, dial or switch
 const TIP_VALUE_ROOM: f32 = 70.0;
-
-/// Width of a tooltip beside its window
-const BESIDE_TIP_WIDTH: f32 = 320.0;
 
 /// How far the tooltip reaches up into its row
 const TIP_OVERLAP: f32 = 2.0;
@@ -50,48 +47,6 @@ impl<'u> PropertySheet<'u> {
         self.paint_info_in(self.right - INFO_SLOT, self.right - INFO_ICON_SIZE / 2.0, center_y);
     }
 
-    /// Paints an i for the row just laid out in the `column` right of the sheet, its tooltip beside the window the sheet is in
-    pub(crate) fn beside_info(&mut self, column: f32, tip: &str) {
-        let center_y = self.cursor_y() - ROW_HEIGHT / 2.0;
-        let row_top = center_y - ROW_HEIGHT / 2.0;
-        let edge = self.right + SIDE_PADDING_POINTS + column;
-        let slot = Rect::from_min_max(pos2(edge - SIDE_PADDING_POINTS - INFO_SLOT, row_top), pos2(edge - SIDE_PADDING_POINTS, row_top + ROW_HEIGHT));
-        let id = self.next_id();
-        let response = self.ui.interact(slot, id, Sense::hover());
-        response.widget_info(|| WidgetInfo::labeled(Role::Image, true, tip));
-
-        let tokens = self.tokens;
-        let color = if response.hovered() { tokens.text } else { tokens.text_dim };
-        self.ui.painter().text(slot.center(), Align2::CENTER_CENTER, ic::INFO, FontId::proportional(INFO_ICON_SIZE), color);
-
-        // Beside the window, from this row down, so it covers none of the rows under it
-        let layer = self.ui.layer_id().id;
-        let window = self.ui.ctx().memory(|memory| memory.area_rect(layer)).unwrap_or(self.ui.clip_rect());
-        let anchor = Rect::from_min_max(pos2(window.left(), row_top), pos2(window.right(), row_top + ROW_HEIGHT));
-        let mut tooltip = egui::Tooltip::for_enabled(&response);
-        tooltip.popup = tooltip
-            .popup
-            .anchor(anchor)
-            .align(RectAlign::RIGHT_START)
-            .align_alternatives(&[RectAlign::LEFT_START])
-            .frame(self.tip_frame())
-            .width(BESIDE_TIP_WIDTH);
-        tooltip.show(|ui| {
-            ui.set_width(BESIDE_TIP_WIDTH);
-            ui.label(RichText::new(tip).size(SMALL_TEXT_SIZE).color(tokens.text).line_height(Some(TIP_LINE_HEIGHT)));
-        });
-    }
-
-    /// The tooltips' box: the chrome, a hairline, rounded, with a hard shadow
-    fn tip_frame(&self) -> Frame {
-        Frame::NONE
-            .fill(self.tokens.chrome)
-            .stroke(Stroke::new(1.0, self.tokens.field_border))
-            .corner_radius(CornerRadius::same(TIP_ROUNDING))
-            .inner_margin(TIP_MARGIN)
-            .shadow(TIP_SHADOW)
-    }
-
     /// Paints the pending i at `glyph_x` in its slot from `slot_left`
     fn paint_info_in(&mut self, slot_left: f32, glyph_x: f32, center_y: f32) {
         let Some(tip) = self.info.take() else { return };
@@ -108,7 +63,12 @@ impl<'u> PropertySheet<'u> {
 
         // Under the row from the i, ending before the value column; above it where the window ends first
         let anchor = Rect::from_min_max(pos2(self.left, row_top), pos2(self.right - TIP_VALUE_ROOM, row_top + ROW_HEIGHT));
-        let frame = self.tip_frame();
+        let frame = Frame::NONE
+            .fill(tokens.chrome)
+            .stroke(Stroke::new(1.0, tokens.field_border))
+            .corner_radius(CornerRadius::same(TIP_ROUNDING))
+            .inner_margin(TIP_MARGIN)
+            .shadow(TIP_SHADOW);
         let text_width = anchor.width() - TIP_MARGIN.sum().x;
 
         let mut tooltip = egui::Tooltip::for_enabled(&response);

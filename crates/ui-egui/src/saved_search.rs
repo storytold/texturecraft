@@ -2,14 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The search text, tab, library folder and Favorites choice of a saved shelf query, under the name it lists as
+/// The search text, tab and library folder of a saved shelf query, under the name it lists as
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedSearch {
     pub name: String,
     pub filter: String,
     pub tab: usize,
     pub path: Vec<String>,
-    /// Only favorites show; searches saved before favorites show everything
-    #[serde(default)]
-    pub favorites_only: bool,
 }

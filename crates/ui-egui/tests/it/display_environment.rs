@@ -110,7 +110,7 @@ fn an_image_dropped_on_the_slot_becomes_the_environment() {
     h.run_steps(SETTLE);
 
     let slot = h.get_by_role_and_label(Role::Button, "Studio Soft").rect().center();
-    egui::DragAndDrop::set_payload(&h.ctx, ShelfDrag { asset: Asset::Texture(name.clone()), label: "Dragged".into(), thumb: None });
+    egui::DragAndDrop::set_payload(&h.ctx, ShelfDrag { asset: Asset::Texture(name.clone()), label: "Dragged".into() });
     h.hover_at(slot);
     h.run_steps(2);
     h.event(Event::PointerButton { pos: slot, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });

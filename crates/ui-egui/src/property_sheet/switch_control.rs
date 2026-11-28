@@ -38,9 +38,6 @@ const TOGGLE_LABEL_AIR: f32 = 10.0;
 /// From that column to the pill's centre: the pill starts on the column
 const TOGGLE_CENTER_OFFSET: f32 = PILL_SIZE.x / 2.0;
 
-/// Room a toggle takes right of its label: the air and the switch
-pub(crate) const TOGGLE_ROOM: f32 = TOGGLE_LABEL_AIR + PILL_SIZE.x;
-
 /// From one of a pair's toggles to the next, and from its name to its pill's centre
 const PAIR_PITCH: f32 = 76.0;
 const PAIR_NAME_TO_PILL: f32 = 32.0;
@@ -194,15 +191,6 @@ impl PropertySheet<'_> {
 
     /// An on/off beside its label; every toggle in a panel lines up past the longest toggle label
     pub(crate) fn toggle(&mut self, label: &str, on: &mut bool) -> bool {
-        self.toggle_in(label, on, true)
-    }
-
-    /// A [`Self::toggle`] greyed out and off: a setting this app can't act on yet, said in its row's i
-    pub(crate) fn unavailable_toggle(&mut self, label: &str) {
-        self.toggle_in(label, &mut false, false);
-    }
-
-    fn toggle_in(&mut self, label: &str, on: &mut bool, enabled: bool) -> bool {
         let rect = self.take(ROW_HEIGHT);
         let center_y = rect.center().y;
         let label_x = self.left + self.lead_shift();
@@ -213,19 +201,11 @@ impl PropertySheet<'_> {
 
         let column = (self.column() - self.left).max(self.used.toggle_label_end).max(label_end);
         let pill = Rect::from_center_size(pos2(self.left + column + TOGGLE_CENTER_OFFSET, center_y), PILL_SIZE);
-        let hit = Rect::from_min_max(pos2(label_x, rect.top()), pos2(pill.right(), rect.bottom()));
-        let clicked = if enabled {
-            self.toggle_hit(hit, label, on)
-        } else {
-            let id = self.next_id();
-            let response = self.ui.interact(hit, id, Sense::hover());
-            response.widget_info(|| WidgetInfo::selected(Role::CheckBox, false, false, label));
-            false
-        };
+        let clicked = self.toggle_hit(Rect::from_min_max(pos2(label_x, rect.top()), pos2(pill.right(), rect.bottom())), label, on);
 
-        let text = if enabled { self.tokens.text } else { self.tokens.text_dim };
+        let text = self.tokens.text;
         self.ui.painter().text(pos2(label_x, center_y), Align2::LEFT_CENTER, label, font, text);
-        self.pill(pill.center(), *on, enabled);
+        self.pill(pill.center(), *on, true);
         self.drawn(center_y + PILL_SIZE.y / 2.0);
         clicked
     }

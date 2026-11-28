@@ -385,21 +385,6 @@ pub(crate) fn path_images(kind: &EffectKind) -> Vec<String> {
     shapes.iter().filter_map(|shape| read_paint(shape).ok()?.mask_image).collect()
 }
 
-/// Points the stored paths of `kind` that paint with image resource `from` (as mask image or brush alpha) at `to`
-pub(crate) fn rename_path_images(kind: &mut EffectKind, from: &str, to: &str) {
-    let EffectKind::Path(shapes) = kind else { return };
-
-    for shape in shapes {
-        for pointer in ["/mask_image", "/brush/alpha_image"] {
-            if let Some(image) = shape.paint.pointer_mut(pointer)
-                && image.as_str() == Some(from)
-            {
-                *image = serde_json::Value::String(to.to_string());
-            }
-        }
-    }
-}
-
 /// The Path tool state showing a stored path (finite points only, at most [`MAX_PATH_POINTS`])
 fn state_of(shape: &PathShape) -> PathState {
     let points = shape.points.iter().filter(|p| p.iter().all(|v| v.is_finite())).take(MAX_PATH_POINTS).map(|p| Vec3::from_array(*p)).collect();

@@ -739,15 +739,6 @@ impl Source {
         }
     }
 
-    /// [`Source::images`], to rename them
-    pub fn images_mut(&mut self) -> Vec<&mut String> {
-        match self {
-            Source::Image { name, .. } => vec![name],
-            Source::Procedural { pattern, .. } => pattern.tile.iter_mut().flat_map(|tile| tile.images_mut()).collect(),
-            Source::Uniform(_) | Source::Anchor { .. } => Vec::new(),
-        }
-    }
-
     /// The gradient map stops of a procedural or anchor source (empty: none).
     pub fn ramp(&self) -> &[[f32; 3]] {
         match self {
@@ -853,12 +844,6 @@ pub struct LinkPreset {
 }
 
 impl Fill {
-    /// The image resource names the fill holds, to rename them: its sources' and, when linked, its package and cooked outputs
-    pub fn images_mut(&mut self) -> impl Iterator<Item = &mut String> {
-        let link = self.link.iter_mut().map(|link| &mut **link).flat_map(|link| std::iter::once(&mut link.package).chain(link.outputs.values_mut()));
-        self.sources.values_mut().flat_map(Source::images_mut).chain(link)
-    }
-
     /// Value used for `c` when the fill has no source for it: the channel default.
     pub fn source(&self, c: Channel) -> Source {
         self.sources.get(&c).cloned().unwrap_or_else(|| Source::uniform_of(c))
@@ -1300,17 +1285,6 @@ impl Generator {
     pub fn sources(&self) -> impl Iterator<Item = &Source> {
         let micro = self.micro.iter().flat_map(|micro| micro.sources()).chain(self.grayscale_controls_ref().and_then(|grayscale| grayscale.source.as_ref()));
         self.inputs.values().chain(self.texture.as_ref().and_then(|texture| texture.source.as_ref())).chain(self.grunge.as_ref()).chain(micro)
-    }
-
-    /// [`Generator::sources`], to rename the images they read
-    pub fn sources_mut(&mut self) -> impl Iterator<Item = &mut Source> {
-        let grayscale = match self.controls.as_deref_mut() {
-            Some(KindControls::Grayscale(grayscale)) if self.kind == GeneratorKind::GrayscaleConversion => grayscale.source.as_mut(),
-            _ => None,
-        };
-        let micro = self.micro.iter_mut().flat_map(|micro| micro.sources_mut()).chain(grayscale);
-        let texture = self.texture.as_mut().and_then(|texture| texture.source.as_mut());
-        self.inputs.values_mut().chain(texture).chain(self.grunge.as_mut()).chain(micro)
     }
 
     /// The micro details as saved, when the generator computes with them: with a slot switched on, except a micro detail saved before Micro Details on a generator still on the earlier model, which [`Generator::earlier_micro`] reads (bring them into range before use: saved files are not trusted)
@@ -2374,17 +2348,6 @@ impl EffectKind {
         sources.into_iter().flat_map(Source::images).chain(id_map)
     }
 
-    /// [`EffectKind::images_read`], to rename them
-    pub fn images_mut(&mut self) -> Vec<&mut String> {
-        match self {
-            EffectKind::Fill { source, .. } => source.images_mut(),
-            EffectKind::Material(fill) => fill.images_mut().collect(),
-            EffectKind::Generator(generator) => generator.sources_mut().flat_map(Source::images_mut).collect(),
-            EffectKind::ColorSelection(selection) => selection.id_map.iter_mut().collect(),
-            _ => Vec::new(),
-        }
-    }
-
     /// Reads a channel of the layer or of the stack below it (a compare mask's layer sides)
     pub fn reads_stack(&self) -> bool {
         matches!(self, EffectKind::Compare { left, right, .. } if left.reads_stack() || right.reads_stack())
@@ -2445,11 +2408,6 @@ impl Effect {
     /// The image resources the effect reads: its kind's ([`EffectKind::images_read`]) and its filter image inputs'
     pub fn images_read(&self) -> impl Iterator<Item = &str> {
         self.kind.images_read().chain(self.inputs.values().flat_map(Source::images))
-    }
-
-    /// [`Effect::images_read`], to rename them
-    pub fn images_mut(&mut self) -> impl Iterator<Item = &mut String> {
-        self.kind.images_mut().into_iter().chain(self.inputs.values_mut().flat_map(Source::images_mut))
     }
 
     /// Whether a source of the effect, or one of its image inputs, reads anchor point `anchor` (any anchor point when None)

@@ -88,7 +88,7 @@ fn an_assets_image_dropped_on_the_stencil_slot_becomes_the_stencil() {
     assert!(harness.state().session.tool.stencil.is_none());
 
     let slot = harness.get_all_by_role(Role::ComboBox).find(|node| node.value().as_deref() == Some("None")).unwrap().rect().center();
-    egui::DragAndDrop::set_payload(&harness.ctx, ShelfDrag { asset: Asset::Texture(name.clone()), label: "Dragged".into(), thumb: None });
+    egui::DragAndDrop::set_payload(&harness.ctx, ShelfDrag { asset: Asset::Texture(name.clone()), label: "Dragged".into() });
     harness.hover_at(slot);
     harness.run_steps(2);
     harness.event(Event::PointerButton { pos: slot, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });

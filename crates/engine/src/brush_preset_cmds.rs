@@ -146,15 +146,6 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("brush.preset.delete", "Delete a brush preset", [], None, "{name} — one of the user's presets (built-ins are read-only)", always, delete),
         cmd!("brush.preset.save", "Save brush preset", [], None, "{path} — the current brush as a .tcbrush file", always, save),
         cmd!("brush.preset.load", "Load brush preset", [], None, "{path} — a .tcbrush file's stroke on the brush, keeping the size", always, load),
-        cmd!(
-            "brush.preset.export",
-            "Export brush preset",
-            [],
-            None,
-            "{name, path} — one of the user's presets as a .tcbrush file, as its library folder holds it",
-            always,
-            export
-        ),
     ]
 }
 
@@ -334,26 +325,6 @@ fn load(_: &mut Session, _: &Value) -> Result<Value> {
     Err(bad("brush.preset.load", "file paths are not available in the browser"))
 }
 
-/// Writes user preset `name` to `path` as the library folder holds it
-#[cfg(not(target_arch = "wasm32"))]
-fn export(session: &mut Session, params: &Value) -> Result<Value> {
-    const CMD: &str = "brush.preset.export";
-    let name = name_param(params, "name", CMD)?;
-    let path = strp(params, "path").ok_or_else(|| bad(CMD, "`path` is required"))?;
-    let preset = session.brush_presets.find(&name).and_then(|index| session.brush_presets.list.get(index));
-    let preset = preset.ok_or_else(|| bad(CMD, format!("no user brush preset `{name}`")))?;
-    let bytes = serde_json::to_vec_pretty(preset).map_err(|error| bad(CMD, error.to_string()))?;
-
-    std::fs::write(path, bytes).map_err(|error| bad(CMD, format!("cannot write {path}: {error}")))?;
-
-    Ok(json!({ "path": path }))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn export(_: &mut Session, _: &Value) -> Result<Value> {
-    Err(bad("brush.preset.export", "file paths are not available in the browser"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,31 +404,6 @@ mod tests {
         run(&mut test_session, "brush.preset.store", json!({"name": "a/b"})).unwrap();
         assert!(run(&mut test_session, "brush.preset.store", json!({"name": "a?b"})).is_err(), "same file name as `a/b`");
         assert_eq!(names(&test_session), ["a/b"]);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn an_exported_preset_loads_as_the_same_brush() {
-        let dir = std::env::temp_dir().join(format!("tc-brush-export-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut test_session = session();
-        run(&mut test_session, "tool.brush", json!({"size": 41, "hardness": 70})).unwrap();
-        run(&mut test_session, "brush.preset.store", json!({"name": "Ink pen"})).unwrap();
-        run(&mut test_session, "tool.brush", json!({"size": 5})).unwrap();
-
-        let path = dir.join("shared.tcbrush");
-        run(&mut test_session, "brush.preset.export", json!({"name": "ink pen", "path": path.to_str().unwrap()})).unwrap();
-
-        let mut fresh = session();
-        assert!(fresh.load_brush_presets(dir.clone()).is_empty());
-        assert_eq!(names(&fresh), ["Ink pen"], "the file carries the preset's name");
-        assert_eq!(fresh.brush_presets.list[0].brush, test_session.brush_presets.list[0].brush, "the stored brush, not the current one");
-        assert!(
-            run(&mut test_session, "brush.preset.export", json!({"name": "Airbrush", "path": path.to_str().unwrap()})).is_err(),
-            "built-ins are not exported"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -13,7 +13,7 @@ use texturecraft_engine::paint::presets::{BrushPreset, PRESETS};
 use texturecraft_engine::smart_masks::{SMART_MASKS, SmartMask};
 
 use crate::TextureCraftApp;
-use crate::i18n::{n_, tr};
+use crate::i18n::tr;
 use crate::shelf::{Asset, Tab, apply};
 use crate::shelf_preview::ShelfPreview;
 
@@ -122,21 +122,6 @@ impl ShelfEntry {
     pub(crate) fn in_folder(&self, path: &[String]) -> bool {
         let own = self.path();
         path.len() <= own.len() && path.iter().zip(own).all(|(wanted, have)| wanted == have)
-    }
-
-    /// What the asset is used as, lowercase (English, shown through `tr`): the menu's Usages row
-    pub(crate) fn usage(&self) -> &'static str {
-        match self {
-            ShelfEntry::Material(material) if material.smart => n_("smart material"),
-            ShelfEntry::Material(_) => n_("material"),
-            ShelfEntry::SmartMask(_) => n_("smart mask"),
-            ShelfEntry::Filter(_) => n_("filter"),
-            ShelfEntry::Brush(_) | ShelfEntry::SavedBrush { .. } => n_("brush"),
-            ShelfEntry::Alpha(_) => n_("alpha"),
-            ShelfEntry::Procedural(_) => n_("procedural"),
-            ShelfEntry::Environment(_) => n_("environment"),
-            ShelfEntry::Image(_) => n_("texture"),
-        }
     }
 
     /// The name under the tile, translated where the asset's name is

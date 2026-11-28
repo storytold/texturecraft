@@ -1,4 +1,4 @@
-//! The shelf's bottom toolbar: the side pane toggles on the left; refresh, reset query, new panel and import on the right
+//! The shelf's bottom toolbar: the side pane toggles on the left; refresh, reset query and import on the right
 
 use egui::Ui;
 use egui_phosphor::regular as ic;
@@ -18,7 +18,6 @@ pub(crate) fn height(ui: &Ui) -> f32 {
 /// The toolbar
 pub(crate) fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     let size = ui.spacing().interact_size.y;
-    let panel = ui.max_rect();
     ui.add_space(GAP_ABOVE);
     ui.horizontal(|ui| {
         crate::shelf_panes::toggles(app, ui, size);
@@ -26,13 +25,12 @@ pub(crate) fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
             if icon_button(ui, ic::PLUS, tr("Import resources..."), false, size).clicked() {
                 crate::menus::invoke(app, &ui.ctx().clone(), "resource.import");
             }
-            if icon_button(ui, ic::FOLDER, tr("New Assets panel"), false, size).clicked() {
-                app.ui.dock.focus(crate::docking::Panel::AssetsSecond);
-            }
             if icon_button(ui, ic::X_CIRCLE, tr("Reset query"), false, size).clicked() {
                 reset_query(app);
             }
-            crate::shelf_updates::button(app, ui, size, panel);
+            if icon_button(ui, ic::ARROWS_CLOCKWISE, tr("Refresh"), false, size).clicked() {
+                refresh(app);
+            }
         });
     });
 }
@@ -42,5 +40,16 @@ pub(crate) fn reset_query(app: &mut TextureCraftApp) {
     app.ui.shelf_filter.clear();
     app.ui.shelf_tab = crate::shelf_tabs::NO_TYPE;
     app.ui.shelf_path.clear();
-    app.ui.shelf_favorites_only = false;
+}
+
+/// Read the user's saved assets from disk again and redraw their thumbnails
+fn refresh(app: &mut TextureCraftApp) {
+    app.library = None;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    for warning in app.session.load_brush_presets(crate::user_dir("brushes")) {
+        app.toast(warning, true);
+    }
+
+    app.thumbs.forget_saved_files();
 }
