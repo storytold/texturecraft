@@ -110,6 +110,8 @@ pub struct GpuLink {
     /// kinds uploaded since recreation. A set that keeps its size retains its textures.
     sent: HashMap<usize, BTreeSet<DisplayKind>>,
     pub adapter: String,
+
+    visible: texturecraft_engine::session::VisibleTiles,
     /// Most tiles waiting to be composited since compositing last caught up (progress).
     composite_total: usize,
     bake_scene: BakeSceneLink,
@@ -170,6 +172,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         aux_id_mask: None,
         sent: HashMap::new(),
         adapter: format!("{} ({:?})", info.name, info.backend),
+        visible: Default::default(),
         composite_total: 0,
         bake_scene: BakeSceneLink::default(),
     }
@@ -193,13 +196,28 @@ impl GpuLink {
     }
 
     /// Collect everything the GPU needs this frame, running the compositor first: `bake` is what bake mode's 3D view draws besides the low poly, `spent_ms` the time this frame already took
-    pub fn sync(&mut self, session: &mut Session, aux_map: Option<AuxView>, bake: Option<BakeVisualization>, shift: u32, spent_ms: f64) -> SceneSync {
+    pub fn sync(
+        &mut self,
+        session: &mut Session,
+        aux_map: Option<AuxView>,
+        bake: Option<BakeVisualization>,
+        shift: u32,
+        spent_ms: f64,
+        scene_view: bool,
+    ) -> SceneSync {
         let start_ms = crate::now_ms();
         let mut queued = 0usize;
         let time_left_ms = |queued: usize| FRAME_BUDGET_MS - spent_ms - (crate::now_ms() - start_ms) - queued as f64 * UPLOAD_MS_PER_TILE;
         let pending = session.pending_tiles();
         self.composite_total = if pending == 0 { 0 } else { self.composite_total.max(pending) };
-        session.update_for(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms);
+        let prioritize = scene_view && pending >= 32 && !session.stroke_active();
+        let uploads_pending = session.caches.iter().any(|cache| !cache.upload.is_empty());
+        let use_hint = scene_view && !session.stroke_active() && (prioritize || uploads_pending);
+        if use_hint {
+            let deadline = crate::now_ms() + time_left_ms(0).clamp(0.0, 1.0);
+            self.visible.refresh(session, || crate::now_ms() >= deadline);
+        }
+        session.update_with_visible(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms, prioritize.then_some(&self.visible));
 
         let mut out = SceneSync::default();
         if self.lost.swap(false, Ordering::AcqRel) {
@@ -250,7 +268,10 @@ impl GpuLink {
         }
 
         for texture_set in 0..session.caches.len() {
-            let tiles = session.take_uploads(texture_set);
+            let mut tiles = session.take_uploads(texture_set);
+            if use_hint {
+                tiles.sort_by_key(|tile| !self.visible.contains(texture_set, tile));
+            }
             if tiles.is_empty() {
                 continue;
             }
@@ -597,6 +618,7 @@ mod tests {
             adapter: String::new(),
             composite_total: 0,
             bake_scene: BakeSceneLink::default(),
+            visible: Default::default(),
         }
     }
 
@@ -620,31 +642,31 @@ mod tests {
         let owner = s.doc.project.locate(layer).unwrap().0;
         let sets = s.doc.project.texture_sets.len();
 
-        let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0);
+        let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0, false);
         assert_eq!(out.aux.len(), sets, "every set gets an aux texture");
         for (set, _, rgba) in &out.aux {
             let blank = rgba.chunks(4).all(|px| px == MASK_VIEW_BLANK);
             assert_eq!(blank, *set != owner, "set {set}: only the other sets are blank");
         }
         drop(out);
-        let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0);
+        let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0, false);
         assert!(out.aux.is_empty(), "nothing is sent again while the view stays");
         drop(out);
 
         execute(&mut s, "mask.toggle", &json!({"layer": layer.0, "enabled": false})).unwrap();
-        let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0);
+        let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0, false);
         assert_eq!(out.aux.len(), 1, "disabling the displayed mask replaces its old upload");
         let (set, resolution, rgba) = &out.aux[0];
         assert_eq!(*set, owner);
         assert_eq!(*rgba, MASK_VIEW_BLANK.repeat((resolution * resolution) as usize));
         assert_eq!(gpu.aux.len(), sets, "only view keys remain in the link");
         drop(out);
-        let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0);
+        let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0, false);
         assert!(out.aux.is_empty(), "the disabled view needs no repeat upload");
         drop(out);
 
         execute(&mut s, "mask.toggle", &json!({"layer": layer.0, "enabled": true})).unwrap();
-        let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0);
+        let out = gpu.sync(&mut s, Some(AuxView::Mask(layer)), None, 0, 0.0, false);
         assert_eq!(out.aux.len(), 1, "re-enabling the mask uploads its values again");
         assert!(out.aux[0].2.chunks(4).any(|pixel| pixel != MASK_VIEW_BLANK));
     }
@@ -659,7 +681,7 @@ mod tests {
         let name = s.import_resource_bytes("stone.png", png).unwrap();
         execute(&mut s, "viewport.view", &json!({"mode": "image", "image": name})).unwrap();
 
-        let out = gpu.sync(&mut s, Some(AuxView::Image), None, 0, 0.0);
+        let out = gpu.sync(&mut s, Some(AuxView::Image), None, 0, 0.0, false);
 
         assert_eq!(out.image_aux.len(), 1, "equal resolutions share a single pixel buffer");
 
@@ -670,7 +692,7 @@ mod tests {
         assert!(bytes.as_chunks::<4>().0.iter().all(|pixel| *pixel == [9, 9, 9, 255]));
 
         drop(out);
-        let out = gpu.sync(&mut s, Some(AuxView::Image), None, 0, 0.0);
+        let out = gpu.sync(&mut s, Some(AuxView::Image), None, 0, 0.0, false);
         assert!(out.image_aux.is_empty(), "nothing is sent again while the view stays");
 
         drop(out);
@@ -679,7 +701,7 @@ mod tests {
         let shown = s.doc.project.texture_set(0).unwrap().size().0;
         let resolution = if shown == 256 { 512 } else { 256 };
         execute(&mut s, "textureSet.resolution", &json!({"resolution": resolution})).unwrap();
-        let out = gpu.sync(&mut s, Some(AuxView::Image), None, 0, 0.0);
+        let out = gpu.sync(&mut s, Some(AuxView::Image), None, 0, 0.0, false);
         assert!(out.sets.is_some());
         assert_eq!(out.image_aux.get(&resolution).unwrap().0, [0], "the resized set gets pixels at its new resolution");
 
@@ -688,13 +710,13 @@ mod tests {
         execute(&mut s, "resource.remove", &json!({"name": name})).unwrap();
 
         assert!(original.upgrade().is_none(), "even a pending upload does not hold the decoded source");
-        assert!(gpu.sync(&mut s, None, None, 0, 0.0).image_aux.is_empty());
+        assert!(gpu.sync(&mut s, None, None, 0, 0.0, false).image_aux.is_empty());
         assert!(gpu.aux_image.is_none());
 
         let replacement = Arc::new(ImageRes::new(1, 1, vec![[1.0, 0.0, 0.0, 1.0]], true));
         s.images.insert(name.clone(), replacement);
         execute(&mut s, "viewport.view", &json!({"mode": "image", "image": name})).unwrap();
-        let updated = gpu.sync(&mut s, Some(AuxView::Image), None, 0, 0.0);
+        let updated = gpu.sync(&mut s, Some(AuxView::Image), None, 0, 0.0, false);
         assert_eq!(updated.image_aux.len(), 2);
         assert!(updated.image_aux.values().all(|(_, pixels)| pixels.as_chunks::<4>().0.iter().all(|pixel| *pixel == [255, 0, 0, 255])));
     }
@@ -711,7 +733,7 @@ mod tests {
         session.images.insert(resource.into(), image([1.0, 0.0, 0.0, 1.0]));
         execute(&mut session, "effect.set", &json!({"effect": effect.0, "idMap": resource})).unwrap();
 
-        let first = gpu.sync(&mut session, Some(AuxView::IdMask(effect)), None, 0, 0.0);
+        let first = gpu.sync(&mut session, Some(AuxView::IdMask(effect)), None, 0, 0.0, false);
 
         assert!(first.aux[0].2.as_chunks::<4>().0.iter().all(|pixel| *pixel == [255, 0, 0, 255]));
 
@@ -727,15 +749,15 @@ mod tests {
         gpu.aux.get_mut(&set).unwrap().1 = Arc::as_ptr(&replacement) as u64;
         session.images.insert(resource.into(), replacement);
 
-        let updated = gpu.sync(&mut session, Some(AuxView::IdMask(effect)), None, 0, 0.0);
+        let updated = gpu.sync(&mut session, Some(AuxView::IdMask(effect)), None, 0, 0.0, false);
 
         assert_eq!(updated.aux.len(), 1, "replacement pixels must be sent even when the raw address key matches");
         assert!(updated.aux[0].2.as_chunks::<4>().0.iter().all(|pixel| *pixel == [0, 0, 255, 255]));
-        assert!(gpu.sync(&mut session, Some(AuxView::IdMask(effect)), None, 0, 0.0).aux.is_empty());
+        assert!(gpu.sync(&mut session, Some(AuxView::IdMask(effect)), None, 0, 0.0, false).aux.is_empty());
 
-        gpu.sync(&mut session, None, None, 0, 0.0);
+        gpu.sync(&mut session, None, None, 0, 0.0, false);
 
-        assert!(gpu.sync(&mut session, Some(AuxView::IdMask(effect)), None, 0, 0.0).aux.is_empty(), "an unchanged pick reuses the existing upload");
+        assert!(gpu.sync(&mut session, Some(AuxView::IdMask(effect)), None, 0, 0.0, false).aux.is_empty(), "an unchanged pick reuses the existing upload");
 
         let (_, active) = session.id_mask_image(effect).unwrap();
         let active = Arc::downgrade(active);
@@ -743,7 +765,7 @@ mod tests {
 
         assert!(active.upgrade().is_none(), "only the resource store owns the decoded pixels");
 
-        gpu.sync(&mut session, None, None, 0, 0.0);
+        gpu.sync(&mut session, None, None, 0, 0.0, false);
 
         assert!(gpu.aux_id_mask.is_none(), "the upload identity expires with the removed image");
     }
@@ -755,11 +777,11 @@ mod tests {
     #[test]
     fn a_kind_sent_before_a_project_change_is_overwritten_while_its_textures_survive() {
         let mut gpu = link();
-        let out = gpu.sync(&mut session(true), None, None, 0, 0.0);
+        let out = gpu.sync(&mut session(true), None, None, 0, 0.0, false);
         assert!(kinds(&out).contains(&DisplayKind::Emissive));
 
         // A same-size project retains the old emissive texture, so it must be overwritten
-        let out = gpu.sync(&mut session(false), None, None, 0, 0.0);
+        let out = gpu.sync(&mut session(false), None, None, 0, 0.0, false);
         assert!(out.mesh.is_some() && out.sets.is_some());
         assert!(kinds(&out).contains(&DisplayKind::Emissive), "the stale emissive texture is overwritten");
     }
@@ -767,27 +789,27 @@ mod tests {
     #[test]
     fn a_kind_uploaded_after_recreation_is_overwritten_by_the_next_project() {
         let mut gpu = link();
-        let out = gpu.sync(&mut session(true), None, None, 0, 0.0);
+        let out = gpu.sync(&mut session(true), None, None, 0, 0.0, false);
         assert!(kinds(&out).contains(&DisplayKind::Emissive));
 
         // The renderer recreated set zero and uploaded this sync's emissive tiles
         record_recreated_uploads(&mut gpu.recreated.lock().unwrap(), &[0], &out);
         gpu.reset.store(true, Ordering::Release);
 
-        let out = gpu.sync(&mut session(false), None, None, 0, 0.0);
+        let out = gpu.sync(&mut session(false), None, None, 0, 0.0, false);
         assert!(kinds(&out).contains(&DisplayKind::Emissive), "the uploaded emissive texture is overwritten");
     }
 
     #[test]
     fn a_recreated_set_converts_only_the_kinds_it_has_channels_for() {
         let mut gpu = link();
-        gpu.sync(&mut session(true), None, None, 0, 0.0);
+        gpu.sync(&mut session(true), None, None, 0, 0.0, false);
         let mut plain = session(false);
-        gpu.sync(&mut plain, None, None, 0, 0.0);
+        gpu.sync(&mut plain, None, None, 0, 0.0, false);
         // The recreated set starts neutral, so old display kinds need no upload
         gpu.recreated.lock().unwrap().insert(0, BTreeSet::new());
         gpu.reset.store(true, Ordering::Release);
-        let out = gpu.sync(&mut plain, None, None, 0, 0.0);
+        let out = gpu.sync(&mut plain, None, None, 0, 0.0, false);
         assert!(!out.tiles.is_empty());
         assert!(!kinds(&out).contains(&DisplayKind::Emissive), "nothing to overwrite in a neutral texture");
     }
@@ -798,7 +820,7 @@ mod tests {
         for texture_set in 0..64 {
             gpu.sent.insert(texture_set, BTreeSet::from([DisplayKind::Emissive]));
         }
-        gpu.sync(&mut session(false), None, None, 0, 0.0);
+        gpu.sync(&mut session(false), None, None, 0, 0.0, false);
 
         assert_eq!(gpu.sent.len(), 1);
         assert!(gpu.sent.contains_key(&0));
