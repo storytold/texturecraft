@@ -948,7 +948,8 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
         let height = f32(to_u16(scalars[5] * 0.5 + 0.5)) * (2.0 / 65535.0) - 1.0;
         let f0 = quantized_color(lobe_colors[1]);
         let height_index = display_index(3u, index);
-        output[height_index] = pack2x16float(vec2(height, f0.r));
+        // P2: a capture program keeps the Height at f32 (gpu_generator_p2's anchor heights)
+        output[height_index] = select(pack2x16float(vec2(height, f0.r)), bitcast<u32>(scalars[5]), composite_capture);
         output[height_index + 1u] = pack2x16float(f0.gb);
     }
     if writes_display(4u) {

@@ -13,6 +13,8 @@ struct Features {
     mask_preview: bool,
     extended_blend_modes: bool,
     generators: bool,
+    // P1: an operation on the wear, section or light controls
+    generator_controls: bool,
     curvature: bool,
     sampled_generator_inputs: bool,
     spatial: bool,
@@ -22,6 +24,12 @@ struct Features {
     anchors: bool,
     material_anchors: bool,
     color_selection: bool,
+    // P3b: a generator reads a whole-map field (gpu_generator_p3b.rs)
+    p3b_fields: bool,
+    // P2: a generator reads Micro Details (gpu_generator_p2.rs)
+    generator_p2: bool,
+    // P2: a capture program, whose Height display keeps the f32 value (the micro anchor heights)
+    capture: bool,
     // The GPU port packages' WGSL files compiled in full (gpu_composite_packages.rs)
     packages: ShaderFlags,
 }
@@ -33,6 +41,7 @@ impl Features {
             mask_preview: program.is_mask_preview(),
             spatial: !program.filters.stages.is_empty(),
             packages: ShaderFlags::of(program),
+            capture: program.micro.is_capture(),
             ..Self::default()
         };
         features.material_anchors = program.filters.stages.iter().any(|stage| stage.anchor.is_some());
@@ -50,12 +59,21 @@ impl Features {
             features.extended_blend_modes |= op.balance[2] > 8.0;
             features.anchors |= kind == ANCHOR_SOURCE;
             features.color_selection |= kind == COLOR_SELECTION_OPCODE;
+            features.p3b_fields |= super::p3b::reads_field(op);
             features.patterns |= matches!(kind, 1..=9 | 11..=13 | FIRST_EXTENDED_PATTERN..=TILE_GENERATOR_OPCODE);
             features.extended_patterns |= (FIRST_EXTENDED_PATTERN..TILE_GENERATOR_OPCODE).contains(&kind);
             features.tile_generator |= kind == TILE_GENERATOR_OPCODE;
             if (FIRST_GENERATOR..FIRST_EXTENDED_PATTERN).contains(&kind) {
                 features.generators = true;
                 features.curvature |= op.uv[1] != 0.0;
+                // P1: the controls read the curvature levels and their detail sizes
+                if kind < 47 && op.ext[0] != 0 {
+                    features.generator_controls = true;
+                    features.curvature = true;
+                }
+                features.generator_p2 |= op.uv[3] != 0.0;
+                // P1's replaced inputs and P2's slots and grunge read source operations
+                features.sampled_generator_inputs |= kind < 47 && ((op.effects[2] != 0 && op.ext[0] != 0) || op.uv[3] != 0.0);
                 if let Some(source) = op.effects[3].checked_sub(1).and_then(|index| program.operations.get(index as usize)) {
                     features.sampled_generator_inputs |= source.ids[1] != 0;
                 }
@@ -64,7 +82,7 @@ impl Features {
         features
     }
 
-    fn source(self, supports_curvature: bool, supports_id: bool) -> String {
+    fn source(self, supports_curvature: bool, supports_id: bool, supports_fields: bool) -> String {
         fn include(enabled: bool, full: &'static str, stub: &'static str) -> &'static str {
             if enabled { full } else { stub }
         }
@@ -73,7 +91,7 @@ impl Features {
         // function bodies. Omit those helpers so Mesa does not inline them
         // before its dead-code pass.
         [
-            "override enable_authored_images: bool = false;\n             override enable_generators: bool = false;\n             override enable_curvature_detail: bool = false;\n             override enable_spatial_fields: bool = false;\n             override enable_anchor_reads: bool = false;",
+            "override enable_authored_images: bool = false;\n             override enable_generators: bool = false;\n             override enable_curvature_detail: bool = false;\n             override enable_spatial_fields: bool = false;\n             override enable_anchor_reads: bool = false;\n             override composite_capture: bool = false;",
             include_str!("shaders/noise.wgsl"),
             // Keep the gradient fallback when the program has no extended patterns.
             include(
@@ -94,13 +112,13 @@ impl Features {
             include(
                 self.authored_images,
                 include_str!("shaders/material_image.wgsl"),
-                "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }\n                 fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> { return vec4(0.0); }\n                 const MISSING_IMAGE: u32 = 0xffffffffu;\n                 fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> { return rgb; }",
+                "fn authored_image_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec3<f32> { return layer.low.rgb; }\n                 fn decal_fill_value(layer: Operation, uv: vec2<f32>, surface: Surface) -> vec4<f32> { return vec4(layer.low.rgb, 1.0); }\n                 fn material_image_at(image: u32, uv: vec2<f32>) -> vec4<f32> { return vec4(0.0); }\n                 fn material_image_texel(image: u32, pixel: vec2<i32>, size: vec2<i32>) -> vec4<f32> { return vec4(0.0); }\n                 const MISSING_IMAGE: u32 = 0xffffffffu;\n                 fn decode_image_sample(layer: Operation, rgb: vec3<f32>) -> vec3<f32> { return rgb; }",
             ),
             include_str!("shaders/stencil_projection.wgsl"),
             include(
                 self.curvature && supports_curvature,
                 include_str!("shaders/curvature_sample.wgsl"),
-                "fn curvature_level_at(pixel: vec2<u32>, level: u32) -> f32 { return 0.0; }",
+                "fn curvature_level_at(pixel: vec2<u32>, level: u32) -> f32 { return 0.0; }\n                 fn curvature_level_present(level: u32) -> bool { return false; }",
             ),
             include(
                 self.curvature,
@@ -108,19 +126,40 @@ impl Features {
                 "fn generator_curvature(effect: Operation, pixel: vec2<u32>, finest: f32, mode: u32, micro: f32) -> f32 { return 0.0; }",
             ),
             include(
+                self.generator_p2 && self.curvature && supports_curvature,
+                include_str!("shaders/generator_p2_levels_read.wgsl"),
+                "fn generator_level_at(effect: Operation, pixel: vec2<u32>, level: u32) -> f32 { return curvature_level_at(pixel, level); }",
+            ),
+            include(
+                self.generator_p2 && supports_curvature,
+                include_str!("shaders/generator_p2.wgsl"),
+                "fn generator_micro(effect: Operation, pixel: vec2<u32>, baked: vec3<f32>) -> vec3<f32> { return baked; }\n                 fn generator_texture(effect: Operation, texel: LayerTexel, signal: f32, position: vec3<f32>, normal: vec3<f32>) -> f32 { return signal; }\n                 fn generator_grunge(effect: Operation, texel: LayerTexel, position: vec3<f32>, normal: vec3<f32>) -> f32 { return 0.0; }\n                 fn p2_source_ops(effect: Operation, count: u32) -> u32 { return count; }",
+            ),
+            include(
                 self.sampled_generator_inputs,
-                "fn generator_source_value(index: u32, texel: LayerTexel) -> f32 {\n                     return fill_value(layers[index], texel.uv, texel.surface).x;\n                 }",
-                "fn generator_source_value(index: u32, texel: LayerTexel) -> f32 { return layers[index].low.x; }",
+                "fn generator_source_value(index: u32, texel: LayerTexel) -> vec3<f32> {\n                     return fill_value(layers[index], texel.uv, texel.surface).xyz;\n                 }",
+                "fn generator_source_value(index: u32, texel: LayerTexel) -> vec3<f32> { return layers[index].low.xyz; }",
+            ),
+            include(
+                self.generator_controls,
+                include_str!("shaders/generator_p1.wgsl"),
+                "fn p1_generator_ramp(effect: Operation, texel: LayerTexel) -> f32 { return 0.0; }\n                 fn p1_finish_signal(effect: Operation, ramp: f32) -> f32 { return ramp; }\n                 fn p1_source_ops(op: Operation, count: u32) -> u32 { return count; }",
+            ),
+            include(
+                self.p3b_fields && supports_fields,
+                include_str!("shaders/generator_p3b_sample.wgsl"),
+                "fn p3b_field_ramp(effect: Operation, pixel: vec2<u32>) -> f32 { return 0.0; }",
             ),
             include(
                 self.generators,
                 include_str!("shaders/composite_generators.wgsl"),
                 "fn generator_ramp(effect: Operation, texel: LayerTexel) -> f32 { return 0.0; }\n                 fn finish_generator(effect: Operation, ramp: f32) -> f32 { return ramp; }",
             ),
+            include(self.generators, include_str!("shaders/generator_p3a.wgsl"), ""),
             include(
                 self.spatial,
                 include_str!("shaders/composite_spatial.wgsl"),
-                "fn previous_field(start: u32, count: u32) -> u32 { return 0u; }\n                 fn filter_value(slot: u32, pixel: vec2<u32>) -> vec4<f32> { return vec4(0.0); }\n                 var<private> preceding_field: u32 = 0xffffffffu;\n                 fn preceding_stage_word(pixel: vec2<u32>) -> f32 { return 0.0; }",
+                "fn previous_field(start: u32, count: u32) -> u32 { return 0u; }\n                 fn filter_value(slot: u32, pixel: vec2<u32>) -> vec4<f32> { return vec4(0.0); }\n                 var<private> preceding_field: u32 = 0xffffffffu;\n                 fn preceding_stage_word(pixel: vec2<u32>) -> f32 { return 0.0; }\n                 var<private> generator_second_stage: bool = false;",
             ),
             include(
                 self.color_selection && supports_id,
@@ -130,7 +169,7 @@ impl Features {
             include(
                 self.mask_effects,
                 include_str!("shaders/composite_mask_effects.wgsl"),
-                "fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 { return layer.balance.y; }",
+                "fn layer_mask(layer: Operation, texel: LayerTexel, count: u32) -> f32 { return layer.balance.y; }\n                 fn mask_base(layer: Operation) -> u32 { return layer.spatial.z; }",
             ),
             include(
                 self.content_effects,
@@ -156,7 +195,7 @@ impl Features {
         .join("\n")
     }
 
-    fn constants(self, grouped: bool) -> [(&'static str, f64); 8] {
+    fn constants(self, grouped: bool) -> [(&'static str, f64); 9] {
         [
             ("enable_authored_images", f64::from(u8::from(self.authored_images))),
             ("enable_generators", f64::from(u8::from(self.generators))),
@@ -166,6 +205,7 @@ impl Features {
             ("composite_groups", f64::from(u8::from(grouped))),
             ("composite_mask_preview", f64::from(u8::from(self.mask_preview))),
             ("enable_extended_blend_modes", f64::from(u8::from(self.extended_blend_modes))),
+            ("composite_capture", f64::from(u8::from(self.capture))),
         ]
     }
 }
@@ -218,6 +258,7 @@ struct Variants {
 pub(super) struct CompositePipelines {
     supports_curvature: bool,
     supports_id: bool,
+    supports_fields: bool,
     variants: BTreeMap<Features, Variants>,
 }
 
@@ -225,20 +266,20 @@ pub(super) struct CompositePipelines {
 /// share, [`crate::headless::Headless::for_tests`]) one set for every such compositor, so a test
 /// does not compile the variants an earlier one compiled (llvmpipe keeps what it compiled until
 /// the process ends, and compiling dominates its tests' time).
-pub(super) fn shared(shared: bool, supports_curvature: bool, supports_id: bool) -> Arc<Mutex<CompositePipelines>> {
+pub(super) fn shared(shared: bool, supports_curvature: bool, supports_id: bool, supports_fields: bool) -> Arc<Mutex<CompositePipelines>> {
     #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
     if shared {
         static SHARED: std::sync::OnceLock<Arc<Mutex<CompositePipelines>>> = std::sync::OnceLock::new();
-        return SHARED.get_or_init(|| Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)))).clone();
+        return SHARED.get_or_init(|| Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id, supports_fields)))).clone();
     }
     #[cfg(not(all(any(test, feature = "test-support"), not(target_arch = "wasm32"))))]
     let _ = shared;
-    Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id)))
+    Arc::new(Mutex::new(CompositePipelines::new(supports_curvature, supports_id, supports_fields)))
 }
 
 impl CompositePipelines {
-    pub(super) fn new(supports_curvature: bool, supports_id: bool) -> Self {
-        Self { supports_curvature, supports_id, variants: BTreeMap::new() }
+    pub(super) fn new(supports_curvature: bool, supports_id: bool, supports_fields: bool) -> Self {
+        Self { supports_curvature, supports_id, supports_fields, variants: BTreeMap::new() }
     }
 
     /// Start compiling `program`'s pipelines without waiting (`get` returns them once ready).
@@ -259,10 +300,11 @@ impl CompositePipelines {
         let features = Features::of(program);
         let supports_curvature = self.supports_curvature;
         let supports_id = self.supports_id;
+        let supports_fields = self.supports_fields;
         let variants = self.variants.entry(features).or_insert_with(|| Variants {
             module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tc_gpu_composite"),
-                source: wgpu::ShaderSource::Wgsl(features.source(supports_curvature, supports_id).into()),
+                source: wgpu::ShaderSource::Wgsl(features.source(supports_curvature, supports_id, supports_fields).into()),
             }),
             render: [None, None],
             prepare: [None, None],
@@ -338,6 +380,8 @@ mod tests {
             .flat_map(|packages| [false, true].map(|spatial| Features { spatial, mask_effects: true, content_effects: true, packages, ..Features::default() }))
             .collect();
         variants.push(Features { mask_preview: true, spatial: true, mask_effects: true, packages: ShaderFlags::ALL, ..Features::default() });
+        // Generators without authored images: Grayscale Conversion's image read is a stub
+        variants.push(Features { generators: true, mask_effects: true, ..Features::default() });
         variants.push(Features {
             patterns: true,
             extended_patterns: true,
@@ -346,6 +390,7 @@ mod tests {
             mask_preview: false,
             extended_blend_modes: true,
             generators: true,
+            generator_controls: true,
             curvature: true,
             sampled_generator_inputs: true,
             spatial: true,
@@ -355,6 +400,9 @@ mod tests {
             anchors: true,
             material_anchors: true,
             color_selection: true,
+            p3b_fields: true,
+            generator_p2: true,
+            capture: true,
             packages: ShaderFlags::ALL,
         });
         variants
@@ -401,7 +449,8 @@ mod tests {
         for features in variants() {
             for (curvature, id) in [(false, false), (true, true)] {
                 let constants = [false, true].map(|grouped| features.constants(grouped).to_vec());
-                naga_check(&format!("{features:?} curvature {curvature} id {id}"), &features.source(curvature, id), &entry_points(features), &constants);
+                let source = features.source(curvature, id, curvature && id);
+                naga_check(&format!("{features:?} curvature {curvature} id {id}"), &source, &entry_points(features), &constants);
             }
         }
         naga_check("neighbourhood", &NeighbourhoodGpu::source(), &NeighbourhoodGpu::ENTRY_POINTS, &[Vec::new()]);
@@ -556,9 +605,9 @@ mod tests {
             ("UV tile atlas: plain fill", uv_tiles(project(Vec::new(), Vec::new()))),
         ];
         let compositor = GpuCompositor::new(&gpu.device);
-        let (curvature, id) = {
+        let (curvature, id, fields) = {
             let pipelines = compositor.pipelines();
-            (pipelines.supports_curvature, pipelines.supports_id)
+            (pipelines.supports_curvature, pipelines.supports_id, pipelines.supports_fields)
         };
         let programs =
             cases.map(|(label, project)| (label, Features::of(&CompositeProgram::try_compile_region(&project, &PixelStore::default(), 0, None).unwrap())));
@@ -567,7 +616,7 @@ mod tests {
         for (label, features) in programs.into_iter().chain(everything) {
             let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tc_bench"),
-                source: wgpu::ShaderSource::Wgsl(features.source(curvature, id).into()),
+                source: wgpu::ShaderSource::Wgsl(features.source(curvature, id, fields).into()),
             });
             for entry in entry_points(features) {
                 let started = std::time::Instant::now();
@@ -594,9 +643,9 @@ mod tests {
     fn package_shaders_build_compute_pipelines_in_full_and_as_stubs() {
         let Some(gpu) = oracle::headless() else { return };
         let compositor = GpuCompositor::new(&gpu.device);
-        let (curvature, id) = {
+        let (curvature, id, fields) = {
             let pipelines = compositor.pipelines();
-            (pipelines.supports_curvature, pipelines.supports_id)
+            (pipelines.supports_curvature, pipelines.supports_id, pipelines.supports_fields)
         };
         // Every package variant; the program with every other feature too is left to the naga
         // check above: Mesa's GL compiler needs over 28 GB for it (llvmpipe, measured)
@@ -608,7 +657,7 @@ mod tests {
             let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
             let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tc_gpu_composite_packages"),
-                source: wgpu::ShaderSource::Wgsl(features.source(curvature, id).into()),
+                source: wgpu::ShaderSource::Wgsl(features.source(curvature, id, fields).into()),
             });
             for grouped in [false, true] {
                 for entry in entry_points(features) {

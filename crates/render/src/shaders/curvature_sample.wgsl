@@ -1,7 +1,7 @@
 // Coarsened curvature deviations sampled within their UV tile block of the bake (the whole bake
 // of a classic set), as compose's CurvatureSizeLevel::sample interpolates.
 struct CurvatureLayout {
-    levels: array<vec4<u32>, 6>, // Atlas origin, step (zero if absent), unused.
+    levels: array<vec4<u32>, 8>, // Atlas origin, step (zero if absent), unused.
     bake_size: vec4<u32>,        // Bake width and height, a UV tile block's width and height.
 }
 
@@ -31,4 +31,9 @@ fn curvature_sample(image: texture_2d<u32>, mapping: CurvatureLayout, baked_pixe
 
 fn curvature_level_at(pixel: vec2<u32>, level: u32) -> f32 {
     return curvature_sample(curvature_levels, curvature_layout, pixel, level);
+}
+
+// Whether curvature level `level` is built (compose reads the map itself where one is missing)
+fn curvature_level_present(level: u32) -> bool {
+    return curvature_layout.levels[level].z != 0u;
 }

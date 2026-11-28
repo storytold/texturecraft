@@ -151,11 +151,18 @@ pub(super) fn runs_over(layout: Option<&UdimLayout>, level: u32, field_rect: [u3
         .any(|by| columns.clone().any(|bx| bx < layout.grid.cols && levels.get((by * layout.grid.cols + bx) as usize) == Some(&level)))
 }
 
-/// Whether level stage `output` filters the field its base stage prepared, unchanged since: no
+/// Whether level stage `output` filters the field its base stage prepared, unchanged since: the
+/// base stage prepared into the shared field (a direct one writes its output instead) and no
 /// stage of its group before it averaged that field into cells.
 pub(super) fn reuses_base_field(stages: &[FilterStage], output: usize) -> bool {
     let level = stages.get(output).map_or(0, |stage| stage.level as usize);
-    level != 0 && output >= level && stages[output - level..output].iter().all(|stage| stage.cell <= 1 || stage.filter.is_none())
+    if level == 0 || output < level {
+        return false;
+    }
+
+    let base = &stages[output - level];
+    let base_prepared_shared = base.filter.is_some() || base.cell > 1;
+    base_prepared_shared && stages[output - level..output].iter().all(|stage| stage.cell <= 1 || stage.filter.is_none())
 }
 
 /// Pack a UV tile atlas's record into the side table and return its offset (`udim_record` in
@@ -201,9 +208,9 @@ mod tests {
         BakedMaps, Composite, DisplayKind, ImageRes, ImageStore, Inputs, MaskGray, PaintTarget, PixelStore, StrokePreview, composite_tiles, tile_bytes,
     };
     use texturecraft_core::{
-        BakedMap, Bevel, BlendMode, Channel, ColorSelection, Effect, EffectKind, Fill, Filter, GeneratorKind, GradientInput, HeightToNormal, Layer, LayerId,
-        LayerKind, Mask, MaskBackground, Mirror, Procedural, ProceduralKind, Project, Projection, Sampling, Source, SourceWarp, StylizedLighting, TextureSet,
-        TileTransform, WarpMode, WarpSource, WarpSourceMode,
+        BakedMap, Bevel, BlendMode, Channel, ColorSelection, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, GradientInput, HeightToNormal, Layer,
+        LayerId, LayerKind, Mask, MaskBackground, Mirror, Procedural, ProceduralKind, Project, Projection, Sampling, Source, SourceWarp, StylizedLighting,
+        TextureSet, TileTransform, WarpMode, WarpSource, WarpSourceMode,
     };
     use texturecraft_geom::glam::Vec2;
     use texturecraft_geom::{Mesh, UvGBuffer, primitives};
@@ -553,7 +560,9 @@ mod tests {
         }
     }
 
-    /// A mask generator at a coarser resolution and blurred takes each tile's cells and blur.
+    /// A mask generator at a coarser resolution and blurred takes each tile's cells and blur, also
+    /// on its section controls, which adjust between the cells and the blur (P1's second stage),
+    /// and a textured section blur's direct second stage at each tile scale.
     #[test]
     fn a_reduced_generator_takes_each_tiles_cells() {
         let Some(mut gpu) = headless() else { return };
@@ -561,20 +570,34 @@ mod tests {
         generator.global.blur = 0.4;
         generator.resolution.factor = -2;
         generator.inputs.insert(BakedMap::AmbientOcclusion, Source::image("Occlusion"));
+        let mut section = Generator::new(GeneratorKind::AmbientOcclusion);
+        section.section = section.section.map(|section| texturecraft_core::SectionParameters { balance: 0.35, contrast: 0.3, ..section });
+        section.global = generator.global;
+        section.resolution = generator.resolution;
+        section.inputs = generator.inputs.clone();
+
+        // A section blur with a texture and no global blur: a direct second stage at every scale, whose levels prepare their own field
+        let mut textured = Generator::new(GeneratorKind::AmbientOcclusion);
+        textured.section = textured.section.map(|section| texturecraft_core::SectionParameters { blur: 16.0, balance: 0.4, ..section });
+        let texture = texturecraft_core::TextureLayer { enabled: true, source: Some(Source::image("Occlusion")), opacity: 0.6, ..Default::default() };
+        textured.texture = Some(Box::new(texture));
+        textured.inputs = generator.inputs.clone();
         let occlusion: Vec<[f32; 4]> = (0..64).map(|texel| [0.1 + 0.8 * ((texel % 8 + texel / 8 * 3) % 8) as f32 / 7.0; 4]).collect();
         let images = ImageStore::from([("Occlusion".into(), Arc::new(ImageRes::new(8, 8, occlusion, false)))]);
         let baked = BakedMaps::default();
 
-        for scaled in [false, true] {
-            let (mut project, mesh, pixels, owner, _) = painted(scaled, &[]);
-            let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(generator.clone()));
-            generated.blend = BlendMode::Multiply;
-            project.layers.get_mut(&owner).and_then(|layer| layer.mask.as_mut()).unwrap().effects.push(generated);
-            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
-            case.mask_owner = Some(owner);
-            case.region = Some(BLOCK_CORNER);
+        for (label, generator) in [("reduced generator", generator), ("reduced section", section), ("textured section blur", textured)] {
+            for scaled in [false, true] {
+                let (mut project, mesh, pixels, owner, _) = painted(scaled, &[]);
+                let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(generator.clone()));
+                generated.blend = BlendMode::Multiply;
+                project.layers.get_mut(&owner).and_then(|layer| layer.mask.as_mut()).unwrap().effects.push(generated);
+                let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+                case.mask_owner = Some(owner);
+                case.region = Some(BLOCK_CORNER);
 
-            assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("reduced generator, scaled {scaled}"));
+                assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("{label}, scaled {scaled}"));
+            }
         }
     }
 
@@ -722,6 +745,93 @@ mod tests {
 
                 assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("{kind:?} detail, scaled {scaled}"));
             }
+        }
+    }
+
+    /// P2: Micro Details sample, blur and occlude each UV tile block of the bake on its own, the
+    /// detail sizes blur each block's micro curvature, a micro map of its own height (the
+    /// occlusion's, shorter than the curvature's) reads at that height, a blurred generator's
+    /// stage reads the micro maps, and a micro height read from an anchor point reads each tile's
+    /// share of the anchor's height
+    #[test]
+    fn micro_details_work_per_uv_tile_block() {
+        use texturecraft_core::{Generator, MicroDetails, NormalFormat};
+
+        let Some(mut gpu) = headless() else { return };
+        const BAKE_SIDE: u32 = 512;
+        const OCCLUSION_ROWS: u32 = 384;
+        let wave = |rows: u32, phase: f32| -> Arc<Vec<f32>> {
+            Arc::new(
+                (0..BAKE_SIDE * rows)
+                    .map(|index| 0.5 + 0.2 * ((index % BAKE_SIDE) as f32 * 0.07 + phase).sin() * ((index / BAKE_SIDE) as f32 * 0.05).cos())
+                    .collect(),
+            )
+        };
+        let baked = BakedMaps {
+            resolution: BAKE_SIDE,
+            maps: BTreeMap::from([(BakedMap::Curvature, wave(BAKE_SIDE, 0.0)), (BakedMap::AmbientOcclusion, wave(OCCLUSION_ROWS, 1.3))]),
+        };
+        let noise = |side: u32, seed: u32| -> Arc<ImageRes> {
+            let hash = |texel: u32, channel: u32| {
+                ((texel.wrapping_mul(0x9e37_79b9) ^ (channel + seed).wrapping_mul(0x85eb_ca6b)).wrapping_mul(0xc2b2_ae35) >> 8) as f32 / (1 << 24) as f32
+            };
+            Arc::new(ImageRes::new(side, side, (0..side * side).map(|texel| [hash(texel, 0), hash(texel, 1), hash(texel, 2), 1.0]).collect(), false))
+        };
+        let images = ImageStore::from([("Micro height".into(), noise(61, 1)), ("Micro normal".into(), noise(53, 2))]);
+        let micro = |kind| MicroDetails {
+            enabled: true,
+            height_source: Some(Source::image("Micro height")),
+            normal_source: Some(Source::Image { name: "Micro normal".into(), normal_format: NormalFormat::DirectX }),
+            ao_radius: 0.8,
+            ao_depth: 0.4,
+            ..MicroDetails::defaults(kind).unwrap()
+        };
+        let pixels = PixelStore::default();
+
+        for scaled in [false, true] {
+            let (mut project, mesh) = atlas(scaled, &[Channel::BaseColor, Channel::Height]);
+
+            // A height fill with an anchor point, which a micro height reads per tile block
+            let height = Fill { sources: BTreeMap::from([(Channel::Height, Source::image("Micro height"))]), ..Fill::default() };
+            let mut height = Layer::new(project.alloc_id(), "Height", LayerKind::Fill(height), &[Channel::Height]);
+            let anchor = project.alloc_id();
+            height.content_effects.push(Effect::new(anchor, EffectKind::Anchor));
+            project.insert_layer(0, height, None, false).unwrap();
+            let owner = project.alloc_id();
+            let fill = Fill { sources: BTreeMap::from([(Channel::BaseColor, Source::Uniform([0.7, 0.4, 0.2]))]), ..Fill::default() };
+            let mut layer = Layer::new(owner, "Micro", LayerKind::Fill(fill), &[Channel::BaseColor]);
+            let mut mask = Mask::new(MaskBackground::Black);
+            let anchored = MicroDetails {
+                height: true,
+                height_source: Some(Source::Anchor { anchor, channel: Channel::Height, ramp: Vec::new() }),
+                ..micro(GeneratorKind::Dirt)
+            };
+            let mut dirt = Effect::new(
+                project.alloc_id(),
+                EffectKind::Generator(Generator { micro: Some(Box::new(anchored)), ..crate::gpu_composite::oracle::earlier_generator(GeneratorKind::Dirt) }),
+            );
+            dirt.blend = BlendMode::Multiply;
+            for kind in [GeneratorKind::Curvature, GeneratorKind::AmbientOcclusion] {
+                let occlusion = kind == GeneratorKind::AmbientOcclusion;
+                let mut generator = Generator { micro: Some(Box::new(micro(kind))), ..crate::gpu_composite::oracle::earlier_generator(kind) };
+
+                // The occlusion blurred: its stage reads the micro maps too
+                if occlusion {
+                    generator.global.blur = 0.5;
+                }
+                let mut generated = Effect::new(project.alloc_id(), EffectKind::Generator(generator));
+                if occlusion {
+                    generated.blend = BlendMode::Multiply;
+                }
+                mask.effects.push(generated);
+            }
+            mask.effects.push(dirt);
+            layer.mask = Some(mask);
+            project.insert_layer(0, layer, None, false).unwrap();
+            let mut case = OracleCase::new(&project, &pixels, &baked, &images, &mesh);
+            case.mask_owner = Some(owner);
+
+            assert_matches_cpu(&mut gpu, &case, Tolerance::NEIGHBOURHOOD, &format!("micro details, scaled {scaled}"));
         }
     }
 

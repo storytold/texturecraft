@@ -2169,16 +2169,8 @@ pub(crate) mod tests {
         session.active_set = 1;
         execute(&mut session, "material.apply", &json!({"material": "gold_polished"})).unwrap();
         let layer = session.selected_layer().unwrap();
-        // `on_gpu`: the mask composes on the GPU, else on the CPU, saying why
-        let mut check_mask = |session: &mut Session, name: &str, on_gpu: bool| {
-            if !on_gpu {
-                session.view = ViewMode::Mask(layer);
-                link.sync(session, Some(AuxView::Mask(layer)), None, 0, 0.0);
-                if link.compositor_status() != ("Mask: CPU", "A mask generator uses CPU compositing.") {
-                    failures.push(format!("{name}: {:?}, expected the CPU", link.compositor_status()));
-                }
-                return;
-            }
+        // The mask composes on the GPU, in the material and in the mask view
+        let mut check_mask = |session: &mut Session, name: &str| {
             session.view = ViewMode::Material;
             if let Err(reason) = plan_library_preview(&mut link, session, None) {
                 failures.push(format!("{name} on the material: {reason}"));
@@ -2190,19 +2182,27 @@ pub(crate) mod tests {
         };
         for mask in SMART_MASKS {
             execute(&mut session, "mask.smart.apply", &json!({"name": mask.id, "layer": layer.0})).unwrap();
-            check_mask(&mut session, mask.id, true);
+            check_mask(&mut session, mask.id);
         }
-        // A default generator on the earlier model (ThinAreas) composes on the GPU; the others start
-        // on the reference app's controls, which compose on the CPU
+        // Every default generator composes on the GPU
         for generator in GeneratorKind::ALL {
             execute(&mut session, "mask.remove", &json!({"layer": layer.0})).unwrap();
             execute(&mut session, "mask.add.black", &json!({"layer": layer.0})).unwrap();
             let name = format!("{generator:?}");
             execute(&mut session, "effect.add.generator", &json!({"target": "mask", "layer": layer.0, "generator": name})).unwrap();
-            let effects = &session.doc.project.layer(layer).unwrap().mask.as_ref().unwrap().effects;
-            let on_gpu = matches!(&effects.last().unwrap().kind, texturecraft_engine::core::EffectKind::Generator(added) if added.on_earlier_model());
-            check_mask(&mut session, &name, on_gpu);
+            check_mask(&mut session, &name);
         }
+
+        // A generator the GPU does not evaluate as the CPU does (a wear level that is not a number) composes on the CPU, saying why
+        let effects = &mut session.doc.project.layer_mut(layer).unwrap().mask.as_mut().unwrap().effects;
+        if let Some(texturecraft_engine::core::EffectKind::Generator(generator)) = effects.last_mut().map(|effect| &mut effect.kind) {
+            *generator = texturecraft_engine::core::Generator::new(GeneratorKind::Dirt);
+            generator.wear.as_mut().unwrap().level = f32::NAN;
+        }
+        session.touched();
+        session.view = ViewMode::Mask(layer);
+        link.sync(&mut session, Some(AuxView::Mask(layer)), None, 0, 0.0);
+        assert_eq!(link.compositor_status(), ("Mask: CPU", "A mask generator uses CPU compositing."));
 
         assert!(failures.is_empty(), "GPU library sweep errors: {failures:#?}");
     }
