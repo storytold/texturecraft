@@ -45,7 +45,13 @@ uniform ivec4 codes;
 void shade(V2F i) {
     bool exact = code==3 && codes.x==-1 && codes.y==2147483647 && codes.z==(-2147483647-1) && codes.w==16777217;
     bool neutral_normal = dot(normalUnpack(vec4(0.0)),vec3(0.0,0.0,1.0))>0.99;
-    diffuseShadingOutput((exact && neutral_normal ? vec3(1.0,0.0,0.0) : vec3(0.0,1.0,0.0))*getShadowFactor());
+    vec3 partial_flat = normalUnpack(vec4(0.25,0.25,0.5,0.5));
+    vec3 opaque_tilt = normalUnpack(vec4(1.0,0.5,0.5,1.0),1.0);
+    vec3 partial_tilt = normalUnpack(vec4(0.5,0.25,0.25,0.5),1.0);
+    bool alpha_normal = dot(partial_flat,vec3(0.0,0.0,1.0))>0.99
+        && partial_tilt.x>0.0 && partial_tilt.x<opaque_tilt.x && partial_tilt.z>opaque_tilt.z
+        && abs(dot(partial_tilt,partial_tilt)-1.0)<0.001;
+    diffuseShadingOutput((exact && neutral_normal && alpha_normal ? vec3(1.0,0.0,0.0) : vec3(0.0,1.0,0.0))*getShadowFactor());
 }
 "#;
     let mut typed = texturecraft_formats::custom_shader::import("Exact lanes", probe).unwrap();

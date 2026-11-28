@@ -127,7 +127,8 @@ vec3 pbrComputeSpecular(LocalVectors frame,vec3 f0,vec3 f82,float roughness,floa
 vec3 pbrComputeSpecular(LocalVectors frame,vec3 f0,vec3 f82,float roughness) { return pbrComputeSpecular(frame,f0,f82,roughness,1.0,0.0); }
 vec3 normalUnpack(vec4 value,float y_coeff) {
     if (value.a == 0.0) return vec3(0.0,0.0,1.0);
-    return normalize((value.xyz*2.0-1.0)*vec3(1.0,y_coeff,1.0));
+    vec3 decoded = (value.rgb / value.a * 2.0 - 1.0) * vec3(1.0,y_coeff,1.0);
+    return normalize(mix(vec3(0.0,0.0,1.0),decoded,value.a));
 }
 vec3 normalUnpack(vec4 value) { return normalUnpack(value,g.mode.w); }
 vec3 normalBlend(vec3 base,vec3 over) { return normalize(vec3(base.xy+over.xy,base.z*over.z)); }

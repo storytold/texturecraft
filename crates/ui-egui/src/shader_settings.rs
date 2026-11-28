@@ -269,7 +269,16 @@ fn custom_parameters(app: &mut TextureCraftApp, ui: &mut Ui, shader: &texturecra
                 let response = ui.color_edit_button_rgb(&mut color);
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tr(&p.label)));
                 let changed = response.on_hover_text(tr(&p.description)).changed();
-                value = serde_json::json!(color);
+                value = serde_json::json!(color.map(|component| {
+                    let mut component = f64::from(component);
+                    if let Some(min) = p.min {
+                        component = component.max(min);
+                    }
+                    if let Some(max) = p.max {
+                        component = component.min(max);
+                    }
+                    component
+                }));
                 changed
             } else {
                 let mut values: Vec<f64> =
