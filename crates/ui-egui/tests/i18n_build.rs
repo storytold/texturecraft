@@ -77,13 +77,26 @@ fn unreadable_catalog_fails_before_generating_rust_source() {
 }
 
 #[test]
-fn generated_paths_compile_and_embed_the_catalog_contents() {
+fn generated_catalogs_are_readable_through_the_runtime_accessor() {
     let fixture = Fixture::new();
-    std::fs::write(fixture.0.join("locales/es/texturecraft.tsv"), "\tLayers\tCapas\n").unwrap();
+    let app = "\tLayers\tCapas\n";
+    std::fs::write(fixture.0.join("locales/es/texturecraft.tsv"), app).unwrap();
 
-    let generated = generate(Some(&fixture.0), true).unwrap();
+    let populated = generate(Some(&fixture.0), true).unwrap();
+    let empty = generate(None, false).unwrap();
     let program = format!(
-        "extern crate self as craft_i18n;\npub type Embedded = [(&'static str, &'static str, &'static str)];\n{generated}\nfn main() {{ assert_eq!(CRAFT_I18N[0].2, \"\\tLayers\\tCapas\\n\"); }}"
+        r#"
+extern crate self as craft_i18n;
+pub type Embedded = [(&'static str, &'static str, &'static str)];
+
+mod populated {{ {populated} }}
+mod empty {{ {empty} }}
+
+fn main() {{
+    assert_eq!(populated::craft_i18n_catalogs(), &[("es", "", {app:?})]);
+    assert!(empty::craft_i18n_catalogs().is_empty());
+}}
+"#
     );
     let source = fixture.0.join("check.rs");
     let binary = fixture.0.join(format!("check{}", std::env::consts::EXE_SUFFIX));

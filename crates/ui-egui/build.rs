@@ -33,6 +33,7 @@ type Faces = &'static [(&'static str, &'static str)];
 
 fn main() {
     let catalogs = i18n_build::embed();
+    deflate_assets();
     println!("cargo::rerun-if-env-changed=CRAFT_FONTS_DIR");
     println!("cargo::rerun-if-env-changed=CRAFT_FONTS_REQUIRED");
     let mut src = String::from("pub static CRAFT_FONTS: &[CraftFont] = &[\n");
@@ -89,15 +90,23 @@ fn craft_fonts(dir: &std::path::Path, rel: &str, desktop: &[(&str, &str)], web: 
             let bytes = std::fs::read(&path).map_err(|e| format!("{file}: {e}"))?;
             let cut =
                 if rel == LATIN_MANIFEST { without_private_use(&bytes) } else { cut_to_catalogs(&bytes, catalogs) }.map_err(|e| format!("{file}: {e}"))?;
-            let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join(path.file_name().unwrap_or_default());
+            let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join(out_name(file, ""));
             std::fs::write(&out, cut).map_err(|e| format!("{}: {e}", out.display()))?;
             path = out;
+        }
+
+        // The web build embeds its faces deflated: the wasm is under a download budget and fonts halve.
+        if wasm {
+            let bytes = std::fs::read(&path).map_err(|e| format!("{file}: {e}"))?;
+            let deflated = PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join(out_name(file, ".deflate"));
+            std::fs::write(&deflated, i18n_build::deflate(&bytes)?).map_err(|e| format!("{}: {e}", deflated.display()))?;
+            path = deflated;
         }
 
         let scripts: Vec<String> = tags.iter().map(|s| format!("{s:?}")).collect();
         let _ = writeln!(
             out,
-            "    CraftFont {{ family: {family:?}, style: {style:?}, scripts: &[{}], bytes: include_bytes!({:?}) }},",
+            "    CraftFont {{ family: {family:?}, style: {style:?}, scripts: &[{}], data: include_bytes!({:?}), deflated: {wasm} }},",
             scripts.join(", "),
             path.display().to_string(),
         );
@@ -155,4 +164,39 @@ fn subset(font: &FontRef, unicodes: &IntSet<u32>) -> Result<Vec<u8>, String> {
         &languages,
     );
     subset_font(font, &plan).map_err(|e| e.to_string())
+}
+
+/// A face's file name under `OUT_DIR`: its path in the craft-fonts checkout with every separator flattened, so faces
+/// that share a file name (`jp/Regular.ttf`, `ar/Regular.ttf`) stay apart.
+fn out_name(file: &str, suffix: &str) -> String {
+    let flat: String = file.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+    format!("craft-font-{flat}{suffix}")
+}
+
+/// The files a web build embeds deflated (the wasm is under a download budget): the icon font and the studio
+/// environment, from this crate's directory to the name they have under `OUT_DIR` (`name.deflate`). The other builds
+/// include the files themselves.
+const DEFLATED_ASSETS: &[(&str, &str)] =
+    &[("../../vendor/egui-phosphor/res/Phosphor.ttf", "Phosphor.ttf"), ("../../assets/hdr/studio_small_09_512.hdr", "studio_small_09_512.hdr")];
+
+/// Writes [`DEFLATED_ASSETS`] under `OUT_DIR` for the web build.
+fn deflate_assets() {
+    if !std::env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|a| a == "wasm32") {
+        return;
+    }
+
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default());
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
+    for (source, name) in DEFLATED_ASSETS {
+        let source = manifest.join(source);
+        println!("cargo::rerun-if-changed={}", source.display());
+        let target = out.join(format!("{name}.deflate"));
+        let written = std::fs::read(&source)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| i18n_build::deflate(&bytes))
+            .and_then(|d| std::fs::write(&target, d).map_err(|e| e.to_string()));
+        if let Err(e) = written {
+            println!("cargo::error={}: {e}", source.display());
+        }
+    }
 }

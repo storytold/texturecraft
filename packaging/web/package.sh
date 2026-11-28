@@ -36,6 +36,18 @@ for wasm in "$SITE"/*.wasm; do
   echo "$(basename "$wasm"): $size bytes ($((size / 1048576)) MiB; limit $MAX_WASM_BYTES)"
   if [[ "$size" -gt "$MAX_WASM_BYTES" ]]; then
     echo "error: $(basename "$wasm") is $size bytes, over the $MAX_WASM_BYTES-byte limit (Cloudflare's per-file cap is 25 MiB)" >&2
+    # Where the bytes go: the optimized file has no function names, so the crate breakdown reads
+    # cargo's own output (before wasm-bindgen and wasm-opt), which keeps them. Best effort only.
+    report="$HERE/wasm_size_report.py"
+    if command -v python3 >/dev/null && [[ -f "$report" ]]; then
+      echo "--- sections of $(basename "$wasm") ---" >&2
+      python3 "$report" "$wasm" >&2 || true
+      raw="$CARGO_TARGET_DIR/wasm32-unknown-unknown/wasm-release/texturecraft-web.wasm"
+      if [[ -f "$raw" ]]; then
+        echo "--- largest crates and functions in cargo's output (before wasm-opt) ---" >&2
+        python3 "$report" "$raw" >&2 || true
+      fi
+    fi
     exit 1
   fi
 done

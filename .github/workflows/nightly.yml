@@ -22,9 +22,9 @@ jobs:
       actions: read
       attestations: write
       id-token: write
-    uses: storytold/craft-common-actions/.github/workflows/nightly-unsigned.yml@f94a43818dabb2e85f2f4d5cd768bb8e5662600a
+    uses: storytold/craft-common-actions/.github/workflows/nightly-unsigned.yml@bf94b15b708089b95c4e2d1c978e66ecf1f2f4f3
     with:
-      tooling-revision: f94a43818dabb2e85f2f4d5cd768bb8e5662600a
+      tooling-revision: bf94b15b708089b95c4e2d1c978e66ecf1f2f4f3
       app-name: texturecraft
       manual-actors: '["bflatastic","dylanmtaylor","echelon","FredApps","skylartaylor"]'
       craft-fonts-ref: aced4137c022f1f587624d48e81ec77e1914a9cc

@@ -18,8 +18,9 @@ texturecraft-engine = { workspace = true }
 texturecraft-ui-egui = { workspace = true }
 log = { workspace = true }
 
-# `wgpu` pulls egui-wgpu's defaults: WebGPU plus the WebGL2 fallback.
-eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "persistence"] }
+# `wgpu` pulls egui-wgpu's defaults: WebGPU plus the WebGL2 fallback. No `default_fonts`: the UI takes egui's faces
+# from craft-ui's deflated copies (the wasm is under a download budget).
+eframe = { workspace = true, features = ["wgpu", "accesskit", "persistence"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
