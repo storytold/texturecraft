@@ -17,6 +17,8 @@ use crate::projection_gizmo::{Gizmo, dragging};
 use crate::theme::{AXIS_COLORS, SHAFT_HALO, SHAFT_HALO_EXTRA_WIDTH, SHAFT_WIDTH, Tokens};
 use crate::viewport::{project, view_ray};
 
+#[cfg(test)]
+mod box_resize_tests;
 mod round_grab;
 mod shape;
 mod size_handle;
@@ -170,16 +172,17 @@ impl RoundGizmo {
 
         let corners = (0..BOX_CORNERS).filter_map(|index| at(corner(index)));
         if let Some(top_right) = corners.max_by(|first, second| (first.x - first.y).total_cmp(&(second.x - second.y))) {
-            self.sizes.push(SizeHandle { at: kept_in(view, top_right), axes: [true; 3], along: None });
+            self.sizes.push(SizeHandle { at: kept_in(view, top_right), axes: [true; 3], along: None, face: None });
         }
         for (axis, direction) in self.directions().iter().enumerate() {
             // The face toward the camera, on the other side in the projector's units when a mirrored axis flips it
             let facing_side = if direction.dot(forward) > 0.0 { -1.0 } else { 1.0 };
             let toward = facing_side * self.stretch[axis].signum();
-            let Some(face) = at(local + Vec3::AXES[axis] * size * toward) else { continue };
+            let face_local = Vec3::AXES[axis] * size * toward;
+            let Some(face) = at(local + face_local) else { continue };
             let out = face - self.center;
             if out.length() >= FACE_CLEARANCE {
-                self.sizes.push(SizeHandle { at: kept_in(view, face), axes: only_axis(axis), along: Some(out.normalized()) });
+                self.sizes.push(SizeHandle { at: kept_in(view, face), axes: only_axis(axis), along: Some(out.normalized()), face: Some(face_local) });
             }
         }
     }
@@ -190,7 +193,7 @@ impl RoundGizmo {
         let (tangent, bitangent) = facing.any_orthonormal_pair();
         let silhouette = circle(|unit| at(local + (tangent * unit.x + bitangent * unit.y) * radius));
         if let Some(side) = silhouette.iter().copied().max_by(|first, second| first.x.total_cmp(&second.x)) {
-            self.sizes.push(SizeHandle { at: kept_in(view, side), axes: [true; 3], along: None });
+            self.sizes.push(SizeHandle { at: kept_in(view, side), axes: [true; 3], along: None, face: None });
         }
         self.outline.push(silhouette);
         self.outline.push(circle(|unit| at(local + Vec3::new(unit.x, 0.0, unit.y) * radius)));
@@ -210,7 +213,7 @@ impl RoundGizmo {
             _ => None,
         };
         if let Some(rim) = top.iter().copied().min_by(|first, second| first.y.total_cmp(&second.y)) {
-            self.sizes.push(SizeHandle { at: kept_in(view, rim), axes: only_axis(axis), along: along_axis });
+            self.sizes.push(SizeHandle { at: kept_in(view, rim), axes: only_axis(axis), along: along_axis, face: None });
         }
         let right_of_rim = top.iter().copied().max_by(|first, second| first.x.total_cmp(&second.x));
         self.outline.extend([top, cap(-half_height)]);
@@ -231,7 +234,7 @@ impl RoundGizmo {
         if let Some(side) = across_at {
             let mut across = [true; 3];
             across[axis] = false;
-            self.sizes.push(SizeHandle { at: kept_in(view, side), axes: across, along: None });
+            self.sizes.push(SizeHandle { at: kept_in(view, side), axes: across, along: None, face: None });
         }
     }
 
@@ -251,7 +254,7 @@ impl RoundGizmo {
     }
 
     /// The `layer.fill.projection` params a drag of `grab` from `from` to `to` sets; only a size handle sets the scale, so a mirrored axis keeps its sign through a slide or turn
-    fn params(&self, app: &TextureCraftApp, rect: Rect, grab: RoundGrab, from: Pos2, to: Pos2) -> Option<Value> {
+    fn params(&self, app: &TextureCraftApp, rect: Rect, grab: RoundGrab, from: Pos2, to: Pos2, one_sided: bool) -> Option<Value> {
         let origin = self.world(self.local);
         let (turn, stretch, center) = match grab {
             RoundGrab::Slide => {
@@ -274,11 +277,14 @@ impl RoundGizmo {
                 (turn, self.stretch, origin)
             }
             RoundGrab::Size(axes) => {
-                // Clamp the drag to the command's size limits so the offset keeps the same center
+                // Clamp the drag to the command's size limits; with Shift on a box face, move that face alone
                 let reach = from - self.center;
-                let factor = ((to - self.center).dot(reach) / reach.length().max(MIN_HANDLE_REACH).powi(2)).max(0.0);
-                let stretch = Vec3::from(axes.map(|on| if on { factor } else { 1.0 })) * self.stretch;
-                (self.turn, stretch.map(signed_scale), origin)
+                let raw_span_factor = (to - self.center).dot(reach) / reach.length().max(MIN_HANDLE_REACH).powi(2);
+                let face = one_sided.then(|| self.sizes.iter().find(|size| size.axes == axes).and_then(|size| size.face)).flatten();
+                let factor = if face.is_some() { (0.5 * (1.0 + raw_span_factor)).max(0.0) } else { raw_span_factor.max(0.0) };
+                let stretch = (Vec3::from(axes.map(|on| if on { factor } else { 1.0 })) * self.stretch).map(signed_scale);
+                let center = face.map_or(origin, |face_local| origin + self.turn * ((stretch - self.stretch) * face_local) * self.radius);
+                (self.turn, stretch, center)
             }
         };
 
@@ -324,7 +330,19 @@ impl Gizmo for RoundGizmo {
     }
 
     fn edit(&self, app: &TextureCraftApp, rect: Rect, grab: RoundGrab, from: Pos2, to: Pos2) -> Option<(&'static str, Value)> {
-        Some((self.command, self.params(app, rect, grab, from, to)?))
+        Some((self.command, self.params(app, rect, grab, from, to, false)?))
+    }
+
+    fn edit_with_modifiers(
+        &self,
+        app: &TextureCraftApp,
+        rect: Rect,
+        grab: RoundGrab,
+        from: Pos2,
+        to: Pos2,
+        modifiers: egui::Modifiers,
+    ) -> Option<(&'static str, Value)> {
+        Some((self.command, self.params(app, rect, grab, from, to, modifiers.shift)?))
     }
 
     /// A size handle's resize cursor runs along its arrow
@@ -422,7 +440,24 @@ pub(crate) fn overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, gizmo: &RoundG
         }
     }
     move_handles(&painter, gizmo.center, gizmo.arrows, |axis| axis_color(axis, RoundGrab::Axis(axis)), fill(RoundGrab::Slide));
+
+    // Hint at Shift one-sided resize when hovering a box face arrow
+    if gizmo.shape == Shape::Box
+        && let Some(RoundGrab::Size(axes)) = active.or(hovered)
+        && let Some(handle) = gizmo.sizes.iter().find(|size| size.axes == axes && size.face.is_some())
+    {
+        let hint = crate::i18n::tr("Hold Shift to resize one side");
+        let galley = painter.layout_no_wrap(hint.to_owned(), egui::FontId::proportional(BOX_HINT_TEXT_SIZE), tokens.text_strong);
+        let badge = Rect::from_min_size(handle.at + BOX_HINT_OFFSET, galley.size()).expand2(BOX_HINT_PAD);
+        painter.rect_filled(badge, BOX_HINT_RADIUS, tokens.panel);
+        painter.galley(badge.min + BOX_HINT_PAD, galley, tokens.text_strong);
+    }
 }
+
+const BOX_HINT_TEXT_SIZE: f32 = 11.0;
+const BOX_HINT_OFFSET: egui::Vec2 = egui::vec2(12.0, -24.0);
+const BOX_HINT_PAD: egui::Vec2 = egui::vec2(6.0, 3.0);
+const BOX_HINT_RADIUS: f32 = 3.0;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -576,7 +611,7 @@ pub(crate) mod tests {
         let (mut harness, layer) = fill_app("cylindrical");
         let cylinder = gizmo(&harness);
         let height = cylinder.sizes.iter().find(|size| size.axes == [false, true, false]).expect("the height handle");
-        let SizeHandle { at: top, axes, along } = *height;
+        let SizeHandle { at: top, axes, along, .. } = *height;
 
         assert_eq!(axes, [false, true, false], "the top handle works along the axis");
 

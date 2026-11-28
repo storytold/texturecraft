@@ -53,10 +53,10 @@ pub(crate) fn input<G: Gizmo>(app: &mut TextureCraftApp, ctx: &egui::Context, re
     // A drag lives only while its gizmo shows, so the gizmo drawn this frame names the cursor
     ctx.set_cursor_icon(gizmo.unwrap_or(&drag.start).cursor(drag.grab, true));
 
-    let (moved, snapping) = ctx.input(|input| (input.pointer.delta() != egui::Vec2::ZERO, input.modifiers.ctrl || input.modifiers.command));
+    let (moved, modifiers) = ctx.input(|input| (input.pointer.delta() != egui::Vec2::ZERO, input.modifiers));
     if moved
         && let Some(pointer) = response.interact_pointer_pos()
-        && let Some((command, params)) = drag.start.edit_with_snap(app, rect, drag.grab, drag.from, pointer, snapping)
+        && let Some((command, params)) = drag.start.edit_with_modifiers(app, rect, drag.grab, drag.from, pointer, modifiers)
     {
         edit_in_one_step(&mut app.session, command, params, &mut drag.edited_revision);
 

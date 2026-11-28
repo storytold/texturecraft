@@ -1,4 +1,5 @@
 use egui::Pos2;
+use texturecraft_engine::geom::glam::Vec3;
 
 use super::SIZE_ARROW;
 use crate::frame_gizmo::distance_to_segment;
@@ -11,6 +12,8 @@ pub(crate) struct SizeHandle {
     pub axes: [bool; 3],
     /// A double arrow's direction on screen; None for a dot
     pub along: Option<egui::Vec2>,
+    /// Local offset from the projector centre to a box face, for one-sided Shift drags
+    pub face: Option<Vec3>,
 }
 
 impl SizeHandle {
