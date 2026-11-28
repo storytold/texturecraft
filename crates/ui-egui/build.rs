@@ -90,7 +90,7 @@ fn craft_fonts(dir: &std::path::Path, rel: &str, desktop: &[(&str, &str)], web: 
             let bytes = std::fs::read(&path).map_err(|e| format!("{file}: {e}"))?;
             let cut =
                 if rel == LATIN_MANIFEST { without_private_use(&bytes) } else { cut_to_catalogs(&bytes, catalogs) }.map_err(|e| format!("{file}: {e}"))?;
-            let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join(path.file_name().unwrap_or_default());
+            let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join(out_name(file, ""));
             std::fs::write(&out, cut).map_err(|e| format!("{}: {e}", out.display()))?;
             path = out;
         }
@@ -98,9 +98,7 @@ fn craft_fonts(dir: &std::path::Path, rel: &str, desktop: &[(&str, &str)], web: 
         // The web build embeds its faces deflated: the wasm is under a download budget and fonts halve.
         if wasm {
             let bytes = std::fs::read(&path).map_err(|e| format!("{file}: {e}"))?;
-            let mut name = path.file_name().unwrap_or_default().to_os_string();
-            name.push(".deflate");
-            let deflated = PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join(name);
+            let deflated = PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_default()).join(out_name(file, ".deflate"));
             std::fs::write(&deflated, i18n_build::deflate(&bytes)?).map_err(|e| format!("{}: {e}", deflated.display()))?;
             path = deflated;
         }
@@ -166,6 +164,13 @@ fn subset(font: &FontRef, unicodes: &IntSet<u32>) -> Result<Vec<u8>, String> {
         &languages,
     );
     subset_font(font, &plan).map_err(|e| e.to_string())
+}
+
+/// A face's file name under `OUT_DIR`: its path in the craft-fonts checkout with every separator flattened, so faces
+/// that share a file name (`jp/Regular.ttf`, `ar/Regular.ttf`) stay apart.
+fn out_name(file: &str, suffix: &str) -> String {
+    let flat: String = file.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+    format!("craft-font-{flat}{suffix}")
 }
 
 /// The files a web build embeds deflated (the wasm is under a download budget): the icon font and the studio
