@@ -817,6 +817,100 @@ fn directx_normal_images_flip_green() {
     assert_eq!(old, texturecraft_engine::core::Source::image("n"));
 }
 
+/// Copying one fill channel's source onto another reuses its pattern, values or image.
+#[test]
+fn fill_copies_one_channels_source_settings_to_another() {
+    let mut s = session();
+    let layer = id(execute(&mut s, "layer.add.fill", &Value::Null).unwrap(), "layer");
+    let fill_of = |s: &Session| match &s.doc.project.layer(layer).unwrap().kind {
+        LayerKind::Fill(fill) => fill.clone(),
+        _ => panic!("a fill layer"),
+    };
+    let copy = |s: &mut Session, p: Value| {
+        let mut p = p;
+        p["layer"] = json!(layer.0);
+        execute(s, "layer.fill.copyChannel", &p)
+    };
+
+    execute(
+        &mut s,
+        "layer.fill.set",
+        &json!({"layer": layer.0, "channel": "baseColor", "procedural": "Clouds", "scale": 7.0, "seed": 42, "contrast": 2.5, "balance": 0.25, "invert": true, "low": [0.1, 0.2, 0.3], "high": [0.9, 0.8, 0.7]}),
+    )
+    .unwrap();
+    execute(&mut s, "layer.fill.set", &json!({"layer": layer.0, "channel": "metallic", "value": 0.3})).unwrap();
+    let name = s.import_resource_bytes("n.png", png(4, 4, |_, _| [128, 204, 255, 255])).unwrap();
+    execute(&mut s, "layer.fill.set", &json!({"layer": layer.0, "channel": "normal", "image": name, "normalFormat": "directX"})).unwrap();
+
+    assert!(copy(&mut s, json!({"from": "baseColor", "to": "baseColor"})).is_err(), "a channel cannot copy onto itself");
+    assert!(copy(&mut s, json!({"to": "roughness"})).is_err(), "`from` is required");
+    assert!(copy(&mut s, json!({"from": "baseColor"})).is_err(), "`to` is required");
+    assert!(copy(&mut s, json!({"from": "sparkle", "to": "roughness"})).is_err(), "unknown channels are rejected");
+    copy(&mut s, json!({"from": "height", "to": "roughness"})).unwrap();
+    assert_eq!(
+        fill_of(&s).sources[&Channel::Roughness],
+        Source::Uniform(Channel::Height.default_value()),
+        "an enabled channel without an explicit source copies what it shows"
+    );
+    execute(&mut s, "layer.fill.set", &json!({"layer": layer.0, "channel": "metallic", "enabled": false})).unwrap();
+    let disabled = copy(&mut s, json!({"from": "metallic", "to": "roughness"}));
+    assert!(disabled.is_err(), "a switched-off channel cannot be read");
+    assert_eq!(disabled.unwrap_err().to_string(), "`layer.fill.copyChannel`: the channel has no source to copy");
+    execute(&mut s, "layer.fill.set", &json!({"layer": layer.0, "channel": "metallic", "enabled": true})).unwrap();
+
+    // Both targets start switched off, so each copy must switch its target on.
+    execute(&mut s, "layer.fill.set", &json!({"layer": layer.0, "channel": "roughness", "enabled": false})).unwrap();
+    execute(&mut s, "layer.fill.set", &json!({"layer": layer.0, "channel": "height", "enabled": false})).unwrap();
+    let depth = s.history_labels().len();
+    copy(&mut s, json!({"from": "baseColor", "to": "roughness"})).unwrap();
+    copy(&mut s, json!({"from": "normal", "to": "height"})).unwrap();
+    assert_eq!(s.history_labels().len(), depth + 2, "each copy is one undo step");
+
+    let fill = fill_of(&s);
+    assert_eq!(fill.sources[&Channel::Roughness], fill.sources[&Channel::BaseColor], "the pattern copies over whole");
+    match &fill.sources[&Channel::Roughness] {
+        Source::Procedural { pattern, low, high, .. } => {
+            assert_eq!((pattern.scale, pattern.seed, pattern.contrast, pattern.balance, pattern.invert), (7.0, 42, 2.5, 0.25, true));
+            assert_eq!((*low, *high), ([0.1, 0.2, 0.3], [0.9, 0.8, 0.7]));
+        }
+        other => panic!("a procedural copy, got {other:?}"),
+    }
+    assert_eq!(fill.sources[&Channel::Height], fill.sources[&Channel::Normal], "the image copies over with its normal format");
+    assert!(matches!(&fill.sources[&Channel::Height], Source::Image { name: kept, .. } if *kept == name));
+    let channels = &s.doc.project.layer(layer).unwrap().channels;
+    assert!(channels.contains_key(&Channel::Roughness) && channels.contains_key(&Channel::Height), "copies switch their target on");
+    assert_eq!(fill.sources[&Channel::Metallic], Source::Uniform([0.3; 3]), "unrelated channels keep their source");
+
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    let fill = fill_of(&s);
+    assert!(!fill.sources.contains_key(&Channel::Height), "undo takes the image copy back");
+    assert!(!s.doc.project.layer(layer).unwrap().channels.contains_key(&Channel::Height), "and switches its target back off");
+    assert!(fill.sources.contains_key(&Channel::Roughness), "the earlier copy stays");
+    execute(&mut s, "edit.redo", &Value::Null).unwrap();
+    assert_eq!(fill_of(&s).sources[&Channel::Height], fill_of(&s).sources[&Channel::Normal]);
+}
+
+/// Content fill effects copy channel sources the same way, dropping the source when switched off.
+#[test]
+fn fill_effects_copy_one_channels_source_onto_another() {
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+    let fill = id(execute(&mut s, "effect.add.fill", &json!({"target": "content", "roughness": 0.7})).unwrap(), "effect");
+    let sources = |s: &Session| match &s.doc.project.effect(fill).unwrap().1.kind {
+        EffectKind::Material(fill) => fill.sources.clone(),
+        other => panic!("a content fill effect, got {}", other.name()),
+    };
+    execute(&mut s, "layer.fill.set", &json!({"effect": fill.0, "channel": "roughness", "value": 0.9})).unwrap();
+    execute(&mut s, "layer.fill.copyChannel", &json!({"effect": fill.0, "from": "roughness", "to": "metallic"})).unwrap();
+    assert_eq!(sources(&s)[&Channel::Metallic], sources(&s)[&Channel::Roughness]);
+
+    execute(&mut s, "layer.fill.set", &json!({"effect": fill.0, "channel": "roughness", "enabled": false})).unwrap();
+    let gone = execute(&mut s, "layer.fill.copyChannel", &json!({"effect": fill.0, "from": "roughness", "to": "metallic"})).unwrap_err();
+    assert_eq!(gone.to_string(), "`layer.fill.copyChannel`: the channel has no source to copy");
+    let hsl = id(execute(&mut s, "effect.add.filter", &json!({"target": "content", "filter": "hsl"})).unwrap(), "effect");
+    assert!(execute(&mut s, "layer.fill.copyChannel", &json!({"effect": hsl.0, "from": "roughness", "to": "metallic"})).is_err(), "not a fill effect");
+}
+
 /// Red texels of the cube's -X face (turned away from where the decals are placed) whose position satisfies `inside`
 fn red_on_minus_x(s: &mut Session, inside: impl Fn(f32, f32) -> bool) -> usize {
     s.update();

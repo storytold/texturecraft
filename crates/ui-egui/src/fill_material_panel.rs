@@ -200,6 +200,22 @@ pub(crate) fn source_card(
         sheet.slot(&thumb, slot_of.name(), &line, None, !uniform, procedural)
     };
 
+    // A channel's card keeps the channel menu's Copy settings to: its source copied onto another
+    // channel of the fill, in one step (#483).
+    if let SourceSlot::Channel(channel) = slot_of {
+        let channels = app.session.doc.project.texture_set(app.session.ts()).map(|set| set.channel_list()).unwrap_or_default();
+        slot.pick.context_menu(|ui| {
+            ui.menu_button(tr("Copy settings to"), |ui| {
+                for other in channels.iter().copied().filter(|other| *other != channel) {
+                    if ui.button(tr(other.label())).clicked() {
+                        app.run("layer.fill.copyChannel", with(base, json!({"from": channel.id(), "to": other.id()})));
+                        ui.close();
+                    }
+                }
+            });
+        });
+    }
+
     let popup = sheet.ui.make_persistent_id(("source_picker", fill_key(base), slot_of.key()));
     if slot.pick.clicked() {
         resource_picker::toggle(sheet.ui.ctx(), popup);
