@@ -1,8 +1,9 @@
 name: TextureCraft unsigned nightly
 
-# Enabled for supervised manual runs by the reviewed manual actor only; no schedule yet.
-# A later explicit opt-in may add a cadence (and turn on nightly-dispatch.yml with it).
+# Automated daily schedule at 06:00 UTC plus supervised manual runs by reviewed manual actors.
 on:
+  schedule:
+    - cron: '0 6 * * *'
   workflow_dispatch:
 
 permissions:

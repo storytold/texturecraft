@@ -217,15 +217,21 @@ class TrustedSourcePreparation(unittest.TestCase):
                     (indicator, expression), = job_conditions(jobs)
                     self.assertFalse(indicator == ">-" and " ".join(expression.split()) == expected)
 
-    def test_no_nightly_schedule_is_registered(self):
-        for name, event in (("nightly.yml", "workflow_dispatch"),
-                            ("nightly-sign.yml", "workflow_dispatch")):
+    def test_nightly_triggers_match_reviewed_schedule_and_dispatch(self):
+        expected = {
+            "nightly.yml": ["  schedule:", "  workflow_dispatch:"],
+            "nightly-sign.yml": ["  workflow_dispatch:"],
+        }
+        for name, expected_triggers in expected.items():
             source = (ROOT / ".github/workflows" / name).read_text()
             events = source.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
             triggers = [line for line in events.splitlines() if line.startswith("  ")
                         and not line.startswith("   ") and line.strip() and not line.lstrip().startswith("#")]
             with self.subTest(workflow=name):
-                self.assertEqual(triggers, [f"  {event}:"], "schedule/activation needs explicit review")
+                self.assertEqual(triggers, expected_triggers, "schedule/activation needs explicit review")
+        producer = (ROOT / ".github/workflows/nightly.yml").read_text()
+        self.assertEqual(re.findall(r"(?m)^    - cron: '([^']+)'$", producer), ["0 6 * * *"],
+                         "nightly schedule must remain pinned to the reviewed 06:00 UTC cron")
 
     def test_signer_serialization_contract_is_enforced(self):
         assert_nightly_serialization((ROOT / ".github/workflows/nightly-sign.yml").read_text())
@@ -360,7 +366,8 @@ class NightlyEnabledCallers(unittest.TestCase):
         source = (ROOT / ".github/workflows/nightly.yml").read_text()
         policy = json.loads(INSTALLED_POLICY.read_text())
         self.assertEqual(reviewed_manual_actors(source, policy), RELEASE_MANAGERS)
-        self.assertEqual(policy["automatic_signer_actors"], [], "no automatic signer without a schedule")
+        self.assertEqual(policy["automatic_signer_actors"], ["github-actions[bot]"],
+                         "automatic signer is limited to github-actions[bot]")
 
     def test_an_actor_outside_the_release_managers_is_refused(self):
         source = (ROOT / ".github/workflows/nightly.yml").read_text()
@@ -824,19 +831,23 @@ def dispatch_triggers(source):
 
 
 class NightlyDispatchTransport(unittest.TestCase):
-    """The scheduled transport stays literally off and can only reach the signer branch."""
+    """The scheduled transport runs only in its exact context and can only reach the signer branch."""
+
+    DISPATCH_GUARD = "github.repository == 'storytold/texturecraft' && github.event_name == 'workflow_run'"
 
     def setUp(self):
         self.source = (ROOT / ".github/workflows/nightly-dispatch.yml").read_text()
 
-    def test_every_dispatch_job_is_literal_off(self):
+    def test_dispatch_job_keeps_exact_context_guard(self):
         jobs = self.source.split("\njobs:\n", 1)[1]
-        headers = re.findall(r"(?m)^  (?![\s#])[^\n]+", jobs)
+        self.assertEqual(re.findall(r"(?m)^  ([^\s#][^:]*):", jobs), ["dispatch"])
         conditions = job_conditions(jobs)
-        self.assertTrue(headers)
-        self.assertEqual(len(conditions), len(headers), "every job needs a literal-off condition")
-        for _, expression in conditions:
-            self.assertTrue(literal_off(expression), "nightly activation requires reviewed test update")
+        self.assertEqual(len(conditions), 1)
+        indicator, expression = conditions[0]
+        self.assertEqual(indicator, ">-")
+        self.assertFalse(literal_off(expression), "scheduled dispatch transport must be enabled")
+        self.assertEqual(" ".join(expression.split()), self.DISPATCH_GUARD,
+                         "dispatch guard may only change with review")
 
     def test_only_a_completed_scheduled_producer_is_transported(self):
         self.assertEqual(re.findall(r"(?m)^    workflows: (.+)$", self.source),
