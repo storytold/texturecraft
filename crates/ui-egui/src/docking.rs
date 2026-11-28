@@ -475,11 +475,9 @@ pub(crate) const HEADER_TITLE_LEFT: f32 = 12.0;
 /// Whether one of TextureCraft's own modal layers or the update dialogs hold the input, so the
 /// panels floated into windows of their own do not take it (`FrameInput::app_modal`).
 pub(crate) fn input_blocked(app: &TextureCraftApp, context: &egui::Context) -> bool {
-    let modal = context.memory(|memory| memory.top_modal_layer()).is_some();
+    let modal = crate::windows::remove_unused_confirmation_open(app) || context.memory(|memory| memory.top_modal_layer()).is_some();
     #[cfg(not(target_arch = "wasm32"))]
     let modal = modal || crate::updates_ui::blocks_input(app);
-    #[cfg(target_arch = "wasm32")]
-    let _ = app;
     modal
 }
 

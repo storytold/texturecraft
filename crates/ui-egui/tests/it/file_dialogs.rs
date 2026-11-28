@@ -106,6 +106,68 @@ fn the_sample_picker_asks_to_save_only_after_a_path_is_chosen() {
 }
 
 #[test]
+fn removing_unused_resources_asks_before_cleanup_and_reports_the_result() {
+    use serde_json::{Value, json};
+
+    let mut h = harness(false);
+    h.state_mut().ui.prefs.language = "en".into();
+    let png = texturecraft_engine::formats::gray16_png(1, 1, [0.5].into_iter()).unwrap();
+    let s = &mut h.state_mut().session;
+    let kept = s.import_resource_bytes("brush.png", png.clone()).unwrap();
+    let unused = s.import_resource_bytes("unused.png", png).unwrap();
+    texturecraft_engine::execute(s, "tool.brush", &json!({"alpha": {"image": kept}})).unwrap();
+    let contains = |h: &Harness<'_, TextureCraftApp>, name: &str| h.state().session.images.contains_key(name);
+
+    invoke(&mut h, "file.removeUnused");
+    h.run_steps(2);
+    assert!(contains(&h, &unused), "the menu waits for confirmation");
+    let hide_ui = h.state().ui.hide_ui;
+    h.key_press(egui::Key::Tab);
+    h.run_steps(2);
+    assert_eq!(h.state().ui.hide_ui, hide_ui, "Tab in the confirmation does not hide the panels");
+    assert!(h.get_by_label("Cancel").is_focused() || h.get_by_label("Remove").is_focused(), "Tab focuses a button in the confirmation");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert!(contains(&h, &unused));
+
+    invoke(&mut h, "file.removeUnused");
+    h.run_steps(2);
+    h.get_by_label("Remove").click();
+    h.run_steps(2);
+    assert!(contains(&h, &kept));
+    assert!(!contains(&h, &unused));
+    assert!(h.state().toasts.iter().any(|toast| !toast.error && toast.text.contains("Removed 1 unused resource")));
+
+    invoke(&mut h, "file.removeUnused");
+    h.run_steps(2);
+    h.get_by_label("Remove").click();
+    h.run_steps(2);
+    assert!(h.state().toasts.iter().any(|toast| !toast.error && toast.text.contains("No unused resources")));
+
+    h.state_mut().run("edit.undo", Value::Null).unwrap();
+    assert!(contains(&h, &unused));
+}
+
+#[test]
+fn escape_closes_the_resource_cleanup_dialog_without_cancelling_painting() {
+    let mut h = harness(false);
+    assert_eq!(h.state().ui.mode, texturecraft_ui_egui::state::Mode::Painting);
+    texturecraft_engine::execute(&mut h.state_mut().session, "layer.add.paint", &serde_json::json!({})).unwrap();
+    h.state_mut().session.begin_stroke_uv(texturecraft_engine::geom::glam::Vec2::splat(0.5), 1.0).unwrap();
+
+    invoke(&mut h, "file.removeUnused");
+    h.run_steps(2);
+    assert!(h.state().ui.windows.confirm_remove_unused.is_some());
+    assert!(h.state().session.stroke_active());
+    assert!(h.ctx.memory(|memory| memory.focused().is_none()));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    assert!(h.state().ui.windows.confirm_remove_unused.is_none(), "Escape closes the confirmation");
+    assert!(h.state().session.stroke_active(), "Escape leaves the painting stroke active");
+}
+
+#[test]
 fn a_dialog_that_cannot_show_is_reported() {
     let mut h = harness(false);
     answer(&mut h, |_| Answer::Unavailable("no portal".into()));

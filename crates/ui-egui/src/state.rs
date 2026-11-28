@@ -131,6 +131,9 @@ pub struct Windows {
     /// The generator effect whose preview is open enlarged in its own window
     #[serde(skip)]
     pub generator_preview: Option<u64>,
+    /// The project whose unused resources are awaiting confirmation.
+    #[serde(skip)]
+    pub confirm_remove_unused: Option<u64>,
 }
 
 /// An action that replaces or ends the project, held while the project has unsaved changes.

@@ -94,6 +94,30 @@ fn placing_points_previews_the_path_and_enter_applies_it_as_one_step() {
     assert_eq!(path_sublayers(&h), vec![(eid, 1)]);
 }
 
+#[test]
+fn backspace_leaves_the_path_while_resource_cleanup_is_open() {
+    let mut h = harness();
+    for at in [A, B, C] {
+        click(&mut h, at);
+    }
+    let path = h.state().session.tool.path.clone();
+    assert_eq!(path.points.len(), 3);
+
+    let ctx = h.ctx.clone();
+    texturecraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "file.removeUnused");
+    h.run_steps(2);
+    assert!(h.state().ui.windows.confirm_remove_unused.is_some());
+    assert!(h.ctx.memory(|memory| memory.focused().is_none()));
+
+    key(&mut h, Key::Backspace);
+    assert_eq!(h.state().session.tool.path, path, "Backspace leaves the path behind the dialog");
+
+    key(&mut h, Key::Escape);
+    assert!(h.state().ui.windows.confirm_remove_unused.is_none());
+    key(&mut h, Key::Backspace);
+    assert_eq!(h.state().session.tool.path.points.len(), 2);
+}
+
 /// Applying with the pointer commits the preview without leaving the current texture set
 #[test]
 fn apply_button_commits_the_path_in_the_current_texture_set() {

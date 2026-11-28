@@ -109,9 +109,12 @@ impl TextureCraftApp {
     /// TextureCraft's own egui modals shows in the root window, the runtime blocks the panels floated into windows of
     /// their own.
     pub(crate) fn frame_input(&mut self, ctx: &egui::Context, output: FrameOutput, scale: f32) -> FrameInput {
-        for (viewport, toggle) in &output.chrome_toggles {
-            if *viewport == ViewportId::ROOT && *toggle == ChromeToggle::Panels {
-                self.ui.hide_ui = !self.ui.hide_ui;
+        let confirming_cleanup = crate::windows::remove_unused_confirmation_open(self);
+        if !confirming_cleanup {
+            for (viewport, toggle) in &output.chrome_toggles {
+                if *viewport == ViewportId::ROOT && *toggle == ChromeToggle::Panels {
+                    self.ui.hide_ui = !self.ui.hide_ui;
+                }
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -123,7 +126,7 @@ impl TextureCraftApp {
         };
         let mut root = RootEnv::new().mode(mode).scale(Scale::new(scale));
         // Hide UI on another key leaves Tab to focus traversal and the shortcuts
-        root.tab_toggles_chrome = crate::keymap::shortcut_of(&self.ui.keymap, "ui.hideUi") == Some("Tab");
+        root.tab_toggles_chrome = !confirming_cleanup && crate::keymap::shortcut_of(&self.ui.keymap, "ui.hideUi") == Some("Tab");
         let app_modal = crate::docking::input_blocked(self, ctx).then_some(ViewportId::ROOT);
         FrameInput::new(root).commands(CommandInput::new().overrides(command_overrides())).host(Arc::clone(&self.framework_host)).app_modal(app_modal)
     }

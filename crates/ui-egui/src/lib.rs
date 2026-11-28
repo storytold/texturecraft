@@ -1460,6 +1460,7 @@ impl eframe::App for TextureCraftApp {
         }
 
         windows::show(self, &ctx);
+        windows::confirm_remove_unused(self, ui);
 
         // After every drop target has said whether it takes the dragged asset
         shelf_drag_ghost::show(&ctx);

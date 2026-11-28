@@ -47,6 +47,52 @@ pub(crate) fn reset_ui_keys(app: &mut TextureCraftApp, input: &mut egui::InputSt
     }
 }
 
+pub(crate) fn remove_unused_confirmation_open(app: &TextureCraftApp) -> bool {
+    app.ui.windows.confirm_remove_unused == Some(app.session.project_id)
+}
+
+pub(crate) fn confirm_remove_unused(app: &mut TextureCraftApp, ui: &mut Ui) {
+    use craft_ui::contract::overlay::Outside;
+    use craft_ui::contract::{Bind, Show as _, ShowContainer as _};
+    use craft_ui::dialog::Dialog;
+    use craft_ui::display::Text;
+    use craft_ui::runtime::focus::Initial;
+    use craft_ui::sections::{DialogRole, FooterButton};
+
+    let Some(project) = app.ui.windows.confirm_remove_unused else { return };
+    if project != app.session.project_id {
+        app.ui.windows.confirm_remove_unused = None;
+        return;
+    }
+
+    let mut open = true;
+    let response = Dialog::prompt(tr("Remove unused resources"))
+        .overlay(|mut overlay| {
+            overlay.dismiss = overlay.dismiss.outside(Outside::Absorb);
+            overlay
+        })
+        .opened(Bind::bound(&mut open))
+        .initial_focus(Initial::Keep)
+        .buttons([FooterButton::new(tr("Cancel"), DialogRole::Cancel), FooterButton::new(tr("Remove"), DialogRole::Destructive)])
+        .show(ui, |ui, _| {
+            Text::new(tr("Remove resources with no references in this project? Undo restores them.")).show(ui);
+        });
+    if !open {
+        app.ui.windows.confirm_remove_unused = None;
+    }
+    if response.picked == Some(1)
+        && let Some(value) = app.run("file.removeUnused", json!({}))
+    {
+        let removed = value["removed"].as_array().map_or(0, Vec::len);
+        let message = match removed {
+            0 => tr("No unused resources to remove.").to_owned(),
+            1 => tr("Removed 1 unused resource.").to_owned(),
+            count => trf("Removed {count} unused resources.", &[("count", &count)]),
+        };
+        app.toast(message, false);
+    }
+}
+
 fn reset_ui(app: &mut TextureCraftApp, ctx: &egui::Context) {
     if !app.ui.windows.confirm_reset_ui {
         return;

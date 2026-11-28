@@ -1271,7 +1271,12 @@ fn path_keys(app: &mut TextureCraftApp, ui: &Ui) {
         return;
     }
 
-    if !tool_acts(app) || app.session.tool.tool != Tool::Path || app.session.tool.path.points.is_empty() || crate::framework::widget_has_keyboard(ui.ctx()) {
+    if crate::windows::remove_unused_confirmation_open(app)
+        || !tool_acts(app)
+        || app.session.tool.tool != Tool::Path
+        || app.session.tool.path.points.is_empty()
+        || crate::framework::widget_has_keyboard(ui.ctx())
+    {
         return;
     }
 

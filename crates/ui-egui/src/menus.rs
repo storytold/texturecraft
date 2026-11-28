@@ -230,6 +230,7 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
         "ui.recent.clear" => app.ui.recent.clear(),
         "ui.newProject" => crate::new_project_advanced::open(app),
         "ui.export" => app.ui.windows.export = true,
+        "file.removeUnused" => app.ui.windows.confirm_remove_unused = Some(app.session.project_id),
 
         // The mesh export options come first; their Export leads to the file choice
         "file.exportMesh" => app.ui.windows.mesh_export_options = Some(app.session.project_id),
@@ -419,6 +420,9 @@ pub fn forwarded_shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context, event
     }
     app.bindings.sync(&app.ui.keymap, craft_keymap::egui::platform(ctx));
     for event in events {
+        if crate::windows::remove_unused_confirmation_open(app) {
+            break;
+        }
         let event = forwarded_press(&app.bindings, event, held);
         if !matches!(event, egui::Event::Key { pressed: true, repeat: false, .. }) {
             continue;
@@ -459,6 +463,11 @@ fn effect_command<'a>(app: &TextureCraftApp, id: &'a str) -> &'a str {
 
 /// Runs the commands bound to the keys pressed this frame, with no widget but the viewport focused, outside key capture
 pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    // The modal owns the keyboard, even before its buttons take focus.
+    if crate::windows::remove_unused_confirmation_open(app) {
+        return;
+    }
+
     if crate::keymap::capturing(ctx) || crate::framework::widget_has_keyboard(ctx) {
         return;
     }
@@ -584,6 +593,9 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
     }
 
     for id in &commands_to_invoke {
+        if crate::windows::remove_unused_confirmation_open(app) {
+            break;
+        }
         run_shortcut(app, ctx, id);
     }
 }
