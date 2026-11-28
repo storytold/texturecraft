@@ -113,7 +113,9 @@ fn dragging_the_pan_button_moves_the_camera_target_and_paints_nothing() {
 
     let after = harness.state().session.camera;
     assert!((after.target - camera.target).length() > 1e-3, "pan: {camera:?} -> {after:?}");
-    assert_eq!((after.yaw, after.pitch, after.distance), (camera.yaw, camera.pitch, camera.distance));
+    assert_eq!((after.yaw, after.pitch), (camera.yaw, camera.pitch), "no orbit");
+    // The pivot may settle onto the surface (distance follows it), but the eye only moves sideways
+    assert!((after.eye() - camera.eye()).dot(camera.forward()).abs() < 1e-3, "no zoom: {camera:?} -> {after:?}");
     assert_eq!(history(&harness), labels, "nothing painted");
 }
 

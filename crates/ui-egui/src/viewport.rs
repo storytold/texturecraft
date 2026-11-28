@@ -791,11 +791,11 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         // The stencil, the brush or the held Move on model button changes instead of the camera
     } else if response.dragged_by(PointerButton::Middle) {
         app.camera_glide = None;
-        app.session.camera.pan(delta.x / size.y, delta.y / size.y);
+        app.session.pan_camera(delta.x / size.y, delta.y / size.y);
     } else if alt && ctrl && response.dragged_by(PointerButton::Primary) {
         // Ctrl+Alt+left is "Camera translate (alt.)": it pans like the middle button
         app.camera_glide = None;
-        app.session.camera.pan(delta.x / size.y, delta.y / size.y);
+        app.session.pan_camera(delta.x / size.y, delta.y / size.y);
     } else if alt && response.dragged_by(PointerButton::Primary) {
         // Navigating takes over from a glide in progress, which would put the camera back
         app.camera_glide = None;
@@ -852,7 +852,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         app.camera_glide = None;
         let moved = gesture.translation_delta;
         if gesture.num_touches >= 3 {
-            app.session.camera.pan(moved.x / size.y, moved.y / size.y);
+            app.session.pan_camera(moved.x / size.y, moved.y / size.y);
         } else {
             orbit(app, moved);
         }

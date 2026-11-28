@@ -83,6 +83,8 @@ pub struct Stroke {
     last_dir: Option<Vec3>,
     /// Every stamp emitted so far (for replay, inspect and tests).
     pub stamps: Vec<Stamp>,
+    /// A screen-space brush uses [`OrbitCamera::pivot_brush_scale`] (paths saved before the framed scale).
+    pub pivot_scale: bool,
 }
 
 fn rand01(n: u32, k: u32) -> f32 {
@@ -94,7 +96,18 @@ impl Stroke {
         let s = settings.sanitized();
         let (lo, hi) = mesh.bounds();
         let diag = (hi - lo).length().max(1e-4);
-        Stroke { radius: s.size * diag, settings: s, center: (lo + hi) * 0.5, last: None, dist: 0.0, lazy: None, count: 0, last_dir: None, stamps: Vec::new() }
+        Stroke {
+            radius: s.size * diag,
+            settings: s,
+            center: (lo + hi) * 0.5,
+            last: None,
+            dist: 0.0,
+            lazy: None,
+            count: 0,
+            last_dir: None,
+            stamps: Vec::new(),
+            pivot_scale: false,
+        }
     }
 
     /// Feed a pointer position (pixels) with pen pressure (1 for a mouse). Returns new stamps.
@@ -129,7 +142,12 @@ impl Stroke {
         let p = pressure.clamp(0.0, 1.0);
         let scale = self.settings.min_size + (1.0 - self.settings.min_size) * p;
         let r = self.radius * if pressure < 1.0 { scale } else { 1.0 };
-        if self.settings.screen_space { r * (pos.distance(ctx.camera.eye()) / ctx.camera.distance.max(1e-4)) } else { r }
+        let eye_distance = pos.distance(ctx.camera.eye());
+        match (self.settings.screen_space, self.pivot_scale) {
+            (false, _) => r,
+            (true, false) => r * ctx.camera.screen_brush_scale(eye_distance),
+            (true, true) => r * ctx.camera.pivot_brush_scale(eye_distance),
+        }
     }
 
     fn feed(&mut self, ctx: &PickCtx, screen: Vec2, pressure: f32, depth: u32, out: &mut Vec<Stamp>) {

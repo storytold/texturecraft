@@ -89,7 +89,7 @@ fn apply(app: &mut TextureCraftApp, rect: Rect, view: NavView, button: NavButton
     let size = rect.size();
     match (view, button) {
         (NavView::Scene, NavButton::Orbit) => crate::viewport::orbit(app, delta),
-        (NavView::Scene, NavButton::Pan) => app.session.camera.pan(delta.x / size.y, delta.y / size.y),
+        (NavView::Scene, NavButton::Pan) => app.session.pan_camera(delta.x / size.y, delta.y / size.y),
         (NavView::Scene, NavButton::Zoom) => app.session.camera.zoom(-delta.y * DRAG_ZOOM_PER_POINT * app.ui.prefs.drag_zoom_scale()),
         (NavView::Uv, NavButton::Pan) => {
             app.ui.uv_pan[0] += delta.x / size.x * 2.0;

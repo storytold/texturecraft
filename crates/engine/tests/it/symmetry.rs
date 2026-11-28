@@ -143,24 +143,30 @@ fn a_closed_path_fill_reaches_a_copy_in_front_of_the_source_surface() {
 
 #[test]
 fn screen_space_fill_copy_depth_is_limited_at_the_source_hit() {
-    // The source hit allows about 0.071 world units; the search bound allows about 0.122
-    for (displacement, painted) in [(-0.074, false), (0.068, true), (0.1, false)] {
-        let mut session = session(wall());
-        session.camera.ortho = true;
-        session.camera.distance = 1.0;
-        execute(
-            &mut session,
-            "tool.brush",
-            &json!({"size": 10, "screenSpace": true, "symmetryRadial": 2, "symmetryAxis": "y", "symmetryOffset": [0.0, 0.0, displacement * 0.5]}),
-        )
-        .unwrap();
-        let inside = surface(&session, 265.0, 200.0);
+    // With the brush sized for the same world depth as a scale of 1, the source hit allows about
+    // 0.071 world units. In perspective the search bound, from the farthest bounding-box corner,
+    // allows about 0.122. In orthographic view a screen-space brush has one scale at every depth.
+    for ortho in [true, false] {
+        for (displacement, painted) in [(-0.074, false), (0.068, true), (0.1, false)] {
+            let mut session = session(wall());
+            session.camera.ortho = ortho;
+            session.camera.distance = 1.0;
+            let inside = surface(&session, 265.0, 200.0);
+            // The brush size that gives the same world copy depth as a scale of 1
+            let size = 10.0 / session.camera.screen_brush_scale(inside.distance(session.camera.eye()));
+            execute(
+                &mut session,
+                "tool.brush",
+                &json!({"size": size, "screenSpace": true, "symmetryRadial": 2, "symmetryAxis": "y", "symmetryOffset": [0.0, 0.0, displacement * 0.5]}),
+            )
+            .unwrap();
 
-        let square = json!([[250, 180], [280, 180], [280, 220], [250, 220]]);
-        execute(&mut session, "tool.path", &json!({"points": square, "closed": true, "fill": true, "commit": true})).unwrap();
+            let square = json!([[250, 180], [280, 180], [280, 220], [250, 220]]);
+            execute(&mut session, "tool.path", &json!({"points": square, "closed": true, "fill": true, "commit": true})).unwrap();
 
-        assert!(red_at(&session, inside), "the filled lasso");
-        assert_eq!(red_at(&session, Vec3::new(-inside.x, inside.y, 0.0)), painted, "source displacement {displacement}");
+            assert!(red_at(&session, inside), "the filled lasso");
+            assert_eq!(red_at(&session, Vec3::new(-inside.x, inside.y, 0.0)), painted, "source displacement {displacement}, ortho={ortho}");
+        }
     }
 }
 

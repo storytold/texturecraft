@@ -11,6 +11,7 @@ mod bake_resolution;
 mod bake_settings;
 mod bake_tiles;
 mod brush_material;
+mod camera_pan;
 mod closed_session;
 mod color_selection;
 mod compare_mask;

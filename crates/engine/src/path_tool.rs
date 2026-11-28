@@ -181,6 +181,10 @@ struct PathPaint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mask_image: Option<String>,
     camera: OrbitCamera,
+    /// A screen-space brush is sized by [`OrbitCamera::screen_brush_scale`]. Paths saved before
+    /// that (false) keep the older scale, the eye distance over the pivot distance, when repainted.
+    #[serde(default)]
+    framed_screen_scale: bool,
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -497,6 +501,7 @@ impl Session {
             mask_value: t.mask_value,
             mask_image: t.mask_image.clone(),
             camera,
+            framed_screen_scale: true,
         };
         PathShape {
             points: path.points.iter().map(|p| p.to_array()).collect(),
@@ -575,7 +580,8 @@ impl Session {
             let stored_corners = state_of(stored).corner_flags();
             (&current.points, &current.corners, current.uv, current.closed, current.fill)
                 == (&stored.points, &stored_corners, stored.uv, stored.closed, stored.fill)
-                && read_paint(&current).is_ok_and(|current_paint| current_paint == paint)
+                // Editing a path saved with the older brush scale isn't a change by itself
+                && read_paint(&current).is_ok_and(|current_paint| PathPaint { framed_screen_scale: paint.framed_screen_scale, ..current_paint } == paint)
         })
     }
 
@@ -1034,6 +1040,7 @@ impl Session {
             }
         }
         self.painting_paths = false;
+        self.path_pivot_scale = false;
         (self.tool, self.camera, self.target, self.quick_mask.editing) = saved;
         (self.undo, self.redo) = history;
         result.map(|_| out)
@@ -1042,6 +1049,8 @@ impl Session {
     fn paint_shape(&mut self, shape: &PathShape) -> Result<Value> {
         let paint = read_paint(shape)?;
         let (camera, viewport) = paint_view(shape, &paint);
+        // A screen-space brush saved before the framed scale keeps the scale it painted with
+        self.path_pivot_scale = !paint.framed_screen_scale;
         self.tool.brush = paint.brush;
         self.tool.values = paint.values;
         self.tool.enabled = paint.enabled;
@@ -1136,11 +1145,13 @@ impl Session {
             // Copies can leave the source surface, within the same depth allowed for brush stamps
             let copy_depth = brush.size * (bounds_max - bounds_min).length().max(MIN_BRUSH_SCALE) * brush.depth;
             let eye = self.camera.eye();
-            let camera_distance = self.camera.distance.max(MIN_BRUSH_SCALE);
+            let camera = self.camera;
+            let screen_scale =
+                |eye_distance: f32| if self.path_pivot_scale { camera.pivot_brush_scale(eye_distance) } else { camera.screen_brush_scale(eye_distance) };
 
             // Bound the search using the farthest bounding-box corner; acceptance still uses the actual hit
             let max_copy_depth =
-                if brush.screen_space { copy_depth * (bounds_min - eye).abs().max((bounds_max - eye).abs()).length() / camera_distance } else { copy_depth };
+                if brush.screen_space { copy_depth * screen_scale((bounds_min - eye).abs().max((bounds_max - eye).abs()).length()) } else { copy_depth };
 
             fill_coverage(&mut canvas, &uv_buffer, |texel, _| {
                 let Some(surface) = uv_buffer.surface(mesh, texel) else { return 0.0 };
@@ -1174,7 +1185,7 @@ impl Session {
                     let off_surface = if !is_copy {
                         0.0
                     } else if brush.screen_space {
-                        copy_depth * (origin + direction * hit.t).distance(eye) / camera_distance
+                        copy_depth * screen_scale((origin + direction * hit.t).distance(eye))
                     } else {
                         copy_depth
                     };

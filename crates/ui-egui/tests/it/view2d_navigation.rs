@@ -299,7 +299,9 @@ fn ctrl_alt_left_pans_the_3d_camera_and_neither_orbits_it_nor_adjusts_the_brush(
 
     let after = harness.state().session.camera;
     assert!(after.target != camera.target, "the camera panned");
-    assert_eq!((after.yaw, after.pitch, after.distance), (camera.yaw, camera.pitch, camera.distance), "no orbit, no zoom");
+    assert_eq!((after.yaw, after.pitch), (camera.yaw, camera.pitch), "no orbit");
+    // The pivot may settle onto the surface (distance follows it), but the eye only moves sideways
+    assert!((after.eye() - camera.eye()).dot(camera.forward()).abs() < 1e-3, "no zoom: {camera:?} -> {after:?}");
     assert_eq!(harness.state().session.tool.brush, brush, "the brush is left alone");
 }
 

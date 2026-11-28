@@ -699,6 +699,16 @@ current angles. The orbit pivot (`camera.get` `target`) is the framed center, so
 Alt+drag orbit turn around the object being painted even with a floor plane or other helper geometry in
 the mesh. `viewport.frameSelection` (Shift+F) is the same as `target: "selection"`; a set with no triangles
 frames the whole mesh. Both return the camera like `camera.get`.
+
+`camera.pan {dx?, dy?}` moves the view sideways by a fraction of the viewport height, like a middle-drag.
+After the move, the pivot slides along the line of view onto the surface at the view center, so the next
+orbit turns around the part panned to and not around a point inside the mesh at the old depth. The eye
+does not move, so the picture does not jump; an orthographic camera keeps its distance, which sets its
+scale. Only visible texture sets take the pivot. With no surface at the view center the pivot keeps its
+depth. An orthographic eye moves with the pivot, so there the pivot moves away from the camera only as far
+as keeps the eye in front of the mesh. A brush sized in screen space keeps its size on screen through a pan,
+and through zoom: at the pivot of a freshly framed view it is the size it would be in world space. It returns the camera like
+`camera.get`.
 In the app, `viewport.frame` also resets the 2D view (pan, zoom and rotation), as F does, on the next 2D draw. This happens only when the layout is not `Only3D` and the mode is not `Rendering`; otherwise the previous pan, zoom and rotation stay. In a UV tile set the reset frames tile 1001, or the lowest tile when tile 1001 is absent. The engine alone has no 2D view state.
 
 ## Camera views and projection

@@ -830,3 +830,84 @@ fn paths_saved_without_corner_flags_load_smooth() {
     assert!(!s.path_live().unwrap(), "a loaded smooth path matches what is stored");
     assert_eq!(s.doc.pixels.layers, pixels.layers);
 }
+
+/// Red texels after a screen-space stroke path of brush `size` is repainted from storage, painted
+/// zoomed in from the framed view. `legacy`: its settings are as saved before the framed brush scale.
+fn repainted_screen_space_path(size: f32, legacy: bool) -> usize {
+    let mut s = session(primitives::sphere(1.0, 48, 24));
+    s.camera.distance = s.camera.framed_distance() * 0.6;
+    execute(&mut s, "tool.brush", &json!({"size": size, "screenSpace": true})).unwrap();
+    // A first path, removed below so the second one repaints from what is stored
+    let first = execute(&mut s, "tool.path", &json!({"uvPoints": [[0.05, 0.05], [0.1, 0.05]], "commit": true})).unwrap();
+    let eid = first["committed"]["effect"].as_u64().unwrap();
+    execute(&mut s, "tool.path", &json!({"points": [[140, 210], [200, 180], [260, 210]], "commit": true})).unwrap();
+    if legacy {
+        let Some(texturecraft_engine::core::Effect { kind: texturecraft_engine::core::EffectKind::Path(shapes), .. }) =
+            s.doc.project.effect_mut(texturecraft_engine::core::LayerId(eid))
+        else {
+            panic!("a path sublayer")
+        };
+        shapes[1].paint.as_object_mut().unwrap().remove("framed_screen_scale");
+    }
+    execute(&mut s, "path.remove", &json!({"effect": eid, "index": 0})).unwrap();
+    s.update();
+    (0..RES as u32).flat_map(|y| (0..RES as u32).map(move |x| (x, y))).filter(|&(x, y)| red_uv(&s, (x as f32 + 0.5) / RES, (y as f32 + 0.5) / RES)).count()
+}
+
+#[test]
+fn a_screen_space_path_saved_before_the_framed_brush_scale_repaints_at_its_old_size() {
+    // Saved zoomed in to 0.6 of the framed distance, the older scale made the brush 1 / 0.6 as wide
+    let legacy = repainted_screen_space_path(6.0, true);
+    let as_painted = repainted_screen_space_path(6.0 / 0.6, false);
+    let current = repainted_screen_space_path(6.0, false);
+    assert!(legacy > current, "the old path keeps its wider stroke: {legacy} vs {current}");
+    let ratio = legacy as f32 / as_painted as f32;
+    assert!((ratio - 1.0).abs() < 0.05, "as wide as it was painted: {legacy} vs {as_painted}");
+}
+
+/// Is the mirrored copy of a screen-space lasso fill, displaced `displacement` toward the camera,
+/// painted once the stored path repaints? Orthographic, with the pivot 0.5 behind the wall: the eye
+/// is 1 from the wall and 1.5 from the pivot. `legacy`: saved before the framed brush scale.
+fn repainted_orthographic_lasso_copy(displacement: f32, legacy: bool) -> bool {
+    let mut s = session(wall());
+    s.camera.ortho = true;
+    s.camera.target = Vec3::new(0.0, 0.0, -0.5);
+    s.camera.distance = 1.5;
+    execute(
+        &mut s,
+        "tool.brush",
+        &json!({"size": 10, "screenSpace": true, "symmetryRadial": 2, "symmetryAxis": "y", "symmetryOffset": [0.0, 0.0, displacement * 0.5]}),
+    )
+    .unwrap();
+    let inside = s.pick(Vec2::new(265.0, 200.0), s.viewport).unwrap().pos;
+    // A first path, removed below so the lasso repaints from what is stored
+    let first = execute(&mut s, "tool.path", &json!({"uvPoints": [[0.05, 0.05], [0.1, 0.05]], "commit": true})).unwrap();
+    let eid = first["committed"]["effect"].as_u64().unwrap();
+    let square = json!([[250, 180], [280, 180], [280, 220], [250, 220]]);
+    execute(&mut s, "tool.path", &json!({"points": square, "closed": true, "fill": true, "commit": true})).unwrap();
+    if legacy {
+        let Some(texturecraft_engine::core::Effect { kind: texturecraft_engine::core::EffectKind::Path(shapes), .. }) =
+            s.doc.project.effect_mut(texturecraft_engine::core::LayerId(eid))
+        else {
+            panic!("a path sublayer")
+        };
+        shapes[1].paint.as_object_mut().unwrap().remove("framed_screen_scale");
+    }
+    execute(&mut s, "path.remove", &json!({"effect": eid, "index": 0})).unwrap();
+    s.update();
+
+    let copy = Vec3::new(-inside.x, inside.y, 0.0);
+    let ndc = s.camera.project(copy, 1.0).unwrap();
+    assert!(red_at(&s, 265.0, 200.0), "the filled lasso");
+    red_at(&s, (ndc.x * 0.5 + 0.5) * 400.0, (0.5 - ndc.y * 0.5) * 400.0)
+}
+
+#[test]
+fn an_orthographic_lasso_saved_before_the_framed_brush_scale_keeps_its_copy_depth() {
+    // Copy depth at a brush scale of 1 is about 0.071. Here the older scale is the eye distance to
+    // each hit over the pivot distance (1 / 1.5: about 0.047), the framed one 1.5 over the framed
+    // distance (about 0.023).
+    assert!(repainted_orthographic_lasso_copy(0.035, true), "within the older scale's depth, as when it was painted");
+    assert!(!repainted_orthographic_lasso_copy(0.035, false), "beyond the framed scale's depth");
+    assert!(!repainted_orthographic_lasso_copy(0.06, true), "the older scale is taken at the hit, not at the pivot");
+}
