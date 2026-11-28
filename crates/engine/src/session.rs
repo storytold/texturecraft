@@ -1028,6 +1028,8 @@ impl Session {
         Ok(label)
     }
 
+    /// Bookkeeping after an undo or redo moved the document from `other` to the current one: mark it
+    /// modified, invalidate what changed, and keep the paint target valid.
     fn after_history(&mut self, other: &Document) {
         self.follow_renamed_resources(other);
 
@@ -1047,8 +1049,29 @@ impl Session {
             let content = p.effect(e).and_then(|(owner, _)| p.layers.get(&owner)).is_some_and(|l| l.content_effects.iter().any(|x| x.id == e));
             self.target = if content { StackTarget::Content } else { StackTarget::Mask };
         }
-        let has_mask = self.selected_layer().and_then(|lid| self.doc.project.layer(self.doc.project.mask_owner(lid)).ok()).is_some_and(|l| l.mask.is_some());
-        if self.target == StackTarget::Mask && !has_mask {
+        self.settle_mask_target(other);
+    }
+
+    /// Keep the paint target valid after undo or redo. The target is not part of the history,
+    /// so a step that adds or removes the selected layer's mask would leave it pointing at a mask
+    /// that does not exist (the next stroke would then silently create a new black mask).
+    /// Undoing "Add mask" goes back to the layer's content; redoing it, or undoing a mask
+    /// delete, goes back to the mask.
+    fn settle_mask_target(&mut self, other: &Document) {
+        let Some(id) = self.selected_layer() else {
+            if self.target == StackTarget::Mask {
+                self.target = StackTarget::Content;
+            }
+            return;
+        };
+        let has_mask = |d: &Document| d.project.layers.get(&d.project.mask_owner(id)).is_some_and(|l| l.mask.is_some());
+        // An instance resolves its mask through its source, so its own override mask coming back
+        // does not change `has_mask`: look at the layer's own mask too.
+        let own = |d: &Document| d.project.layers.get(&id).is_some_and(|l| l.mask.is_some());
+        let (now, before) = (has_mask(&self.doc), has_mask(other));
+        if (now && !before) || (own(&self.doc) && !own(other)) {
+            self.target = StackTarget::Mask;
+        } else if !now && self.target == StackTarget::Mask {
             self.target = StackTarget::Content;
         }
     }
