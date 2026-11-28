@@ -226,10 +226,18 @@ pub fn materialcraft_tool(name: &str, env: &str) -> std::path::PathBuf {
     }
 
     let exe = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-    let dir = std::env::current_exe().ok().and_then(|e| e.parent().map(std::path::Path::to_path_buf));
-    let beside = dir.as_ref().map(|d| d.join(&exe));
-    let sibling = dir.as_ref().and_then(|d| Some(d.parent()?.join("MaterialCraft").join(&exe)));
-    beside.into_iter().chain(sibling).find(|p| p.is_file()).unwrap_or_else(|| exe.into())
+    let app_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(std::path::Path::to_path_buf));
+    app_dir.and_then(|d| find_installed_tool(&d, &exe)).unwrap_or_else(|| exe.into())
+}
+
+/// `exe` in `app_dir` (next to this program), else in the sibling `MaterialCraft` folder beside `app_dir`
+/// (`<root>/TextureCraft` and `<root>/MaterialCraft`, as the ArtCraft Launcher installs them). `None` if neither has it.
+/// Versioned `<app>/<version>/` layouts and macOS `.app` bundles are not searched.
+#[cfg(not(target_arch = "wasm32"))]
+fn find_installed_tool(app_dir: &std::path::Path, exe: &str) -> Option<std::path::PathBuf> {
+    let beside = app_dir.join(exe);
+    let sibling = app_dir.parent().map(|root| root.join("MaterialCraft").join(exe));
+    std::iter::once(beside).chain(sibling).find(|p| p.is_file())
 }
 
 /// A command for a MaterialCraft executable that opens no console window.
@@ -243,12 +251,15 @@ fn quiet(program: &std::path::Path) -> std::process::Command {
 }
 
 /// Open `package` (a published material or authoring package) in the MaterialCraft app (`$MATERIALCRAFT`, next to this
-/// program, or on `PATH`).
+/// program, in the sibling `MaterialCraft` folder, or on `PATH`).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_in_materialcraft(package: &std::path::Path) -> Result<()> {
     let app = materialcraft_tool("materialcraft", "MATERIALCRAFT");
     quiet(&app).arg(package).spawn().map(drop).map_err(|e| {
-        EngineError::Other(format!("MaterialCraft ({}) did not start: {e}. Install MaterialCraft next to TextureCraft or set MATERIALCRAFT", app.display()))
+        EngineError::Other(format!(
+            "MaterialCraft ({}) did not start: {e}. Install MaterialCraft next to TextureCraft or in a sibling MaterialCraft folder, or set MATERIALCRAFT",
+            app.display()
+        ))
     })
 }
 
@@ -581,5 +592,42 @@ mod tests {
         assert_eq!(typed(&p, &json!("#aabbccdd")), None);
         assert_eq!(typed(&p, &json!("#+f+f+f")), None);
         assert!(typed(&p, &json!("#ff8000")).is_some());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn touch(dir: &std::path::Path, exe: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(exe);
+        std::fs::write(&p, b"").unwrap();
+        p
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn launcher_layout_finds_the_sibling_materialcraft_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("TextureCraft");
+        std::fs::create_dir_all(&app).unwrap();
+        let tool = touch(&root.path().join("MaterialCraft"), "materialcraft-cli");
+        assert_eq!(super::find_installed_tool(&app, "materialcraft-cli"), Some(tool));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_tool_beside_the_program_wins_over_the_sibling_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("TextureCraft");
+        let beside = touch(&app, "materialcraft-cli");
+        touch(&root.path().join("MaterialCraft"), "materialcraft-cli");
+        assert_eq!(super::find_installed_tool(&app, "materialcraft-cli"), Some(beside));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_missing_tool_is_none_so_the_caller_falls_back_to_path() {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("TextureCraft");
+        std::fs::create_dir_all(root.path().join("MaterialCraft")).unwrap();
+        assert_eq!(super::find_installed_tool(&app, "materialcraft-cli"), None);
     }
 }

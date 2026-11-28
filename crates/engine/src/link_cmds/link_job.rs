@@ -118,7 +118,7 @@ fn run_bounded(command: &std::process::Command, stdout: &Path, stderr: &Path, re
         .stdout(std::fs::File::create(stdout).map_err(io)?)
         .stderr(std::fs::File::create(stderr).map_err(io)?)
         .spawn()
-        .map_err(|error| io(format!("could not start the MaterialCraft cook: {error}. Install MaterialCraft or set MATERIALCRAFT_CLI")))?;
+        .map_err(|error| io(format!("could not start the MaterialCraft cook: {error}. Install MaterialCraft next to TextureCraft or in a sibling MaterialCraft folder, or set MATERIALCRAFT_CLI")))?;
 
     loop {
         if canceled.load(Ordering::Relaxed) {

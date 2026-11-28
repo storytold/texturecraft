@@ -517,7 +517,7 @@ operation returns a busy error and can be retried.
 | `material.link.saveSource` | `{layer?, path}`: the original linked source with its `.mcmat`, `.mcraft` or `.sbs` extension |
 
 For a 1024-pixel texture set, TextureCraft requests `materialcraft-cli export source.mcmat maps --profile maps --size 1024x1024` with repeated `--set` and `--input` arguments. It discovers the published image inputs through `info` when the texture set supplies mesh maps. The desktop worker decodes the returned maps before installing the fill at its original drop target. The executable is resolved from
-`$MATERIALCRAFT_CLI`, else `materialcraft-cli` next to the TextureCraft executable, else on `PATH`
+`$MATERIALCRAFT_CLI`, else `materialcraft-cli` next to the TextureCraft executable, else in a `MaterialCraft` folder beside TextureCraft's own folder (the launcher's layout), else on `PATH`
 (the app is `$MATERIALCRAFT` / `materialcraft`). Baked maps feed graph input nodes whose identifier
 matches the map's shared id (`ambientOcclusion`, `curvature`, `thickness`, `position`,
 `worldNormal`, `normal`, `height`, `id`, `bentNormal`, `opacity`, `colorMap`, `worldDirection`;
