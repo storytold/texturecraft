@@ -338,8 +338,9 @@ impl TexturecraftMcp {
         match &*self.backend {
             Backend::Headless(h) => {
                 let (h, m) = (h.clone(), method.to_string());
-                // A panicking command poisons the lock, but edits run on a document snapshot
-                // (`Session::edit`), so the session stays consistent: keep serving.
+                // A panicking command poisons the lock: keep serving. `Session::edit` rolls the
+                // document back on unwind, but work outside it (scripted strokes) and other
+                // session state, such as the selection or tool, is not rolled back.
                 tokio::task::spawn_blocking(move || h.lock().unwrap_or_else(PoisonError::into_inner).handle(&m, &p))
                     .await
                     .unwrap_or_else(|_| Err(AutomationError::Other(format!("internal error in `{method}`"))))

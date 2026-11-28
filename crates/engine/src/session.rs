@@ -700,7 +700,8 @@ impl Session {
     // -----------------------------------------------------------------------------------------
     // History
 
-    /// Run an undoable edit. On error the document is left untouched.
+    /// Run an undoable edit. On error, or if `f` panics, the document is left untouched (other
+    /// session state, such as the selection, is not restored).
     pub fn edit<T>(&mut self, label: &str, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
         self.edit_merging(label, self.merge_edits, f)
     }
@@ -716,7 +717,20 @@ impl Session {
         self.end_polygon_fill_box();
 
         let before = self.doc.clone();
-        let result = change(self).and_then(|(value, changed)| {
+        // A panic inside `change` must not leave a half-edited document behind: the automation
+        // servers catch panics and keep serving this session. (On wasm a panic aborts, so
+        // there is nothing to restore.)
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| change(self)));
+        let result = match ran {
+            Ok(result) => result,
+            Err(panic) => {
+                self.doc = before;
+                // As for an error below: a repaint may have cached tiles from the discarded document
+                self.path_cache = None;
+                std::panic::resume_unwind(panic);
+            }
+        };
+        let result = result.and_then(|(value, changed)| {
             if changed && let Some(id) = self.doc.project.instance_cycle() {
                 return Err(EngineError::Other(format!("instance layer {} would draw itself", id.0)));
             }

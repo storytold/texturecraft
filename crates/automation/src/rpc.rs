@@ -124,8 +124,9 @@ impl Headless {
     }
 }
 
-/// Answer one request line. A panic inside a command becomes an error reply (edits run on a
-/// snapshot, so the session stays consistent).
+/// Answer one request line. A panic inside a command becomes an error reply. `Session::edit`
+/// rolls the document back on unwind, but work outside it (scripted strokes) and other session
+/// state, such as the selection or tool, is not rolled back.
 pub fn respond(h: &Mutex<Headless>, line: &str) -> Value {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,

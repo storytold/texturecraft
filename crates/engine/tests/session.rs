@@ -1,8 +1,9 @@
 use serde_json::{Value, json};
+use texturecraft_engine::compose::PixelStore;
 use texturecraft_engine::core::{Channel, MIN_RESOLUTION};
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_engine::geom::primitives;
-use texturecraft_engine::{Session, command_specs, execute};
+use texturecraft_engine::{Document, Session, command_specs, execute};
 
 fn session() -> Session {
     session_at(256)
@@ -15,6 +16,22 @@ fn session_at(texture_size: u32) -> Session {
     s.camera.pitch = 0.0;
     s.update();
     s
+}
+
+/// Whether two documents hold the same content (`Document` has no `PartialEq`). Destructured so
+/// a new field must be compared here too.
+fn same_document(a: &Document, b: &Document) -> bool {
+    let Document { project, pixels: PixelStore { layers, masks }, baked, bake_paint, resources, bake_meshes } = a;
+    // Bake meshes have no equality (each holds a mesh and its BVH): the same high polys and cage
+    // stand in for them.
+    let same_meshes = bake_meshes.high.len() == b.bake_meshes.high.len() && bake_meshes.cage.is_some() == b.bake_meshes.cage.is_some();
+    *project == b.project
+        && *layers == b.pixels.layers
+        && *masks == b.pixels.masks
+        && *baked == b.baked
+        && *bake_paint == b.bake_paint
+        && *resources == b.resources
+        && same_meshes
 }
 
 #[test]
@@ -498,6 +515,55 @@ fn an_srgb_hex_colour_matches_its_linear_rgb_value() {
     assert!(hex.iter().zip(&linear).all(|(a, b)| (a - b).abs() < 2e-3), "{hex:?} {linear:?}");
     let digits = base_color(json!([0.7843, 0.0627, 0.1804]));
     assert!(digits[0] - hex[0] > 0.1, "{digits:?} {hex:?}");
+}
+
+/// A command that panics halfway through an edit leaves the document and history as they were.
+#[test]
+fn a_panic_inside_an_edit_restores_the_document() {
+    let mut s = session();
+    let before = s.doc.clone();
+    let history = s.history_labels();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = s.edit("Half done", |s| -> texturecraft_engine::Result<()> {
+            s.doc.project.name = "changed".into();
+            s.doc.pixels.mask_mut(texturecraft_engine::core::LayerId(u64::MAX), (64, 64));
+            s.doc.resources.insert("half.png".into(), std::sync::Arc::new(vec![1, 2, 3]));
+            panic!("boom");
+        });
+    }));
+    assert!(r.is_err(), "the panic still reaches the caller");
+    assert!(same_document(&s.doc, &before), "the half-made change was rolled back");
+    assert_eq!(s.history_labels(), history, "no undo step was recorded");
+}
+
+/// A command that fails leaves the document and history as they were (commands are atomic).
+#[test]
+fn failed_commands_leave_the_document_unchanged() {
+    let hostile = [
+        Value::Null,
+        json!({}),
+        json!({"layer": u64::MAX, "ts": 99, "channel": "nope", "mode": "???", "opacity": f64::MAX}),
+        json!({"layer": 1, "index": -5, "delta": i64::MIN, "above": "x", "points": [[f64::MAX, -1e300]], "size": -1e30}),
+        json!({"resolution": 0, "maps": ["x"], "rays": u64::MAX, "antialiasing": 3, "color": [1], "value": "nan"}),
+        json!({"effect": 0, "x": 1e30, "y": -1e30, "viewport": [0, 0], "mesh": "../../etc", "material": ""}),
+    ];
+    let mut offenders = Vec::new();
+    for spec in command_specs() {
+        if spec.id == "project.sample" {
+            continue; // slow (bakes); covered elsewhere
+        }
+        for p in &hostile {
+            let mut s = session_at(MIN_RESOLUTION);
+            for texture_set in &mut s.doc.project.texture_sets {
+                texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R64;
+            }
+            let (before, history) = (s.doc.clone(), s.history_labels());
+            if execute(&mut s, spec.id, p).is_err() && (!same_document(&s.doc, &before) || s.history_labels() != history) {
+                offenders.push(format!("{} {p}", spec.id));
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "failed commands changed the document:\n{}", offenders.join("\n"));
 }
 
 #[test]
