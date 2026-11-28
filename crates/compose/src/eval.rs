@@ -4559,11 +4559,49 @@ pub fn composite_tiles_with_projectors(
     composite_evaluation_tiles(&mut inputs, out, tiles, below);
 }
 
-fn composite_evaluation_tiles(inp: &mut EvaluationInputs, out: &mut Composite, tiles: &[(u32, u32)], mut below: Option<&mut BelowCache>) {
-    let Ok(set) = inp.project.texture_set(inp.ts) else { return };
+fn composite_evaluation_tiles(inp: &mut EvaluationInputs, out: &mut Composite, tiles: &[(u32, u32)], below: Option<&mut BelowCache>) {
     if (inp.gbuf.width, inp.gbuf.height) != (out.resolution, out.height) {
         return;
     }
+
+    evaluate_tiles(
+        inp,
+        tiles,
+        below,
+        || false,
+        |value, signed| if signed { to_u16_signed(value) } else { to_u16(value) },
+        |(tx, ty), channels, data| {
+            for (channel, tile) in channels.iter().zip(data) {
+                if let Some(image) = out.channels.get_mut(channel) {
+                    image.set_tile(tx, ty, tile);
+                }
+            }
+        },
+    );
+}
+
+/// Evaluate the material in `inputs` into unquantized channel tiles for another compositor.
+/// The caller supplies the stack it wants to evaluate and uses channel defaults for empty tiles.
+pub fn composite_linear_tiles(
+    inputs: &Inputs<'_>,
+    projectors: &ProjectorDepthCache,
+    tiles: &[(u32, u32)],
+    cancelled: impl Fn() -> bool,
+    consume: impl FnMut((u32, u32), &[Channel], Vec<Option<Arc<Vec<f32>>>>),
+) {
+    let mut inputs = EvaluationInputs::new(inputs, projectors).of_the_session_stack();
+    evaluate_tiles(&mut inputs, tiles, None, cancelled, |value, _| value, consume);
+}
+
+fn evaluate_tiles<T: Copy + Default + Send + Sync>(
+    inp: &mut EvaluationInputs,
+    tiles: &[(u32, u32)],
+    mut below: Option<&mut BelowCache>,
+    cancelled: impl Fn() -> bool,
+    encode: impl Fn(f32, bool) -> T + Sync,
+    mut consume: impl FnMut((u32, u32), &[Channel], Vec<Option<Arc<Vec<T>>>>),
+) {
+    let Ok(set) = inp.project.texture_set(inp.ts) else { return };
 
     if !tiles.is_empty() {
         prepare_generators(inp, None);
@@ -4601,6 +4639,10 @@ fn composite_evaluation_tiles(inp: &mut EvaluationInputs, out: &mut Composite, t
     }
 
     for (block_index, block) in &blocks {
+        if cancelled() {
+            break;
+        }
+
         let uncached = |tile: &(u32, u32)| below.as_deref().zip(split.as_deref()).is_none_or(|(cache, _)| cache.tile(*tile).is_none());
         let fresh: Vec<(u32, u32)> = block.iter().copied().filter(uncached).collect();
         let held = below.as_deref().and_then(|cache| cache.held.as_ref()).filter(|held| {
@@ -4643,7 +4685,7 @@ fn composite_evaluation_tiles(inp: &mut EvaluationInputs, out: &mut Composite, t
         };
 
         let cached = below.as_deref().zip(split.as_deref());
-        let records = composite_block(inp, (&set.stack, &channels), out, block, cached, quota, &fields);
+        let records = composite_block(inp, (&set.stack, &channels), block, cached, quota, &fields, (&encode, &mut consume));
         if let Some(b) = below.as_deref_mut() {
             for t in block {
                 b.touch(*t);
@@ -4719,24 +4761,24 @@ const BAND: u32 = 16;
 
 /// One band of a tile: per-channel buffers, what to cache of it (when recorded) and whether
 /// any texel is covered.
-type BandResult = (Vec<Vec<u16>>, Option<Band>, bool);
+type BandResult<T> = (Vec<Vec<T>>, Option<Band>, bool);
 
 /// Per-channel tiles of one composited tile and whether any texel is covered.
-type Joined = (Vec<Option<std::sync::Arc<Vec<u16>>>>, bool);
+type Joined<T> = (Vec<Option<Arc<Vec<T>>>>, bool);
 
 /// Composite one block of tiles, split along the path to the hot layer when `below` holds it;
 /// returns what to cache (for at most `quota` tiles).
-fn composite_block(
+fn composite_block<T: Copy + Default + Send + Sync>(
     inp: &EvaluationInputs,
     (stack, planned_channels): (&[LayerId], &[Channel]),
-    out: &mut Composite,
     tiles: &[(u32, u32)],
     below: Option<(&BelowCache, &[Level])>,
     quota: usize,
     fields: &Fields,
+    (encode, consume): (&(impl Fn(f32, bool) -> T + Sync), &mut impl FnMut((u32, u32), &[Channel], Vec<Option<Arc<Vec<T>>>>)),
 ) -> Vec<((u32, u32), Vec<Band>)> {
     let channels: Vec<Channel> = inp.project.texture_set(inp.ts).map(|s| s.channel_list()).unwrap_or_default();
-    let (w, h) = (out.resolution, out.height);
+    let (w, h) = (inp.gbuf.width, inp.gbuf.height);
     let split = below.map(|(_, l)| l);
     let cached = |t: (u32, u32)| below.and_then(|(b, _)| b.tile(t));
     let fresh: Vec<(u32, u32)> = tiles.iter().copied().filter(|t| cached(*t).is_none()).collect();
@@ -4749,7 +4791,7 @@ fn composite_block(
     // Tiles split into bands of rows, so a handful of tiles still keeps every thread busy
     let bands = TILE / BAND;
     let tasks: Vec<((u32, u32), u32)> = tiles.iter().flat_map(|t| (0..bands).map(move |b| (*t, b))).collect();
-    let mut results: Vec<BandResult> = tasks
+    let mut results: Vec<BandResult<T>> = tasks
         .par_iter()
         .map(|&((tx, ty), band)| {
             let warm = cached((tx, ty)).and_then(|b| b.get(band as usize));
@@ -4776,7 +4818,7 @@ fn composite_block(
             }
             let slots = stored.iter().filter(|s| **s).count() * stride;
             let preview_tile = inp.preview.and_then(|p| p.alpha.tile(tx, ty));
-            let mut channel_buffers: Vec<Vec<u16>> = channels.iter().map(|c| vec![0u16; rows * c.components()]).collect();
+            let mut channel_buffers: Vec<Vec<T>> = channels.iter().map(|c| vec![T::default(); rows * c.components()]).collect();
             let mut anchors = Vec::new();
             let mut any = false;
             for ly in band * BAND..(band + 1) * BAND {
@@ -4832,9 +4874,8 @@ fn composite_block(
                     for (l, buf) in lanes.iter().zip(&mut channel_buffers) {
                         let v = acc.get(l.ch).copied().unwrap_or([0.0; 3]);
                         for (k, x) in v.iter().take(l.n).enumerate() {
-                            let encoded = if l.signed { to_u16_signed(*x) } else { to_u16(*x) };
                             if let Some(slot) = buf.get_mut(band_offset * l.n + k) {
-                                *slot = encoded;
+                                *slot = encode(*x, l.signed);
                             }
                         }
                     }
@@ -4846,7 +4887,7 @@ fn composite_block(
         .collect();
 
     // Join the bands of each tile (in parallel; uncovered tiles are freed)
-    let joined: Vec<Joined> = results
+    let joined: Vec<Joined<T>> = results
         .par_chunks(bands as usize)
         .map(|parts| {
             let any = parts.iter().any(|p| p.2);
@@ -4866,11 +4907,7 @@ fn composite_block(
         .collect();
     let mut records = Vec::new();
     for ((&(tx, ty), (data, any)), parts) in tiles.iter().zip(joined).zip(results.chunks_mut(bands as usize)) {
-        for (c, d) in channels.iter().zip(data) {
-            if let Some(img) = out.channels.get_mut(c) {
-                img.set_tile(tx, ty, d);
-            }
-        }
+        consume((tx, ty), &channels, data);
 
         // Tiles without covered texels cost nothing to composite: not worth caching
         if any && let Some(bands) = parts.iter_mut().map(|p| p.1.take()).collect::<Option<Vec<Band>>>() {

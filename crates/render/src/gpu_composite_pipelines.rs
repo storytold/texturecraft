@@ -6,6 +6,7 @@ use super::{ANCHOR_PUBLISH_LAYER, ANCHOR_SOURCE, COLOR_SELECTION_OPCODE, Composi
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Features {
+    material_underlay: bool,
     patterns: bool,
     extended_patterns: bool,
     tile_generator: bool,
@@ -37,6 +38,7 @@ struct Features {
 impl Features {
     fn of(program: &CompositeProgram) -> Self {
         let mut features = Self {
+            material_underlay: program.underlay.is_some(),
             authored_images: !program.material_images.is_empty(),
             mask_preview: program.is_mask_preview(),
             spatial: !program.filters.stages.is_empty(),
@@ -185,6 +187,12 @@ impl Features {
                 "fn mask_with_height(layer: Operation, texel: LayerTexel, mask: f32) -> f32 { return mask; }",
             ),
             include_str!("shaders/composite_groups.wgsl"),
+            include(
+                self.material_underlay,
+                include_str!("shaders/material_underlay.wgsl"),
+                "fn material_underlay_page(pixel: vec2<u32>) -> u32 { return 0u; }
+                 fn underlay_value(page: u32, pixel: vec2<u32>, slot: u32, default_value: vec3<f32>) -> vec3<f32> { return default_value; }",
+            ),
             include_str!("shaders/composite.wgsl"),
         ]
         .into_iter()
@@ -383,6 +391,7 @@ mod tests {
         // Generators without authored images: Grayscale Conversion's image read is a stub
         variants.push(Features { generators: true, mask_effects: true, ..Features::default() });
         variants.push(Features {
+            material_underlay: false,
             patterns: true,
             extended_patterns: true,
             tile_generator: true,

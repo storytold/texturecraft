@@ -36,6 +36,7 @@ pub mod gpu_trace;
 pub mod headless;
 mod high_poly_gpu;
 pub mod ibl;
+pub mod material_underlay;
 pub mod mesh_maps;
 mod mips_dirty;
 mod missing_seam_gpu;

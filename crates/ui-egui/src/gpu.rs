@@ -33,6 +33,9 @@ use texturecraft_render::gpu_quick_mask::{QuickMaskAlpha, QuickMaskOverlay};
 use crate::bake_scene::{BakeSceneLink, CageUpload};
 use crate::i18n::n_;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod underlay;
+
 /// Content shown through the aux texture.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AuxView {
@@ -263,6 +266,8 @@ const NO_COVERED_TEXELS: &str = n_("The texture set has no covered UV texels.");
 
 #[derive(Default)]
 struct SetCompositor {
+    #[cfg(not(target_arch = "wasm32"))]
+    underlay: Option<underlay::Underlay>,
     current: Option<CompositeKey>,
     stroke: Option<u64>,
     rejected: Option<(CompositeKey, &'static str)>,
@@ -320,6 +325,15 @@ impl SetCompositor {
         self.current.is_some() && !self.failed.load(Ordering::Acquire)
     }
 
+    fn uses_underlay(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.underlay.is_some() && self.uses_gpu() {
+            return true;
+        }
+
+        false
+    }
+
     fn plan(
         &mut self,
         session: &Session,
@@ -327,6 +341,7 @@ impl SetCompositor {
         shift: u32,
         global_reason: &'static str,
         mask: Option<LayerId>,
+        underlay_budget: u64,
     ) -> Result<Option<CompositeProgram>, &'static str> {
         let cache = session.caches.get(ts).ok_or(n_("The texture set is missing."))?;
         let key = CompositeKey { mesh: session.mesh_id, revision: cache.material_revision, size: cache.size, shift };
@@ -336,6 +351,10 @@ impl SetCompositor {
             self.stroke = None;
         }
         if !global_reason.is_empty() {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.underlay = None;
+            }
             return Err(global_reason);
         }
         if self.failed_key == Some(key) {
@@ -357,15 +376,58 @@ impl SetCompositor {
             return Err(NO_COVERED_TEXELS);
         }
         let stroke_id = stroke.map(|(id, _)| id);
+        #[cfg(not(target_arch = "wasm32"))]
+        let underlay_layer = if mask.is_none()
+            && ts == session.ts()
+            && session.solo.is_none()
+            && underlay_budget > 0
+            && (self.current != Some(key) || self.underlay.is_some())
+        {
+            session.selected_layer().and_then(|id| {
+                let project = &session.doc.project;
+                let stack = &project.texture_sets.get(ts)?.stack;
+                let index = stack.iter().position(|layer| *layer == id)?;
+                let layer = project.content_layer(id)?;
+                if index == 0 || !matches!(layer.kind, texturecraft_engine::core::LayerKind::Paint) {
+                    return None;
+                }
+
+                let lower = project.render_tree(&stack[..index]);
+                let owner = session.stroke_paint_owner().unwrap_or(layer.id);
+                (!lower.contains(&owner)).then_some((id, index))
+            })
+        } else {
+            None
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let same_underlay = {
+            let selected = underlay_layer.map(|(layer, _)| layer);
+            let same_selection = self.underlay.as_ref().is_none_or(|underlay| underlay.matches_selection(session, selected));
+            if !same_selection {
+                self.underlay = None;
+            }
+            same_selection && self.underlay.as_ref().is_none_or(|underlay| underlay.matches_environment(session))
+        };
+        #[cfg(target_arch = "wasm32")]
+        let same_underlay = {
+            let _ = underlay_budget;
+            true
+        };
         // A program lit by the environment is current only while the environment stays as it was
         let waited = self.pending.swap(false, Ordering::AcqRel);
-        let current = self.current == Some(key) && !waited && self.environment.as_ref().is_none_or(|lit| lit.matches(session));
+        let current = self.current == Some(key) && !waited && same_underlay && self.environment.as_ref().is_none_or(|lit| lit.matches(session));
         let unchanged_stroke = self.stroke == stroke_id;
         if current && unchanged_stroke && stroke.is_none_or(|(_, tiles)| tiles.is_empty()) {
             return Ok(None);
         }
+        let rejected = self.rejected.filter(|(rejected, _)| *rejected == key).map(|(_, reason)| reason);
+        #[cfg(not(target_arch = "wasm32"))]
+        let can_try_underlay = underlay_layer.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let can_try_underlay = false;
         if stroke.is_none()
-            && let Some((_, reason)) = self.rejected.filter(|(rejected, _)| *rejected == key)
+            && !can_try_underlay
+            && let Some(reason) = rejected
         {
             return Err(reason);
         }
@@ -429,15 +491,35 @@ impl SetCompositor {
         let brush = None;
         let project = view_project(session, mask.is_some());
         let program = match mask {
-            Some(owner) => CompositeProgram::try_compile_mask_preview(&project, pixels, ts, owner, region, brush),
-            None => CompositeProgram::try_compile_with_brush(&project, pixels, ts, region, brush),
+            Some(owner) => CompositeProgram::try_compile_mask_preview(&project, pixels, ts, owner, region, brush.clone()),
+            None => match rejected.filter(|_| stroke.is_none() || can_try_underlay) {
+                Some(reason) => Err(reason),
+                None => CompositeProgram::try_compile_with_brush(&project, pixels, ts, region, brush.clone()),
+            },
         };
         let mut program = match program {
-            Ok(program) => program,
+            Ok(program) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.underlay = None;
+                }
+                program
+            }
             Err(reason) => {
                 if stroke_id.is_none() {
                     self.rejected = Some((key, reason));
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some((layer, first)) = underlay_layer {
+                    let mut suffix = CompositeProgram::try_compile_above(&project, pixels, ts, first, region, brush).map_err(|_| reason)?;
+                    let material = underlay::Underlay::material(&mut self.underlay, session, ts, (layer, first), key, underlay_budget).ok_or(reason)?;
+                    suffix.set_material_underlay(material)?;
+                    suffix
+                } else {
+                    self.underlay = None;
+                    return Err(reason);
+                }
+                #[cfg(target_arch = "wasm32")]
                 return Err(reason);
             }
         };
@@ -507,6 +589,7 @@ pub struct GpuLink {
     pub(crate) prefer_gpu_layers: bool,
     pub(crate) material_start_preview: bool,
     compositors: Vec<SetCompositor>,
+    underlay_budget: u64,
     mask_preview: Option<MaskPreview>,
     quick_mask_failed: Arc<AtomicBool>,
     gpu_composite_in_flight: Arc<AtomicUsize>,
@@ -579,6 +662,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         prefer_gpu_layers: true,
         material_start_preview: true,
         compositors: Vec::new(),
+        underlay_budget: CompositeProgram::material_underlay_limit(&rs.device.limits()),
         mask_preview: None,
         quick_mask_failed: Arc::default(),
         gpu_composite_in_flight: Arc::default(),
@@ -625,7 +709,13 @@ impl GpuLink {
             _ => self.compositors.get(ts)?,
         };
         let key = CompositeKey { mesh: session.mesh_id, revision: cache.material_revision, size: cache.size, shift: self.shift };
-        if !state.uses_gpu() || state.current != Some(key) {
+        if !state.uses_gpu()
+            || state.current != Some(key)
+            || state
+                .underlay
+                .as_ref()
+                .is_some_and(|underlay| !underlay.matches_selection(session, session.selected_layer()) || !underlay.matches_environment(session))
+        {
             return None;
         }
         backend()
@@ -654,6 +744,11 @@ impl GpuLink {
 
     /// CPU display work can stay deferred while the current detail textures are GPU-resident.
     pub(crate) fn display_pending(&self, session: &Session) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.compositors.iter().any(|state| state.underlay.as_ref().is_some_and(underlay::Underlay::pending)) {
+            return true;
+        }
+
         self.cpu_sets(session).any(|cache| !cache.dirty.is_empty() || !cache.settle.is_empty() || !cache.upload.is_empty())
     }
 
@@ -679,6 +774,9 @@ impl GpuLink {
         let reason =
             cpu.map_or(n_("Waiting for the first material update"), |set| if set.failed.load(Ordering::Acquire) { GPU_COMPOSITE_ERROR } else { set.reason });
         match (uses_gpu, cpu) {
+            (true, None) if self.compositors.iter().any(SetCompositor::uses_underlay) => {
+                (n_("Layers: GPU + CPU"), n_("The GPU composites over cached material from the CPU."))
+            }
             (true, None) => (n_("Layers: GPU"), n_("The graphics card composes the material.")),
             (true, Some(_)) => (n_("Layers: GPU + CPU"), reason),
             (false, None) if !self.compositors.is_empty() => (n_("Layers: idle"), n_("No layers need compositing.")),
@@ -703,7 +801,7 @@ impl GpuLink {
         let mut submitted_stroke = false;
         let mut cpu_changed = false;
         for (ts, state) in self.compositors.iter_mut().enumerate() {
-            let reason = match state.plan(session, ts, shift, global_reason, None) {
+            let reason = match state.plan(session, ts, shift, global_reason, None, self.underlay_budget) {
                 Ok(program) => {
                     if let Some(program) = program {
                         out.composites.push((ts, program, state.failed.clone(), state.pending.clone()));
@@ -731,6 +829,8 @@ impl GpuLink {
             state.reason = reason;
             let (backend, detail) = if !reason.is_empty() {
                 ("CPU", reason)
+            } else if state.uses_underlay() {
+                ("GPU + CPU", "layer compositor with a cached CPU material")
             } else if state.neutral {
                 ("idle", "no layers need compositing")
             } else {
@@ -768,7 +868,7 @@ impl GpuLink {
         let global_reason = self.gpu_composite_reason(baking);
         let Some(preview) = self.mask_preview.as_mut() else { return false };
         let state = &mut preview.compositor;
-        let reason = match state.plan(session, ts, shift, global_reason, Some(layer)) {
+        let reason = match state.plan(session, ts, shift, global_reason, Some(layer), 0) {
             Ok(program) => {
                 if let Some(program) = program {
                     out.composites.push((ts, program, state.failed.clone(), state.pending.clone()));
@@ -1483,6 +1583,7 @@ pub(crate) mod tests {
             prefer_gpu_layers: true,
             material_start_preview: true,
             compositors: Vec::new(),
+            underlay_budget: 0,
             mask_preview: None,
             quick_mask_failed: Arc::default(),
             gpu_composite_in_flight: Arc::default(),
@@ -2639,7 +2740,7 @@ pub(crate) mod tests {
     fn gpu_brush_previews_empty_layer_and_survives_switch_to_cpu() {
         use texturecraft_render::readback::Readback;
 
-        let Ok(gpu) = Headless::for_tests() else { return };
+        let Some(gpu) = Headless::for_required_tests() else { return };
         let brush = Arc::new(HeadlessBrush(Mutex::new(gpu)));
         let mut s = Session::new_project("GPU brush", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
         let layer = s.selected_layer().unwrap();
@@ -2694,6 +2795,59 @@ pub(crate) mod tests {
         s.end_stroke().unwrap();
         assert_eq!(s.doc.pixels.layer(layer, Channel::BaseColor).unwrap().get(64, 64), pixel);
         assert_eq!(display_at_center(link.sync(&mut s, None, None, 0, 0.0)), painted);
+
+        use texturecraft_engine::core::{LayerKind, Procedural, ProceduralKind, Projection, Source};
+
+        let mut s = Session::new_project("CPU underlay", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        execute(&mut s, "layer.add.fill", &json!({"color": [0.0, 0.0, 1.0]})).unwrap();
+        let lower = s.selected_layer().unwrap();
+        let LayerKind::Fill(fill) = &mut s.doc.project.layers.get_mut(&lower).unwrap().kind else {
+            panic!("expected a fill layer");
+        };
+        let blue = [0.0, 0.0, 1.0];
+        // The shader's coordinate guard leaves this high-frequency fill on the CPU.
+        fill.projection = Projection::Uv { scale: [32_768.0; 2], rotation: 0.0, offset: [0.0; 2] };
+        fill.sources
+            .insert(Channel::BaseColor, Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: blue, high: blue, ramp: Vec::new() });
+        execute(&mut s, "layer.add.paint", &json!({})).unwrap();
+        execute(&mut s, "tool.material", &json!({"channel": "baseColor", "solo": true, "color": [1.0, 0.0, 0.0]})).unwrap();
+        assert!(CompositeProgram::try_compile_with_brush(&s.doc.project, &s.doc.pixels, 0, None, None).is_err(), "the complete stack must fall back");
+
+        let mut link = self::link();
+        link.gpu_composite_enabled = true;
+        link.brush_device = Some(brush.clone());
+        let fallback = link.sync(&mut s, None, None, 0, 0.0);
+        assert!(fallback.composites.is_empty() && link.brush_device(&s).is_none());
+        let apply = |frame: SceneSync| {
+            let Headless { renderer, device, queue, .. } = &mut *brush.0.lock().unwrap();
+            let (_, errors, _) = frame.apply_display(renderer, device, queue);
+            assert!(errors.is_empty(), "{errors:?}");
+        };
+        apply(fallback);
+        link.underlay_budget = CompositeProgram::material_underlay_limit(&brush.0.lock().unwrap().device.limits());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let background = loop {
+            let frame = link.sync(&mut s, None, None, 0, 0.0);
+            if !frame.composites.is_empty() {
+                break display_at_center(frame);
+            }
+            apply(frame);
+            assert!(std::time::Instant::now() < deadline && link.display_pending(&s), "selection must warm the underlay");
+            std::thread::yield_now();
+        };
+        assert_eq!(background, [0, 0, 255, 255]);
+        let cached = link.compositors[0].underlay.as_ref().unwrap().ready().unwrap();
+
+        s.brush_device = link.brush_device(&s);
+        s.begin_stroke_uv(Vec2::splat(0.5), 1.0).unwrap();
+        assert!(s.device_stroke().is_some(), "a lower CPU layer cannot move this stroke off the device");
+        let frame = link.sync(&mut s, None, None, 0, 0.0);
+        assert!(!frame.composites.is_empty() && frame.tiles.is_empty());
+        let live = display_at_center(frame);
+        assert_ne!(live, background);
+        s.end_stroke().unwrap();
+        assert_eq!(display_at_center(link.sync(&mut s, None, None, 0, 0.0)), live);
+        assert!(Arc::ptr_eq(&cached, &link.compositors[0].underlay.as_ref().unwrap().ready().unwrap()));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

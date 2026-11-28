@@ -841,6 +841,23 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     // Grouped by the destination slots assigned by Rust.
     var lobe_colors = array<vec3<f32>, 4>(vec3(1.0), vec3(0.04), vec3(0.0), vec3(0.5, 0.5, 1.0));
     var lobe_values = array<f32, 9>(0.0, 0.5, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.5);
+    var underlay = 0u;
+    if covered {
+        underlay = material_underlay_page(pixel);
+    }
+    if underlay != 0u {
+        base = underlay_value(underlay, pixel, 0u, base);
+        normal = underlay_value(underlay, pixel, 7u, normal);
+        for (var index = 0u; index < 6u; index++) {
+            scalars[index] = underlay_value(underlay, pixel, index + 1u, vec3(scalars[index])).x;
+        }
+        for (var index = 0u; index < 4u; index++) {
+            lobe_colors[index] = underlay_value(underlay, pixel, index + 8u, lobe_colors[index]);
+        }
+        for (var index = 0u; index < 9u; index++) {
+            lobe_values[index] = underlay_value(underlay, pixel, index + 12u, vec3(lobe_values[index])).x;
+        }
+    }
     var last_mask = 0xffffffffu;
     var mask_value = 1.0;
     var triangle = 0xffffffffu;

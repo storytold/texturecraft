@@ -698,6 +698,11 @@ impl Session {
         self.stroke.as_ref().map(|stroke| stroke.ts)
     }
 
+    /// The layer whose content or mask the active stroke changes.
+    pub fn stroke_paint_owner(&self) -> Option<LayerId> {
+        self.stroke.as_ref()?.target.map(|target| self.paint_owner(target))
+    }
+
     pub fn stroke_mask_owner(&self) -> Option<LayerId> {
         let Some(PaintTarget::Mask(effect)) = self.stroke.as_ref()?.target else { return None };
         self.doc.project.effect(effect).map(|(layer, _)| layer)

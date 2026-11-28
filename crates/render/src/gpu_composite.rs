@@ -25,6 +25,7 @@ use crate::gpu_image_source::{DECAL_PROJECTION, IMAGE_SOURCE_OPCODE, ImageUse, M
 use crate::gpu_neighbourhood::{self, FIELD_WORDS, NeighbourhoodFilter, NeighbourhoodGpu, NeighbourhoodRegion};
 use crate::gpu_stencil::GpuStencil;
 use crate::gpu_tile_pattern::{TILE_GENERATOR_OPCODE, TileImageAtlas, TilePatterns};
+use crate::material_underlay::MaterialUnderlay;
 use crate::paint_window::CompositePaintWindow;
 use wgpu::util::DeviceExt;
 
@@ -1444,6 +1445,7 @@ impl CompositeRegion {
 }
 
 /// The active stroke's GPU alpha, sampled in the corresponding paint layer or mask effect.
+#[derive(Clone)]
 pub struct LiveBrush {
     pub target: LiveBrushTarget,
     pub opacity: f32,
@@ -1455,6 +1457,7 @@ pub struct LiveBrush {
     pub stencil: Option<GpuStencil>,
 }
 
+#[derive(Clone)]
 pub enum LiveBrushTarget {
     Layer {
         layer: LayerId,
@@ -1497,6 +1500,7 @@ impl LiveBrush {
 
 #[derive(Debug)]
 pub struct CompositeProgram {
+    underlay: Option<Arc<MaterialUnderlay>>,
     operations: Vec<Operation>,
     layer_count: u32,
     filters: FilterPlan,
@@ -1566,7 +1570,7 @@ fn display_bit(kind: DisplayKind) -> u32 {
 }
 
 // Destination slots match the channel groups consumed by composite.wgsl.
-fn channel_slot(channel: Channel) -> u32 {
+pub(super) fn channel_slot(channel: Channel) -> u32 {
     use Channel::*;
     match channel {
         BaseColor => 0,
@@ -1612,9 +1616,32 @@ fn slot_kind(slot: u32) -> ChannelKind {
 }
 
 impl CompositeProgram {
+    /// Maximum size of a resident linear material underlay for this device.
+    pub fn material_underlay_limit(limits: &wgpu::Limits) -> u64 {
+        if limits.max_storage_buffers_per_shader_stage >= 7 && limits.max_bindings_per_bind_group >= 20 {
+            limits.max_storage_buffer_binding_size.min(limits.max_buffer_size)
+        } else {
+            0
+        }
+    }
+
+    /// Start the layer stack from the CPU material before display conversion.
+    pub fn set_material_underlay(&mut self, underlay: Arc<MaterialUnderlay>) -> Result<(), &'static str> {
+        if self.mask_preview || self.filters.stages.iter().any(|stage| stage.anchor.is_some()) {
+            return Err("The GPU layer stack reads across the CPU material boundary.");
+        }
+
+        for channel in Channel::ALL.into_iter().filter(|&channel| underlay.has_channel(channel)) {
+            self.display_outputs |= display_bit(DisplayKind::of_channel(channel));
+        }
+        self.underlay = Some(underlay);
+        Ok(())
+    }
+
     pub fn is_neutral(&self) -> bool {
         !self.mask_preview
             && !self.glossiness
+            && self.underlay.is_none()
             && self.layer_count == 0
             && self.baked.as_ref().is_none_or(|baked| baked.maps[0].is_none() && baked.maps[1].is_none())
     }
@@ -1744,7 +1771,24 @@ impl CompositeProgram {
         region: Option<CompositeRegion>,
         brush: Option<LiveBrush>,
     ) -> Result<Self, &'static str> {
+        Self::try_compile_above(project, pixels, ts, 0, region, brush)
+    }
+
+    /// Compile the draws after a root-level CPU material boundary.
+    pub fn try_compile_above(
+        project: &Project,
+        pixels: &PixelStore,
+        ts: usize,
+        first_layer: usize,
+        region: Option<CompositeRegion>,
+        brush: Option<LiveBrush>,
+    ) -> Result<Self, &'static str> {
         let set = project.texture_sets.get(ts).ok_or("The texture set is missing.")?;
+        let stack = set.stack.get(first_layer..).ok_or("The CPU material boundary is outside the layer stack.")?;
+        if first_layer != 0 && project.render_tree(stack).iter().filter_map(|id| project.layers.get(id)).any(|layer| layer.reads_stack()) {
+            return Err("The GPU layer stack reads across the CPU material boundary.");
+        }
+
         packages::check_set(set, false)?;
         if let Some(brush) = &brush {
             brush.validate(set.size())?;
@@ -1761,10 +1805,10 @@ impl CompositeProgram {
         let mut groups = GroupPlan::default();
         let mut group_depth = 0;
         let mut mask_layers = Vec::new();
-        let mut non_default = [false; Channel::ALL.len()];
+        let mut non_default = [first_layer != 0; Channel::ALL.len()];
         let stencil_pigment = brush.as_ref().is_some_and(|brush| brush.stencil.is_some());
         // Each draw carries the Scale and Rotation of the folders holding it (an instanced folder's too)
-        let mut layers: Vec<_> = set.stack.iter().rev().map(|&id| (StackWork::Layer(id, 0, 0), ContentsOffset::NONE)).collect();
+        let mut layers: Vec<_> = stack.iter().rev().map(|&id| (StackWork::Layer(id, 0, 0), ContentsOffset::NONE)).collect();
         while let Some((work, around)) = layers.pop() {
             let (id, depth, inherited_geometry) = match work {
                 StackWork::Layer(id, depth, geometry) => (id, depth, geometry),
@@ -2080,6 +2124,7 @@ impl CompositeProgram {
         // P2: the programs that composite the anchor heights micro details read
         generator_p2::compile_captures(&mut procedural.micro, project, pixels, ts)?;
         Ok(Self {
+            underlay: None,
             operations,
             layer_count,
             filters,
@@ -2169,6 +2214,7 @@ impl CompositeProgram {
         // P2: the programs that composite the anchor heights micro details read
         generator_p2::compile_captures(&mut procedural.micro, project, pixels, ts)?;
         Ok(Self {
+            underlay: None,
             operations,
             layer_count: 1,
             filters,
@@ -2890,6 +2936,8 @@ pub(crate) struct GpuCompositor {
     default_tile_images: wgpu::TextureView,
     tile_images: BTreeMap<usize, TileImageAtlas>,
     paint_upload: Option<wgpu::Buffer>,
+    underlay_binding: bool,
+    underlays: BTreeMap<usize, (Weak<MaterialUnderlay>, wgpu::Buffer)>,
     /// The working buffer of the last update, reused while the next one fits it
     scratch: Option<wgpu::Buffer>,
     /// Bytes of the last update's working space and paint upload (tests report them)
@@ -2968,6 +3016,10 @@ impl GpuCompositor {
         if supports_fields {
             entries.push(binding(17, texture(wgpu::TextureSampleType::Float { filterable: false }, wgpu::TextureViewDimension::D2Array)));
         }
+        let underlay_binding = CompositeProgram::material_underlay_limit(&limits) > 0;
+        if underlay_binding {
+            entries.push(binding(19, read));
+        }
         let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("tc_gpu_composite_bindings"), entries: &entries });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tc_gpu_composite_layout"),
@@ -3021,6 +3073,8 @@ impl GpuCompositor {
             default_tile_images: TileImageAtlas::empty_view(device),
             tile_images: BTreeMap::new(),
             paint_upload: None,
+            underlay_binding,
+            underlays: BTreeMap::new(),
             scratch: None,
             update_bytes: [0; 2],
         }
@@ -3129,10 +3183,12 @@ impl GpuCompositor {
             fields.retain_texture_sets(count);
         }
         self.tile_images.retain(|&ts, _| ts < count);
+        self.underlays.retain(|&ts, _| ts < count);
     }
 
     pub(crate) fn release_unused_surfaces(&mut self) {
         self.tile_images.retain(|_, atlas| atlas.is_live());
+        self.underlays.retain(|_, (material, _)| material.strong_count() != 0);
         self.surfaces.retain(|cache| cache.gbuf.strong_count() != 0);
         self.id_bakes.retain(|_, cache| cache.data.strong_count() != 0);
         if let Some(curvature) = &mut self.curvature {
@@ -3161,6 +3217,7 @@ impl GpuCompositor {
             fields.release(ts);
         }
         self.tile_images.remove(&ts);
+        self.underlays.remove(&ts);
     }
 
     fn id_bake_input(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ts: usize, id_bake: Option<&IdBake>) -> Result<Option<wgpu::TextureView>, String> {
@@ -3447,8 +3504,29 @@ impl GpuCompositor {
         let halo = radius.saturating_add(program.filters.band_reach());
         let whole = program.filters.whole_set();
         let limits = device.limits();
+        let underlay = match &program.underlay {
+            Some(material) => {
+                let bytes = (material.words.len() * size_of::<u32>()) as u64;
+                if !self.underlay_binding || material.size != source_size || bytes > limits.max_buffer_size.min(limits.max_storage_buffer_binding_size) {
+                    return Err("The CPU material underlay exceeds the GPU compositor limits.".into());
+                }
+
+                let key = Arc::downgrade(material);
+                if self.underlays.get(&ts).is_none_or(|(old, _)| !old.ptr_eq(&key)) {
+                    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("tc_cpu_material_underlay"),
+                        contents: bytemuck::cast_slice(&material.words),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+                    self.underlays.insert(ts, (key, buffer));
+                }
+                self.underlays.get(&ts).map(|(_, buffer)| buffer.clone())
+            }
+            None => None,
+        };
         // The other buffers an update keeps alive: paint, operations and the parameter lookup
         let live = self.paint_upload.as_ref().map_or(0, wgpu::Buffer::size)
+            + underlay.as_ref().map_or(0, wgpu::Buffer::size)
             + (program.operations.len() * size_of::<Operation>()) as u64
             + (u64::from(LOOKUP_WORDS) + program.ramp_words.len() as u64 + program.geometry.words.len() as u64) * 4;
         let scratch_limit = scratch_limit(&limits, live);
@@ -3762,6 +3840,10 @@ impl GpuCompositor {
             // P3b: the whole-map generator fields
             if let Some(fields) = &generator_fields {
                 entries.push(wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(fields) });
+            }
+            if self.underlay_binding {
+                let buffer = underlay.as_ref().unwrap_or(&lookup);
+                entries.push(wgpu::BindGroupEntry { binding: 19, resource: buffer.as_entire_binding() });
             }
             device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("tc_composite_band"), layout: &self.bindings, entries: &entries })
         };
@@ -4117,6 +4199,10 @@ impl GpuCompositor {
     /// Whether `program`'s pipelines are compiled; starts compiling them otherwise (on worker
     /// threads when [`Self::set_asynchronous_compile`] is on). An error when their compile failed.
     pub(crate) fn pipelines_ready(&mut self, device: &wgpu::Device, program: &CompositeProgram) -> Result<bool, String> {
+        if program.underlay.is_some() && !self.underlay_binding {
+            return Err("The GPU cannot bind a CPU material underlay.".into());
+        }
+
         Ok(self.pipelines().get(device, &self.pipeline_layout, program, self.asynchronous)?.is_some())
     }
 
@@ -6164,6 +6250,7 @@ mod paint_window_tests {
             }
         }
         let program = CompositeProgram {
+            underlay: None,
             filters: FilterPlan::default(),
             groups: GroupPlan::default(),
             geometry: GeometryMasks::default(),
