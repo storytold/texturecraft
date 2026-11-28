@@ -26,6 +26,8 @@ use crate::{Document, EngineError, Result, Session, cmd};
 
 /// Control points kept at most.
 pub const MAX_PATH_POINTS: usize = 4096;
+/// Control points an outline needs to enclose an area
+const MIN_AREA_POINTS: usize = 3;
 /// The undo step that adds a new path
 pub(crate) const NEW_PATH_LABEL: &str = "Path";
 /// Curve sampling step in viewport pixels (3D view) and texture units (2D view).
@@ -148,8 +150,8 @@ impl PathState {
             }
         }
 
-        // A new filled path keeps its mode below three points, while a stored one opens to stay paintable
-        if self.closed && (!self.fill || self.editing.is_some()) && self.points.len() < 3 {
+        // A filled path keeps its mode below three points, so adding them back fills again
+        if self.closed && !self.fill && self.points.len() < MIN_AREA_POINTS {
             self.closed = false;
         }
     }
@@ -628,9 +630,13 @@ impl Session {
         }
 
         let path = &self.tool.path;
-        if path.closed && path.fill && path.points.len() < 3 {
-            // Nothing fills yet, so the preview of a longer outline goes
-            return Ok(self.remove_draft_preview());
+        if path.closed && path.fill && path.points.len() < MIN_AREA_POINTS {
+            // Nothing fills yet, so the preview goes, and the tool must not keep pointing at it
+            let removed = self.remove_draft_preview();
+            if removed {
+                self.tool.path.editing = None;
+            }
+            return Ok(removed);
         }
 
         let Some((eid, index, stored)) = stored else { return self.start_path_draft(viewport) };
@@ -744,6 +750,12 @@ impl Session {
 
         self.path_checkpoint();
         self.tool.path.remove_selected();
+
+        // A stored path opens instead, so it stays paintable; a new path's preview also counts as edited, so the draft tells them apart
+        let stored = self.tool.path.editing.is_some() && self.path_draft.is_none();
+        if stored && self.tool.path.points.len() < MIN_AREA_POINTS {
+            self.tool.path.closed = false;
+        }
     }
 
     /// Make a point a corner or smooth again, with point undo; false when nothing changed
@@ -1106,7 +1118,7 @@ impl Session {
             return Err(EngineError::Other("the path has no points: click the surface to add some".into()));
         }
 
-        if fill && pts.len() < 3 {
+        if fill && pts.len() < MIN_AREA_POINTS {
             return Err(EngineError::Other("a filled path needs at least three points".into()));
         }
 

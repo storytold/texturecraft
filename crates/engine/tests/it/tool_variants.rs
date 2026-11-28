@@ -9,6 +9,8 @@ use texturecraft_engine::{Session, Tool, execute};
 
 const RES: f32 = 256.0;
 const SQUARE_UV: [[f32; 2]; 4] = [[0.3, 0.3], [0.7, 0.3], [0.7, 0.7], [0.3, 0.7]];
+// Wide enough that its middle stays clear of the line its first two points paint
+const TRIANGLE_UV: [[f32; 2]; 3] = [[0.1, 0.1], [0.9, 0.1], [0.5, 0.9]];
 
 fn session() -> Session {
     session_on(primitives::sphere(1.0, 48, 24))
@@ -178,27 +180,45 @@ fn removing_a_point_keeps_filled() {
 fn a_filled_preview_goes_below_three_points() {
     let mut s = session();
     execute(&mut s, "tool.variant.pathFilled", &Value::Null).unwrap();
-    execute(&mut s, "tool.path", &json!({"uvPoints": [[0.3, 0.3], [0.7, 0.3], [0.5, 0.7]]})).unwrap();
-    assert!(red_uv(&s, 0.5, 0.4), "three points preview the fill");
+    execute(&mut s, "tool.path", &json!({"uvPoints": TRIANGLE_UV})).unwrap();
+    assert!(red_uv(&s, 0.5, 0.5), "three points preview the fill");
 
     s.remove_selected_path_point();
     s.path_live().unwrap();
+    s.path_live().unwrap();
+    s.update();
 
-    assert!(!red_uv(&s, 0.5, 0.4), "two points fill nothing");
+    assert!(!red_uv(&s, 0.5, 0.5), "two points fill nothing");
+    assert_eq!(s.tool.path.points.len(), 2, "the points stay");
+    assert_eq!(variant_of(&mut s, "path"), "pathFilled");
+}
+
+#[test]
+fn picking_filled_path_over_a_two_point_preview_keeps_the_points() {
+    let mut s = session();
+    execute(&mut s, "tool.path", &json!({"uvPoints": [[0.3, 0.3], [0.7, 0.3]]})).unwrap();
+
+    execute(&mut s, "tool.variant.pathFilled", &Value::Null).unwrap();
+    s.path_live().unwrap();
+    s.path_live().unwrap();
+    s.update();
+
+    assert_eq!(s.tool.path.points.len(), 2);
+    assert!(!red_uv(&s, 0.5, 0.3), "the open line's preview goes");
 }
 
 #[test]
 fn removing_a_point_of_a_stored_filled_path_repaints_it_open() {
     let mut s = session();
-    let report =
-        execute(&mut s, "tool.path", &json!({"uvPoints": [[0.3, 0.3], [0.7, 0.3], [0.5, 0.7]], "closed": true, "fill": true, "commit": true})).unwrap();
+    let report = execute(&mut s, "tool.path", &json!({"uvPoints": TRIANGLE_UV, "closed": true, "fill": true, "commit": true})).unwrap();
     execute(&mut s, "path.edit", &json!({"effect": report["committed"]["effect"], "index": 0})).unwrap();
 
     s.remove_selected_path_point();
     s.path_live().unwrap();
+    s.update();
 
-    assert!(!red_uv(&s, 0.5, 0.4), "the old fill is repainted away");
-    assert!(red_uv(&s, 0.5, 0.3), "the two points paint as an open line");
+    assert!(!red_uv(&s, 0.5, 0.5), "the old fill is repainted away");
+    assert!(red_uv(&s, 0.5, 0.1), "the two points paint as an open line");
 }
 
 #[test]
